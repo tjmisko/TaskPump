@@ -282,9 +282,13 @@ cmd_claim() {
   local file; file=$(task_file_required "$id")
 
   local status; status=$(fm_get "$file" '.status')
-  [[ "$status" != "open" ]] && die "cannot claim $id: status=$status (must be open)"
   local claimed_by; claimed_by=$(fm_get "$file" '.claimed_by')
-  if [[ -n "$claimed_by" && "$claimed_by" != "$branch" ]]; then
+  # Idempotent re-claim by the same branch refreshes the turn budget.
+  if [[ "$status" == "in_progress" && "$claimed_by" == "$branch" ]]; then
+    dbg "refreshing claim on $id (already held by $branch)"
+  elif [[ "$status" != "open" ]]; then
+    die "cannot claim $id: status=$status (must be open or in_progress by same branch)"
+  elif [[ -n "$claimed_by" && "$claimed_by" != "$branch" ]]; then
     die "cannot claim $id: already claimed by '$claimed_by'"
   fi
 
