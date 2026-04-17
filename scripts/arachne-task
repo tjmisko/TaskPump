@@ -1,0 +1,541 @@
+#!/usr/bin/env bash
+# arachne-task — task-management CLI for the Arachne task-loop.
+#
+# Task state lives as per-file markdown with YAML frontmatter. This CLI is the
+# single writer / reader to that state. See /home/tjmisko/.claude/plans/
+# check-the-logs-from-floofy-tarjan.md Layer 3 for the contract.
+#
+# Env vars:
+#   ARACHNE_TASKS_DIR      Path to tasks directory. Default: $PWD/task-loop/tasks
+#   ARACHNE_TASK_OUT       Path to the JSON "next task" surface file.
+#                          Default: $(dirname $ARACHNE_TASKS_DIR)/.next-task
+#   ARACHNE_TASK_PUSH      If "1", `git push` after each state-mutating commit.
+#                          Default: unset (local commits only).
+#   ARACHNE_TASK_NOCOMMIT  If "1", skip git commit entirely (fixture mode).
+#   ARACHNE_TASK_DEBUG     If "1", print debug traces to stderr.
+
+set -euo pipefail
+
+# ── Config ────────────────────────────────────────────────────────────────────
+: "${ARACHNE_TASKS_DIR:=$PWD/task-loop/tasks}"
+: "${ARACHNE_TASK_OUT:=$(dirname "$ARACHNE_TASKS_DIR")/.next-task}"
+: "${ARACHNE_TASK_PUSH:=0}"
+: "${ARACHNE_TASK_NOCOMMIT:=0}"
+: "${ARACHNE_TASK_DEBUG:=0}"
+
+dbg() {
+  [[ "$ARACHNE_TASK_DEBUG" == "1" ]] && printf '[arachne-task] %s\n' "$*" >&2
+  return 0
+}
+
+die() {
+  printf 'arachne-task: %s\n' "$*" >&2
+  exit 1
+}
+
+# ── Frontmatter helpers ───────────────────────────────────────────────────────
+
+# Read a frontmatter field from a task file.
+# Usage: fm_get <file> <yq-expr>
+# Returns empty string if the field is null or absent.
+fm_get() {
+  local file=$1 expr=$2 val
+  val=$(yq --front-matter=extract "$expr" "$file" 2>/dev/null || echo "")
+  # yq returns "null" for missing keys; normalize to empty.
+  [[ "$val" == "null" ]] && val=""
+  printf '%s' "$val"
+}
+
+# Set (or unset) a frontmatter field in-place.
+# Usage: fm_set <file> <yq-expr-with-assignment>
+# Example: fm_set F17.10.md '.status = "in_progress"'
+fm_set() {
+  local file=$1 expr=$2
+  yq -i --front-matter=process "$expr" "$file"
+}
+
+# Path to a task file by id. Returns empty if not found.
+task_file() {
+  local id=$1 file
+  file="$ARACHNE_TASKS_DIR/$id.md"
+  [[ -f "$file" ]] && printf '%s' "$file"
+}
+
+# Require a task file to exist; print its path.
+task_file_required() {
+  local id=$1 file
+  file=$(task_file "$id")
+  [[ -z "$file" ]] && die "no task file for id='$id' in $ARACHNE_TASKS_DIR"
+  printf '%s' "$file"
+}
+
+# ── Sort key for phase-anchored ids ───────────────────────────────────────────
+# "F17.10" → "17 10" so `sort -n -k1,1 -k2,2` orders F9 < F10 < F17.2 < F17.10.
+# "F-MERGE.2" → "999999 2" (special phase sorted last within its bucket).
+phase_sort_key() {
+  local id=$1 phase_part num_part phase_num
+  phase_part=${id%%.*}         # F17 from F17.10
+  num_part=${id##*.}           # 10 from F17.10
+  if [[ "$phase_part" =~ ^F([0-9]+)$ ]]; then
+    phase_num=${BASH_REMATCH[1]}
+  else
+    # Non-numeric phase (e.g., F-MERGE). Sort after numeric phases.
+    phase_num=999999
+  fi
+  printf '%s %s' "$phase_num" "$num_part"
+}
+
+# ── JSON helper (portable escaping via jq) ────────────────────────────────────
+json_object() {
+  # Usage: json_object key1 val1 key2 val2 ...
+  # Emits a compact JSON object. Values are treated as strings unless numeric.
+  local args=()
+  while (( $# )); do
+    args+=(--arg "k$#" "$1")
+    shift
+    args+=(--arg "v$#" "$1")
+    shift
+  done
+  # Simpler: build via jq from positional.
+  local out='{}'
+  while read -r k v; do
+    out=$(jq -c --arg k "$k" --arg v "$v" '. + {($k): $v}' <<<"$out")
+  done < <(paste -d' ' <(printf '%s\n' "$@" | awk 'NR%2==1') <(printf '%s\n' "$@" | awk 'NR%2==0'))
+  printf '%s' "$out"
+}
+
+# ── Git helpers ───────────────────────────────────────────────────────────────
+git_commit_state() {
+  # Commits the current state of ARACHNE_TASKS_DIR with a given message.
+  # Respects ARACHNE_TASK_NOCOMMIT and ARACHNE_TASK_PUSH.
+  local msg=$1
+  if [[ "$ARACHNE_TASK_NOCOMMIT" == "1" ]]; then
+    dbg "skipping commit (ARACHNE_TASK_NOCOMMIT=1): $msg"
+    return 0
+  fi
+  local tasks_git_root
+  tasks_git_root=$(git -C "$ARACHNE_TASKS_DIR" rev-parse --show-toplevel 2>/dev/null || true)
+  if [[ -z "$tasks_git_root" ]]; then
+    dbg "not a git repo at $ARACHNE_TASKS_DIR; skipping commit"
+    return 0
+  fi
+  git -C "$tasks_git_root" add -A -- "$ARACHNE_TASKS_DIR"
+  if git -C "$tasks_git_root" diff --cached --quiet; then
+    dbg "no changes to commit for: $msg"
+    return 0
+  fi
+  git -C "$tasks_git_root" -c user.name='arachne-task' -c user.email='task@arachne.local' commit -m "$msg" >/dev/null
+  dbg "committed: $msg"
+  if [[ "$ARACHNE_TASK_PUSH" == "1" ]]; then
+    # Retry push up to 3x with fetch-rebase on non-fast-forward.
+    local try
+    for try in 1 2 3; do
+      if git -C "$tasks_git_root" push 2>/dev/null; then
+        dbg "pushed (attempt $try)"
+        return 0
+      fi
+      dbg "push rejected (attempt $try); fetching and rebasing"
+      git -C "$tasks_git_root" fetch origin
+      git -C "$tasks_git_root" rebase origin/"$(git -C "$tasks_git_root" rev-parse --abbrev-ref HEAD)" || {
+        dbg "rebase failed on try $try"
+      }
+    done
+    die "push failed after 3 retries"
+  fi
+}
+
+# ── Subcommands ───────────────────────────────────────────────────────────────
+
+# List task files as newline-separated paths.
+list_all_files() {
+  [[ -d "$ARACHNE_TASKS_DIR" ]] || return 0
+  find "$ARACHNE_TASKS_DIR" -maxdepth 1 -name '*.md' -type f | sort
+}
+
+# True if all blockers of <file> are status: done.
+blockers_satisfied() {
+  local file=$1 blockers blocker bfile bstatus
+  # Read blockers as newline-separated list.
+  blockers=$(yq --front-matter=extract '.blockers[]?' "$file" 2>/dev/null || echo "")
+  [[ -z "$blockers" ]] && return 0
+  while IFS= read -r blocker; do
+    [[ -z "$blocker" ]] && continue
+    bfile=$(task_file "$blocker")
+    if [[ -z "$bfile" ]]; then
+      dbg "blocker '$blocker' has no task file; treating as unsatisfied"
+      return 1
+    fi
+    bstatus=$(fm_get "$bfile" '.status')
+    if [[ "$bstatus" != "done" ]]; then
+      return 1
+    fi
+  done <<<"$blockers"
+  return 0
+}
+
+cmd_next() {
+  local branch=""
+  while (( $# )); do
+    case $1 in
+      --branch) branch=$2; shift 2;;
+      --branch=*) branch=${1#--branch=}; shift;;
+      *) die "unknown arg to next: $1";;
+    esac
+  done
+
+  # Walk tasks, collect (sort_key, id, file) for eligible ones.
+  local candidates=() file id status claimed_by sort_key
+  while IFS= read -r file; do
+    [[ -z "$file" ]] && continue
+    id=$(fm_get "$file" '.id')
+    [[ -z "$id" ]] && { dbg "skip $file: no id"; continue; }
+    status=$(fm_get "$file" '.status')
+    if [[ "$status" != "open" ]]; then
+      dbg "skip $id: status=$status"
+      continue
+    fi
+    claimed_by=$(fm_get "$file" '.claimed_by')
+    if [[ -n "$claimed_by" && "$claimed_by" != "$branch" ]]; then
+      dbg "skip $id: claimed by '$claimed_by' (current branch: '$branch')"
+      continue
+    fi
+    if ! blockers_satisfied "$file"; then
+      dbg "skip $id: blockers not satisfied"
+      continue
+    fi
+    sort_key=$(phase_sort_key "$id")
+    candidates+=("$sort_key|$id|$file")
+  done < <(list_all_files)
+
+  if (( ${#candidates[@]} == 0 )); then
+    # No eligible task. Write an empty-ish JSON to the out file and exit 1.
+    printf '%s\n' "null" >| "$ARACHNE_TASK_OUT"
+    echo "null"
+    return 1
+  fi
+
+  # Sort by numeric phase then numeric within-phase. IFS hack since bash
+  # arrays sort lexically by default.
+  local sorted
+  sorted=$(printf '%s\n' "${candidates[@]}" | sort -n -k1,1 -k2,2 -t'.' -s)
+  # Take the first line.
+  local top
+  top=$(printf '%s\n' "$sorted" | head -n1)
+  local top_id=${top#*|}
+  top_id=${top_id%%|*}
+  local top_file=${top#*|*|}
+
+  # Emit JSON.
+  local json
+  json=$(jq -n \
+    --arg id "$top_id" \
+    --arg file "$top_file" \
+    --arg branch "$branch" \
+    '{id: $id, file: $file, branch: $branch, ready: true}')
+  printf '%s\n' "$json" >| "$ARACHNE_TASK_OUT"
+  printf '%s\n' "$json"
+  return 0
+}
+
+cmd_list() {
+  local filter_status=""
+  while (( $# )); do
+    case $1 in
+      --status) filter_status=$2; shift 2;;
+      --status=*) filter_status=${1#--status=}; shift;;
+      *) die "unknown arg to list: $1";;
+    esac
+  done
+
+  printf '%-10s %-14s %-24s %-20s %s\n' "ID" "STATUS" "CLAIMED_BY" "BLOCKERS" "TITLE"
+  local file id status claimed_by title blockers
+  while IFS= read -r file; do
+    [[ -z "$file" ]] && continue
+    id=$(fm_get "$file" '.id')
+    status=$(fm_get "$file" '.status')
+    if [[ -n "$filter_status" && "$status" != "$filter_status" ]]; then
+      continue
+    fi
+    claimed_by=$(fm_get "$file" '.claimed_by')
+    title=$(fm_get "$file" '.title')
+    blockers=$(yq --front-matter=extract '.blockers | join(",")' "$file" 2>/dev/null || echo "")
+    [[ "$blockers" == "null" ]] && blockers=""
+    printf '%-10s %-14s %-24s %-20s %s\n' \
+      "$id" "$status" "${claimed_by:--}" "${blockers:--}" "$title"
+  done < <(list_all_files)
+}
+
+cmd_claim() {
+  local id="" branch="" turns="50"
+  while (( $# )); do
+    case $1 in
+      --branch) branch=$2; shift 2;;
+      --branch=*) branch=${1#--branch=}; shift;;
+      --turns) turns=$2; shift 2;;
+      --turns=*) turns=${1#--turns=}; shift;;
+      -*) die "unknown flag: $1";;
+      *) [[ -z "$id" ]] && id=$1 || die "too many positional args"; shift;;
+    esac
+  done
+  [[ -z "$id" ]] && die "usage: arachne-task claim <id> --branch <b> [--turns <n>]"
+  [[ -z "$branch" ]] && die "--branch is required"
+  local file; file=$(task_file_required "$id")
+
+  local status; status=$(fm_get "$file" '.status')
+  [[ "$status" != "open" ]] && die "cannot claim $id: status=$status (must be open)"
+  local claimed_by; claimed_by=$(fm_get "$file" '.claimed_by')
+  if [[ -n "$claimed_by" && "$claimed_by" != "$branch" ]]; then
+    die "cannot claim $id: already claimed by '$claimed_by'"
+  fi
+
+  local now; now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  fm_set "$file" "
+    .status = \"in_progress\" |
+    .claimed_by = \"$branch\" |
+    .claimed_at = \"$now\" |
+    .turn_budget_remaining = $turns |
+    .consecutive_failed_iterations = 0 |
+    .last_heartbeat_head_sha = null
+  "
+  git_commit_state "claim $id on $branch (turns=$turns)"
+  echo "claimed $id for $branch (turn_budget=$turns)"
+}
+
+# Read the current git HEAD SHA of the *code repo* (not the tasks repo).
+# Used by heartbeat to detect productive commits.
+code_head_sha() {
+  local code_repo_root
+  # If ARACHNE_CODE_REPO is set, use it; else cwd.
+  : "${ARACHNE_CODE_REPO:=$PWD}"
+  code_repo_root=$(git -C "$ARACHNE_CODE_REPO" rev-parse --show-toplevel 2>/dev/null || true)
+  [[ -z "$code_repo_root" ]] && { printf ''; return; }
+  git -C "$code_repo_root" rev-parse HEAD 2>/dev/null || printf ''
+}
+
+# List files touched by commits from <since_sha>..HEAD in the code repo.
+code_files_touched_since() {
+  local since_sha=$1 code_repo_root
+  : "${ARACHNE_CODE_REPO:=$PWD}"
+  code_repo_root=$(git -C "$ARACHNE_CODE_REPO" rev-parse --show-toplevel 2>/dev/null || true)
+  [[ -z "$code_repo_root" ]] && return
+  [[ -z "$since_sha" ]] && return
+  git -C "$code_repo_root" diff --name-only "$since_sha"..HEAD 2>/dev/null || true
+}
+
+cmd_heartbeat() {
+  local id="" mode="start"
+  while (( $# )); do
+    case $1 in
+      --start) mode="start"; shift;;
+      --end) mode="end"; shift;;
+      -*) die "unknown flag: $1";;
+      *) [[ -z "$id" ]] && id=$1 || die "too many positional args"; shift;;
+    esac
+  done
+  [[ -z "$id" ]] && die "usage: arachne-task heartbeat <id> [--start|--end]"
+  local file; file=$(task_file_required "$id")
+
+  local status; status=$(fm_get "$file" '.status')
+  if [[ "$status" != "in_progress" ]]; then
+    dbg "heartbeat skipped: $id status=$status"
+    return 0
+  fi
+
+  local head_now; head_now=$(code_head_sha)
+
+  if [[ "$mode" == "start" ]]; then
+    # Record the starting HEAD so --end can compare.
+    fm_set "$file" ".last_heartbeat_head_sha = \"$head_now\""
+    git_commit_state "heartbeat start $id (head=$head_now)"
+    echo "heartbeat start $id"
+    return 0
+  fi
+
+  # mode=end: decrement budget, check for productive commits on task's files.
+  local budget; budget=$(fm_get "$file" '.turn_budget_remaining')
+  [[ -z "$budget" ]] && budget=0
+  local new_budget=$((budget - 1))
+  (( new_budget < 0 )) && new_budget=0
+
+  local start_sha; start_sha=$(fm_get "$file" '.last_heartbeat_head_sha')
+  local productive=0
+  if [[ -n "$start_sha" && "$start_sha" != "$head_now" ]]; then
+    # Check if any touched file overlaps files:[] — if listed; otherwise any commit counts.
+    local task_files touched overlap
+    task_files=$(yq --front-matter=extract '.files[]?' "$file" 2>/dev/null || echo "")
+    touched=$(code_files_touched_since "$start_sha")
+    if [[ -z "$task_files" ]]; then
+      # No scoped file list — any code commit counts as productive.
+      [[ -n "$touched" ]] && productive=1
+    else
+      # Any overlap?
+      overlap=$(comm -12 <(printf '%s\n' "$task_files" | sort -u) <(printf '%s\n' "$touched" | sort -u) | head -1)
+      [[ -n "$overlap" ]] && productive=1
+    fi
+  fi
+
+  local failures; failures=$(fm_get "$file" '.consecutive_failed_iterations')
+  [[ -z "$failures" ]] && failures=0
+  local new_failures
+  if (( productive == 1 )); then
+    new_failures=0
+  else
+    new_failures=$((failures + 1))
+  fi
+
+  fm_set "$file" "
+    .turn_budget_remaining = $new_budget |
+    .consecutive_failed_iterations = $new_failures |
+    .last_heartbeat_head_sha = null
+  "
+  git_commit_state "heartbeat end $id (budget=$new_budget failures=$new_failures productive=$productive)"
+  echo "heartbeat end $id: budget=$new_budget failures=$new_failures productive=$productive"
+}
+
+cmd_complete() {
+  local id="" commits=""
+  while (( $# )); do
+    case $1 in
+      --commits) commits=$2; shift 2;;
+      --commits=*) commits=${1#--commits=}; shift;;
+      -*) die "unknown flag: $1";;
+      *) [[ -z "$id" ]] && id=$1 || die "too many positional args"; shift;;
+    esac
+  done
+  [[ -z "$id" ]] && die "usage: arachne-task complete <id> [--commits <sha,sha>]"
+  local file; file=$(task_file_required "$id")
+
+  local now; now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  # Build JSON array of commits.
+  local commits_json
+  if [[ -n "$commits" ]]; then
+    commits_json=$(printf '%s' "$commits" | jq -R 'split(",") | map(ltrimstr(" ") | rtrimstr(" "))')
+  else
+    commits_json='[]'
+  fi
+
+  fm_set "$file" "
+    .status = \"done\" |
+    .completed_at = \"$now\" |
+    .completed_by_commits = $commits_json |
+    .claimed_by = null |
+    .turn_budget_remaining = null |
+    .consecutive_failed_iterations = 0 |
+    .last_heartbeat_head_sha = null
+  "
+
+  # Optionally append completion notes from stdin.
+  if ! [ -t 0 ]; then
+    local notes; notes=$(cat)
+    if [[ -n "$notes" ]]; then
+      printf '\n## Completion notes (%s)\n\n%s\n' "$now" "$notes" >> "$file"
+    fi
+  fi
+
+  git_commit_state "complete $id"
+  echo "completed $id"
+}
+
+cmd_block() {
+  local id="" reason=""
+  while (( $# )); do
+    case $1 in
+      --reason) reason=$2; shift 2;;
+      --reason=*) reason=${1#--reason=}; shift;;
+      -*) die "unknown flag: $1";;
+      *) [[ -z "$id" ]] && id=$1 || die "too many positional args"; shift;;
+    esac
+  done
+  [[ -z "$id" ]] && die "usage: arachne-task block <id> --reason \"...\""
+  [[ -z "$reason" ]] && die "--reason is required"
+  local file; file=$(task_file_required "$id")
+  local now; now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+  fm_set "$file" "
+    .status = \"blocked\" |
+    .claimed_by = null |
+    .blocked_at = \"$now\" |
+    .blocked_reason = \"$reason\"
+  "
+  printf '\n## Blocked (%s)\n\n%s\n' "$now" "$reason" >> "$file"
+  git_commit_state "block $id: $reason"
+  echo "blocked $id"
+}
+
+cmd_scrub() {
+  local scrubbed=0
+  local file id budget failures
+  while IFS= read -r file; do
+    [[ -z "$file" ]] && continue
+    id=$(fm_get "$file" '.id')
+    local status; status=$(fm_get "$file" '.status')
+    [[ "$status" != "in_progress" ]] && continue
+    budget=$(fm_get "$file" '.turn_budget_remaining')
+    [[ -z "$budget" ]] && budget=9999
+    failures=$(fm_get "$file" '.consecutive_failed_iterations')
+    [[ -z "$failures" ]] && failures=0
+
+    if (( budget <= 0 )); then
+      fm_set "$file" "
+        .status = \"needs-review\" |
+        .claimed_by = null |
+        .scrub_reason = \"turn_budget exhausted\"
+      "
+      echo "scrub: $id → needs-review (budget=0)"
+      scrubbed=$((scrubbed + 1))
+    elif (( failures >= 3 )); then
+      fm_set "$file" "
+        .status = \"stuck\" |
+        .claimed_by = null |
+        .scrub_reason = \"consecutive_failed_iterations=$failures\"
+      "
+      echo "scrub: $id → stuck (failures=$failures)"
+      scrubbed=$((scrubbed + 1))
+    fi
+  done < <(list_all_files)
+  if (( scrubbed > 0 )); then
+    git_commit_state "scrub: $scrubbed task(s) relabeled"
+  fi
+}
+
+usage() {
+  cat <<'EOF'
+usage: arachne-task <command> [args]
+
+Commands:
+  next [--branch <b>]                Emit next ready task as JSON.
+  list [--status <s>]                Human-readable listing.
+  claim <id> --branch <b> [--turns N]  Atomically claim a task.
+  heartbeat <id> [--start|--end]     Budget + failure tracking.
+  complete <id> [--commits sha,sha]  Mark done; stdin → completion notes.
+  block <id> --reason "..."          Mark blocked with reason.
+  scrub                              Supervisor: relabel stale claims.
+
+Env:
+  ARACHNE_TASKS_DIR   tasks dir (default: $PWD/task-loop/tasks)
+  ARACHNE_TASK_OUT    next-task JSON path (default: <parent>/.next-task)
+  ARACHNE_TASK_PUSH=1 push after commits
+  ARACHNE_TASK_NOCOMMIT=1 skip commits (fixture mode)
+  ARACHNE_TASK_DEBUG=1 print debug traces
+  ARACHNE_CODE_REPO   code repo root (default: $PWD) — used by heartbeat
+EOF
+}
+
+main() {
+  local cmd=${1:-}
+  [[ -z "$cmd" ]] && { usage; exit 1; }
+  shift
+  case $cmd in
+    next) cmd_next "$@";;
+    list) cmd_list "$@";;
+    claim) cmd_claim "$@";;
+    heartbeat) cmd_heartbeat "$@";;
+    complete) cmd_complete "$@";;
+    block) cmd_block "$@";;
+    scrub) cmd_scrub "$@";;
+    -h|--help|help) usage;;
+    *) die "unknown command: $cmd";;
+  esac
+}
+
+main "$@"
