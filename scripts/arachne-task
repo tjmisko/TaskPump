@@ -6,7 +6,7 @@
 # check-the-logs-from-floofy-tarjan.md Layer 3 for the contract.
 #
 # Env vars:
-#   ARACHNE_TASKS_DIR      Path to tasks directory. Default: $PWD/task-loop/tasks
+#   ARACHNE_TASKS_DIR      Path to tasks directory. Default: $PWD/ops/task-loop/tasks
 #   ARACHNE_TASK_OUT       Path to the JSON "next task" surface file.
 #                          Default: $(dirname $ARACHNE_TASKS_DIR)/.next-task
 #   ARACHNE_TASK_PUSH      If "1", `git push` after each state-mutating commit.
@@ -17,7 +17,7 @@
 set -euo pipefail
 
 # ── Config ────────────────────────────────────────────────────────────────────
-: "${ARACHNE_TASKS_DIR:=$PWD/task-loop/tasks}"
+: "${ARACHNE_TASKS_DIR:=$PWD/ops/task-loop/tasks}"
 : "${ARACHNE_TASK_OUT:=$(dirname "$ARACHNE_TASKS_DIR")/.next-task}"
 : "${ARACHNE_TASK_PUSH:=0}"
 : "${ARACHNE_TASK_NOCOMMIT:=0}"
@@ -512,7 +512,7 @@ Commands:
   scrub                              Supervisor: relabel stale claims.
 
 Env:
-  ARACHNE_TASKS_DIR   tasks dir (default: $PWD/task-loop/tasks)
+  ARACHNE_TASKS_DIR   tasks dir (default: $PWD/ops/task-loop/tasks)
   ARACHNE_TASK_OUT    next-task JSON path (default: <parent>/.next-task)
   ARACHNE_TASK_PUSH=1 push after commits
   ARACHNE_TASK_NOCOMMIT=1 skip commits (fixture mode)
