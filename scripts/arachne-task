@@ -17,8 +17,14 @@
 set -euo pipefail
 
 # ── Config ────────────────────────────────────────────────────────────────────
-: "${ARACHNE_TASKS_DIR:=$PWD/ops/task-loop/tasks}"
+# Derive defaults from the script's own location (resolving symlinks) so the
+# CLI works regardless of cwd. Env vars still override.
+_arachne_script_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+_arachne_repo_root="$(cd "$_arachne_script_dir/.." && pwd)"
+
+: "${ARACHNE_TASKS_DIR:=$_arachne_repo_root/ops/task-loop/tasks}"
 : "${ARACHNE_TASK_OUT:=$(dirname "$ARACHNE_TASKS_DIR")/.next-task}"
+: "${ARACHNE_CODE_REPO:=$_arachne_repo_root}"
 : "${ARACHNE_TASK_PUSH:=0}"
 : "${ARACHNE_TASK_NOCOMMIT:=0}"
 : "${ARACHNE_TASK_DEBUG:=0}"
@@ -309,8 +315,6 @@ cmd_claim() {
 # Used by heartbeat to detect productive commits.
 code_head_sha() {
   local code_repo_root
-  # If ARACHNE_CODE_REPO is set, use it; else cwd.
-  : "${ARACHNE_CODE_REPO:=$PWD}"
   code_repo_root=$(git -C "$ARACHNE_CODE_REPO" rev-parse --show-toplevel 2>/dev/null || true)
   [[ -z "$code_repo_root" ]] && { printf ''; return; }
   git -C "$code_repo_root" rev-parse HEAD 2>/dev/null || printf ''
@@ -319,7 +323,6 @@ code_head_sha() {
 # List files touched by commits from <since_sha>..HEAD in the code repo.
 code_files_touched_since() {
   local since_sha=$1 code_repo_root
-  : "${ARACHNE_CODE_REPO:=$PWD}"
   code_repo_root=$(git -C "$ARACHNE_CODE_REPO" rev-parse --show-toplevel 2>/dev/null || true)
   [[ -z "$code_repo_root" ]] && return
   [[ -z "$since_sha" ]] && return
@@ -516,12 +519,15 @@ Commands:
   scrub                              Supervisor: relabel stale claims.
 
 Env:
-  ARACHNE_TASKS_DIR   tasks dir (default: $PWD/ops/task-loop/tasks)
+  ARACHNE_TASKS_DIR   tasks dir (default: <repo-root>/ops/task-loop/tasks)
   ARACHNE_TASK_OUT    next-task JSON path (default: <parent>/.next-task)
   ARACHNE_TASK_PUSH=1 push after commits
   ARACHNE_TASK_NOCOMMIT=1 skip commits (fixture mode)
   ARACHNE_TASK_DEBUG=1 print debug traces
-  ARACHNE_CODE_REPO   code repo root (default: $PWD) — used by heartbeat
+  ARACHNE_CODE_REPO   code repo root (default: <repo-root>) — used by heartbeat
+
+Repo root is derived from the script's own location, so the CLI works
+regardless of cwd. The env vars above still override.
 EOF
 }
 
