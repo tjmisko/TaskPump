@@ -469,6 +469,38 @@ cmd_block() {
   echo "blocked $id"
 }
 
+cmd_release() {
+  local id="" reason=""
+  while (( $# )); do
+    case $1 in
+      --reason) reason=$2; shift 2;;
+      --reason=*) reason=${1#--reason=}; shift;;
+      -*) die "unknown flag: $1";;
+      *) [[ -z "$id" ]] && id=$1 || die "too many positional args"; shift;;
+    esac
+  done
+  [[ -z "$id" ]] && die "usage: arachne-task release <id> --reason \"...\""
+  [[ -z "$reason" ]] && die "--reason is required"
+  local file; file=$(task_file_required "$id")
+
+  local status; status=$(fm_get "$file" '.status')
+  if [[ "$status" != "in_progress" ]]; then
+    die "cannot release $id: status=$status (must be in_progress)"
+  fi
+
+  local now; now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  fm_set "$file" "
+    .status = \"open\" |
+    .claimed_by = null |
+    .claimed_at = null |
+    .turn_budget_remaining = null |
+    .last_heartbeat_head_sha = null
+  "
+  printf '\n## Released (%s)\n\n%s\n' "$now" "$reason" >> "$file"
+  git_commit_state "release $id: $reason"
+  echo "released $id"
+}
+
 cmd_scrub() {
   local scrubbed=0
   local file id budget failures
@@ -516,6 +548,7 @@ Commands:
   heartbeat <id> [--start|--end]     Budget + failure tracking.
   complete <id> [--commits sha,sha]  Mark done; stdin → completion notes.
   block <id> --reason "..."          Mark blocked with reason.
+  release <id> --reason "..."        Relinquish a claim back to status=open.
   scrub                              Supervisor: relabel stale claims.
 
 Env:
@@ -542,6 +575,7 @@ main() {
     heartbeat) cmd_heartbeat "$@";;
     complete) cmd_complete "$@";;
     block) cmd_block "$@";;
+    release) cmd_release "$@";;
     scrub) cmd_scrub "$@";;
     -h|--help|help) usage;;
     *) die "unknown command: $cmd";;
