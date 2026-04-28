@@ -366,9 +366,10 @@ cmd_heartbeat() {
 
   local start_sha; start_sha=$(fm_get "$file" '.last_heartbeat_head_sha')
   local productive=0
+  local touched=""
   if [[ -n "$start_sha" && "$start_sha" != "$head_now" ]]; then
     # Check if any touched file overlaps files:[] — if listed; otherwise any commit counts.
-    local task_files touched overlap
+    local task_files overlap
     task_files=$(yq --front-matter=extract '.files[]?' "$file" 2>/dev/null || echo "")
     touched=$(code_files_touched_since "$start_sha")
     if [[ -z "$task_files" ]]; then
@@ -378,6 +379,36 @@ cmd_heartbeat() {
       # Any overlap?
       overlap=$(comm -12 <(printf '%s\n' "$task_files" | sort -u) <(printf '%s\n' "$touched" | sort -u) | head -1)
       [[ -n "$overlap" ]] && productive=1
+    fi
+  fi
+
+  # Lenient + alarm: if we'd credit this task as productive, check whether
+  # the same touched files match ANY OTHER in_progress task's files: list.
+  # If so, the productivity attribution is ambiguous — refuse to credit
+  # either, and warn loudly so a human can disambiguate. 2026-04-28 incident:
+  # F21.5 was credited productive=1 because F21.10's routes.rs commit
+  # overlapped its files: list while F21.10 was the actual task being worked.
+  local conflicting_tasks=""
+  if (( productive == 1 )) && [[ -n "$touched" ]]; then
+    local touched_sorted other_file other_id other_status other_files other_overlap
+    touched_sorted=$(printf '%s\n' "$touched" | sort -u)
+    while IFS= read -r other_file; do
+      [[ -z "$other_file" ]] && continue
+      [[ "$other_file" == "$file" ]] && continue
+      other_status=$(fm_get "$other_file" '.status')
+      [[ "$other_status" != "in_progress" ]] && continue
+      other_files=$(yq --front-matter=extract '.files[]?' "$other_file" 2>/dev/null || echo "")
+      [[ -z "$other_files" ]] && continue
+      other_overlap=$(comm -12 <(printf '%s\n' "$other_files" | sort -u) <(printf '%s\n' "$touched_sorted") | head -1)
+      if [[ -n "$other_overlap" ]]; then
+        other_id=$(fm_get "$other_file" '.id')
+        conflicting_tasks="$conflicting_tasks $other_id"
+      fi
+    done < <(list_all_files)
+    if [[ -n "$conflicting_tasks" ]]; then
+      printf 'WARNING: heartbeat %s productivity ambiguous — touched files also match in_progress task(s):%s. Not crediting.\n' \
+        "$id" "$conflicting_tasks" >&2
+      productive=0
     fi
   fi
 
@@ -469,6 +500,38 @@ cmd_block() {
   echo "blocked $id"
 }
 
+cmd_release() {
+  local id="" reason=""
+  while (( $# )); do
+    case $1 in
+      --reason) reason=$2; shift 2;;
+      --reason=*) reason=${1#--reason=}; shift;;
+      -*) die "unknown flag: $1";;
+      *) [[ -z "$id" ]] && id=$1 || die "too many positional args"; shift;;
+    esac
+  done
+  [[ -z "$id" ]] && die "usage: arachne-task release <id> --reason \"...\""
+  [[ -z "$reason" ]] && die "--reason is required"
+  local file; file=$(task_file_required "$id")
+
+  local status; status=$(fm_get "$file" '.status')
+  if [[ "$status" != "in_progress" ]]; then
+    die "cannot release $id: status=$status (must be in_progress)"
+  fi
+
+  local now; now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  fm_set "$file" "
+    .status = \"open\" |
+    .claimed_by = null |
+    .claimed_at = null |
+    .turn_budget_remaining = null |
+    .last_heartbeat_head_sha = null
+  "
+  printf '\n## Released (%s)\n\n%s\n' "$now" "$reason" >> "$file"
+  git_commit_state "release $id: $reason"
+  echo "released $id"
+}
+
 cmd_scrub() {
   local scrubbed=0
   local file id budget failures
@@ -516,6 +579,7 @@ Commands:
   heartbeat <id> [--start|--end]     Budget + failure tracking.
   complete <id> [--commits sha,sha]  Mark done; stdin → completion notes.
   block <id> --reason "..."          Mark blocked with reason.
+  release <id> --reason "..."        Relinquish a claim back to status=open.
   scrub                              Supervisor: relabel stale claims.
 
 Env:
@@ -542,6 +606,7 @@ main() {
     heartbeat) cmd_heartbeat "$@";;
     complete) cmd_complete "$@";;
     block) cmd_block "$@";;
+    release) cmd_release "$@";;
     scrub) cmd_scrub "$@";;
     -h|--help|help) usage;;
     *) die "unknown command: $cmd";;

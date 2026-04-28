@@ -237,6 +237,113 @@ assert_fm "$TASKS/F18.2.md" '.consecutive_failed_iterations' '3'
 assert_fm "$TASKS/F18.2.md" '.status' 'stuck'
 assert_fm "$TASKS/F18.2.md" '.claimed_by' 'null'
 
+# ── Test 9: release returns a claim to status=open ───────────────────────────
+echo
+echo "--- Test 9: release ---"
+make_task "$TASKS" F18.3 F18 open "Release-test task"
+git -C "$TASKS_REPO" add -A; git -C "$TASKS_REPO" -c user.name=test -c user.email=t@e commit -q -m "add release fixture" || true
+"$CLI" claim F18.3 --branch feat/mine --turns 25 >/dev/null
+assert_fm "$TASKS/F18.3.md" '.status' 'in_progress'
+assert_fm "$TASKS/F18.3.md" '.claimed_by' 'feat/mine'
+"$CLI" release F18.3 --reason "wrong scope for this iteration" >/dev/null
+assert_fm "$TASKS/F18.3.md" '.status' 'open'
+assert_fm "$TASKS/F18.3.md" '.claimed_by' 'null'
+assert_fm "$TASKS/F18.3.md" '.turn_budget_remaining' 'null'
+if grep -q "Released" "$TASKS/F18.3.md" && grep -q "wrong scope for this iteration" "$TASKS/F18.3.md"; then
+  pass "F18.3 release reason appended to body"
+else
+  fail "F18.3 release reason missing from body"
+fi
+# Cannot release an open task.
+if "$CLI" release F18.3 --reason "second try" >/dev/null 2>&1; then
+  fail "release should reject already-open task"
+else
+  pass "release rejects task with status != in_progress"
+fi
+# Reason is required.
+"$CLI" claim F18.3 --branch feat/mine --turns 25 >/dev/null
+if "$CLI" release F18.3 >/dev/null 2>&1; then
+  fail "release should require --reason"
+else
+  pass "release requires --reason"
+fi
+
+# ── Test 10: heartbeat lenient+alarm — ambiguous attribution refused ─────────
+echo
+echo "--- Test 10: heartbeat ambiguous productivity ---"
+# Two tasks both list shared.rs in their files. F19.1 claims first, F19.2
+# claims second. A commit touches shared.rs while both are in_progress.
+# Heartbeat-end on F19.1 should refuse to credit (productive=0) and warn,
+# because F19.2 also matches the same file.
+cat >| "$TASKS/F19.1.md" <<'EOF'
+---
+id: F19.1
+phase: F19
+title: First task with shared file
+status: open
+claimed_by: null
+claimed_at: null
+turn_budget_remaining: null
+consecutive_failed_iterations: 0
+blockers: []
+completed_by_commits: []
+milestone: milestone/f19
+files:
+  - shared.rs
+created: 2026-04-28
+---
+
+# F19.1 — fixture
+EOF
+cat >| "$TASKS/F19.2.md" <<'EOF'
+---
+id: F19.2
+phase: F19
+title: Second task with shared file
+status: open
+claimed_by: null
+claimed_at: null
+turn_budget_remaining: null
+consecutive_failed_iterations: 0
+blockers: []
+completed_by_commits: []
+milestone: milestone/f19
+files:
+  - shared.rs
+created: 2026-04-28
+---
+
+# F19.2 — fixture
+EOF
+git -C "$TASKS_REPO" add -A; git -C "$TASKS_REPO" -c user.name=test -c user.email=t@e commit -q -m "add ambiguity fixtures" || true
+"$CLI" claim F19.1 --branch feat/mine --turns 10 >/dev/null
+"$CLI" claim F19.2 --branch feat/mine --turns 10 >/dev/null
+"$CLI" heartbeat F19.1 --start >/dev/null
+"$CLI" heartbeat F19.2 --start >/dev/null
+echo "fn x() {}" >| "$CODE_REPO/shared.rs"
+git -C "$CODE_REPO" add shared.rs
+git -C "$CODE_REPO" -c user.name=test -c user.email=t@e commit -q -m "touch shared.rs"
+ALARM_OUT=$("$CLI" heartbeat F19.1 --end 2>&1 1>/dev/null || true)
+if printf '%s' "$ALARM_OUT" | grep -q "WARNING: heartbeat F19.1 productivity ambiguous"; then
+  pass "ambiguous-productivity WARNING emitted on stderr"
+else
+  fail "expected WARNING on stderr; got: $ALARM_OUT"
+fi
+# Productivity should NOT be credited; failure counter should increment.
+assert_fm "$TASKS/F19.1.md" '.consecutive_failed_iterations' '1'
+
+# Now make F19.2 not in_progress (release it). Re-do the heartbeat cycle on
+# F19.1; since no other in_progress task overlaps shared.rs anymore, the
+# next productive commit should credit cleanly.
+"$CLI" release F19.2 --reason "test cleanup" >/dev/null
+"$CLI" heartbeat F19.1 --start >/dev/null
+echo "fn y() {}" >| "$CODE_REPO/shared.rs"
+git -C "$CODE_REPO" add shared.rs
+git -C "$CODE_REPO" -c user.name=test -c user.email=t@e commit -q -m "second touch shared.rs"
+"$CLI" heartbeat F19.1 --end 2>/dev/null
+# consecutive_failed_iterations should reset to 0 (productive=1 again).
+assert_fm "$TASKS/F19.1.md" '.consecutive_failed_iterations' '0'
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo
 echo "=============================================="
