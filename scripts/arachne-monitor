@@ -158,6 +158,7 @@ snapshot() {
         case "$s" in blocked|stuck|needs-review) flagged+="  $t (${SLUG_NAME[$slug]}): $s\n" ;; esac
     done
     [[ -n "$flagged" ]] && { echo "Needs attention:"; printf "$flagged"; }
+    return 0   # never let a false trailing conditional abort the watch loop (set -e)
 }
 
 # demo -- synthetic sessions exercising every state, for iterating on the UI
@@ -191,12 +192,25 @@ demo() {
       | render_session messaging running in_progress F41.4 "20 seconds" "-" 0 "$width"
     echo "Needs attention:"
     printf '  %s\n' "F41.2 (calendar): running but log stale 318s"
+    return 0
 }
 
 render_all() { if [[ "$DEMO" -eq 1 ]]; then demo; else snapshot; fi; }
 
 if [[ "$WATCH" -eq 1 ]]; then
-    while true; do clear; render_all; sleep "$INTERVAL"; done
+    # Full-screen repaint on the alternate buffer, like top/watch: take over the
+    # terminal, hide the cursor, and restore both when the user quits (Ctrl-C) or
+    # the loop dies for any reason. `|| true` keeps a transient render failure
+    # (e.g. a docker hiccup) from ending the watch under `set -e`.
+    restore() { tput cnorm 2>/dev/null || true; tput rmcup 2>/dev/null || true; }
+    trap restore EXIT INT TERM
+    tput smcup 2>/dev/null || true   # enter alternate screen
+    tput civis 2>/dev/null || true   # hide cursor
+    while true; do
+        printf '\033[H\033[2J'       # home cursor + clear screen (flicker-free in alt buffer)
+        render_all || true
+        sleep "$INTERVAL"
+    done
 else
     render_all
 fi
