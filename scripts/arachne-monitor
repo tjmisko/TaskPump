@@ -1,0 +1,119 @@
+#!/bin/bash
+# arachne-monitor -- at-a-glance status of parallel Arachne agents.
+#
+# Maps each running/recent arachne-agent container to its worktree, epic task
+# status (from the canonical ops/ task files), uptime, and last log line, so
+# you can see overall progress and spot anything stuck/blocked/parked.
+#
+# Usage:
+#   ./scripts/arachne-monitor            # one snapshot
+#   ./scripts/arachne-monitor --watch    # refresh every 10s
+#   ./scripts/arachne-monitor --watch 5  # refresh every 5s
+set -euo pipefail
+
+REPO_ROOT="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
+MANIFEST="${MANIFEST:-$REPO_ROOT/ops/task-loop/parallel-manifest.tsv}"
+TASKS_DIR="$REPO_ROOT/ops/task-loop/tasks"
+
+WATCH=0; INTERVAL=10
+if [[ "${1:-}" == "--watch" ]]; then WATCH=1; [[ -n "${2:-}" ]] && INTERVAL="$2"; fi
+
+# branch-slug -> "name<TAB>epic_task" lookup from the manifest.
+declare -A SLUG_NAME SLUG_TASK SLUG_BRANCH
+if [[ -f "$MANIFEST" ]]; then
+    while IFS=$'\t' read -r name branch brief task _rest; do
+        [[ -z "${name// }" || "${name:0:1}" == "#" ]] && continue
+        slug="${branch//\//-}"
+        SLUG_NAME["$slug"]="$name"; SLUG_TASK["$slug"]="$task"; SLUG_BRANCH["$slug"]="$branch"
+    done < "$MANIFEST"
+fi
+
+task_status() {  # $1 = task id -> status string or "-"
+    local f="$TASKS_DIR/$1.md"
+    [[ -f "$f" ]] || { echo "-"; return; }
+    yq --front-matter=extract '.status' "$f" 2>/dev/null || echo "?"
+}
+
+colorize() {  # colorize a status word
+    case "$1" in
+        running)        printf '\033[36m%s\033[0m' "$1" ;;        # cyan
+        done)           printf '\033[32m%s\033[0m' "$1" ;;        # green
+        blocked|stuck)  printf '\033[31m%s\033[0m' "$1" ;;        # red
+        needs-review)   printf '\033[33m%s\033[0m' "$1" ;;        # yellow
+        exited)         printf '\033[90m%s\033[0m' "$1" ;;        # grey
+        *)              printf '%s' "$1" ;;
+    esac
+}
+
+snapshot() {
+    echo "Arachne parallel agents — $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "-------------------------------------------------------------------------------"
+    printf '%-12s %-9s %-7s %-13s %-6s %s\n' NAME CONTAINER UPTIME TASK AGE LASTLINE
+    local found=0
+    # Running + recently-exited arachne-agent containers.
+    while IFS='|' read -r cname state status; do
+        [[ -z "$cname" ]] && continue
+        [[ "$cname" == arachne-agent* ]] || continue
+        found=1
+        local slug="${cname#arachne-agent-}"
+        local name="${SLUG_NAME[$slug]:-$slug}"
+        local task="${SLUG_TASK[$slug]:-}"
+        local tstat="-"; [[ -n "$task" ]] && tstat="$(task_status "$task")"
+        local cstate="running"; [[ "$state" != "running" ]] && cstate="exited"
+        # uptime: docker status string already reads "Up 12 minutes" / "Exited (0) ..."
+        local up; up="$(echo "$status" | sed -E 's/^(Up|Exited[^ ]*) //; s/ ago$//' | cut -c1-11)"
+        # Resolve the log path from the BRANCH (worktrees with '/' in the branch
+        # are nested dirs, e.g. .worktrees/feat/agentic-interaction/). Fall back
+        # to a find for containers whose slug isn't in the manifest.
+        local logf=""
+        local branch="${SLUG_BRANCH[$slug]:-}"
+        if [[ -n "$branch" ]]; then
+            logf="$REPO_ROOT/.worktrees/$branch/.arachne-agent.log"
+        else
+            local cand
+            while IFS= read -r cand; do
+                local d; d="$(dirname "$cand")"; d="${d#"$REPO_ROOT/.worktrees/"}"
+                [[ "${d//\//-}" == "$slug" ]] && { logf="$cand"; break; }
+            done < <(find "$REPO_ROOT/.worktrees" -name .arachne-agent.log 2>/dev/null)
+        fi
+        local age="-" last="-"
+        if [[ -n "$logf" && -f "$logf" ]]; then
+            # Freshness: seconds since the log last grew. A "running" container
+            # whose log is minutes stale is the real stuck signal.
+            local mtime; mtime="$(stat -c %Y "$logf" 2>/dev/null || echo 0)"
+            [[ "$mtime" -gt 0 ]] && age="$(( $(date +%s) - mtime ))s"
+            # stream-json: extract the most recent human-meaningful event;
+            # fall back to the raw tail. Best-effort — never errors the table.
+            # `|| true`: these substitutions are best-effort; under `set -o
+            # pipefail` a non-zero jq/tail must not trip `set -e` and abort the loop.
+            last="$(tail -60 "$logf" 2>/dev/null \
+                | jq -rR 'fromjson?
+                    | if .type=="assistant" then (.message.content[]? | (.text // ("⚙ "+(.name//"tool"))))
+                      elif .type=="result" then ("✓ "+(.subtype//"done"))
+                      else empty end' 2>/dev/null | tail -1 || true)"
+            [[ -z "$last" ]] && last="$(tail -1 "$logf" 2>/dev/null || true)"
+            last="$(printf '%s' "$last" | tr -d '\n' | cut -c1-46 || true)"
+            [[ -z "$last" ]] && last="-"
+        fi
+        printf '%-12s %-9s %-7s %-13s %-6s %s\n' \
+            "$name" "$(colorize "$cstate")" "$up" \
+            "$task:$(colorize "$tstat")" "$age" "$last"
+    done < <(docker ps -a --filter 'name=arachne-agent' --format '{{.Names}}|{{.State}}|{{.Status}}' 2>/dev/null)
+    [[ "$found" -eq 0 ]] && echo "(no arachne-agent containers running or recently exited)"
+    echo
+    # Surface blocked/stuck/needs-review epics from the manifest regardless of container state.
+    local flagged=""
+    for slug in "${!SLUG_TASK[@]}"; do
+        local t="${SLUG_TASK[$slug]}"; local s; s="$(task_status "$t")"
+        case "$s" in blocked|stuck|needs-review) flagged+="  $t (${SLUG_NAME[$slug]}): $s\n" ;; esac
+    done
+    if [[ -n "$flagged" ]]; then
+        echo "Needs attention:"; printf "$flagged"
+    fi
+}
+
+if [[ "$WATCH" -eq 1 ]]; then
+    while true; do clear; snapshot; sleep "$INTERVAL"; done
+else
+    snapshot
+fi

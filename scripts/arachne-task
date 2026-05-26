@@ -133,21 +133,49 @@ git_commit_state() {
   git -C "$tasks_git_root" -c user.name='arachne-task' -c user.email='task@arachne.local' commit -m "$msg" >/dev/null
   dbg "committed: $msg"
   if [[ "$ARACHNE_TASK_PUSH" == "1" ]]; then
-    # Retry push up to 3x with fetch-rebase on non-fast-forward.
-    local try
-    for try in 1 2 3; do
+    # Retry push with fetch-rebase + jittered backoff on non-fast-forward.
+    # Under 10-12 concurrent agents, many small ops/ pushes collide; jitter
+    # spreads the retries so they don't thundering-herd the same remote ref.
+    local try max=${ARACHNE_PUSH_RETRIES:-6} branch
+    branch=$(git -C "$tasks_git_root" rev-parse --abbrev-ref HEAD)
+    for (( try=1; try<=max; try++ )); do
       if git -C "$tasks_git_root" push 2>/dev/null; then
         dbg "pushed (attempt $try)"
         return 0
       fi
-      dbg "push rejected (attempt $try); fetching and rebasing"
-      git -C "$tasks_git_root" fetch origin
-      git -C "$tasks_git_root" rebase origin/"$(git -C "$tasks_git_root" rev-parse --abbrev-ref HEAD)" || {
-        dbg "rebase failed on try $try"
-      }
+      dbg "push rejected (attempt $try/$max); fetch + rebase onto origin/$branch"
+      git -C "$tasks_git_root" fetch origin >/dev/null 2>&1 || true
+      if ! git -C "$tasks_git_root" rebase "origin/$branch" >/dev/null 2>&1; then
+        # Leave no half-finished rebase behind for the next invocation.
+        git -C "$tasks_git_root" rebase --abort >/dev/null 2>&1 || true
+        dbg "rebase failed (attempt $try); aborted, will retry push"
+      fi
+      # Backoff with jitter: 0.2s .. ~1.5s, seeded per-process so concurrent
+      # agents desynchronize.
+      sleep "$(awk "BEGIN{srand($$+$try); printf \"%.2f\", 0.2 + rand()*1.3}")"
     done
-    die "push failed after 3 retries"
+    die "push failed after $max retries"
   fi
+}
+
+# ── Cross-agent state lock ─────────────────────────────────────────────────────
+# Serializes the read-modify-write + commit of every mutating subcommand across
+# concurrent agents. All parallel containers bind-mount the same repo, so an
+# flock on a lockfile in the ops git root is shared by inode across containers,
+# closing the claim race and preventing index.lock contention. Held for the
+# lifetime of the process via FD 9 (auto-released on exit). Degrades to a no-op
+# where flock is unavailable (e.g. a stock macOS host).
+acquire_state_lock() {
+  [[ "$ARACHNE_TASK_NOCOMMIT" == "1" ]] && return 0
+  command -v flock >/dev/null 2>&1 || { dbg "flock unavailable; no state lock"; return 0; }
+  local root lockfile
+  root=$(git -C "$ARACHNE_TASKS_DIR" rev-parse --show-toplevel 2>/dev/null || echo "")
+  lockfile="${root:-/tmp}/.arachne-task.lock"
+  exec 9>"$lockfile" 2>/dev/null || { dbg "cannot open lockfile $lockfile"; return 0; }
+  if ! flock -w "${ARACHNE_LOCK_WAIT:-120}" 9; then
+    die "could not acquire state lock ($lockfile) within ${ARACHNE_LOCK_WAIT:-120}s"
+  fi
+  dbg "acquired state lock $lockfile"
 }
 
 # ── Subcommands ───────────────────────────────────────────────────────────────
@@ -599,6 +627,11 @@ main() {
   local cmd=${1:-}
   [[ -z "$cmd" ]] && { usage; exit 1; }
   shift
+  # Mutating subcommands serialize on the cross-agent state lock for their
+  # whole read-modify-write + commit. Read-only commands (next/list) skip it.
+  case $cmd in
+    claim|heartbeat|complete|block|release|scrub) acquire_state_lock;;
+  esac
   case $cmd in
     next) cmd_next "$@";;
     list) cmd_list "$@";;
