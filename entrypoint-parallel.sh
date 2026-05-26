@@ -68,9 +68,10 @@ if [[ -d /tmp/claude-home ]]; then
 fi
 # Merge MCP config + Auto Mode settings into one settings.json so MCP servers
 # and the auto permission mode + allow rules coexist. Auto settings win on
-# conflicting keys.
-MCP_JSON="$WORKSPACE_PATH/claude-mcp.json"
-AUTO_JSON="$WORKSPACE_PATH/claude-settings-auto.json"
+# conflicting keys. These live with the orchestrator in the primary checkout
+# (REPO_ROOT), NOT in the worktree, so connector worktrees stay pure-from-main.
+MCP_JSON="$REPO_ROOT/claude-mcp.json"
+AUTO_JSON="$REPO_ROOT/claude-settings-auto.json"
 if [[ -f "$MCP_JSON" && -f "$AUTO_JSON" ]]; then
     jq -s '.[0] * .[1]' "$MCP_JSON" "$AUTO_JSON" > /home/dev/.claude/settings.json
 elif [[ -f "$AUTO_JSON" ]]; then

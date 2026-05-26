@@ -11,7 +11,7 @@
 #   ./scripts/arachne-monitor --watch 5  # refresh every 5s
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+REPO_ROOT="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
 MANIFEST="${MANIFEST:-$REPO_ROOT/ops/task-loop/parallel-manifest.tsv}"
 TASKS_DIR="$REPO_ROOT/ops/task-loop/tasks"
 
