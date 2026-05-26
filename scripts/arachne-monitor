@@ -19,12 +19,12 @@ WATCH=0; INTERVAL=10
 if [[ "${1:-}" == "--watch" ]]; then WATCH=1; [[ -n "${2:-}" ]] && INTERVAL="$2"; fi
 
 # branch-slug -> "name<TAB>epic_task" lookup from the manifest.
-declare -A SLUG_NAME SLUG_TASK
+declare -A SLUG_NAME SLUG_TASK SLUG_BRANCH
 if [[ -f "$MANIFEST" ]]; then
     while IFS=$'\t' read -r name branch brief task _rest; do
         [[ -z "${name// }" || "${name:0:1}" == "#" ]] && continue
         slug="${branch//\//-}"
-        SLUG_NAME["$slug"]="$name"; SLUG_TASK["$slug"]="$task"
+        SLUG_NAME["$slug"]="$name"; SLUG_TASK["$slug"]="$task"; SLUG_BRANCH["$slug"]="$branch"
     done < "$MANIFEST"
 fi
 
@@ -48,7 +48,7 @@ colorize() {  # colorize a status word
 snapshot() {
     echo "Arachne parallel agents — $(date '+%Y-%m-%d %H:%M:%S')"
     echo "-------------------------------------------------------------------------------"
-    printf '%-12s %-10s %-7s %-13s %s\n' NAME CONTAINER UPTIME TASK LASTLINE
+    printf '%-12s %-9s %-7s %-13s %-6s %s\n' NAME CONTAINER UPTIME TASK AGE LASTLINE
     local found=0
     # Running + recently-exited arachne-agent containers.
     while IFS='|' read -r cname state status; do
@@ -62,13 +62,42 @@ snapshot() {
         local cstate="running"; [[ "$state" != "running" ]] && cstate="exited"
         # uptime: docker status string already reads "Up 12 minutes" / "Exited (0) ..."
         local up; up="$(echo "$status" | sed -E 's/^(Up|Exited[^ ]*) //; s/ ago$//' | cut -c1-11)"
-        local wt="$REPO_ROOT/.worktrees/"*"$slug"
-        local logf; logf="$(ls "$REPO_ROOT/.worktrees/"*/.arachne-agent.log 2>/dev/null | grep -F "$slug/" | head -1 || true)"
-        local last="-"
-        [[ -n "$logf" && -f "$logf" ]] && last="$(tail -1 "$logf" 2>/dev/null | cut -c1-46)"
-        printf '%-12s %-10s %-7s %-13s %s\n' \
+        # Resolve the log path from the BRANCH (worktrees with '/' in the branch
+        # are nested dirs, e.g. .worktrees/feat/agentic-interaction/). Fall back
+        # to a find for containers whose slug isn't in the manifest.
+        local logf=""
+        local branch="${SLUG_BRANCH[$slug]:-}"
+        if [[ -n "$branch" ]]; then
+            logf="$REPO_ROOT/.worktrees/$branch/.arachne-agent.log"
+        else
+            local cand
+            while IFS= read -r cand; do
+                local d; d="$(dirname "$cand")"; d="${d#"$REPO_ROOT/.worktrees/"}"
+                [[ "${d//\//-}" == "$slug" ]] && { logf="$cand"; break; }
+            done < <(find "$REPO_ROOT/.worktrees" -name .arachne-agent.log 2>/dev/null)
+        fi
+        local age="-" last="-"
+        if [[ -n "$logf" && -f "$logf" ]]; then
+            # Freshness: seconds since the log last grew. A "running" container
+            # whose log is minutes stale is the real stuck signal.
+            local mtime; mtime="$(stat -c %Y "$logf" 2>/dev/null || echo 0)"
+            [[ "$mtime" -gt 0 ]] && age="$(( $(date +%s) - mtime ))s"
+            # stream-json: extract the most recent human-meaningful event;
+            # fall back to the raw tail. Best-effort — never errors the table.
+            # `|| true`: these substitutions are best-effort; under `set -o
+            # pipefail` a non-zero jq/tail must not trip `set -e` and abort the loop.
+            last="$(tail -60 "$logf" 2>/dev/null \
+                | jq -rR 'fromjson?
+                    | if .type=="assistant" then (.message.content[]? | (.text // ("⚙ "+(.name//"tool"))))
+                      elif .type=="result" then ("✓ "+(.subtype//"done"))
+                      else empty end' 2>/dev/null | tail -1 || true)"
+            [[ -z "$last" ]] && last="$(tail -1 "$logf" 2>/dev/null || true)"
+            last="$(printf '%s' "$last" | tr -d '\n' | cut -c1-46 || true)"
+            [[ -z "$last" ]] && last="-"
+        fi
+        printf '%-12s %-9s %-7s %-13s %-6s %s\n' \
             "$name" "$(colorize "$cstate")" "$up" \
-            "$task:$(colorize "$tstat")" "$last"
+            "$task:$(colorize "$tstat")" "$age" "$last"
     done < <(docker ps -a --filter 'name=arachne-agent' --format '{{.Names}}|{{.State}}|{{.Status}}' 2>/dev/null)
     [[ "$found" -eq 0 ]] && echo "(no arachne-agent containers running or recently exited)"
     echo
