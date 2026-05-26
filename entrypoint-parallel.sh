@@ -20,9 +20,11 @@
 #   ARACHNE_BRIEF    -- path to the kickoff brief .md (the agent's prompt)
 #   ARACHNE_TASK_ID  -- epic/top task ID for this worktree (e.g. F41.3)
 # Optional env:
-#   GITHUB_TOKEN     -- for ops/ submodule fetch + gh
-#   MAX_TURNS        -- max turns for the single session (default 600)
-#   AGENT_MODEL      -- model alias (default opus)
+#   GITHUB_TOKEN        -- for ops/ submodule fetch + gh
+#   MAX_TURNS           -- max turns for the single session (default 600)
+#   AGENT_MODEL         -- model alias (default opus)
+#   ARACHNE_RESUME_NOTE -- path to a resume preamble (run-parallel.sh --resume);
+#                          prepended to the brief on stdin when present.
 set -euo pipefail
 
 : "${WORKSPACE_PATH:=/workspace}"
@@ -115,6 +117,18 @@ fi
 [[ -f "$ARACHNE_BRIEF" ]] || { echo "ERROR: brief not found: $ARACHNE_BRIEF" | tee -a "$LOG_FILE" >&2; exit 1; }
 echo "Brief: $ARACHNE_BRIEF" | tee -a "$LOG_FILE"
 
+# Optional resume preamble. Bind-mounted at the same absolute path as the host,
+# so the env value resolves directly; fall back to the conventional location.
+: "${ARACHNE_RESUME_NOTE:=}"
+if [[ -n "$ARACHNE_RESUME_NOTE" && ! -f "$ARACHNE_RESUME_NOTE" && -f "$WORKSPACE_PATH/.arachne-resume.md" ]]; then
+    ARACHNE_RESUME_NOTE="$WORKSPACE_PATH/.arachne-resume.md"
+fi
+if [[ -n "$ARACHNE_RESUME_NOTE" && -f "$ARACHNE_RESUME_NOTE" ]]; then
+    echo "Resume preamble: $ARACHNE_RESUME_NOTE (prepended to brief)" | tee -a "$LOG_FILE"
+else
+    ARACHNE_RESUME_NOTE=""
+fi
+
 chmod 666 "$LOG_FILE"
 chown -R dev:dev "$WORKSPACE_PATH/.arachne-agent.log" 2>/dev/null || true
 
@@ -158,7 +172,10 @@ exec su dev -c "
     # --permission-mode auto: server-side classifier gates dangerous actions;
     # no --dangerously-skip-permissions. In headless -p, the session aborts
     # after repeated classifier blocks; we treat that as park-for-review.
-    cat '$ARACHNE_BRIEF' | claude -p \
+    # A resume preamble (if any) is prepended to the brief on stdin.
+    PROMPT_PARTS=''
+    [ -n '$ARACHNE_RESUME_NOTE' ] && [ -f '$ARACHNE_RESUME_NOTE' ] && PROMPT_PARTS='$ARACHNE_RESUME_NOTE '
+    cat \$PROMPT_PARTS '$ARACHNE_BRIEF' | claude -p \
         --permission-mode auto \
         --model '$AGENT_MODEL' \
         --verbose \
