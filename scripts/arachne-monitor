@@ -5,8 +5,13 @@
 # status (from the canonical ops/ task files), uptime, and last log line, so
 # you can see overall progress and spot anything stuck/blocked/parked.
 #
+# Each session renders as a header line (name, container state, epic task
+# status, uptime, log freshness) followed by a fixed 5-line area showing the
+# most recent meaningful log events. In --watch the whole view repaints on the
+# interval.
+#
 # Usage:
-#   ./scripts/arachne-monitor            # one snapshot
+#   ./scripts/arachne-monitor            # one paint
 #   ./scripts/arachne-monitor --watch    # refresh every 10s
 #   ./scripts/arachne-monitor --watch 5  # refresh every 5s
 set -euo pipefail
@@ -15,8 +20,15 @@ REPO_ROOT="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
 MANIFEST="${MANIFEST:-$REPO_ROOT/ops/task-loop/parallel-manifest.tsv}"
 TASKS_DIR="$REPO_ROOT/ops/task-loop/tasks"
 
-WATCH=0; INTERVAL=10
-if [[ "${1:-}" == "--watch" ]]; then WATCH=1; [[ -n "${2:-}" ]] && INTERVAL="$2"; fi
+WATCH=0; INTERVAL=10; DEMO=0
+for a in "$@"; do
+    case "$a" in
+        --watch)  WATCH=1 ;;
+        --demo)   DEMO=1 ;;        # render synthetic sessions; no docker needed
+        [0-9]*)   INTERVAL="$a" ;;
+        *)        echo "ERROR: unknown arg '$a'" >&2; exit 1 ;;
+    esac
+done
 
 # branch-slug -> "name<TAB>epic_task" lookup from the manifest.
 declare -A SLUG_NAME SLUG_TASK SLUG_BRANCH
@@ -36,7 +48,7 @@ task_status() {  # $1 = task id -> status string or "-"
 
 colorize() {  # colorize a status word
     case "$1" in
-        running)        printf '\033[36m%s\033[0m' "$1" ;;        # cyan
+        running|in_progress) printf '\033[36m%s\033[0m' "$1" ;;   # cyan
         done)           printf '\033[32m%s\033[0m' "$1" ;;        # green
         blocked|stuck)  printf '\033[31m%s\033[0m' "$1" ;;        # red
         needs-review)   printf '\033[33m%s\033[0m' "$1" ;;        # yellow
@@ -45,28 +57,79 @@ colorize() {  # colorize a status word
     esac
 }
 
+TAIL_LINES=4   # max log-tail lines per session (blanks are skipped, not padded)
+
+# log_events -- up to $TAIL_LINES recent single-line meaningful events from a
+# stream-json log. Best-effort; never errors the caller (used under pipefail).
+log_events() {  # $1 = log file
+    local logf="$1" out
+    out="$(tail -200 "$logf" 2>/dev/null \
+        | jq -rR 'fromjson?
+            | (if .type=="assistant" then (.message.content[]? | (.text // ("⚙ "+(.name//"tool"))))
+               elif .type=="result"  then ("✓ "+(.subtype//"done"))
+               else empty end)
+            | gsub("\\s+";" ") | sub("^ ";"")' 2>/dev/null \
+        | grep -v '^$' | tail -"$TAIL_LINES" || true)"
+    [[ -z "$out" ]] && out="$(tail -"$TAIL_LINES" "$logf" 2>/dev/null || true)"
+    printf '%s' "$out"
+}
+
+# render_session -- one header line + a fixed TAIL_LINES tail area.
+# Args: name cstate tstat task up age stale width ; stdin = log lines.
+render_session() {
+    local name="$1" cstate="$2" tstat="$3" task="$4" up="$5" age="$6" stale="$7" width="$8"
+    local dot age_c
+    case "$cstate" in
+        running) dot=$'\033[36m●\033[0m' ;;   # cyan
+        *)       dot=$'\033[90m●\033[0m' ;;    # grey
+    esac
+    if [[ "$stale" == "1" ]]; then age_c=$'\033[31m'"$age"$'\033[0m'; else age_c="$age"; fi
+    printf '%b %-11s [%s] %s  up %s  log %s\n' \
+        "$dot" "$name" "$(colorize "$cstate")" "${task}:$(colorize "$tstat")" "$up" "$age_c"
+    local -a lines=(); local ln
+    while IFS= read -r ln; do
+        [[ -z "${ln// }" ]] && continue   # skip blank lines, don't pad
+        lines+=("$ln")
+    done
+    # keep only the most recent TAIL_LINES
+    if [[ "${#lines[@]}" -gt "$TAIL_LINES" ]]; then
+        lines=("${lines[@]: -$TAIL_LINES}")
+    fi
+    if [[ "${#lines[@]}" -eq 0 ]]; then
+        printf '    \033[90m(no log output yet)\033[0m\n'
+    else
+        for ln in "${lines[@]}"; do
+            printf '    \033[90m%s\033[0m\n' "$(printf '%s' "$ln" | cut -c1-"$((width - 4))")"
+        done
+    fi
+    echo   # one blank line between sessions
+}
+
+header() {  # $1 = optional suffix tag
+    local w; w="$(tput cols 2>/dev/null || echo 100)"; [[ "$w" -lt 40 ]] && w=100
+    echo "Arachne parallel agents — $(date '+%Y-%m-%d %H:%M:%S')${1:-}"
+    printf '%*s\n' "$w" '' | tr ' ' '-'
+}
+
+term_width() { local w; w="$(tput cols 2>/dev/null || echo 100)"; [[ "$w" -lt 40 ]] && w=100; echo "$w"; }
+
 snapshot() {
-    echo "Arachne parallel agents — $(date '+%Y-%m-%d %H:%M:%S')"
-    echo "-------------------------------------------------------------------------------"
-    printf '%-12s %-9s %-7s %-13s %-6s %s\n' NAME CONTAINER UPTIME TASK AGE LASTLINE
+    local width; width="$(term_width)"
+    header
     local found=0
-    # Running + recently-exited arachne-agent containers.
     while IFS='|' read -r cname state status; do
         [[ -z "$cname" ]] && continue
         [[ "$cname" == arachne-agent* ]] || continue
         found=1
         local slug="${cname#arachne-agent-}"
         local name="${SLUG_NAME[$slug]:-$slug}"
-        local task="${SLUG_TASK[$slug]:-}"
-        local tstat="-"; [[ -n "$task" ]] && tstat="$(task_status "$task")"
+        local task="${SLUG_TASK[$slug]:-—}"
+        local tstat="-"; [[ "$task" != "—" ]] && tstat="$(task_status "$task")"
         local cstate="running"; [[ "$state" != "running" ]] && cstate="exited"
-        # uptime: docker status string already reads "Up 12 minutes" / "Exited (0) ..."
         local up; up="$(echo "$status" | sed -E 's/^(Up|Exited[^ ]*) //; s/ ago$//' | cut -c1-11)"
         # Resolve the log path from the BRANCH (worktrees with '/' in the branch
-        # are nested dirs, e.g. .worktrees/feat/agentic-interaction/). Fall back
-        # to a find for containers whose slug isn't in the manifest.
-        local logf=""
-        local branch="${SLUG_BRANCH[$slug]:-}"
+        # are nested dirs). Fall back to a find for off-manifest slugs.
+        local logf="" branch="${SLUG_BRANCH[$slug]:-}"
         if [[ -n "$branch" ]]; then
             logf="$REPO_ROOT/.worktrees/$branch/.arachne-agent.log"
         else
@@ -76,44 +139,64 @@ snapshot() {
                 [[ "${d//\//-}" == "$slug" ]] && { logf="$cand"; break; }
             done < <(find "$REPO_ROOT/.worktrees" -name .arachne-agent.log 2>/dev/null)
         fi
-        local age="-" last="-"
+        local age="-" stale=0
         if [[ -n "$logf" && -f "$logf" ]]; then
-            # Freshness: seconds since the log last grew. A "running" container
-            # whose log is minutes stale is the real stuck signal.
             local mtime; mtime="$(stat -c %Y "$logf" 2>/dev/null || echo 0)"
-            [[ "$mtime" -gt 0 ]] && age="$(( $(date +%s) - mtime ))s"
-            # stream-json: extract the most recent human-meaningful event;
-            # fall back to the raw tail. Best-effort — never errors the table.
-            # `|| true`: these substitutions are best-effort; under `set -o
-            # pipefail` a non-zero jq/tail must not trip `set -e` and abort the loop.
-            last="$(tail -60 "$logf" 2>/dev/null \
-                | jq -rR 'fromjson?
-                    | if .type=="assistant" then (.message.content[]? | (.text // ("⚙ "+(.name//"tool"))))
-                      elif .type=="result" then ("✓ "+(.subtype//"done"))
-                      else empty end' 2>/dev/null | tail -1 || true)"
-            [[ -z "$last" ]] && last="$(tail -1 "$logf" 2>/dev/null || true)"
-            last="$(printf '%s' "$last" | tr -d '\n' | cut -c1-46 || true)"
-            [[ -z "$last" ]] && last="-"
+            if [[ "$mtime" -gt 0 ]]; then
+                local secs=$(( $(date +%s) - mtime )); age="${secs}s"
+                [[ "$cstate" == running && "$secs" -gt 120 ]] && stale=1
+            fi
         fi
-        printf '%-12s %-9s %-7s %-13s %-6s %s\n' \
-            "$name" "$(colorize "$cstate")" "$up" \
-            "$task:$(colorize "$tstat")" "$age" "$last"
+        log_events "$logf" \
+            | render_session "$name" "$cstate" "$tstat" "$task" "$up" "$age" "$stale" "$width"
     done < <(docker ps -a --filter 'name=arachne-agent' --format '{{.Names}}|{{.State}}|{{.Status}}' 2>/dev/null)
     [[ "$found" -eq 0 ]] && echo "(no arachne-agent containers running or recently exited)"
-    echo
-    # Surface blocked/stuck/needs-review epics from the manifest regardless of container state.
+    # Surface blocked/stuck/needs-review epics regardless of container state.
     local flagged=""
     for slug in "${!SLUG_TASK[@]}"; do
         local t="${SLUG_TASK[$slug]}"; local s; s="$(task_status "$t")"
         case "$s" in blocked|stuck|needs-review) flagged+="  $t (${SLUG_NAME[$slug]}): $s\n" ;; esac
     done
-    if [[ -n "$flagged" ]]; then
-        echo "Needs attention:"; printf "$flagged"
-    fi
+    [[ -n "$flagged" ]] && { echo "Needs attention:"; printf "$flagged"; }
 }
 
+# demo -- synthetic sessions exercising every state, for iterating on the UI
+# without launching containers. Pure rendering; touches no docker, no logs.
+demo() {
+    local width; width="$(term_width)"
+    header "   [DEMO — synthetic data]"
+    printf '%s\n' \
+        "Reading ops/planning/2026-04-13 - Integrations Roadmap.md" \
+        "⚙ Read crates/arachne-connectors/src/email/mod.rs" \
+        "Adding ImapSource block spec with an OAuth2 token field" \
+        "⚙ Bash cargo test -p arachne-connectors email::" \
+        "test imap::tests::parses_envelope ... ok" \
+      | render_session email running in_progress F41.1 "12 minutes" "3s" 0 "$width"
+    printf '%s\n' \
+        "⚙ Edit web/src/canvas/Node.tsx" \
+        "Wiring AgentConfidence.overall into the node confidence chip" \
+      | render_session agentic running in_progress F42.2 "47 minutes" "8s" 0 "$width"
+    printf '%s\n' \
+        "⚙ Bash cargo clippy --workspace -- -D warnings" \
+        "waiting on a long compile…" \
+      | render_session calendar running in_progress F41.2 "9 minutes" "318s" 1 "$width"
+    printf '%s\n' \
+        "✓ success" \
+        "Opened PR #214 against main" \
+        "⚙ Bash gh pr create -d -r tjmisko" \
+        "All tests green; web build green" \
+        "Marked F41.5 complete with commit shas" \
+      | render_session crm exited done F41.5 "2 minutes" "61s" 0 "$width"
+    printf '' \
+      | render_session messaging running in_progress F41.4 "20 seconds" "-" 0 "$width"
+    echo "Needs attention:"
+    printf '  %s\n' "F41.2 (calendar): running but log stale 318s"
+}
+
+render_all() { if [[ "$DEMO" -eq 1 ]]; then demo; else snapshot; fi; }
+
 if [[ "$WATCH" -eq 1 ]]; then
-    while true; do clear; snapshot; sleep "$INTERVAL"; done
+    while true; do clear; render_all; sleep "$INTERVAL"; done
 else
-    snapshot
+    render_all
 fi
