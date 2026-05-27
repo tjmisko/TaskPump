@@ -129,6 +129,36 @@ else
     ARACHNE_RESUME_NOTE=""
 fi
 
+# ── Goal preamble ──────────────────────────────────────────────────────────────
+# Every task handed to an agent gets a clear goal up front. Read the epic's
+# one-line goal from its task file (canonical ops/) and write a small preamble
+# that is prepended to the brief on stdin ahead of any resume note — mirroring
+# the resume-preamble mechanism, so the hand-authored briefs stay pure.
+GOAL_NOTE=""
+if [[ -n "${ARACHNE_TASK_ID:-}" ]]; then
+    GOAL_TEXT="$(yq --front-matter=extract '.goal' "$OPS_DIR/task-loop/tasks/${ARACHNE_TASK_ID}.md" 2>/dev/null || echo '')"
+    [[ "$GOAL_TEXT" == "null" ]] && GOAL_TEXT=""
+    if [[ -n "$GOAL_TEXT" ]]; then
+        GOAL_NOTE="$WORKSPACE_PATH/.arachne-goal.md"
+        {
+            echo "# GOAL — the outcome this session must achieve"
+            echo
+            echo "$GOAL_TEXT"
+            echo
+            echo "Everything below (resume context, kickoff brief) serves this goal. If the"
+            echo "brief's steps and this goal ever appear to conflict, the goal wins — surface"
+            echo "the conflict rather than silently following either."
+            echo
+            echo "---"
+            echo
+        } > "$GOAL_NOTE"
+        chmod 666 "$GOAL_NOTE" 2>/dev/null || true
+        echo "Goal: $GOAL_TEXT" | tee -a "$LOG_FILE"
+    else
+        echo "WARNING: epic ${ARACHNE_TASK_ID} has no goal — set one with 'arachne-task goal ${ARACHNE_TASK_ID} --set \"...\"'" | tee -a "$LOG_FILE"
+    fi
+fi
+
 chmod 666 "$LOG_FILE"
 chown -R dev:dev "$WORKSPACE_PATH/.arachne-agent.log" 2>/dev/null || true
 
@@ -172,9 +202,10 @@ exec su dev -c "
     # --permission-mode auto: server-side classifier gates dangerous actions;
     # no --dangerously-skip-permissions. In headless -p, the session aborts
     # after repeated classifier blocks; we treat that as park-for-review.
-    # A resume preamble (if any) is prepended to the brief on stdin.
+    # Stdin order: goal preamble, then resume preamble (if any), then the brief.
     PROMPT_PARTS=''
-    [ -n '$ARACHNE_RESUME_NOTE' ] && [ -f '$ARACHNE_RESUME_NOTE' ] && PROMPT_PARTS='$ARACHNE_RESUME_NOTE '
+    [ -n '$GOAL_NOTE' ] && [ -f '$GOAL_NOTE' ] && PROMPT_PARTS=\"\$PROMPT_PARTS$GOAL_NOTE \"
+    [ -n '$ARACHNE_RESUME_NOTE' ] && [ -f '$ARACHNE_RESUME_NOTE' ] && PROMPT_PARTS=\"\$PROMPT_PARTS$ARACHNE_RESUME_NOTE \"
     cat \$PROMPT_PARTS '$ARACHNE_BRIEF' | claude -p \
         --permission-mode auto \
         --model '$AGENT_MODEL' \
