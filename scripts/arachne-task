@@ -260,12 +260,15 @@ cmd_next() {
   local top_file=${top#*|*|}
 
   # Emit JSON.
+  local goal; goal=$(fm_get "$top_file" '.goal')
+  [[ -z "$goal" ]] && echo "warning: task $top_id has no goal — run '/goal $top_id' or 'arachne-task goal $top_id --set \"...\"'" >&2
   local json
   json=$(jq -n \
     --arg id "$top_id" \
     --arg file "$top_file" \
     --arg branch "$branch" \
-    '{id: $id, file: $file, branch: $branch, ready: true}')
+    --arg goal "$goal" \
+    '{id: $id, file: $file, branch: $branch, goal: $goal, ready: true}')
   printf '%s\n' "$json" >| "$ARACHNE_TASK_OUT"
   printf '%s\n' "$json"
   return 0
@@ -282,7 +285,7 @@ cmd_list() {
   done
 
   printf '%-10s %-14s %-24s %-20s %s\n' "ID" "STATUS" "CLAIMED_BY" "BLOCKERS" "TITLE"
-  local file id status claimed_by title blockers
+  local file id status claimed_by title blockers goal
   while IFS= read -r file; do
     [[ -z "$file" ]] && continue
     id=$(fm_get "$file" '.id')
@@ -294,6 +297,11 @@ cmd_list() {
     title=$(fm_get "$file" '.title')
     blockers=$(yq --front-matter=extract '.blockers | join(",")' "$file" 2>/dev/null || echo "")
     [[ "$blockers" == "null" ]] && blockers=""
+    # Flag open/in_progress tasks that still lack a goal.
+    goal=$(fm_get "$file" '.goal')
+    if [[ -z "$goal" && ( "$status" == "open" || "$status" == "in_progress" ) ]]; then
+      title="$title  ⚑ no goal"
+    fi
     printf '%-10s %-14s %-24s %-20s %s\n' \
       "$id" "$status" "${claimed_by:--}" "${blockers:--}" "$title"
   done < <(list_all_files)
@@ -337,6 +345,8 @@ cmd_claim() {
   "
   git_commit_state "claim $id on $branch (turns=$turns)"
   echo "claimed $id for $branch (turn_budget=$turns)"
+  local goal; goal=$(fm_get "$file" '.goal')
+  [[ -n "$goal" ]] && echo "goal: $goal"
 }
 
 # Read the current git HEAD SHA of the *code repo* (not the tasks repo).
@@ -596,13 +606,62 @@ cmd_scrub() {
   fi
 }
 
+# ── goal: read / set / list-missing the one-line outcome goal ──────────────────
+# The `goal` frontmatter field is a single crisp sentence stating what success
+# looks like for the task. This CLI is its sole writer (per the no-hand-edit
+# frontmatter invariant). `/goal` drives the authoring UX on top of this.
+cmd_goal() {
+  local id="" set_text="" do_set=0 missing=0
+  while (( $# )); do
+    case $1 in
+      --set) set_text=$2; do_set=1; shift 2;;
+      --set=*) set_text=${1#--set=}; do_set=1; shift;;
+      --missing) missing=1; shift;;
+      -*) die "unknown flag to goal: $1";;
+      *) [[ -z "$id" ]] && id=$1 || die "too many positional args to goal"; shift;;
+    esac
+  done
+
+  # --missing: ids of open/in_progress tasks with no goal (drives /goal sweep
+  # and the prep-long-session gate). Read-only.
+  if (( missing )); then
+    local file status goal
+    while IFS= read -r file; do
+      [[ -z "$file" ]] && continue
+      status=$(fm_get "$file" '.status')
+      [[ "$status" == "open" || "$status" == "in_progress" ]] || continue
+      goal=$(fm_get "$file" '.goal')
+      [[ -z "$goal" ]] || continue
+      fm_get "$file" '.id'; echo
+    done < <(list_all_files)
+    return 0
+  fi
+
+  [[ -z "$id" ]] && die "usage: arachne-task goal <id> [--set \"text\"]  |  goal --missing"
+  local file; file=$(task_file_required "$id")
+
+  if (( do_set )); then
+    [[ -z "$set_text" ]] && die "goal --set requires non-empty text"
+    # Serialize the read-modify-write + commit like other mutators (read path
+    # below stays lock-free, mirroring next/list).
+    acquire_state_lock
+    GOAL="$set_text" yq -i --front-matter=process '.goal = strenv(GOAL)' "$file"
+    git_commit_state "goal: set $id"
+    echo "goal set for $id: $set_text"
+  else
+    printf '%s\n' "$(fm_get "$file" '.goal')"
+  fi
+}
+
 usage() {
   cat <<'EOF'
 usage: arachne-task <command> [args]
 
 Commands:
-  next [--branch <b>]                Emit next ready task as JSON.
-  list [--status <s>]                Human-readable listing.
+  next [--branch <b>]                Emit next ready task as JSON (incl. goal).
+  list [--status <s>]                Human-readable listing (flags missing goals).
+  goal <id> [--set "text"]           Read or set a task's one-line outcome goal.
+  goal --missing                     List open/in_progress tasks with no goal.
   claim <id> --branch <b> [--turns N]  Atomically claim a task.
   heartbeat <id> [--start|--end]     Budget + failure tracking.
   complete <id> [--commits sha,sha]  Mark done; stdin → completion notes.
@@ -635,6 +694,7 @@ main() {
   case $cmd in
     next) cmd_next "$@";;
     list) cmd_list "$@";;
+    goal) cmd_goal "$@";;
     claim) cmd_claim "$@";;
     heartbeat) cmd_heartbeat "$@";;
     complete) cmd_complete "$@";;
