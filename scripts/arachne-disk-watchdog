@@ -1,0 +1,135 @@
+#!/bin/bash
+# arachne-disk-watchdog -- pause new agent launches when free disk drops below
+# a threshold, and optionally trigger an arachne-cleanup --docker sweep if
+# space gets critical.
+#
+# Background: 4-6 parallel agents each maintain ~3 GB of cargo target/ plus
+# the docker build cache, image storage, container writable layers. A box
+# with 50 GB free can become a box with 0 GB free in 30 minutes once cargo
+# rebuilds kick in. When that happens mid-run, cargo writes start ENOSPC'ing
+# and the agents wedge inside half-finished bash tool calls — observed
+# 2026-05-28. The pool cap file (.arachne-pool-cap) is the documented choke
+# point on run-parallel.sh's launch loop; this watchdog drives it from disk
+# pressure.
+#
+# Usage:
+#   ./scripts/arachne-disk-watchdog                # watch + auto-throttle
+#   ./scripts/arachne-disk-watchdog --dry-run      # detect + log only
+#   ./scripts/arachne-disk-watchdog --once         # one check, exit
+#
+# Env:
+#   POLL                 -- seconds between checks (default 30)
+#   PAUSE_THRESHOLD_GB   -- free below this GB → set pool cap to 0 (default 10)
+#   PANIC_THRESHOLD_GB   -- free below this GB → also run cleanup --docker (default 5)
+#   RECOVER_THRESHOLD_GB -- free above this GB → restore original cap (default 20)
+#   ORIGINAL_CAP         -- cap to restore when recovered (default: contents of CAP_FILE at start, else 6)
+#   CAP_FILE             -- pool cap file (default <repo-root>/.arachne-pool-cap)
+#   COOLDOWN             -- seconds to wait after cleanup before re-arming (default 180)
+#   MOUNT                -- mount to check (default /; the partition that holds $HOME)
+set -uo pipefail
+
+REPO_ROOT="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
+CAP_FILE="${CAP_FILE:-$REPO_ROOT/.arachne-pool-cap}"
+POLL="${POLL:-30}"
+PAUSE_THRESHOLD_GB="${PAUSE_THRESHOLD_GB:-10}"
+PANIC_THRESHOLD_GB="${PANIC_THRESHOLD_GB:-5}"
+RECOVER_THRESHOLD_GB="${RECOVER_THRESHOLD_GB:-20}"
+COOLDOWN="${COOLDOWN:-180}"
+MOUNT="${MOUNT:-/}"
+
+# Snapshot the cap at startup so we can restore it after pressure recovers.
+ORIGINAL_CAP="${ORIGINAL_CAP:-}"
+if [[ -z "$ORIGINAL_CAP" && -f "$CAP_FILE" ]]; then
+    ORIGINAL_CAP="$(tr -dc '0-9' < "$CAP_FILE" 2>/dev/null || true)"
+fi
+ORIGINAL_CAP="${ORIGINAL_CAP:-6}"
+
+DRY_RUN=0; ONCE=0
+for a in "$@"; do
+    case "$a" in
+        --dry-run) DRY_RUN=1 ;;
+        --once)    ONCE=1 ;;
+        -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
+        *) echo "ERROR: unknown arg '$a'" >&2; exit 2 ;;
+    esac
+done
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+
+# ── free_gb -- echo whole GB free on $MOUNT.
+free_gb() {
+    df --output=avail -BG "$MOUNT" 2>/dev/null | awk 'NR==2 {gsub("G",""); print $1}'
+}
+
+# ── set_cap <n> -- write the live pool cap. Idempotent (no-op when unchanged).
+set_cap() {
+    local n="$1" cur=""
+    [[ -f "$CAP_FILE" ]] && cur="$(tr -dc '0-9' < "$CAP_FILE" 2>/dev/null || true)"
+    if [[ "$cur" == "$n" ]]; then return 0; fi
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        log "  (dry-run) would set pool cap $cur → $n via $CAP_FILE"
+        return 0
+    fi
+    if ! printf '%s\n' "$n" > "$CAP_FILE" 2>/dev/null; then
+        log "  WARNING: could not write cap file $CAP_FILE (permissions?)"
+        return 1
+    fi
+    log "  pool cap $cur → $n ($CAP_FILE)"
+}
+
+# ── docker_panic -- run cleanup --docker to free space immediately.
+docker_panic() {
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        log "  (dry-run) would run arachne-cleanup --docker"
+        return 0
+    fi
+    "$REPO_ROOT/scripts/arachne-cleanup" --docker 2>&1 | sed 's/^/    cleanup: /'
+}
+
+# ── pressure state machine.
+#    States:  HEALTHY (free > RECOVER), PAUSED (free < PAUSE), PANIC (free < PANIC)
+#    Transitions are one-way until recovery to keep behavior deterministic.
+LAST_STATE="HEALTHY"
+react() {
+    local g; g="$(free_gb || echo 0)"
+    if [[ -z "$g" ]]; then
+        log "WARNING: could not read free GB on $MOUNT (skipping check)"
+        return 0
+    fi
+
+    if   (( g < PANIC_THRESHOLD_GB ));   then NEW="PANIC"
+    elif (( g < PAUSE_THRESHOLD_GB ));   then NEW="PAUSED"
+    elif (( g > RECOVER_THRESHOLD_GB )); then NEW="HEALTHY"
+    else NEW="$LAST_STATE"  # in the hysteresis band
+    fi
+
+    if [[ "$NEW" != "$LAST_STATE" ]]; then
+        log "$MOUNT free=${g}G — $LAST_STATE → $NEW"
+        case "$NEW" in
+            PANIC)
+                set_cap 0
+                docker_panic
+                log "cooling down ${COOLDOWN}s before re-arming"
+                [[ "$DRY_RUN" -eq 0 ]] && sleep "$COOLDOWN" ;;
+            PAUSED)
+                set_cap 0 ;;
+            HEALTHY)
+                set_cap "$ORIGINAL_CAP" ;;
+        esac
+        LAST_STATE="$NEW"
+    fi
+}
+
+mode="watch"; [[ "$ONCE" -eq 1 ]] && mode="once"; [[ "$DRY_RUN" -eq 1 ]] && mode="$mode/dry-run"
+log "arachne-disk-watchdog starting ($mode): mount=$MOUNT poll=${POLL}s pause<${PAUSE_THRESHOLD_GB}G panic<${PANIC_THRESHOLD_GB}G recover>${RECOVER_THRESHOLD_GB}G original_cap=$ORIGINAL_CAP"
+
+if [[ "$ONCE" -eq 1 ]]; then
+    react
+    exit 0
+fi
+
+trap 'log "stopping."; exit 0' INT TERM
+while true; do
+    react
+    sleep "$POLL"
+done
