@@ -82,7 +82,28 @@ elif [[ -f "$MCP_JSON" ]]; then
     cp "$MCP_JSON" /home/dev/.claude/settings.json
 fi
 if [[ -f /tmp/claude-home-json/.claude.json ]]; then
-    cp /tmp/claude-home-json/.claude.json /home/dev/.claude.json
+    # Validated copy with retry. The host file is actively written by the
+    # user's primary claude session (telemetry, recently-used, etc.), so a
+    # naive cp can capture a mid-write torn state — observed 2026-05-28 when
+    # a parallel cohort silently died on `Unexpected EOF` parsing the
+    # corrupted /home/dev/.claude.json. Retry the copy a few times against
+    # `jq -e .` (≈ "parses as valid JSON"); if every attempt loses the race,
+    # bail BEFORE arachne-task heartbeat --start so the failure doesn't
+    # consume an iteration on the task tripwire counter.
+    attempt=0; max_attempts=6; sleep_s=2
+    while (( attempt < max_attempts )); do
+        cp /tmp/claude-home-json/.claude.json /home/dev/.claude.json
+        if jq -e . /home/dev/.claude.json >/dev/null 2>&1; then
+            break
+        fi
+        attempt=$((attempt + 1))
+        echo "WARNING: /home/dev/.claude.json invalid after copy (attempt $attempt/$max_attempts); retrying in ${sleep_s}s" | tee -a "$LOG_FILE"
+        sleep "$sleep_s"
+    done
+    if ! jq -e . /home/dev/.claude.json >/dev/null 2>&1; then
+        echo "ERROR: failed to obtain a valid /home/dev/.claude.json after $max_attempts attempts (host file may be in flux). Exiting before the task heartbeat starts so no failed-iteration is recorded." | tee -a "$LOG_FILE"
+        exit 75  # EX_TEMPFAIL — operator-recoverable
+    fi
 fi
 chown -R dev:dev /home/dev/.claude /home/dev/.claude.json 2>/dev/null || true
 chmod -R u+rw /home/dev/.claude 2>/dev/null || true

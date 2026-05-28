@@ -1,0 +1,235 @@
+#!/bin/bash
+# arachne-cleanup -- one-button rescue for parallel-run agents.
+#
+# Background: a parallel run can leave the box in an awkward state — agents
+# hung on cargo locks after an ENOSPC, runaway dev-server zombies, 30 GB of
+# docker build cache, 4×3 GB cargo target dirs across worktrees. This script
+# packages the cleanup steps so the recovery is one command and not a
+# 20-step muscle-memory ritual.
+#
+# Usage:
+#   ./scripts/arachne-cleanup --status        # what would be cleaned (read-only)
+#   ./scripts/arachne-cleanup --stuck         # stop hung containers, release tasks
+#   ./scripts/arachne-cleanup --targets       # wipe cargo target/ in worktrees
+#   ./scripts/arachne-cleanup --docker        # builder prune + system prune
+#   ./scripts/arachne-cleanup --all           # all three, in that order
+#   ./scripts/arachne-cleanup --all --dry-run # preview the full --all sweep
+#
+# Stuck-detection heuristic: a running arachne-agent-* container whose
+# .arachne-agent.log mtime is older than STUCK_THRESHOLD_MIN (default 15)
+# is considered stuck. The script then:
+#   1. WIP-commits its worktree (so in-flight edits survive the kill).
+#   2. docker stops the container (graceful SIGTERM + 30 s grace, then SIGKILL).
+#   3. arachne-task release <epic> --reason "stuck (no log activity for Nmin)"
+#      so the next run can re-pick or another agent claims it.
+#
+# Env:
+#   STUCK_THRESHOLD_MIN  -- log-stale cutoff, minutes (default 15)
+#   MANIFEST             -- manifest path (default ops/task-loop/parallel-manifest.tsv)
+#   DOCKER_GRACE_SEC     -- docker stop grace period (default 30)
+set -uo pipefail
+
+REPO_ROOT="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
+MANIFEST="${MANIFEST:-$REPO_ROOT/ops/task-loop/parallel-manifest.tsv}"
+STUCK_THRESHOLD_MIN="${STUCK_THRESHOLD_MIN:-15}"
+DOCKER_GRACE_SEC="${DOCKER_GRACE_SEC:-30}"
+
+DRY_RUN=0
+MODE=""
+
+usage() {
+    cat <<EOF
+usage: arachne-cleanup <mode> [--dry-run]
+
+Modes (exactly one):
+  --status     Read-only: print what would be cleaned. Implies --dry-run.
+  --stuck      Stop hung agent containers and release their tasks.
+  --targets    Wipe cargo target/ in every .worktrees/*/.
+  --docker     docker builder prune -af + docker system prune -f.
+  --all        --stuck, then --targets, then --docker.
+
+Flags:
+  --dry-run    Print actions, don't perform them.
+
+Env:
+  STUCK_THRESHOLD_MIN (default 15) — log-stale cutoff, minutes.
+  DOCKER_GRACE_SEC    (default 30) — docker stop grace period.
+EOF
+}
+
+for a in "$@"; do
+    case "$a" in
+        --status)   MODE="status";  DRY_RUN=1 ;;
+        --stuck)    [[ -z "$MODE" ]] && MODE="stuck"    || { echo "ERROR: only one mode allowed"; exit 2; } ;;
+        --targets)  [[ -z "$MODE" ]] && MODE="targets"  || { echo "ERROR: only one mode allowed"; exit 2; } ;;
+        --docker)   [[ -z "$MODE" ]] && MODE="docker"   || { echo "ERROR: only one mode allowed"; exit 2; } ;;
+        --all)      [[ -z "$MODE" ]] && MODE="all"      || { echo "ERROR: only one mode allowed"; exit 2; } ;;
+        --dry-run)  DRY_RUN=1 ;;
+        -h|--help)  usage; exit 0 ;;
+        *)          echo "ERROR: unknown arg '$a'" >&2; usage; exit 2 ;;
+    esac
+done
+
+[[ -z "$MODE" ]] && { usage; exit 2; }
+
+log() { echo "[$(date '+%H:%M:%S')] $*"; }
+act() {
+    if [[ "$DRY_RUN" -eq 1 ]]; then echo "  (dry-run) $*"
+    else echo "  $ $*"; eval "$@"
+    fi
+}
+
+# ── manifest_task_for <container-name> -- echo the epic task id for a
+#    running container, or empty if no match. Compares each manifest branch
+#    transliterated to a slug ('/' → '-') against arachne-agent-<slug>.
+manifest_task_for() {
+    local cname="$1"
+    [[ -f "$MANIFEST" ]] || return 1
+    while IFS=$'\t' read -r name branch _brief task _rest; do
+        [[ "$name" =~ ^# ]] && continue
+        [[ -z "$name"   ]] && continue
+        local slug="${branch//\//-}"
+        if [[ "arachne-agent-$slug" == "$cname" ]]; then
+            echo "$task"; return 0
+        fi
+    done < "$MANIFEST"
+    return 1
+}
+
+# ── worktree_for_container <container-name> -- echo the .worktrees path.
+worktree_for_container() {
+    local cname="$1"
+    local slug="${cname#arachne-agent-}"
+    # Convert the FIRST '-' (after 'feat'/'ops'/etc) back into '/'. Our branch
+    # convention is exactly one '/' (e.g. feat/f44.8, ops/parallel-run).
+    local branch="${slug/-//}"
+    echo "$REPO_ROOT/.worktrees/$branch"
+}
+
+# ── list_agent_containers -- emit names of running arachne-agent-* containers.
+list_agent_containers() {
+    docker ps --format '{{.Names}}' 2>/dev/null | grep '^arachne-agent-' || true
+}
+
+# ── log_age_min <path> -- echo the age of <path> in minutes, or "?" if missing.
+log_age_min() {
+    local f="$1"
+    [[ -f "$f" ]] || { echo "?"; return; }
+    local now mt
+    now=$(date +%s)
+    mt=$(stat -c '%Y' "$f" 2>/dev/null || stat -f '%m' "$f" 2>/dev/null || echo 0)
+    echo $(( (now - mt) / 60 ))
+}
+
+# ── do_stuck -- find log-stale containers, snapshot their worktrees, stop
+#    them, release their epic task claims.
+do_stuck() {
+    log "stuck-agent sweep (threshold=${STUCK_THRESHOLD_MIN}min, dry-run=$DRY_RUN)"
+    local found=0
+    local cname
+    while IFS= read -r cname; do
+        [[ -z "$cname" ]] && continue
+        local wt; wt="$(worktree_for_container "$cname")"
+        local logf="$wt/.arachne-agent.log"
+        local age; age="$(log_age_min "$logf")"
+        if [[ "$age" == "?" ]]; then
+            log "  $cname: no log file at $logf (skip)"
+            continue
+        fi
+        if (( age < STUCK_THRESHOLD_MIN )); then
+            log "  $cname: log fresh (${age}min < ${STUCK_THRESHOLD_MIN}) — leave alone"
+            continue
+        fi
+        found=$((found + 1))
+        log "  $cname: STUCK (log idle ${age}min)"
+        # 1) snapshot worktree progress
+        if [[ -d "$wt/.git" || -f "$wt/.git" ]]; then
+            act "git -C '$wt' add -A"
+            act "git -C '$wt' -c user.name=arachne-cleanup -c user.email=cleanup@arachne.local commit -m 'wip: arachne-cleanup pre-stop snapshot' --allow-empty"
+        fi
+        # 2) stop the container
+        act "docker stop --time=$DOCKER_GRACE_SEC '$cname'"
+        # 3) release the task claim, if known
+        local task; task="$(manifest_task_for "$cname" || true)"
+        if [[ -n "$task" ]]; then
+            act "'$REPO_ROOT/scripts/arachne-task' release '$task' --reason 'arachne-cleanup: stuck (log idle ${age}min)'"
+        else
+            log "  $cname: no manifest task mapping; skipping arachne-task release"
+        fi
+    done < <(list_agent_containers)
+    if (( found == 0 )); then
+        log "no stuck agents found."
+    else
+        log "stuck-agent sweep: $found container(s) handled."
+    fi
+}
+
+# ── do_targets -- wipe cargo target/ in every worktree. Cheap to rebuild;
+#    each is typically 2-6 GB.
+do_targets() {
+    log "wiping worktree cargo target/ dirs (dry-run=$DRY_RUN)"
+    local found=0
+    local wt
+    for wt in "$REPO_ROOT"/.worktrees/*/*; do
+        [[ -d "$wt/target" ]] || continue
+        local size; size="$(du -sh "$wt/target" 2>/dev/null | cut -f1)"
+        log "  $wt/target ($size)"
+        act "rm -rf '$wt/target'"
+        found=$((found + 1))
+    done
+    if (( found == 0 )); then
+        log "no worktree target dirs to wipe."
+    else
+        log "wiped $found target dir(s)."
+    fi
+    # Also offer the primary checkout's target if huge.
+    if [[ -d "$REPO_ROOT/target" ]]; then
+        local size; size="$(du -sh "$REPO_ROOT/target" 2>/dev/null | cut -f1)"
+        log "primary checkout target: $REPO_ROOT/target ($size) — left alone (not a worktree)"
+    fi
+}
+
+# ── do_docker -- prune build cache + dangling containers/images. The
+#    `arachne` image itself is reused, not pruned.
+do_docker() {
+    log "docker prune (build cache + system) (dry-run=$DRY_RUN)"
+    if ! command -v docker >/dev/null 2>&1; then
+        log "docker not on PATH; skipping."
+        return
+    fi
+    act "docker builder prune -af"
+    act "docker system prune -f"
+    log "docker prune complete."
+}
+
+# ── status -- read-only summary.
+do_status() {
+    log "arachne-cleanup --status (read-only)"
+    echo
+    echo "## Agent containers"
+    docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Size}}' 2>/dev/null | grep -E '^NAMES|^arachne-agent-' || echo "(none running)"
+    echo
+    echo "## Log-stale heuristic (threshold=${STUCK_THRESHOLD_MIN}min)"
+    local cname
+    while IFS= read -r cname; do
+        [[ -z "$cname" ]] && continue
+        local wt; wt="$(worktree_for_container "$cname")"
+        local logf="$wt/.arachne-agent.log"
+        local age; age="$(log_age_min "$logf")"
+        printf "  %-40s  log_age=%s min\n" "$cname" "$age"
+    done < <(list_agent_containers)
+    echo
+    echo "## Worktree target/ sizes"
+    du -sh "$REPO_ROOT"/.worktrees/*/*/target 2>/dev/null | sort -h | tail -20 || echo "(none)"
+    echo
+    echo "## Docker storage"
+    docker system df 2>/dev/null || echo "(docker not available)"
+}
+
+case "$MODE" in
+    status)   do_status ;;
+    stuck)    do_stuck ;;
+    targets)  do_targets ;;
+    docker)   do_docker ;;
+    all)      do_stuck; echo; do_targets; echo; do_docker ;;
+esac
