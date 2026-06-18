@@ -127,6 +127,32 @@ else
   fi
 fi
 
+# ── Test 1b: --phase scopes next to one epic (ignores lower-phase tasks) ──────
+# Mirrors the F51 bug: plain next returns the global-lowest-phase task
+# (F15.11), but a parallel worktree scoped to one epic must stay in-epic.
+echo
+echo "--- Test 1b: next --phase scoping ---"
+if ! "$CLI" next --branch feat/mine --phase F17 >/dev/null; then
+  fail "next --phase F17 returned non-zero"
+else
+  got=$(jq -r '.id' < "$ARACHNE_TASK_OUT")
+  if [[ "$got" == "F17.2" ]]; then
+    pass "next --phase F17 picked F17.2 (lower-phase F15.11 correctly ignored)"
+  else
+    fail "next --phase F17 picked '$got'; expected F17.2"
+  fi
+fi
+# Bare-number form normalises to the same scope.
+"$CLI" next --branch feat/mine --phase 17 >/dev/null
+got=$(jq -r '.id' < "$ARACHNE_TASK_OUT")
+[[ "$got" == "F17.2" ]] && pass "next --phase 17 normalises to F17 (got F17.2)" \
+  || fail "next --phase 17 picked '$got'; expected F17.2"
+# A different epic returns that epic's task.
+"$CLI" next --branch feat/mine --phase F15 >/dev/null
+got=$(jq -r '.id' < "$ARACHNE_TASK_OUT")
+[[ "$got" == "F15.11" ]] && pass "next --phase F15 picked F15.11" \
+  || fail "next --phase F15 picked '$got'; expected F15.11"
+
 # ── Test 2: after F15.11 claimed, next picks F17.2 (not blocked F17.3) ───────
 echo
 echo "--- Test 2: claim + next advances ---"
