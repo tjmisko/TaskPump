@@ -208,14 +208,23 @@ blockers_satisfied() {
 }
 
 cmd_next() {
-  local branch=""
+  local branch="" phase=""
   while (( $# )); do
     case $1 in
       --branch) branch=$2; shift 2;;
       --branch=*) branch=${1#--branch=}; shift;;
+      --phase) phase=$2; shift 2;;
+      --phase=*) phase=${1#--phase=}; shift;;
       *) die "unknown arg to next: $1";;
     esac
   done
+  # Normalise the phase filter to the bare phase token (e.g. F51): accept
+  # "F51", "f51", "51", or a full task id like "F51.2" and keep only "F51".
+  if [[ -n "$phase" ]]; then
+    phase=${phase%%.*}                 # F51.2 -> F51
+    phase=${phase#[Ff]}                # F51 / f51 -> 51
+    phase="F${phase}"                  # 51 -> F51 (canonical)
+  fi
 
   # Walk tasks, collect (sort_key, id, file) for eligible ones.
   local candidates=() file id status claimed_by sort_key
@@ -223,6 +232,14 @@ cmd_next() {
     [[ -z "$file" ]] && continue
     id=$(fm_get "$file" '.id')
     [[ -z "$id" ]] && { dbg "skip $file: no id"; continue; }
+    # Epic scoping: when --phase is given, only consider tasks in that phase.
+    # The parallel substrate runs one epic per worktree, so an in-epic next
+    # keeps pickups ordered within the epic instead of jumping to a stray
+    # lower-numbered task from another phase.
+    if [[ -n "$phase" && "${id%%.*}" != "$phase" ]]; then
+      dbg "skip $id: phase ${id%%.*} != requested $phase"
+      continue
+    fi
     status=$(fm_get "$file" '.status')
     if [[ "$status" != "open" ]]; then
       dbg "skip $id: status=$status"
@@ -658,7 +675,8 @@ usage() {
 usage: arachne-task <command> [args]
 
 Commands:
-  next [--branch <b>]                Emit next ready task as JSON (incl. goal).
+  next [--branch <b>] [--phase <FN>] Emit next ready task as JSON (incl. goal).
+                                     --phase scopes to one epic (e.g. F51).
   list [--status <s>]                Human-readable listing (flags missing goals).
   goal <id> [--set "text"]           Read or set a task's one-line outcome goal.
   goal --missing                     List open/in_progress tasks with no goal.
