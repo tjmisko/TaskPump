@@ -9,7 +9,9 @@
 
 set -euo pipefail
 
-SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+# CDPATH= guards against a caller's exported CDPATH making `cd` to the relative
+# dirname echo the target dir into the command substitution (corrupts SCRIPT_DIR).
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 CLI="$SCRIPT_DIR/arachne-task"
 
 PASS=0
@@ -369,6 +371,60 @@ git -C "$CODE_REPO" -c user.name=test -c user.email=t@e commit -q -m "second tou
 "$CLI" heartbeat F19.1 --end 2>/dev/null
 # consecutive_failed_iterations should reset to 0 (productive=1 again).
 assert_fm "$TASKS/F19.1.md" '.consecutive_failed_iterations' '0'
+
+# ── Test 11: ready — frontier + phase range + cross-phase blocker ────────────
+# Two phases (F30, F31) with a CROSS-PHASE blocker: F31.1 blocks on F30.1.
+# Exercises the keep-acquiring frontier, --count's open-regardless-of-blocker
+# semantics, range parsing, single-phase aliasing, and the next == ready[0] tie.
+echo
+echo "--- Test 11: ready (frontier, range, cross-phase blocker) ---"
+make_task "$TASKS" F30.1 F30 open "Range root (no blockers)"
+make_task "$TASKS" F30.2 F30 open "Depends on F30.1" null "F30.1"
+make_task "$TASKS" F31.1 F31 open "Cross-phase depends on F30.1" null "F30.1"
+make_task "$TASKS" F31.2 F31 done "Already done in range"
+make_task "$TASKS" F32.1 F32 open "Out-of-range open task"
+git -C "$TASKS_REPO" add -A; git -C "$TASKS_REPO" -c user.name=test -c user.email=t@e commit -q -m "add ready fixtures" || true
+
+# 11a: --count = open tasks in range regardless of blocker state.
+#   F30.1, F30.2, F31.1 are open (F30.2/F31.1 blocked-by-incomplete still count);
+#   F31.2 is done (excluded); F32.1 is out of range.
+got=$("$CLI" ready --phases F30..F31 --count)
+[[ "$got" == "3" ]] && pass "ready --count = 3 (open in range, blocker state ignored)" \
+  || fail "ready --count expected 3 got '$got'"
+
+# 11b: frontier (eligible) before F30.1 done = just F30.1.
+got=$("$CLI" ready --phases F30..F31 --json | jq -r '[.[].id] | join(",")')
+[[ "$got" == "F30.1" ]] && pass "ready --json frontier = F30.1 (blocked tasks excluded)" \
+  || fail "ready --json frontier expected 'F30.1' got '$got'"
+
+# 11c: complete F30.1 → both dependents become eligible, in phase order.
+echo "done" | "$CLI" complete F30.1 >/dev/null
+got=$("$CLI" ready --phases F30..F31 --json | jq -r '[.[].id] | join(",")')
+[[ "$got" == "F30.2,F31.1" ]] && pass "ready frontier grows after blocker clears (F30.2,F31.1 in phase order)" \
+  || fail "ready frontier after F30.1 done expected 'F30.2,F31.1' got '$got'"
+
+# 11c2: --count now 2 (F30.1 done; F30.2,F31.1 still open).
+got=$("$CLI" ready --phases F30..F31 --count)
+[[ "$got" == "2" ]] && pass "ready --count drops to 2 after F30.1 done" \
+  || fail "ready --count after F30.1 done expected 2 got '$got'"
+
+# 11d: single --phase F30 behaves like a one-phase range.
+got=$("$CLI" ready --phase F30 --json | jq -r '[.[].id] | join(",")')
+[[ "$got" == "F30.2" ]] && pass "ready --phase F30 scopes to one phase (F30.2)" \
+  || fail "ready --phase F30 expected 'F30.2' got '$got'"
+
+# 11e: next --phase returns ready --phase's first element.
+"$CLI" next --branch feat/mine --phase F30 >/dev/null
+nxt=$(jq -r '.id' < "$ARACHNE_TASK_OUT")
+rdy0=$("$CLI" ready --phase F30 --json | jq -r '.[0].id')
+[[ "$nxt" == "$rdy0" ]] && pass "next --phase F30 == ready --phase F30 first element ($nxt)" \
+  || fail "next ($nxt) != ready[0] ($rdy0)"
+
+# 11f: claimed-by-other is excluded from the frontier (like next).
+"$CLI" claim F30.2 --branch feat/other --turns 5 >/dev/null
+got=$("$CLI" ready --phases F30..F31 --json | jq -r '[.[].id] | join(",")')
+[[ "$got" == "F31.1" ]] && pass "ready frontier excludes task claimed by other branch" \
+  || fail "ready frontier after F30.2 claimed-by-other expected 'F31.1' got '$got'"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo

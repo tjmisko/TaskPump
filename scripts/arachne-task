@@ -91,6 +91,36 @@ phase_sort_key() {
   printf '%s %s' "$phase_num" "$num_part"
 }
 
+# ── Phase-range expansion (for `ready --phases`) ───────────────────────────────
+# Expand a phase spec into the canonical set of phase tokens, one per line.
+# Accepts: a single phase ("F55", "f55", "55", or a full id "F55.2" → "F55");
+# an inclusive numeric range ("F55..F63" → F55 F56 … F63); and comma lists of
+# either ("F55,F58..F60"). Non-numeric phase tokens (e.g. "F-MERGE") pass through
+# uppercased as single tokens; they cannot participate in a range.
+expand_phases() {
+  local spec=$1 comp a b lo hi i n
+  local IFS=','
+  for comp in $spec; do
+    comp="${comp//[[:space:]]/}"
+    [[ -z "$comp" ]] && continue
+    if [[ "$comp" == *..* ]]; then
+      a="${comp%%..*}"; b="${comp##*..}"
+      a="${a#[Ff]}"; b="${b#[Ff]}"
+      [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ ]] || die "bad phase range '$comp' (expected FN..FM)"
+      if (( a <= b )); then lo=$a; hi=$b; else lo=$b; hi=$a; fi
+      for (( i=lo; i<=hi; i++ )); do printf 'F%s\n' "$i"; done
+    else
+      comp="${comp%%.*}"            # tolerate a full id: F55.2 -> F55
+      n="${comp#[Ff]}"
+      if [[ "$n" =~ ^[0-9]+$ ]]; then
+        printf 'F%s\n' "$n"
+      else
+        printf '%s\n' "${comp^^}"   # non-numeric phase, e.g. F-MERGE
+      fi
+    fi
+  done
+}
+
 # ── JSON helper (portable escaping via jq) ────────────────────────────────────
 json_object() {
   # Usage: json_object key1 val1 key2 val2 ...
@@ -171,7 +201,12 @@ acquire_state_lock() {
   local root lockfile
   root=$(git -C "$ARACHNE_TASKS_DIR" rev-parse --show-toplevel 2>/dev/null || echo "")
   lockfile="${root:-/tmp}/.arachne-task.lock"
-  exec 9>"$lockfile" 2>/dev/null || { dbg "cannot open lockfile $lockfile"; return 0; }
+  # Open fd 9 to the lockfile for the lifetime of the process. The `2>/dev/null`
+  # MUST be scoped to a brace group: `exec 9>… 2>/dev/null` with no command would
+  # apply 2>/dev/null to the *current shell permanently*, silently swallowing all
+  # subsequent stderr (every warning + `die` reason). The brace group restores
+  # fd 2 after the open while leaving fd 9 (set by exec) in place.
+  { exec 9>"$lockfile"; } 2>/dev/null || { dbg "cannot open lockfile $lockfile"; return 0; }
   if ! flock -w "${ARACHNE_LOCK_WAIT:-120}" 9; then
     die "could not acquire state lock ($lockfile) within ${ARACHNE_LOCK_WAIT:-120}s"
   fi
@@ -291,6 +326,136 @@ cmd_next() {
   return 0
 }
 
+# cmd_ready — emit the WHOLE eligible frontier across a phase range, not just the
+# single top task `next` returns. This is the keep-acquiring engine the pump
+# polls each tick: as blockers complete, more tasks become eligible and surface
+# here on the next call. Read-only (no lock, no commit), like next/list.
+#
+# Eligibility (default + --json) mirrors cmd_next's predicate exactly — status
+# `open` ∧ blockers all `done` ∧ (unclaimed | claimed by --branch) — but emits
+# ALL matches in phase order instead of head -n1. The candidate walk is kept
+# parallel to (not factored out of) cmd_next so that hot path stays byte-for-byte
+# unchanged (F64.1 acceptance: next regression-free).
+#
+# --count is deliberately BROADER: the number of `status: open` tasks in range
+# regardless of blocker state — the pump's drain test ("no open work remains").
+cmd_ready() {
+  local branch="" phases="" json=0 count=0
+  while (( $# )); do
+    case $1 in
+      --branch) branch=$2; shift 2;;
+      --branch=*) branch=${1#--branch=}; shift;;
+      --phases|--phase) phases=$2; shift 2;;
+      --phases=*) phases=${1#--phases=}; shift;;
+      --phase=*) phases=${1#--phase=}; shift;;
+      --json) json=1; shift;;
+      --count) count=1; shift;;
+      *) die "unknown arg to ready: $1";;
+    esac
+  done
+
+  # Build the wanted-phase set (empty = all phases).
+  local -A want=()
+  local have_filter=0
+  if [[ -n "$phases" ]]; then
+    have_filter=1
+    local p
+    while IFS= read -r p; do
+      [[ -n "$p" ]] && want["$p"]=1
+    done < <(expand_phases "$phases")
+  fi
+
+  # --count: number of status:open tasks in range, blocker/claim state ignored.
+  if (( count )); then
+    local n=0 file id status iphase
+    while IFS= read -r file; do
+      [[ -z "$file" ]] && continue
+      id=$(fm_get "$file" '.id'); [[ -z "$id" ]] && continue
+      iphase=${id%%.*}
+      (( have_filter )) && [[ -z "${want[$iphase]:-}" ]] && continue
+      status=$(fm_get "$file" '.status')
+      [[ "$status" == "open" ]] && n=$((n + 1))
+    done < <(list_all_files)
+    printf '%s\n' "$n"
+    return 0
+  fi
+
+  # Frontier: collect eligible (sort_key|id|file), same predicate as cmd_next.
+  local candidates=() file id status claimed_by sort_key iphase
+  while IFS= read -r file; do
+    [[ -z "$file" ]] && continue
+    id=$(fm_get "$file" '.id')
+    [[ -z "$id" ]] && { dbg "skip $file: no id"; continue; }
+    iphase=${id%%.*}
+    if (( have_filter )) && [[ -z "${want[$iphase]:-}" ]]; then
+      dbg "skip $id: phase $iphase not in requested set"
+      continue
+    fi
+    status=$(fm_get "$file" '.status')
+    [[ "$status" != "open" ]] && { dbg "skip $id: status=$status"; continue; }
+    claimed_by=$(fm_get "$file" '.claimed_by')
+    if [[ -n "$claimed_by" && "$claimed_by" != "$branch" ]]; then
+      dbg "skip $id: claimed by '$claimed_by' (branch: '$branch')"
+      continue
+    fi
+    if ! blockers_satisfied "$file"; then
+      dbg "skip $id: blockers not satisfied"
+      continue
+    fi
+    sort_key=$(phase_sort_key "$id")
+    candidates+=("$sort_key|$id|$file")
+  done < <(list_all_files)
+
+  # Sort by numeric phase then within-phase number (same key as cmd_next).
+  local sorted=""
+  if (( ${#candidates[@]} > 0 )); then
+    sorted=$(printf '%s\n' "${candidates[@]}" | sort -n -k1,1 -k2,2 -t'.' -s)
+  fi
+
+  if (( json )); then
+    # Emit a JSON array of {id,file,phase,goal,blockers}. Build per-object with
+    # jq -n then aggregate with jq -s so escaping is correct for goals/blockers.
+    local objs=() line oid ofile ophase ogoal oblockers
+    if [[ -n "$sorted" ]]; then
+      while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        oid=${line#*|}; oid=${oid%%|*}
+        ofile=${line#*|*|}
+        ophase=${oid%%.*}
+        ogoal=$(fm_get "$ofile" '.goal')
+        oblockers=$(yq --front-matter=extract -o=json -I=0 '.blockers' "$ofile" 2>/dev/null || echo "null")
+        [[ -z "$oblockers" || "$oblockers" == "null" ]] && oblockers="[]"
+        objs+=("$(jq -n \
+          --arg id "$oid" --arg file "$ofile" --arg phase "$ophase" \
+          --arg goal "$ogoal" --argjson blockers "$oblockers" \
+          '{id:$id, file:$file, phase:$phase, goal:$goal, blockers:$blockers}')")
+      done <<<"$sorted"
+    fi
+    if (( ${#objs[@]} == 0 )); then
+      printf '[]\n'
+    else
+      printf '%s\n' "${objs[@]}" | jq -s '.'
+    fi
+    return 0
+  fi
+
+  # Default: human table.
+  printf '%-10s %-8s %-12s %s\n' "ID" "PHASE" "STATUS" "BLOCKERS"
+  if [[ -n "$sorted" ]]; then
+    local line tid tfile tphase tblockers
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      tid=${line#*|}; tid=${tid%%|*}
+      tfile=${line#*|*|}
+      tphase=${tid%%.*}
+      tblockers=$(yq --front-matter=extract '.blockers | join(",")' "$tfile" 2>/dev/null || echo "")
+      [[ "$tblockers" == "null" ]] && tblockers=""
+      printf '%-10s %-8s %-12s %s\n' "$tid" "$tphase" "open" "${tblockers:--}"
+    done <<<"$sorted"
+  fi
+  return 0
+}
+
 cmd_list() {
   local filter_status=""
   while (( $# )); do
@@ -364,6 +529,11 @@ cmd_claim() {
   echo "claimed $id for $branch (turn_budget=$turns)"
   local goal; goal=$(fm_get "$file" '.goal')
   [[ -n "$goal" ]] && echo "goal: $goal"
+  # A successful claim must exit 0 regardless of whether the task has a goal —
+  # without this, the trailing `[[ -n "$goal" ]] && …` leaks its exit status (1
+  # when goal is empty), which a caller checking `claim … || handle` (the pump,
+  # the drain brief) would mis-read as a failed claim.
+  return 0
 }
 
 # Read the current git HEAD SHA of the *code repo* (not the tasks repo).
@@ -677,6 +847,11 @@ usage: arachne-task <command> [args]
 Commands:
   next [--branch <b>] [--phase <FN>] Emit next ready task as JSON (incl. goal).
                                      --phase scopes to one epic (e.g. F51).
+  ready [--phases A..B] [--branch <b>] [--json|--count]
+                                     Emit the WHOLE eligible frontier across a
+                                     phase range (default/--json), or --count of
+                                     open tasks in range (the pump's drain test).
+                                     --phases accepts FN, FN..FM, and comma lists.
   list [--status <s>]                Human-readable listing (flags missing goals).
   goal <id> [--set "text"]           Read or set a task's one-line outcome goal.
   goal --missing                     List open/in_progress tasks with no goal.
@@ -711,6 +886,7 @@ main() {
   esac
   case $cmd in
     next) cmd_next "$@";;
+    ready) cmd_ready "$@";;
     list) cmd_list "$@";;
     goal) cmd_goal "$@";;
     claim) cmd_claim "$@";;
