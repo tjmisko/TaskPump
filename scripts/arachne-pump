@@ -47,7 +47,7 @@ source "$SCRIPT_DIR/arachne-pump-lib.sh"
 
 CLAUDE_DIR="$HOME/.claude"
 CLAUDE_JSON="$HOME/.claude.json"
-OPS_DIR="$REPO_ROOT/ops"
+OPS_DIR="${ARACHNE_PUMP_OPS_DIR:-$REPO_ROOT/ops}"
 TASKS_DIR="$OPS_DIR/task-loop/tasks"
 
 ARACHNE_TASK="${ARACHNE_TASK:-$SCRIPT_DIR/arachne-task}"
@@ -69,13 +69,20 @@ BRANCH_PREFIX="${ARACHNE_PUMP_BRANCH_PREFIX:-feat/}"
 BASE_REF="${ARACHNE_PUMP_BASE:-main}"
 MAX_TURNS="${MAX_TURNS:-600}"
 AGENT_MODEL="${AGENT_MODEL:-opus}"
-CAP_FILE="$REPO_ROOT/.arachne-pool-cap"
+CAP_FILE="${ARACHNE_POOL_CAP_FILE:-$REPO_ROOT/.arachne-pool-cap}"
 RESET_FILE="${ARACHNE_USAGE_RESET_FILE:-$REPO_ROOT/.arachne-usage-reset}"
-MODE="run"        # run | dry | list | once
+MODE="run"        # run | dry | list | once | render | help
+DETACH=0
+STATE_FILE="${ARACHNE_PUMP_STATE_FILE:-$REPO_ROOT/.arachne-pump.state}"
+PUMP_LOG="${ARACHNE_PUMP_LOG:-$REPO_ROOT/.arachne-pump.log}"
+PUMP_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 warn() { printf 'arachne-pump: %s\n' "$*" >&2; }
 die()  { warn "$*"; exit 1; }
 log()  { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
+
+# Keep the verbatim argv so --detach can re-exec the same command minus --detach.
+ORIG_ARGS=("$@")
 
 # ── Arg parsing ────────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -217,6 +224,12 @@ render_brief() {
 # ── Launch one phase's worktree + container ────────────────────────────────────
 launch_phase() {
   local phase="$1"
+  # Test/maintenance hook: tick through the gate + plan + state logic without
+  # materialising worktrees or containers.
+  if [[ "${ARACHNE_PUMP_NO_LAUNCH:-0}" -eq 1 ]]; then
+    log "would launch $phase -> $(phase_branch "$phase") (NO_LAUNCH)"
+    return 0
+  fi
   local branch; branch="$(phase_branch "$phase")"
   local wt="$REPO_ROOT/.worktrees/$branch"
   local cname; cname="$(phase_container "$phase")"
@@ -305,6 +318,7 @@ do_tick() {
 
   if ! feed_gate; then
     log "PAUSED feeding — $GATE_REASON (running agents untouched)"
+    write_state paused "$GATE_REASON"
     return 0
   fi
 
@@ -320,12 +334,76 @@ do_tick() {
     fi
   done
   [[ "$launched" -gt 0 ]] && log "tick: launched $launched (live=$have/$cap)"
+  write_state running ""
   return 0
 }
 
 # ── Drain check ────────────────────────────────────────────────────────────────
 is_drained() {
   [[ "$(open_count)" -eq 0 && "$(apl_count_live_agents)" -eq 0 ]]
+}
+
+# ── Restart-safe state (E2) ────────────────────────────────────────────────────
+# Persist enough that a restarted supervisor (or the monitor) can re-derive what
+# is in flight. Restart safety itself falls out of D3: liveness comes from
+# `docker ps` and the queue is recomputed each tick, so a fresh supervisor never
+# disturbs running containers and never double-launches — the state file just
+# makes the run observable (paused_reason) and lets a restart confirm it is
+# resuming the same range.
+write_state() {  # $1=status(running|paused|drained) $2=paused_reason
+  local status="${1:-running}" reason="${2:-}"
+  jq -n \
+    --arg phases "$PHASES" --argjson jobs "$JOBS" --argjson ceiling "$CEILING" \
+    --arg grain "$GRAIN" --arg started "$PUMP_STARTED_AT" \
+    --arg last_tick "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --argjson live "$(apl_count_live_agents)" --argjson open "$(open_count)" \
+    --arg status "$status" --arg reason "$reason" \
+    '{phases:$phases, jobs:$jobs, ceiling:$ceiling, grain:$grain,
+      started_at:$started, last_tick:$last_tick, live_agents:$live,
+      open_tasks:$open, status:$status, paused_reason:$reason}' \
+    >| "$STATE_FILE" 2>/dev/null || true
+}
+
+# ── Notify (E5) ────────────────────────────────────────────────────────────────
+# Pluggable: ARACHNE_NOTIFY_CMD reads the message on stdin; defaults to
+# `notify-send` (desktop) when present, else a no-op (just the log line).
+pump_notify() {
+  local msg="$1"
+  log "$msg"
+  if [[ -n "${ARACHNE_NOTIFY_CMD:-}" ]]; then
+    printf '%s\n' "$msg" | ${ARACHNE_NOTIFY_CMD} >/dev/null 2>&1 || true
+  elif command -v notify-send >/dev/null 2>&1; then
+    notify-send "arachne-pump" "$msg" >/dev/null 2>&1 || true
+  fi
+}
+
+# ── Detach (E3) ────────────────────────────────────────────────────────────────
+# Re-exec the SAME command minus --detach, fully detached so a multi-day run
+# survives terminal close / SSH drop. Prefers a transient systemd --user unit
+# (clean `journalctl --user -u arachne-pump`, Restart not set for transient —
+# use scripts/arachne-pump.service for restart-on-failure); falls back to
+# setsid+nohup. The persistent unit template is scripts/arachne-pump.service.
+detach_and_exit() {
+  local -a fwd=()
+  local a
+  for a in "${ORIG_ARGS[@]}"; do [[ "$a" == "--detach" ]] || fwd+=("$a"); done
+  local unit="arachne-pump-$(printf '%s' "$PHASES" | tr -c 'A-Za-z0-9' '-')"
+  if command -v systemd-run >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+    systemd-run --user --collect --unit="$unit" \
+      --description="Arachne usage-governed pump ($PHASES)" \
+      --setenv=GITHUB_TOKEN="${GITHUB_TOKEN:-}" \
+      "$0" "${fwd[@]}"
+    log "detached as systemd --user unit '$unit'."
+    log "  status: systemctl --user status $unit   logs: journalctl --user -u $unit -f"
+    log "  stop:   systemctl --user stop $unit"
+  else
+    setsid nohup "$0" "${fwd[@]}" >>"$PUMP_LOG" 2>&1 </dev/null &
+    local pid=$!
+    disown "$pid" 2>/dev/null || true
+    log "detached via setsid+nohup (pid=$pid, log=$PUMP_LOG)."
+    log "  stop: kill $pid   (or: pkill -f 'arachne-pump.*$PHASES')"
+  fi
+  exit 0
 }
 
 # ── Modes ──────────────────────────────────────────────────────────────────────
@@ -348,7 +426,20 @@ case "$MODE" in
     ;;
 esac
 
-# Real run (run / once): prerequisites.
+# Real run (run / once): detach first if asked, then check prerequisites.
+[[ "$DETACH" -eq 1 && "$MODE" == "run" ]] && detach_and_exit
+
+# Restart detection (E2): a leftover state file for the SAME range means we are
+# resuming; D3 makes that safe (re-derive from task files + docker ps).
+if [[ -f "$STATE_FILE" ]]; then
+  prev_phases="$(jq -r '.phases // empty' "$STATE_FILE" 2>/dev/null || true)"
+  if [[ "$prev_phases" == "$PHASES" ]]; then
+    log "resuming pump for $PHASES (re-deriving from task files + docker ps; running agents untouched)."
+  elif [[ -n "$prev_phases" ]]; then
+    warn "a pump state file exists for a different range ($prev_phases); overwriting with $PHASES."
+  fi
+fi
+
 [[ -d "$CLAUDE_DIR" ]] || die "no ~/.claude; run 'claude' to authenticate first"
 if [[ -z "${GITHUB_TOKEN:-}" ]] && command -v gh >/dev/null 2>&1; then
   GITHUB_TOKEN="$(gh auth token 2>/dev/null || true)"; export GITHUB_TOKEN
@@ -382,8 +473,9 @@ while true; do
 done
 
 git -C "$OPS_DIR" push >/dev/null 2>&1 || warn "final ops push failed"
-# Summary tally.
-done_n=$("$ARACHNE_TASK" list 2>/dev/null | awk -v ph="$PHASES" '$2=="done"{n++} END{print n+0}')
-log "DONE. $PHASES drained. ($(open_count) open remain — should be 0; blocked/needs-review need human review)."
-[[ -n "${ARACHNE_NOTIFY_CMD:-}" ]] && { printf 'arachne-pump: %s drained\n' "$PHASES" | ${ARACHNE_NOTIFY_CMD} >/dev/null 2>&1 || true; }
+write_state drained ""
+# Tally non-done terminal states that need a human (blocked / stuck / needs-review).
+attention=$("$ARACHNE_TASK" list 2>/dev/null \
+  | awk '$2=="blocked"||$2=="stuck"||$2=="needs-review"{n++} END{print n+0}')
+pump_notify "$PHASES drained: 0 open should remain ($(open_count) open), $attention task(s) need human review (blocked/stuck/needs-review)."
 exit 0

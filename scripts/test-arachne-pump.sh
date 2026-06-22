@@ -131,6 +131,42 @@ grep -qF 'block F55.N' <<<"$r55" && pass "block-and-continue clause rendered" ||
 r60=$(ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" "$PUMP" --render-brief F60)
 grep -qF 'F55' <<<"$r60" && fail "F55 leaked into F60 render" || pass "F60 render has no F55"
 
+echo "--- Test 8: restart-safe state + drain notify (F64.5, no-launch hook) ---"
+STATE="$TMP/pump.state"
+NOTIFY="$TMP/notify.txt"; : >| "$NOTIFY"
+# Hermetic tick: no worktrees/containers (NO_LAUNCH), ops/git ops point at a
+# non-repo (fail-open), state/cap/log/template/usage all redirected.
+pump_tick() {  # $1=phases ; extra env via caller
+  ARACHNE_PUMP_NO_LAUNCH=1 \
+  ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
+  ARACHNE_PUMP_STATE_FILE="$STATE" \
+  ARACHNE_POOL_CAP_FILE="$TMP/cap" \
+  ARACHNE_PUMP_LOG="$TMP/pump.log" \
+  ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+  "$PUMP" --no-health-gate "${@:2}" --phases "$1"
+}
+
+# 8a: a feeding tick writes status=running for the range.
+mk F55.0 open; mk F55.1 open F55.0; mk F56.0 open; mk F57.0 open F55.1
+STUB_GATE_RC=0 pump_tick F55..F57 --once >/dev/null 2>&1
+[[ "$(jq -r '.phases' "$STATE" 2>/dev/null)" == "F55..F57" ]] && pass "state.phases = F55..F57" || fail "state.phases: $(cat "$STATE" 2>/dev/null)"
+[[ "$(jq -r '.status' "$STATE" 2>/dev/null)" == "running" ]] && pass "state.status = running on a feeding tick" || fail "state.status not running: $(cat "$STATE" 2>/dev/null)"
+
+# 8b: a gated tick writes status=paused with a reason.
+STUB_GATE_RC=10 pump_tick F55..F57 --once >/dev/null 2>&1
+[[ "$(jq -r '.status' "$STATE" 2>/dev/null)" == "paused" ]] && pass "state.status = paused when gate trips" || fail "state.status not paused: $(cat "$STATE" 2>/dev/null)"
+[[ -n "$(jq -r '.paused_reason // empty' "$STATE" 2>/dev/null)" ]] && pass "state.paused_reason recorded" || fail "no paused_reason"
+
+# 8c: a fully-drained range exits → status=drained + one notification.
+mk F55.0 done; mk F55.1 done; mk F56.0 done; mk F57.0 done
+STUB_GATE_RC=0 ARACHNE_NOTIFY_CMD="tee -a $NOTIFY" pump_tick F55..F57 >/dev/null 2>&1
+[[ "$(jq -r '.status' "$STATE" 2>/dev/null)" == "drained" ]] && pass "state.status = drained when range empties" || fail "state.status not drained: $(cat "$STATE" 2>/dev/null)"
+grep -qi 'drained' "$NOTIFY" && pass "drain notification fired via ARACHNE_NOTIFY_CMD" || fail "no drain notification: $(cat "$NOTIFY" 2>/dev/null)"
+
+# 8d: restart detection logs a resume for the same range.
+out=$(STUB_GATE_RC=0 pump_tick F55..F57 --once 2>&1 >/dev/null; STUB_GATE_RC=0 pump_tick F55..F57 --once 2>&1)
+grep -qi "resuming pump for F55..F57" <<<"$out" && pass "restart detection logs resume for same range" || fail "no resume log:\n$out"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"
