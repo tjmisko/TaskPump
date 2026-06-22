@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# test-arachne-pump.sh — dry-run fixture harness for scripts/arachne-pump.
+#
+# Per the F64.3 test plan: exercise the planning logic over a synthetic tasks dir
+# with a cross-phase blocker — initial frontier, a cross-phase gate releasing, the
+# docker-ps liveness join (stub `docker ps`), and the usage gate (stub
+# arachne-usage). No real launch / build / ops mutation (that is F64.6's job).
+set -uo pipefail
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+PUMP="$SCRIPT_DIR/arachne-pump"
+REAL_TASK="$SCRIPT_DIR/arachne-task"
+PASS=0; FAIL=0
+pass() { printf 'PASS: %s\n' "$*"; PASS=$((PASS + 1)); }
+fail() { printf 'FAIL: %s\n' "$*" >&2; FAIL=$((FAIL + 1)); }
+have() { grep -qE "$2" <<<"$1"; }
+
+TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+TASKS="$TMP/tasks"; mkdir -p "$TASKS"
+BIN="$TMP/bin"; mkdir -p "$BIN"
+
+# ── Stubs ──────────────────────────────────────────────────────────────────────
+# docker: answer `docker ps … --format {{.Names}}` from $STUB_LIVE (newline list);
+# everything else is a harmless success.
+cat >| "$BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == "ps" ]]; then printf '%s\n' ${STUB_LIVE:-}; exit 0; fi
+exit 0
+EOF
+# arachne-usage: only --gate matters here; exit $STUB_GATE_RC (0 feed / 10 pause).
+cat >| "$BIN/arachne-usage" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == "--gate" ]]; then
+  [[ "${STUB_GATE_RC:-0}" -eq 10 ]] && { echo "pause: stub ceiling tripped" >&2; exit 10; }
+  exit 0
+fi
+exit 0
+EOF
+chmod +x "$BIN/docker" "$BIN/arachne-usage"
+
+export ARACHNE_TASKS_DIR="$TASKS"
+export ARACHNE_TASK_NOCOMMIT=1
+export ARACHNE_TASK="$REAL_TASK"
+export ARACHNE_USAGE="$BIN/arachne-usage"
+export DOCKER="$BIN/docker"
+
+mk() {  # mk <id> <status> [blockers_csv]
+  local id=$1 status=$2 blockers=${3:-}
+  local by="[]"; [[ -n "$blockers" ]] && by="[$(printf '%s' "$blockers" | sed 's/,/, /g')]"
+  cat >| "$TASKS/$id.md" <<EOF
+---
+id: $id
+phase: ${id%%.*}
+title: fixture $id
+status: $status
+claimed_by: null
+claimed_at: null
+turn_budget_remaining: null
+consecutive_failed_iterations: 0
+blockers: $by
+completed_by_commits: []
+files: []
+goal: drain $id
+---
+# $id
+EOF
+}
+
+pump() { "$PUMP" --no-health-gate --dry-run --phases "$1" "${@:2}"; }
+
+# Contiguous range F55..F57 (no phase gaps), with a cross-phase blocker:
+#   F55.0 root → F55.1 (in-phase dep) ; F56.0 root ; F57.0 waits on F55.1 (cross-phase)
+mk F55.0 open
+mk F55.1 open F55.0
+mk F56.0 open
+mk F57.0 open F55.1
+
+echo "--- Test 1: initial frontier (.0 roots launch; cross-phase-gated phase waits) ---"
+out=$(pump F55..F57)
+have "$out" 'LAUNCH +F55' && pass "F55 launches (F55.0 eligible)" || fail "F55 not LAUNCH:\n$out"
+have "$out" 'LAUNCH +F56' && pass "F56 launches (F56.0 eligible)" || fail "F56 not LAUNCH:\n$out"
+have "$out" 'WAITING +F57' && pass "F57 waits (F57.0 blocked on cross-phase F55.1)" || fail "F57 not WAITING:\n$out"
+have "$out" 'open tasks in range: 4' && pass "open count = 4" || fail "open count wrong:\n$out"
+
+echo "--- Test 2: cross-phase blocker releases → F57 enters the frontier ---"
+mk F55.0 done
+mk F55.1 done
+out=$(pump F55..F57)
+have "$out" 'LAUNCH +F57' && pass "F57 launches once F55.1 is done" || fail "F57 not LAUNCH after release:\n$out"
+have "$out" 'DONE +F55' && pass "F55 shown DONE (no open tasks)" || fail "F55 not DONE:\n$out"
+have "$out" 'open tasks in range: 2' && pass "open count drops to 2" || fail "open count after release:\n$out"
+
+echo "--- Test 3: docker-ps liveness join (a live container ⇒ RUNNING, not LAUNCH) ---"
+# Reset fixtures; mark F55's worktree branch container live.
+mk F55.0 open; mk F55.1 open F55.0; mk F56.0 open; mk F57.0 open F55.1
+out=$(STUB_LIVE="arachne-agent-feat-f55" pump F55..F57)
+have "$out" 'RUNNING +F55' && pass "F55 RUNNING (live container, not double-launched)" || fail "F55 not RUNNING:\n$out"
+have "$out" 'LAUNCH +F56' && pass "F56 still LAUNCH (no live container)" || fail "F56 not LAUNCH:\n$out"
+
+echo "--- Test 4: usage gate pause is surfaced ---"
+out=$(STUB_GATE_RC=10 pump F55..F57)
+have "$out" 'GATE: PAUSED' && pass "GATE: PAUSED shown when arachne-usage --gate returns 10" || fail "gate pause not shown:\n$out"
+out=$(STUB_GATE_RC=0 pump F55..F57)
+have "$out" 'GATE: feed-ok' && pass "GATE: feed-ok shown when gate returns 0" || fail "gate feed-ok not shown:\n$out"
+
+echo "--- Test 5: single --phase behaves like a one-phase range ---"
+out=$(pump F56)
+have "$out" 'LAUNCH +F56' && pass "single --phase F56 plans F56" || fail "single phase plan:\n$out"
+
+echo "--- Test 6: fully-drained range reports 0 open ---"
+mk F55.0 done; mk F55.1 done; mk F56.0 done; mk F57.0 done
+out=$(pump F55..F57)
+have "$out" 'open tasks in range: 0' && pass "drained range reports 0 open" || fail "drained count:\n$out"
+have "$out" 'DONE +F57' && pass "F57 DONE when all tasks done" || fail "F57 not DONE:\n$out"
+
+echo
+echo "=============================================="
+echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"
+echo "=============================================="
+[[ $FAIL -eq 0 ]] || exit 1

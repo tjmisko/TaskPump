@@ -1,0 +1,378 @@
+#!/usr/bin/env bash
+# arachne-pump — usage-governed, DAG-aware, keep-acquiring task-loop supervisor.
+#
+# A singular HOST-level loop (so there is no cross-agent claim race — design D1)
+# that points the parallel substrate at a RANGE of phases and drains it for days:
+#
+#   * Queue = the live eligible frontier, recomputed every tick from `blockers:`
+#     via `arachne-task ready --phases A..B` (design D2). Newly-unblocked tasks
+#     enter automatically — this is "keep acquiring".
+#   * Dispatch grain = phase (D4): each phase FN with eligible work gets a
+#     worktree that drains its own sub-tree serially via the in-context
+#     `arachne-task next --phase FN` loop; phases fan out in parallel.
+#   * Liveness from `docker ps`, never task status (D3): a parked epic
+#     (in_progress, dead container) auto-resumes; a live one is never double-launched.
+#   * Feed gate: pause LAUNCHING new work (running agents are never killed) when
+#     `arachne-usage --gate` says we're at/over the ceiling, when a reset-backstop
+#     window is open, or when the brcmfmac WiFi firmware looks wedged. Resume
+#     automatically when the window slides / journal goes quiet.
+#   * Drains: exits only when no open task remains in range AND no live agent
+#     container remains, then pushes ops/ and emits a summary.
+#
+# Design: ops/planning/2026-06-22 - Autonomous Task Loop v2 — Usage-Governed DAG Pump.md
+# Generalizes run-parallel.sh's pool scheduler; shared helpers live in
+# scripts/arachne-pump-lib.sh (sourced by both). run-parallel.sh stays the
+# manifest path.
+#
+# Usage:
+#   arachne-pump --phases F55..F63 --jobs 4 --usage-ceiling 95 --grain phase
+#   arachne-pump --phases F55..F63 --dry-run     # print the plan, launch nothing
+#   arachne-pump --phases F64 --list             # one planning pass, then exit
+#   arachne-pump --phases F64 --once             # one REAL tick (scrub+gate+launch), exit
+#
+# Env overrides (mostly for testing / advanced use):
+#   ARACHNE_TASK    path to arachne-task   (default: alongside this script)
+#   ARACHNE_USAGE   path to arachne-usage  (default: alongside this script)
+#   DOCKER          docker binary          (default: docker)
+#   ARACHNE_PHASE_BRIEF_TEMPLATE  phase-drain brief template (default:
+#                   ops/task-loop/briefs/_phase-drain-template.md — built by F64.4)
+#   MAX_TURNS, AGENT_MODEL, AGENT_MEMORY_MAX, AGENT_MEMORY_SWAP — forwarded to
+#                   launched containers (same meaning as run-parallel.sh).
+set -euo pipefail
+
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+REPO_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=scripts/arachne-pump-lib.sh
+source "$SCRIPT_DIR/arachne-pump-lib.sh"
+
+CLAUDE_DIR="$HOME/.claude"
+CLAUDE_JSON="$HOME/.claude.json"
+OPS_DIR="$REPO_ROOT/ops"
+TASKS_DIR="$OPS_DIR/task-loop/tasks"
+
+ARACHNE_TASK="${ARACHNE_TASK:-$SCRIPT_DIR/arachne-task}"
+ARACHNE_USAGE="${ARACHNE_USAGE:-$SCRIPT_DIR/arachne-usage}"
+DOCKER="${DOCKER:-docker}"
+ARACHNE_PHASE_BRIEF_TEMPLATE="${ARACHNE_PHASE_BRIEF_TEMPLATE:-$OPS_DIR/task-loop/briefs/_phase-drain-template.md}"
+
+# Defaults (flags override).
+PHASES=""
+JOBS="${JOBS:-4}"
+CEILING="${ARACHNE_USAGE_CEILING:-95}"
+GRAIN="phase"
+TICK="${POOL_TICK:-30}"
+STAGGER="${POOL_STAGGER:-3}"
+HEALTH_WINDOW="${HEALTH_WINDOW:-120}"
+HEALTH_GATE=1
+USAGE_GATE=1
+BRANCH_PREFIX="${ARACHNE_PUMP_BRANCH_PREFIX:-feat/}"
+BASE_REF="${ARACHNE_PUMP_BASE:-main}"
+MAX_TURNS="${MAX_TURNS:-600}"
+AGENT_MODEL="${AGENT_MODEL:-opus}"
+CAP_FILE="$REPO_ROOT/.arachne-pool-cap"
+RESET_FILE="${ARACHNE_USAGE_RESET_FILE:-$REPO_ROOT/.arachne-usage-reset}"
+MODE="run"        # run | dry | list | once
+
+warn() { printf 'arachne-pump: %s\n' "$*" >&2; }
+die()  { warn "$*"; exit 1; }
+log()  { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
+
+# ── Arg parsing ────────────────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --phases|--phase) PHASES="$2"; shift 2;;
+    --phases=*) PHASES="${1#--phases=}"; shift;;
+    --phase=*)  PHASES="${1#--phase=}"; shift;;
+    --jobs|-j)
+      [[ "${2:-}" =~ ^[0-9]+$ ]] || die "--jobs needs a non-negative integer"
+      JOBS="$2"; shift 2;;
+    --usage-ceiling)
+      [[ "${2:-}" =~ ^[0-9]+$ ]] || die "--usage-ceiling needs an integer"
+      CEILING="$2"; shift 2;;
+    --usage-ceiling=*) CEILING="${1#--usage-ceiling=}"; shift;;
+    --grain) GRAIN="$2"; shift 2;;
+    --grain=*) GRAIN="${1#--grain=}"; shift;;
+    --tick)
+      [[ "${2:-}" =~ ^[0-9]+$ ]] || die "--tick needs an integer (seconds)"
+      TICK="$2"; shift 2;;
+    --branch-prefix) BRANCH_PREFIX="$2"; shift 2;;
+    --base) BASE_REF="$2"; shift 2;;
+    --no-health-gate) HEALTH_GATE=0; shift;;
+    --no-usage-gate)  USAGE_GATE=0; shift;;
+    --dry-run) MODE="dry"; shift;;
+    --list)    MODE="list"; shift;;
+    --once)    MODE="once"; shift;;
+    --detach)  DETACH=1; shift;;          # F64.5 wires the actual detach mechanism
+    -h|--help) MODE="help"; shift;;
+    --*) die "unknown flag $1 (try --help)";;
+    *) die "unexpected argument: $1";;
+  esac
+done
+
+usage() {
+  sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+}
+[[ "$MODE" == "help" ]] && { usage; exit 0; }
+
+[[ -n "$PHASES" ]] || die "--phases is required (e.g. --phases F55..F63)"
+case "$GRAIN" in
+  phase) ;;
+  task|chain) die "grain '$GRAIN' is not implemented yet; only --grain phase is supported (SPEC_GAP: D4 task/chain grains deferred)";;
+  *) die "unknown grain '$GRAIN' (phase|task|chain)";;
+esac
+
+# ── Phase-range expansion (mirrors arachne-task's expand_phases for display) ───
+# Numeric ranges + comma lists; non-numeric tokens pass through uppercased.
+pump_expand_phases() {
+  local spec=$1 comp a b lo hi i n
+  local IFS=','
+  for comp in $spec; do
+    comp="${comp//[[:space:]]/}"; [[ -z "$comp" ]] && continue
+    if [[ "$comp" == *..* ]]; then
+      a="${comp%%..*}"; b="${comp##*..}"; a="${a#[Ff]}"; b="${b#[Ff]}"
+      [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ ]] || die "bad phase range '$comp'"
+      if (( a <= b )); then lo=$a; hi=$b; else lo=$b; hi=$a; fi
+      for (( i=lo; i<=hi; i++ )); do printf 'F%s\n' "$i"; done
+    else
+      comp="${comp%%.*}"; n="${comp#[Ff]}"
+      if [[ "$n" =~ ^[0-9]+$ ]]; then printf 'F%s\n' "$n"; else printf '%s\n' "${comp^^}"; fi
+    fi
+  done
+}
+
+phase_branch()    { printf '%s%s' "$BRANCH_PREFIX" "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"; }
+branch_slug()     { printf '%s' "${1//\//-}"; }
+phase_container() { printf 'arachne-agent-%s' "$(branch_slug "$(phase_branch "$1")")"; }
+
+# Distinct phases present in the live eligible frontier (have ≥1 launchable task).
+frontier_phases() {
+  "$ARACHNE_TASK" ready --phases "$PHASES" --json 2>/dev/null \
+    | jq -r '.[].phase' 2>/dev/null | sort -u
+}
+
+# Open-task count across the range (the drain test). 0 ⇒ no open work remains.
+open_count() {
+  "$ARACHNE_TASK" ready --phases "$PHASES" --count 2>/dev/null || echo 0
+}
+
+# Open-task count within a single phase (regardless of blocker state).
+phase_open_count() {
+  "$ARACHNE_TASK" ready --phase "$1" --count 2>/dev/null || echo 0
+}
+
+# Is a phase's worktree branch currently owned by a LIVE container? (D3)
+phase_live() {
+  local want; want="$(phase_container "$1")"
+  local slug
+  while IFS= read -r slug; do
+    [[ "arachne-agent-$slug" == "$want" ]] && return 0
+  done < <(apl_live_agent_slugs)
+  return 1
+}
+
+# Lowest eligible task id in a phase (the epic/safety-net task for the container).
+phase_lead_task() {
+  "$ARACHNE_TASK" ready --phase "$1" --json 2>/dev/null | jq -r '.[0].id // empty' 2>/dev/null
+}
+
+# ── Feed gate ──────────────────────────────────────────────────────────────────
+# Echoes a one-line reason and returns 10 to pause feeding, or returns 0 to feed.
+GATE_REASON=""
+feed_gate() {
+  GATE_REASON=""
+  if apl_network_unhealthy; then
+    GATE_REASON="brcmfmac wedge signature in last ${HEALTH_WINDOW}s"
+    return 10
+  fi
+  if [[ "$USAGE_GATE" -eq 1 ]]; then
+    local reason rc
+    reason="$(ARACHNE_USAGE_RESET_FILE="$RESET_FILE" "$ARACHNE_USAGE" --gate --ceiling "$CEILING" 2>&1)"; rc=$?
+    if [[ "$rc" -eq 10 ]]; then
+      GATE_REASON="${reason#arachne-usage: }"
+      return 10
+    fi
+  fi
+  return 0
+}
+
+# ── Brief rendering (D6 / F64.4) ───────────────────────────────────────────────
+# Render the parameterized phase-drain template with $PHASE substituted to a
+# transient per-phase file; echo its path. Errors clearly if the template is
+# absent (F64.4 builds it).
+render_brief() {
+  local phase="$1"
+  [[ -f "$ARACHNE_PHASE_BRIEF_TEMPLATE" ]] \
+    || die "phase-drain brief template not found: $ARACHNE_PHASE_BRIEF_TEMPLATE (built by F64.4)"
+  local out="$REPO_ROOT/.worktrees/$(phase_branch "$phase")/.arachne-phase-brief.md"
+  mkdir -p "$(dirname "$out")" 2>/dev/null || true
+  PHASE="$phase" envsubst '$PHASE' < "$ARACHNE_PHASE_BRIEF_TEMPLATE" >| "$out" 2>/dev/null \
+    || sed "s/\$PHASE/$phase/g; s/{{PHASE}}/$phase/g" "$ARACHNE_PHASE_BRIEF_TEMPLATE" >| "$out"
+  printf '%s' "$out"
+}
+
+# ── Launch one phase's worktree + container ────────────────────────────────────
+launch_phase() {
+  local phase="$1"
+  local branch; branch="$(phase_branch "$phase")"
+  local wt="$REPO_ROOT/.worktrees/$branch"
+  local cname; cname="$(phase_container "$phase")"
+  local lead; lead="$(phase_lead_task "$phase")"
+
+  # Materialise the worktree (idempotent). Create the branch from BASE_REF if new.
+  if [[ ! -d "$wt" ]]; then
+    if git -C "$REPO_ROOT" rev-parse --verify "refs/heads/$branch" >/dev/null 2>&1; then
+      git -C "$REPO_ROOT" worktree add "$wt" "$branch" >/dev/null
+    else
+      git -C "$REPO_ROOT" worktree add "$wt" -b "$branch" "$BASE_REF" >/dev/null
+    fi
+  fi
+  [[ -f "$wt/ops/planning/STATUS.md" ]] || git -C "$wt" submodule update --init --recursive 2>&1 | tail -1 || true
+  apl_repair_worktree_gitignore "$REPO_ROOT"
+  if (cd "$REPO_ROOT" && git check-ignore -q "$wt" 2>/dev/null); then
+    warn "worktree still gitignored: $wt — fix .gitignore; skipping $phase"; return 1
+  fi
+
+  local brief; brief="$(render_brief "$phase")"
+
+  "$DOCKER" rm -f "$cname" >/dev/null 2>&1 || true
+  local cid
+  cid=$("$DOCKER" run --rm -d \
+    --name "$cname" \
+    --cap-add NET_ADMIN \
+    --memory "${AGENT_MEMORY_MAX:-3g}" \
+    --memory-swap "${AGENT_MEMORY_SWAP:-5g}" \
+    -e GITHUB_TOKEN="${GITHUB_TOKEN:-}" \
+    -e WORKSPACE_PATH="$wt" \
+    -e REPO_ROOT="$REPO_ROOT" \
+    -e ARACHNE_BRIEF="$brief" \
+    -e ARACHNE_TASK_ID="$lead" \
+    -e ARACHNE_PHASE="$phase" \
+    -e MAX_TURNS="$MAX_TURNS" \
+    -e AGENT_MODEL="$AGENT_MODEL" \
+    -v "$CLAUDE_DIR":/tmp/claude-home:ro \
+    -v "$CLAUDE_JSON":/tmp/claude-home-json/.claude.json:ro \
+    -v "$REPO_ROOT":"$REPO_ROOT" \
+    -w "$wt" \
+    arachne /entrypoint-parallel.sh)
+  log "launched $phase -> $cname ($(printf '%s' "$cid" | cut -c1-12))  lead=$lead  log: $wt/.arachne-agent.log"
+  return 0
+}
+
+# ── Planning pass: classify every phase in range ───────────────────────────────
+# Sets arrays LAUNCH/RUNNING/WAITING/DONEP. Returns the plan via globals.
+declare -a PLAN_LAUNCH PLAN_RUNNING PLAN_WAITING PLAN_DONE
+compute_plan() {
+  PLAN_LAUNCH=(); PLAN_RUNNING=(); PLAN_WAITING=(); PLAN_DONE=()
+  local -A in_frontier=()
+  local p
+  while IFS= read -r p; do [[ -n "$p" ]] && in_frontier["$p"]=1; done < <(frontier_phases)
+  while IFS= read -r p; do
+    [[ -z "$p" ]] && continue
+    local oc; oc="$(phase_open_count "$p")"
+    if [[ -n "${in_frontier[$p]:-}" ]]; then
+      if phase_live "$p"; then PLAN_RUNNING+=("$p"); else PLAN_LAUNCH+=("$p"); fi
+    elif [[ "$oc" -gt 0 ]]; then
+      # Has open tasks but none eligible — gated on incomplete cross-phase deps,
+      # unless a live container is already draining it.
+      if phase_live "$p"; then PLAN_RUNNING+=("$p"); else PLAN_WAITING+=("$p"); fi
+    else
+      PLAN_DONE+=("$p")
+    fi
+  done < <(pump_expand_phases "$PHASES")
+}
+
+print_plan() {
+  compute_plan
+  local gate_line; if feed_gate; then gate_line="GATE: feed-ok"; else gate_line="GATE: PAUSED — $GATE_REASON"; fi
+  echo "arachne-pump plan — phases $PHASES, grain $GRAIN, cap $(JOBS=$JOBS apl_read_cap), ceiling $CEILING%"
+  echo "$gate_line"
+  local p
+  for p in "${PLAN_LAUNCH[@]:-}";  do [[ -n "$p" ]] && printf '  LAUNCH   %-6s -> %s\n' "$p" "$(phase_branch "$p")"; done
+  for p in "${PLAN_RUNNING[@]:-}"; do [[ -n "$p" ]] && printf '  RUNNING  %-6s -> %s (live container)\n' "$p" "$(phase_branch "$p")"; done
+  for p in "${PLAN_WAITING[@]:-}"; do [[ -n "$p" ]] && printf '  WAITING  %-6s (%s open, none eligible — cross-phase blockers pending)\n' "$p" "$(phase_open_count "$p")"; done
+  for p in "${PLAN_DONE[@]:-}";    do [[ -n "$p" ]] && printf '  DONE     %-6s (no open tasks)\n' "$p"; done
+  echo "frontier: ${#PLAN_LAUNCH[@]} launchable, ${#PLAN_RUNNING[@]} running, ${#PLAN_WAITING[@]} waiting | open tasks in range: $(open_count)"
+}
+
+# ── One tick: scrub, gate, top up the pool to cap ──────────────────────────────
+do_tick() {
+  git -C "$OPS_DIR" pull --ff-only >/dev/null 2>&1 || warn "ops pull --ff-only failed (continuing)"
+  "$ARACHNE_TASK" scrub >/dev/null 2>&1 || warn "scrub failed (continuing)"
+
+  if ! feed_gate; then
+    log "PAUSED feeding — $GATE_REASON (running agents untouched)"
+    return 0
+  fi
+
+  compute_plan
+  local cap have launched=0 p
+  cap="$(JOBS=$JOBS apl_read_cap)"
+  have="$(apl_count_live_agents)"
+  for p in "${PLAN_LAUNCH[@]:-}"; do
+    [[ -z "$p" ]] && continue
+    (( have >= cap )) && break
+    if launch_phase "$p"; then
+      have=$((have + 1)); launched=$((launched + 1)); sleep "$STAGGER"
+    fi
+  done
+  [[ "$launched" -gt 0 ]] && log "tick: launched $launched (live=$have/$cap)"
+  return 0
+}
+
+# ── Drain check ────────────────────────────────────────────────────────────────
+is_drained() {
+  [[ "$(open_count)" -eq 0 && "$(apl_count_live_agents)" -eq 0 ]]
+}
+
+# ── Modes ──────────────────────────────────────────────────────────────────────
+case "$MODE" in
+  dry)
+    echo "[dry-run] no image build, no launches, no ops mutation"
+    print_plan
+    exit 0
+    ;;
+  list)
+    print_plan
+    exit 0
+    ;;
+esac
+
+# Real run (run / once): prerequisites.
+[[ -d "$CLAUDE_DIR" ]] || die "no ~/.claude; run 'claude' to authenticate first"
+if [[ -z "${GITHUB_TOKEN:-}" ]] && command -v gh >/dev/null 2>&1; then
+  GITHUB_TOKEN="$(gh auth token 2>/dev/null || true)"; export GITHUB_TOKEN
+fi
+[[ -f "$ARACHNE_PHASE_BRIEF_TEMPLATE" ]] \
+  || die "phase-drain brief template missing: $ARACHNE_PHASE_BRIEF_TEMPLATE (build F64.4 first)"
+
+# Seed the live cap file for discoverability / retuning.
+[[ -f "$CAP_FILE" ]] || echo "$JOBS" >| "$CAP_FILE" 2>/dev/null || true
+
+log "Building arachne image ..."
+"$DOCKER" build -t arachne "$REPO_ROOT" >/dev/null || die "image build failed"
+
+log "Pump: phases=$PHASES grain=$GRAIN cap=$JOBS (live via $CAP_FILE) ceiling=${CEILING}% tick=${TICK}s"
+log "Singular supervisor; Ctrl-C stops feeding but leaves running agents. Monitor: scripts/arachne-monitor --watch"
+
+if [[ "$MODE" == "once" ]]; then
+  do_tick
+  log "single tick complete (--once)"
+  exit 0
+fi
+
+# Multi-day drain loop.
+while true; do
+  do_tick
+  if is_drained; then
+    log "range $PHASES drained: no open tasks and no live agents remain."
+    break
+  fi
+  sleep "$TICK"
+done
+
+git -C "$OPS_DIR" push >/dev/null 2>&1 || warn "final ops push failed"
+# Summary tally.
+done_n=$("$ARACHNE_TASK" list 2>/dev/null | awk -v ph="$PHASES" '$2=="done"{n++} END{print n+0}')
+log "DONE. $PHASES drained. ($(open_count) open remain — should be 0; blocked/needs-review need human review)."
+[[ -n "${ARACHNE_NOTIFY_CMD:-}" ]] && { printf 'arachne-pump: %s drained\n' "$PHASES" | ${ARACHNE_NOTIFY_CMD} >/dev/null 2>&1 || true; }
+exit 0
