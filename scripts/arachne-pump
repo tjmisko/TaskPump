@@ -102,6 +102,8 @@ while [[ $# -gt 0 ]]; do
     --dry-run) MODE="dry"; shift;;
     --list)    MODE="list"; shift;;
     --once)    MODE="once"; shift;;
+    --render-brief) MODE="render"; PHASES="$2"; shift 2;;   # print rendered brief, exit
+    --render-brief=*) MODE="render"; PHASES="${1#--render-brief=}"; shift;;
     --detach)  DETACH=1; shift;;          # F64.5 wires the actual detach mechanism
     -h|--help) MODE="help"; shift;;
     --*) die "unknown flag $1 (try --help)";;
@@ -205,8 +207,10 @@ render_brief() {
     || die "phase-drain brief template not found: $ARACHNE_PHASE_BRIEF_TEMPLATE (built by F64.4)"
   local out="$REPO_ROOT/.worktrees/$(phase_branch "$phase")/.arachne-phase-brief.md"
   mkdir -p "$(dirname "$out")" 2>/dev/null || true
-  PHASE="$phase" envsubst '$PHASE' < "$ARACHNE_PHASE_BRIEF_TEMPLATE" >| "$out" 2>/dev/null \
-    || sed "s/\$PHASE/$phase/g; s/{{PHASE}}/$phase/g" "$ARACHNE_PHASE_BRIEF_TEMPLATE" >| "$out"
+  # The template's sole placeholder is {{PHASE}} — substituted by plain sed so
+  # there is no envsubst dependency and no clash with the `$PHASE` / `$(…)` shell
+  # examples the brief contains. Phase tokens (FNN) are sed-safe.
+  sed "s/{{PHASE}}/$phase/g" "$ARACHNE_PHASE_BRIEF_TEMPLATE" >| "$out"
   printf '%s' "$out"
 }
 
@@ -326,6 +330,13 @@ is_drained() {
 
 # ── Modes ──────────────────────────────────────────────────────────────────────
 case "$MODE" in
+  render)
+    # Print the phase-drain brief rendered for $PHASES to stdout (debug / test).
+    [[ -f "$ARACHNE_PHASE_BRIEF_TEMPLATE" ]] \
+      || die "phase-drain brief template not found: $ARACHNE_PHASE_BRIEF_TEMPLATE (built by F64.4)"
+    sed "s/{{PHASE}}/$PHASES/g" "$ARACHNE_PHASE_BRIEF_TEMPLATE"
+    exit 0
+    ;;
   dry)
     echo "[dry-run] no image build, no launches, no ops mutation"
     print_plan

@@ -113,6 +113,24 @@ out=$(pump F55..F57)
 have "$out" 'open tasks in range: 0' && pass "drained range reports 0 open" || fail "drained count:\n$out"
 have "$out" 'DONE +F57' && pass "F57 DONE when all tasks done" || fail "F57 not DONE:\n$out"
 
+echo "--- Test 7: phase-drain brief renders {{PHASE}} (F64.4) ---"
+TPL="$TMP/_phase-drain-template.md"
+cat >| "$TPL" <<'EOF'
+# Kickoff brief — drain phase {{PHASE}}
+Loop: scripts/arachne-task next --branch "$(git branch --show-current)" --phase {{PHASE}}
+Only phase {{PHASE}}. NEVER merge, and NEVER commit or push to `main`.
+Open/refresh a DRAFT PR against `main`. If genuinely blocked,
+`scripts/arachne-task block {{PHASE}}.N --reason "..."` and continue.
+EOF
+r55=$(ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" "$PUMP" --render-brief F55)
+grep -qF '{{PHASE}}' <<<"$r55" && fail "stray {{PHASE}} after render" || pass "no stray {{PHASE}}"
+grep -qF -- '--phase F55' <<<"$r55" && pass "next --phase F55 scope rendered" || fail "no --phase F55:\n$r55"
+grep -qiF 'never commit or push to' <<<"$r55" && pass "never-touch-main clause present" || fail "no never-main clause"
+grep -qiF 'DRAFT PR' <<<"$r55" && pass "draft-PR clause present" || fail "no draft-PR clause"
+grep -qF 'block F55.N' <<<"$r55" && pass "block-and-continue clause rendered" || fail "no block clause"
+r60=$(ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" "$PUMP" --render-brief F60)
+grep -qF 'F55' <<<"$r60" && fail "F55 leaked into F60 render" || pass "F60 render has no F55"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"
