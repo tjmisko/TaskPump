@@ -63,6 +63,63 @@ iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
 iptables -A OUTPUT -j DROP
 echo "Firewall configured" | tee -a "$LOG_FILE"
 
+# ── Credential refresher (RC-1 fix, F65.1 / A2) ────────────────────────────────
+# The host ~/.claude is bind-mounted READ-ONLY at /tmp/claude-home, so
+# /tmp/claude-home/.credentials.json always reflects the LIVE host token (the
+# host's Claude Code auth daemon rewrites it in place). But the per-container copy
+# at /home/dev/.claude/.credentials.json is a frozen snapshot taken once at
+# startup — once that access token's TTL (~6h, observed 2026-06-23) elapses every
+# API call 401s and the session dies. refresh_credentials() re-copies the live
+# token (and .claude.json) into the dev home with a JSON-validity guard and an
+# atomic temp-file swap, so a long-running container tracks host refreshes.
+#
+# SPEC_GAP: it is unknown (and undocumented) whether `claude -p` re-reads
+# .credentials.json per API request (Case A) or caches the token in memory at
+# startup (Case B). This is designed for BOTH: under Case A the periodic re-copy
+# rescues the in-flight session as soon as a fresh token lands; under Case B the
+# re-copy cannot rescue an already-started session, but it still leaves a valid
+# token for the NEXT container (the pump's A1 liveness-reclaim relaunches dead
+# containers) and the optional AGENT_WALL_TIMEOUT_S backstop bounds the damage
+# window. The refresh can never do worse than today's single-copy behavior. A
+# live run crossing a real host token refresh is the only proof of which case
+# holds — see the F64 canary runbook.
+refresh_credentials() {
+    local src="/tmp/claude-home/.credentials.json"
+    local dst="/home/dev/.claude/.credentials.json"
+    local tmp="${dst}.tmp.$$"
+
+    # .credentials.json — copy to temp, validate, atomic-swap. On any failure
+    # leave the previous (stale-but-valid) copy in place and retry next tick.
+    if [[ -f "$src" ]]; then
+        if cp "$src" "$tmp" 2>/dev/null && jq -e '.claudeAiOauth.accessToken' "$tmp" >/dev/null 2>&1; then
+            mv "$tmp" "$dst"
+            chown dev:dev "$dst" 2>/dev/null || true
+            chmod u+rw "$dst" 2>/dev/null || true
+            echo "$(date -u) [cred-refresh] .credentials.json refreshed" >> "$LOG_FILE"
+        else
+            echo "$(date -u) [cred-refresh] WARNING: .credentials.json invalid after copy; keeping previous" >> "$LOG_FILE"
+            rm -f "$tmp"
+            return 1
+        fi
+    fi
+
+    # .claude.json — same validated atomic-swap pattern as the startup copy.
+    local src_cj="/tmp/claude-home-json/.claude.json"
+    local dst_cj="/home/dev/.claude.json"
+    local tmp_cj="${dst_cj}.tmp.$$"
+    if [[ -f "$src_cj" ]]; then
+        if cp "$src_cj" "$tmp_cj" 2>/dev/null && jq -e . "$tmp_cj" >/dev/null 2>&1; then
+            mv "$tmp_cj" "$dst_cj"
+            chown dev:dev "$dst_cj" 2>/dev/null || true
+            chmod u+rw "$dst_cj" 2>/dev/null || true
+        else
+            echo "$(date -u) [cred-refresh] WARNING: .claude.json invalid after copy; keeping previous" >> "$LOG_FILE"
+            rm -f "$tmp_cj"
+        fi
+    fi
+    return 0
+}
+
 # ── Configure dev user's Claude home + Auto Mode settings ──────────────────────
 mkdir -p /home/dev/.claude
 if [[ -d /tmp/claude-home ]]; then
@@ -110,6 +167,22 @@ chmod -R u+rw /home/dev/.claude 2>/dev/null || true
 chmod u+rw /home/dev/.claude.json 2>/dev/null || true
 echo "Credentials + Auto Mode settings configured" | tee -a "$LOG_FILE"
 echo "permission mode: $(jq -r '.permissions.defaultMode // "default"' /home/dev/.claude/settings.json 2>/dev/null)" | tee -a "$LOG_FILE"
+
+# ── Background credential refresher (RC-1 fix, F65.1 / A2) ──────────────────────
+# Periodically re-copies .credentials.json (and .claude.json) from the live
+# read-only mount so a long-running container tracks host token refreshes and
+# does not 401 once the startup token's TTL elapses. Runs as root in a child
+# subshell; the container teardown on exit (or `exec su dev` below) reaps it —
+# no explicit cleanup needed. A failed tick (`|| true`) never kills the loop.
+CRED_REFRESH_INTERVAL_S="${CRED_REFRESH_INTERVAL_S:-300}"
+(
+    while true; do
+        sleep "$CRED_REFRESH_INTERVAL_S"
+        refresh_credentials || true
+    done
+) &
+CRED_REFRESH_PID=$!
+echo "Credential refresher started (interval=${CRED_REFRESH_INTERVAL_S}s, pid=$CRED_REFRESH_PID)" | tee -a "$LOG_FILE"
 
 # ── Git HTTPS auth ─────────────────────────────────────────────────────────────
 if [[ -n "${GITHUB_TOKEN:-}" ]]; then
@@ -194,7 +267,11 @@ echo "  Task:      ${TASK_ID:-<none>}" | tee -a "$LOG_FILE"
 echo "  Model:     $AGENT_MODEL    Max turns: $MAX_TURNS" | tee -a "$LOG_FILE"
 echo | tee -a "$LOG_FILE"
 
-exec su dev -c "
+# The single dev-user session script. Captured in a variable so it can be run
+# either with `exec` (default) or wrapped in `timeout` (when a wall-clock cap is
+# set) without duplicating the body. Host-side vars are expanded here at
+# assignment; `\$...` stay literal for the dev shell to expand at run time.
+DEV_SESSION_SCRIPT="
     cd '$WORKSPACE_PATH'
     export PATH=/usr/local/cargo/bin:\$PATH
     export GITHUB_TOKEN='${GITHUB_TOKEN:-}'
@@ -255,3 +332,22 @@ exec su dev -c "
     (cd '$OPS_DIR' && git push 2>&1) | tee -a '$LOG_FILE' || true
     echo \"Parallel agent finished at \$(date -u).\" | tee -a '$LOG_FILE'
 "
+
+# ── Launch the session: optional wall-clock backstop, else exec ────────────────
+# AGENT_WALL_TIMEOUT_S (opt-in; unset = backward-compatible exec path) caps the
+# session wall-clock as a last-resort guard below the token TTL. `timeout` needs
+# a child to signal, so we cannot `exec` in that branch — a desirable side
+# effect is that the end-heartbeat + ops-push inside the script run on a
+# wall-clock kill, whereas `exec` silently drops them when the process is
+# replaced. `|| WALL_RC=$?` keeps `set -e` from aborting before we capture rc.
+if [[ -n "${AGENT_WALL_TIMEOUT_S:-}" ]]; then
+    echo "Wall-clock cap: ${AGENT_WALL_TIMEOUT_S}s" | tee -a "$LOG_FILE"
+    WALL_RC=0
+    timeout "$AGENT_WALL_TIMEOUT_S" su dev -c "$DEV_SESSION_SCRIPT" || WALL_RC=$?
+    if [[ "$WALL_RC" -eq 124 ]]; then
+        echo "$(date -u) [wall-cap] session killed by wall-clock timeout (${AGENT_WALL_TIMEOUT_S}s)" | tee -a "$LOG_FILE"
+    fi
+    exit "$WALL_RC"
+else
+    exec su dev -c "$DEV_SESSION_SCRIPT"
+fi
