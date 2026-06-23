@@ -13,9 +13,13 @@
 #   * Liveness from `docker ps`, never task status (D3): a parked epic
 #     (in_progress, dead container) auto-resumes; a live one is never double-launched.
 #   * Feed gate: pause LAUNCHING new work (running agents are never killed) when
-#     `arachne-usage --gate` says we're at/over the ceiling, when a reset-backstop
+#     `arachne-usage --gate` says we're at/over the ceiling, when free disk drops
+#     below PAUSE_THRESHOLD_GB (`arachne-disk-watchdog --gate`), when a reset-backstop
 #     window is open, or when the brcmfmac WiFi firmware looks wedged. Resume
-#     automatically when the window slides / journal goes quiet.
+#     automatically when the window slides / disk frees / journal goes quiet.
+#   * Disk discipline (A4): a completed phase's worktree target/ is reclaimed
+#     (`cargo clean`) each tick once its container has exited, so a multi-day
+#     drain's disk footprint stays bounded (ARACHNE_DISK_RECLAIM=0 disables).
 #   * Drains: exits only when no open task remains in range AND no live agent
 #     container remains, then pushes ops/ and emits a summary.
 #
@@ -33,6 +37,9 @@
 # Env overrides (mostly for testing / advanced use):
 #   ARACHNE_TASK    path to arachne-task   (default: alongside this script)
 #   ARACHNE_USAGE   path to arachne-usage  (default: alongside this script)
+#   ARACHNE_DISK_WATCHDOG  path to arachne-disk-watchdog (default: alongside this script)
+#   ARACHNE_DISK_RECLAIM   1/0 — cargo-clean a phase's target/ once done (default 1)
+#   ARACHNE_PUMP_WORKTREES_DIR  worktrees base (default: <repo>/.worktrees; tests)
 #   DOCKER          docker binary          (default: docker)
 #   ARACHNE_PHASE_BRIEF_TEMPLATE  phase-drain brief template (default:
 #                   ops/task-loop/briefs/_phase-drain-template.md — built by F64.4)
@@ -52,8 +59,12 @@ TASKS_DIR="$OPS_DIR/task-loop/tasks"
 
 ARACHNE_TASK="${ARACHNE_TASK:-$SCRIPT_DIR/arachne-task}"
 ARACHNE_USAGE="${ARACHNE_USAGE:-$SCRIPT_DIR/arachne-usage}"
+ARACHNE_DISK_WATCHDOG="${ARACHNE_DISK_WATCHDOG:-$SCRIPT_DIR/arachne-disk-watchdog}"
 DOCKER="${DOCKER:-docker}"
 ARACHNE_PHASE_BRIEF_TEMPLATE="${ARACHNE_PHASE_BRIEF_TEMPLATE:-$OPS_DIR/task-loop/briefs/_phase-drain-template.md}"
+# Worktrees base — overridable so the reclaim sweep / launcher can be unit-tested
+# against a fixture tree (single source for both launch_phase and reclaim).
+WORKTREES_DIR="${ARACHNE_PUMP_WORKTREES_DIR:-$REPO_ROOT/.worktrees}"
 
 # Defaults (flags override).
 PHASES=""
@@ -65,6 +76,7 @@ STAGGER="${POOL_STAGGER:-3}"
 HEALTH_WINDOW="${HEALTH_WINDOW:-120}"
 HEALTH_GATE=1
 USAGE_GATE=1
+DISK_GATE=1
 BRANCH_PREFIX="${ARACHNE_PUMP_BRANCH_PREFIX:-feat/}"
 BASE_REF="${ARACHNE_PUMP_BASE:-main}"
 MAX_TURNS="${MAX_TURNS:-600}"
@@ -106,6 +118,7 @@ while [[ $# -gt 0 ]]; do
     --base) BASE_REF="$2"; shift 2;;
     --no-health-gate) HEALTH_GATE=0; shift;;
     --no-usage-gate)  USAGE_GATE=0; shift;;
+    --no-disk-gate)   DISK_GATE=0; shift;;
     --dry-run) MODE="dry"; shift;;
     --list)    MODE="list"; shift;;
     --once)    MODE="once"; shift;;
@@ -201,6 +214,14 @@ feed_gate() {
       return 10
     fi
   fi
+  if [[ "$DISK_GATE" -eq 1 ]]; then
+    local dreason drc
+    dreason="$(apl_disk_low)"; drc=$?
+    if [[ "$drc" -eq 10 ]]; then
+      GATE_REASON="$dreason"
+      return 10
+    fi
+  fi
   return 0
 }
 
@@ -212,7 +233,7 @@ render_brief() {
   local phase="$1"
   [[ -f "$ARACHNE_PHASE_BRIEF_TEMPLATE" ]] \
     || die "phase-drain brief template not found: $ARACHNE_PHASE_BRIEF_TEMPLATE (built by F64.4)"
-  local out="$REPO_ROOT/.worktrees/$(phase_branch "$phase")/.arachne-phase-brief.md"
+  local out="$WORKTREES_DIR/$(phase_branch "$phase")/.arachne-phase-brief.md"
   mkdir -p "$(dirname "$out")" 2>/dev/null || true
   # The template's sole placeholder is {{PHASE}} — substituted by plain sed so
   # there is no envsubst dependency and no clash with the `$PHASE` / `$(…)` shell
@@ -231,7 +252,7 @@ launch_phase() {
     return 0
   fi
   local branch; branch="$(phase_branch "$phase")"
-  local wt="$REPO_ROOT/.worktrees/$branch"
+  local wt="$WORKTREES_DIR/$branch"
   local cname; cname="$(phase_container "$phase")"
   local lead; lead="$(phase_lead_task "$phase")"
 
@@ -311,10 +332,45 @@ print_plan() {
   echo "frontier: ${#PLAN_LAUNCH[@]} launchable, ${#PLAN_RUNNING[@]} running, ${#PLAN_WAITING[@]} waiting | open tasks in range: $(open_count)"
 }
 
-# ── One tick: scrub, gate, top up the pool to cap ──────────────────────────────
+# ── Reclaim build artifacts of completed phases (A4 / F65.3) ───────────────────
+# After compute_plan, every phase with no open tasks is in PLAN_DONE — its agent
+# container has exited (a resumable phase still has an open task and is never
+# PLAN_DONE), so its worktree target/ is dead weight. Reclaim it to keep a
+# multi-day drain's disk footprint bounded. Guards: never touch a phase with a
+# live container (phase_live), and only remove build artifacts — source files and
+# every commit are untouched. Runs every tick regardless of the feed gate, so a
+# disk-pressure pause can self-heal as completed phases free their target/ dirs.
+# Disabled with ARACHNE_DISK_RECLAIM=0.
+reclaim_done_targets() {
+  [[ "${ARACHNE_DISK_RECLAIM:-1}" -eq 1 ]] || return 0
+  local p wt sz
+  for p in "${PLAN_DONE[@]:-}"; do
+    [[ -z "$p" ]] && continue
+    wt="$WORKTREES_DIR/$(phase_branch "$p")"
+    [[ -d "$wt/target" ]] || continue
+    phase_live "$p" && continue
+    sz="$(du -sh "$wt/target" 2>/dev/null | cut -f1)"
+    if command -v cargo >/dev/null 2>&1; then
+      if cargo clean --manifest-path "$wt/Cargo.toml" >/dev/null 2>&1; then
+        log "reclaimed $p target/ (${sz:-?}) via cargo clean"
+      else
+        warn "cargo clean failed for $p ($wt); run scripts/arachne-cleanup --targets to reclaim"
+      fi
+    elif rm -rf "$wt/target"; then
+      log "reclaimed $p target/ (${sz:-?}) via rm -rf (no cargo)"
+    fi
+  done
+}
+
+# ── One tick: scrub, plan, reclaim, gate, top up the pool to cap ───────────────
 do_tick() {
   git -C "$OPS_DIR" pull --ff-only >/dev/null 2>&1 || warn "ops pull --ff-only failed (continuing)"
   "$ARACHNE_TASK" scrub >/dev/null 2>&1 || warn "scrub failed (continuing)"
+
+  # Plan + reclaim run before the gate: classification is read-only and reclaim
+  # frees disk for DONE phases even while feeding is paused (e.g. on the disk gate).
+  compute_plan
+  reclaim_done_targets
 
   if ! feed_gate; then
     log "PAUSED feeding — $GATE_REASON (running agents untouched)"
@@ -322,7 +378,6 @@ do_tick() {
     return 0
   fi
 
-  compute_plan
   local cap have launched=0 p
   cap="$(JOBS=$JOBS apl_read_cap)"
   have="$(apl_count_live_agents)"
@@ -455,6 +510,17 @@ fi
 if [[ "${ARACHNE_PUMP_NO_LAUNCH:-0}" -ne 1 ]]; then
   log "Building arachne image ..."
   "$DOCKER" build -t arachne "$REPO_ROOT" >/dev/null || die "image build failed"
+fi
+
+# Belt-and-suspenders disk discipline (A4): auto-start the disk watchdog like
+# run-parallel.sh does, so disk pressure also drops the live pool cap (cap-file
+# path) on top of the feed gate. --auto-exit retires it once no agents remain.
+# Skipped for --once / NO_LAUNCH ticks and when the disk gate is disabled.
+if [[ "$MODE" == "run" && "$DISK_GATE" -eq 1 && "${ARACHNE_PUMP_NO_LAUNCH:-0}" -ne 1 ]]; then
+  nohup "$ARACHNE_DISK_WATCHDOG" --auto-exit \
+    >>"$REPO_ROOT/.arachne-disk-watchdog.log" 2>&1 </dev/null &
+  disown "$!" 2>/dev/null || true
+  log "disk watchdog started (cap-file path; log: .arachne-disk-watchdog.log)"
 fi
 
 log "Pump: phases=$PHASES grain=$GRAIN cap=$JOBS (live via $CAP_FILE) ceiling=${CEILING}% tick=${TICK}s"
