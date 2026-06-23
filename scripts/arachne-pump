@@ -289,7 +289,10 @@ launch_phase() {
     -e AGENT_MODEL="$AGENT_MODEL" \
     -v "$CLAUDE_DIR":/tmp/claude-home:ro \
     -v "$CLAUDE_JSON":/tmp/claude-home-json/.claude.json:ro \
-    -v "$REPO_ROOT":"$REPO_ROOT" \
+    -v "$REPO_ROOT":"$REPO_ROOT":ro \
+    -v "$REPO_ROOT/.git":"$REPO_ROOT/.git" \
+    -v "$wt":"$wt" \
+    -v "$REPO_ROOT/ops":"$REPO_ROOT/ops" \
     -w "$wt" \
     arachne /entrypoint-parallel.sh)
   log "launched $phase -> $cname ($(printf '%s' "$cid" | cut -c1-12))  lead=$lead  log: $wt/.arachne-agent.log"
@@ -366,6 +369,23 @@ reclaim_done_targets() {
 do_tick() {
   git -C "$OPS_DIR" pull --ff-only >/dev/null 2>&1 || warn "ops pull --ff-only failed (continuing)"
   "$ARACHNE_TASK" scrub >/dev/null 2>&1 || warn "scrub failed (continuing)"
+
+  # RC-4 contamination guard (A8 / F65.5): flag any primary-source dirtiness an
+  # agent slipped past the read-only mount. Clean under normal operation. Always
+  # log it, but desktop-notify only when the contamination CHANGES — otherwise a
+  # persistent dirty tree spams a notification every tick (TICK seconds). The
+  # fingerprint persists in a gitignored marker so dedup survives restarts.
+  local fs_dirt fsg_mark="$REPO_ROOT/.arachne-fsguard.notified"
+  fs_dirt="$(apl_fs_guard "$REPO_ROOT")"
+  if [[ -n "$fs_dirt" ]]; then
+    log "$fs_dirt"
+    if [[ "$fs_dirt" != "$(cat "$fsg_mark" 2>/dev/null)" ]]; then
+      pump_notify "$fs_dirt"
+      printf '%s' "$fs_dirt" >"$fsg_mark" 2>/dev/null || true
+    fi
+  else
+    rm -f "$fsg_mark" 2>/dev/null || true   # clean again → re-arm for next time
+  fi
 
   # Plan + reclaim run before the gate: classification is read-only and reclaim
   # frees disk for DONE phases even while feeding is paused (e.g. on the disk gate).

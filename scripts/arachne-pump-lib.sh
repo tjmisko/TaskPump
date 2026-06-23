@@ -89,3 +89,24 @@ apl_disk_low() {
   fi
   return 0
 }
+
+# apl_fs_guard <repo_root> — RC-4 contamination detector (A8 / F65.5). With the
+# read-only primary mount in place, a container can no longer write the primary
+# source tree, so this guard should always be clean; it is the regression
+# detector that catches a future mount change re-introducing a blanket RW
+# `$REPO_ROOT`. Greps `git status --porcelain` for any dirty path OUTSIDE the
+# allowlist {.worktrees/, ops, ops/} — i.e. a primary *source* edit (crates/,
+# web/, scripts/, Cargo.*, root files) that should have landed in a worktree.
+# `$NF` tolerates `R old -> new` rename rows; the `ops` submodule-pointer line is
+# allowlisted (agents are told to leave it). Echoes a `FS-GUARD:` line when dirty,
+# nothing when clean. Graceful: silent when the repo can't be read.
+apl_fs_guard() {
+  local repo_root="$1" dirty
+  dirty=$(git -C "$repo_root" status --porcelain 2>/dev/null \
+          | awk '{print $NF}' \
+          | grep -Ev '^(\.worktrees/|ops$|ops/)' || true)
+  [[ -n "$dirty" ]] && printf 'FS-GUARD: primary checkout dirty outside allowlist:\n%s\n' "$dirty"
+  # Always succeed: callers assign via $(...) under `set -e`, where a non-zero
+  # return on the clean (no-dirt) path would abort the tick.
+  return 0
+}

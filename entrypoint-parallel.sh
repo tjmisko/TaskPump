@@ -196,6 +196,17 @@ fi
 echo "Running smoke test..." | tee -a "$LOG_FILE"
 WORKSPACE_PATH="$WORKSPACE_PATH" /smoke_test.sh 2>&1 | tee -a "$LOG_FILE" || echo "WARNING: Smoke test had failures (continuing)" | tee -a "$LOG_FILE"
 
+# ── A8 (F65.5) read-only-primary self-check ────────────────────────────────────
+# The primary source tree is mounted read-only; only the worktree, .git, and ops/
+# are writable. A writable primary root means the A8 mount set regressed to a
+# blanket RW $REPO_ROOT — flag it loudly (a silent regression is the RC-4 footgun).
+if touch "$REPO_ROOT/.arachne-rotest" 2>/dev/null; then
+    rm -f "$REPO_ROOT/.arachne-rotest" 2>/dev/null || true
+    echo "WARNING: primary checkout ($REPO_ROOT) is WRITABLE — A8 read-only mount regression" | tee -a "$LOG_FILE" >&2
+else
+    echo "A8 self-check: primary checkout is read-only (expected)" | tee -a "$LOG_FILE"
+fi
+
 # ── Resolve the kickoff brief (the agent's prompt) ─────────────────────────────
 : "${ARACHNE_BRIEF:=}"
 if [[ -z "$ARACHNE_BRIEF" ]]; then
