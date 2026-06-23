@@ -408,6 +408,25 @@ r56=$(rbrief F56)
 grep -qF 'No cross-phase dependencies' <<<"$r56" && pass "empty-deps line for F56 (no cross-phase blockers)" || fail "no empty-deps line:\n$r56"
 grep -qF 'feat/f55' <<<"$r56" && fail "F55 leaked into F56 deps:\n$r56" || pass "F56 deps block clean"
 
+echo "--- Test 16: integration-aware launch gate — done≠integrated (A3 v2) ---"
+# F57.0 depends cross-phase on F55.1; F55.1 is done (ledger-ready) but its CODE
+# may not yet be on auto/trunk. STUB_INTEGRATED drives the ancestor check; the
+# pump reads the fixtures via ARACHNE_PUMP_TASKS_DIR so phase_deps_integrated
+# sees F57's cross-phase blocker.
+ipump() { ARACHNE_PUMP_TASKS_DIR="$TASKS" "$PUMP" --no-health-gate --dry-run --phases "$1" "${@:2}"; }
+mk F55.0 done; mk F55.1 done; mk F56.0 done; mk F57.0 open F55.1
+# 16a: --integration-trunk on, dep NOT integrated → F57 WAITS, does not LAUNCH.
+out=$(STUB_INTEGRATED="" ipump F55..F57 --integration-trunk)
+have "$out" 'WAITING +F57' && pass "F57 WAITING: dep done but not integrated" || fail "F57 not WAITING:\n$out"
+have "$out" 'LAUNCH +F57' && fail "F57 launched before dep integrated:\n$out" || pass "F57 not LAUNCH before integration"
+have "$out" 'not yet integrated' && pass "WAITING reason names the integration gap" || fail "no integration reason:\n$out"
+# 16b: flip the dep to integrated → F57 LAUNCHES.
+out=$(STUB_INTEGRATED="F55" ipump F55..F57 --integration-trunk)
+have "$out" 'LAUNCH +F57' && pass "F57 LAUNCH once F55 integrated" || fail "F57 not LAUNCH after integration:\n$out"
+# 16c: integration OFF → ledger-ready F57 LAUNCHES regardless (opt-out: no gate).
+out=$(STUB_INTEGRATED="" ipump F55..F57)
+have "$out" 'LAUNCH +F57' && pass "flag-off ⇒ F57 LAUNCH on done (no integration gate)" || fail "F57 not LAUNCH with flag off:\n$out"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"

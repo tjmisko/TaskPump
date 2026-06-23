@@ -276,16 +276,14 @@ dep_pr_number() {
   gh pr list --head "$branch" --base main --json number -q '.[0].number // empty' 2>/dev/null || true
 }
 
-# phase_dependencies <FN> — emit a markdown "Depends on / builds upon" block
-# naming this phase's CROSS-PHASE blockers (in-phase deps are the pump's own
-# serial concern), each resolved to branch / integration state / draft PR, so the
-# launched agent learns its lineage instead of re-deriving upstream work. No
-# cross-phase blockers ⇒ a single explanatory line. Pure-ish: the branch name is
-# string-derived (always present); sha/PR are best-effort enrichment.
-phase_dependencies() {
+# phase_cross_blockers <FN> — the unique set of OTHER phases this phase's tasks
+# are blocked on (in-phase blockers are the pump's own serial concern), one phase
+# token per line. The single source of truth for both the dependency brief (v1)
+# and the integration launch gate (v2).
+phase_cross_blockers() {
   local phase="$1"
   local -A seen=()
-  local deps=() f blk bphase
+  local f blk bphase
   shopt -s nullglob
   for f in "$TASKS_DIR/$phase."*.md; do
     while IFS= read -r blk; do
@@ -294,10 +292,42 @@ phase_dependencies() {
       [[ "$bphase" == "$phase" ]] && continue       # in-phase dep — pump-internal
       [[ -n "${seen[$bphase]:-}" ]] && continue
       seen[$bphase]=1
-      deps+=("$bphase")
+      printf '%s\n' "$bphase"
     done < <(yq --front-matter=extract '.blockers[]?' "$f" 2>/dev/null || true)
   done
   shopt -u nullglob
+}
+
+# phase_deps_integrated <FN> — true (0) when EVERY cross-phase blocker's branch is
+# already an ancestor of the integration trunk (its code is physically present on
+# the base downstream is cut from). The v2 launch gate: a frontier phase whose
+# blocker is `done` in the ledger but whose CODE is not yet on auto/trunk stays
+# WAITING. Vacuously true with no cross-phase blockers. Test seam: when
+# STUB_INTEGRATED is set, only its space-separated phases count as integrated.
+phase_deps_integrated() {
+  local phase="$1" dp dbranch
+  while IFS= read -r dp; do
+    [[ -z "$dp" ]] && continue
+    dbranch="$(phase_branch "$dp")"
+    if [[ -n "${STUB_INTEGRATED+x}" ]]; then
+      pump_in_list "$dp" "$STUB_INTEGRATED" || return 1
+    else
+      apl_phase_integrated "$REPO_ROOT" "$dbranch" "$INTEGRATION_TRUNK" || return 1
+    fi
+  done < <(phase_cross_blockers "$phase")
+  return 0
+}
+
+# phase_dependencies <FN> — emit a markdown "Depends on / builds upon" block
+# naming this phase's CROSS-PHASE blockers, each resolved to branch / integration
+# state / draft PR, so the launched agent learns its lineage instead of
+# re-deriving upstream work. No cross-phase blockers ⇒ a single explanatory line.
+# Pure-ish: the branch name is string-derived (always present); sha/PR are
+# best-effort enrichment.
+phase_dependencies() {
+  local phase="$1"
+  local deps=() dp
+  while IFS= read -r dp; do [[ -n "$dp" ]] && deps+=("$dp"); done < <(phase_cross_blockers "$phase")
 
   if (( ${#deps[@]} == 0 )); then
     printf 'No cross-phase dependencies.\n'
@@ -379,6 +409,21 @@ launch_phase() {
   apl_repair_worktree_gitignore "$REPO_ROOT"
   if (cd "$REPO_ROOT" && git check-ignore -q "$wt" 2>/dev/null); then
     warn "worktree still gitignored: $wt — fix .gitignore; skipping $phase"; return 1
+  fi
+
+  # v2: refresh a reused/stale worktree with newly-integrated upstream deps. A
+  # worktree cut from auto/trunk BEFORE a dependency integrated will not contain
+  # it; merging the current trunk in makes a relaunch inherit upstream (a first
+  # launch from BASE_REF=trunk is already up to date → no-op). Conflict → abort,
+  # skip the launch, and quarantine (same gate as reconcile_trunk). Integration
+  # off ⇒ untouched.
+  if [[ "$INTEGRATION" -eq 1 ]] && git -C "$REPO_ROOT" rev-parse --verify "refs/heads/$INTEGRATION_TRUNK" >/dev/null 2>&1; then
+    if ! git -C "$wt" merge --no-ff --no-edit "$INTEGRATION_TRUNK" >/dev/null 2>&1; then
+      git -C "$wt" merge --abort >/dev/null 2>&1 || true
+      warn "worktree $wt conflicts with $INTEGRATION_TRUNK; skipping launch of $phase"
+      quarantine_phase "$phase" "$(git -C "$wt" rev-parse HEAD 2>/dev/null)" "worktree merge conflict"
+      return 1
+    fi
   fi
 
   local brief; brief="$(render_brief "$phase")"
@@ -596,8 +641,9 @@ graduate_trunk() {
 # ── Planning pass: classify every phase in range ───────────────────────────────
 # Sets arrays LAUNCH/RUNNING/WAITING/DONEP. Returns the plan via globals.
 declare -a PLAN_LAUNCH PLAN_RUNNING PLAN_WAITING PLAN_DONE
+declare -A PLAN_WAIT_REASON
 compute_plan() {
-  PLAN_LAUNCH=(); PLAN_RUNNING=(); PLAN_WAITING=(); PLAN_DONE=()
+  PLAN_LAUNCH=(); PLAN_RUNNING=(); PLAN_WAITING=(); PLAN_DONE=(); PLAN_WAIT_REASON=()
   local -A in_frontier=()
   local p
   while IFS= read -r p; do [[ -n "$p" ]] && in_frontier["$p"]=1; done < <(frontier_phases)
@@ -605,11 +651,26 @@ compute_plan() {
     [[ -z "$p" ]] && continue
     local oc; oc="$(phase_open_count "$p")"
     if [[ -n "${in_frontier[$p]:-}" ]]; then
-      if phase_live "$p"; then PLAN_RUNNING+=("$p"); else PLAN_LAUNCH+=("$p"); fi
+      if phase_live "$p"; then
+        PLAN_RUNNING+=("$p")
+      elif [[ "$INTEGRATION" -eq 1 ]] && ! phase_deps_integrated "$p"; then
+        # v2: ledger says ready, but a cross-phase dep's CODE is not yet on the
+        # trunk this phase would be cut from. Hold until the merge lands so the
+        # worktree physically contains its dependencies (RC-3 closure).
+        PLAN_WAITING+=("$p")
+        PLAN_WAIT_REASON["$p"]="deps done but not yet integrated into $INTEGRATION_TRUNK"
+      else
+        PLAN_LAUNCH+=("$p")
+      fi
     elif [[ "$oc" -gt 0 ]]; then
       # Has open tasks but none eligible — gated on incomplete cross-phase deps,
       # unless a live container is already draining it.
-      if phase_live "$p"; then PLAN_RUNNING+=("$p"); else PLAN_WAITING+=("$p"); fi
+      if phase_live "$p"; then
+        PLAN_RUNNING+=("$p")
+      else
+        PLAN_WAITING+=("$p")
+        PLAN_WAIT_REASON["$p"]="$oc open, none eligible — cross-phase blockers pending"
+      fi
     else
       PLAN_DONE+=("$p")
     fi
@@ -624,7 +685,7 @@ print_plan() {
   local p
   for p in "${PLAN_LAUNCH[@]:-}";  do [[ -n "$p" ]] && printf '  LAUNCH   %-6s -> %s\n' "$p" "$(phase_branch "$p")"; done
   for p in "${PLAN_RUNNING[@]:-}"; do [[ -n "$p" ]] && printf '  RUNNING  %-6s -> %s (live container)\n' "$p" "$(phase_branch "$p")"; done
-  for p in "${PLAN_WAITING[@]:-}"; do [[ -n "$p" ]] && printf '  WAITING  %-6s (%s open, none eligible — cross-phase blockers pending)\n' "$p" "$(phase_open_count "$p")"; done
+  for p in "${PLAN_WAITING[@]:-}"; do [[ -n "$p" ]] && printf '  WAITING  %-6s (%s)\n' "$p" "${PLAN_WAIT_REASON[$p]:-cross-phase blockers pending}"; done
   for p in "${PLAN_DONE[@]:-}";    do [[ -n "$p" ]] && printf '  DONE     %-6s (no open tasks)\n' "$p"; done
   echo "frontier: ${#PLAN_LAUNCH[@]} launchable, ${#PLAN_RUNNING[@]} running, ${#PLAN_WAITING[@]} waiting | open tasks in range: $(open_count)"
 }
