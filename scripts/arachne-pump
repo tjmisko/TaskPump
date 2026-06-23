@@ -450,8 +450,12 @@ fi
 # Seed the live cap file for discoverability / retuning.
 [[ -f "$CAP_FILE" ]] || echo "$JOBS" >| "$CAP_FILE" 2>/dev/null || true
 
-log "Building arachne image ..."
-"$DOCKER" build -t arachne "$REPO_ROOT" >/dev/null || die "image build failed"
+# Skip the (~9 GB) image build when we will not launch containers — keeps the
+# NO_LAUNCH tick (tests / live read-only validation) side-effect-free.
+if [[ "${ARACHNE_PUMP_NO_LAUNCH:-0}" -ne 1 ]]; then
+  log "Building arachne image ..."
+  "$DOCKER" build -t arachne "$REPO_ROOT" >/dev/null || die "image build failed"
+fi
 
 log "Pump: phases=$PHASES grain=$GRAIN cap=$JOBS (live via $CAP_FILE) ceiling=${CEILING}% tick=${TICK}s"
 log "Singular supervisor; Ctrl-C stops feeding but leaves running agents. Monitor: scripts/arachne-monitor --watch"
