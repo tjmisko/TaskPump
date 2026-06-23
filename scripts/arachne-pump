@@ -55,7 +55,9 @@ source "$SCRIPT_DIR/arachne-pump-lib.sh"
 CLAUDE_DIR="$HOME/.claude"
 CLAUDE_JSON="$HOME/.claude.json"
 OPS_DIR="${ARACHNE_PUMP_OPS_DIR:-$REPO_ROOT/ops}"
-TASKS_DIR="$OPS_DIR/task-loop/tasks"
+# Tasks dir — overridable (independent of OPS_DIR) so phase_dependencies / brief
+# rendering can be unit-tested against a flat fixture dir.
+TASKS_DIR="${ARACHNE_PUMP_TASKS_DIR:-$OPS_DIR/task-loop/tasks}"
 
 ARACHNE_TASK="${ARACHNE_TASK:-$SCRIPT_DIR/arachne-task}"
 ARACHNE_USAGE="${ARACHNE_USAGE:-$SCRIPT_DIR/arachne-usage}"
@@ -263,20 +265,91 @@ feed_gate() {
   return 0
 }
 
-# ── Brief rendering (D6 / F64.4) ───────────────────────────────────────────────
-# Render the parameterized phase-drain template with $PHASE substituted to a
-# transient per-phase file; echo its path. Errors clearly if the template is
-# absent (F64.4 builds it).
+# ── Dependency-aware briefs (A3 v1 / F65.6) ────────────────────────────────────
+# dep_pr_number <branch> — the open draft-PR number for a dependency branch, or
+# empty. Fail-open: empty when gh is absent / disabled (ARACHNE_PUMP_NO_GH=1, for
+# hermetic tests) / errors.
+dep_pr_number() {
+  local branch="$1"
+  [[ "${ARACHNE_PUMP_NO_GH:-0}" -eq 1 ]] && return 0
+  command -v gh >/dev/null 2>&1 || return 0
+  gh pr list --head "$branch" --base main --json number -q '.[0].number // empty' 2>/dev/null || true
+}
+
+# phase_dependencies <FN> — emit a markdown "Depends on / builds upon" block
+# naming this phase's CROSS-PHASE blockers (in-phase deps are the pump's own
+# serial concern), each resolved to branch / integration state / draft PR, so the
+# launched agent learns its lineage instead of re-deriving upstream work. No
+# cross-phase blockers ⇒ a single explanatory line. Pure-ish: the branch name is
+# string-derived (always present); sha/PR are best-effort enrichment.
+phase_dependencies() {
+  local phase="$1"
+  local -A seen=()
+  local deps=() f blk bphase
+  shopt -s nullglob
+  for f in "$TASKS_DIR/$phase."*.md; do
+    while IFS= read -r blk; do
+      [[ -z "$blk" ]] && continue
+      bphase="${blk%%.*}"
+      [[ "$bphase" == "$phase" ]] && continue       # in-phase dep — pump-internal
+      [[ -n "${seen[$bphase]:-}" ]] && continue
+      seen[$bphase]=1
+      deps+=("$bphase")
+    done < <(yq --front-matter=extract '.blockers[]?' "$f" 2>/dev/null || true)
+  done
+  shopt -u nullglob
+
+  if (( ${#deps[@]} == 0 )); then
+    printf 'No cross-phase dependencies.\n'
+    return 0
+  fi
+
+  printf 'This phase builds upon work from other phases. Their code is integrated\n'
+  printf 'into the `%s` branch you are based on — do not re-derive it:\n\n' "$INTEGRATION_TRUNK"
+  local dp dbranch dstate dpr
+  for dp in "${deps[@]}"; do
+    dbranch="$(phase_branch "$dp")"
+    if apl_phase_integrated "$REPO_ROOT" "$dbranch" "$INTEGRATION_TRUNK"; then
+      dstate="integrated @ $(git -C "$REPO_ROOT" rev-parse --short "$dbranch" 2>/dev/null || echo '?')"
+    elif git -C "$REPO_ROOT" rev-parse --verify "refs/heads/$dbranch" >/dev/null 2>&1; then
+      dstate="not yet integrated"
+    else
+      dstate="not yet started"
+    fi
+    dpr="$(dep_pr_number "$dbranch")"
+    if [[ -n "$dpr" ]]; then dpr="PR #$dpr"; else dpr="no PR yet"; fi
+    printf -- '- **%s** (`%s`) — %s, %s\n' "$dp" "$dbranch" "$dstate" "$dpr"
+  done
+}
+
+# ── Brief rendering (D6 / F64.4; deps A3 v1) ───────────────────────────────────
+# render_brief_stream <phase> — render the parameterized phase-drain template to
+# stdout: substitute {{PHASE}} (plain sed — no envsubst, no clash with the
+# `$PHASE` / `$(…)` shell examples the brief contains; phase tokens FNN are
+# sed-safe) and expand the {{DEPENDS_ON}} placeholder line with the dependency
+# block (awk by literal `index()` — avoids multi-line inline sed and the awk
+# brace-interval pitfall).
+render_brief_stream() {
+  local phase="$1"
+  local depfile; depfile="$(mktemp)"
+  phase_dependencies "$phase" >| "$depfile"
+  sed "s/{{PHASE}}/$phase/g" "$ARACHNE_PHASE_BRIEF_TEMPLATE" \
+    | awk -v df="$depfile" '
+        index($0, "{{DEPENDS_ON}}") { while ((getline line < df) > 0) print line; close(df); next }
+        { print }
+      '
+  rm -f "$depfile" 2>/dev/null || true
+}
+
+# render_brief <phase> — write the rendered brief to a transient per-phase file
+# and echo its path (the launcher passes the path to the container).
 render_brief() {
   local phase="$1"
   [[ -f "$ARACHNE_PHASE_BRIEF_TEMPLATE" ]] \
     || die "phase-drain brief template not found: $ARACHNE_PHASE_BRIEF_TEMPLATE (built by F64.4)"
   local out="$WORKTREES_DIR/$(phase_branch "$phase")/.arachne-phase-brief.md"
   mkdir -p "$(dirname "$out")" 2>/dev/null || true
-  # The template's sole placeholder is {{PHASE}} — substituted by plain sed so
-  # there is no envsubst dependency and no clash with the `$PHASE` / `$(…)` shell
-  # examples the brief contains. Phase tokens (FNN) are sed-safe.
-  sed "s/{{PHASE}}/$phase/g" "$ARACHNE_PHASE_BRIEF_TEMPLATE" >| "$out"
+  render_brief_stream "$phase" >| "$out"
   printf '%s' "$out"
 }
 
@@ -712,9 +785,10 @@ detach_and_exit() {
 case "$MODE" in
   render)
     # Print the phase-drain brief rendered for $PHASES to stdout (debug / test).
+    # Goes through render_brief_stream so {{DEPENDS_ON}} is expanded too (v1).
     [[ -f "$ARACHNE_PHASE_BRIEF_TEMPLATE" ]] \
       || die "phase-drain brief template not found: $ARACHNE_PHASE_BRIEF_TEMPLATE (built by F64.4)"
-    sed "s/{{PHASE}}/$PHASES/g" "$ARACHNE_PHASE_BRIEF_TEMPLATE"
+    render_brief_stream "$PHASES"
     exit 0
     ;;
   dry)

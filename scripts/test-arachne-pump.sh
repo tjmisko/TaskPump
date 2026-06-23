@@ -379,6 +379,35 @@ grep -qi 'Needs review' "$TASKS/F58.0.md" && pass "needs-review appends a body n
 grep -qF 'auto/trunk conflict for F58' "$TASKS/F58.0.md" && pass "needs-review note carries the reason" || fail "reason not in note"
 "$REAL_TASK" needs-review F58.0 >/dev/null 2>&1 && fail "needs-review without --reason should error" || pass "needs-review requires --reason"
 
+echo "--- Test 15: dependency-aware briefs expand {{DEPENDS_ON}} (A3 v1) ---"
+# A template carrying the new {{DEPENDS_ON}} placeholder; rendered via the pump's
+# TASKS_DIR override against the fixtures, gh disabled (ARACHNE_PUMP_NO_GH=1) so
+# the render is hermetic. F60.0 depends cross-phase on F55.7; F56.0 has none.
+TPL2="$TMP/_phase-drain-template-v1.md"
+cat >| "$TPL2" <<'EOF'
+# Kickoff brief — drain phase {{PHASE}}
+You are based on `auto/trunk` (an integration branch off `main`).
+
+## Depends on / builds upon
+{{DEPENDS_ON}}
+
+## Working method
+scripts/arachne-task next --phase {{PHASE}}
+EOF
+mk F60.0 open F55.7        # cross-phase blocker on F55
+rbrief() {  # $1=phase
+  ARACHNE_PUMP_NO_GH=1 ARACHNE_PUMP_TASKS_DIR="$TASKS" \
+  ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL2" "$PUMP" --render-brief "$1"
+}
+r60=$(rbrief F60)
+grep -qF '{{DEPENDS_ON}}' <<<"$r60" && fail "stray {{DEPENDS_ON}} after render:\n$r60" || pass "no stray {{DEPENDS_ON}}"
+grep -qF '{{PHASE}}' <<<"$r60" && fail "stray {{PHASE}} after render (v1):\n$r60" || pass "no stray {{PHASE}} (v1)"
+grep -qF 'Depends on / builds upon' <<<"$r60" && pass "deps section header present" || fail "no deps header:\n$r60"
+grep -qF 'feat/f55' <<<"$r60" && pass "cross-phase blocker names feat/f55" || fail "feat/f55 not named:\n$r60"
+r56=$(rbrief F56)
+grep -qF 'No cross-phase dependencies' <<<"$r56" && pass "empty-deps line for F56 (no cross-phase blockers)" || fail "no empty-deps line:\n$r56"
+grep -qF 'feat/f55' <<<"$r56" && fail "F55 leaked into F56 deps:\n$r56" || pass "F56 deps block clean"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"
