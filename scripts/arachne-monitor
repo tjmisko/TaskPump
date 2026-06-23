@@ -1,51 +1,45 @@
 #!/bin/bash
-# arachne-monitor -- at-a-glance status of parallel Arachne agents.
+# arachne-monitor -- at-a-glance status of parallel Arachne agents (btop-ish).
 #
 # Maps each running/recent arachne-agent container to its worktree, epic task
-# status (from the canonical ops/ task files), uptime, and last log line, so
-# you can see overall progress and spot anything stuck/blocked/parked.
+# status (from the canonical ops/ task files), uptime, and last log lines.
 #
-# Each session renders as a header line (name, container state, epic task
-# status, uptime, log freshness) followed by a fixed 5-line area showing the
-# most recent meaningful log events. In --watch the whole view repaints on the
-# interval.
+# Layout (top is FIXED, sessions SCROLL):
+#   ┌ title + rule
+#   │ pump summary · usage bars (5h/7d) · Disk bar          Notes (right column)
+#   │ disk subinfo (worktrees · main · docker)              ─ wraps under if narrow
+#   ├ rule
+#   │ ● session …   (scrollable viewport; 2 feed lines each)
+#   └ status bar (keys + scroll position)
 #
-# Above the sessions it shows system gauges: the usage-governed pump's status,
-# the Max-plan usage bars (5h session + binding 7d weekly, in the toolbar's bar
-# format), and a Disk gauge — free-space bar plus the on-disk footprint across
-# worktrees, the primary checkout, and docker, with the largest worktrees called
-# out (the cargo target/ accumulation that fills `/`). Disk sizing is cached and
-# refreshed in the background, so it never blocks a redraw; `--no-disk` hides it.
+# All expensive data (the eligible-task scan, the docker session table, disk
+# sizing) is refreshed in BACKGROUND workers on their own TTLs and read from
+# caches, so a paint is cheap (tens of ms) and the first frame is instant —
+# cold caches show "…" placeholders that fill in within a couple seconds.
 #
-# In --watch the view is repainted flicker-free: each frame is built off-screen
-# (all the docker/jq/usage work) while the previous frame stays visible, then
-# painted IN PLACE (cursor-home + erase-to-EOL per row + erase-below) so the
-# screen is never blanked between frames. `--legacy-paint` restores the old
-# clear-then-render behaviour for an A/B comparison of the flicker.
+# In --watch the terminal autowrap is disabled (like btop/htop) so long lines
+# clip at the edge instead of wrapping, and the frame is clipped to the terminal
+# height, so the top never scrolls away.
 #
-# Below the gauges is a Notes field — a free-text scratchpad scoped to the
-# current pump run (keyed by the pump's phase-range + start time, so a new run
-# starts fresh). In --watch it is interactive: press `n` to type a note line
-# inline, Enter to save it, and `e` / Ctrl-G to pop the whole notes buffer into
-# $EDITOR (nvim) — exactly like Claude Code's Ctrl-G — returning to the monitor
-# on save+quit. `q` quits the watch. Notes persist in
+# Notes: a free-text scratchpad scoped to the current pump run (keyed by the
+# pump's phase-range + start time, so a new run starts fresh). Persisted in
 # .arachne-monitor-notes/<run>.md (gitignored).
 #
 # Refresh cadence: --watch defaults to 1s. Set ARACHNE_MONITOR_INTERVAL to change
 # it once in your shell/config; a positional --watch <N> still wins. Fractional
-# seconds are accepted (coreutils sleep), e.g. --watch 0.5.
+# seconds are accepted, e.g. --watch 0.5.
 #
 # Usage:
 #   ./scripts/arachne-monitor             # one paint
-#   ./scripts/arachne-monitor --watch     # refresh every 1s (batched, flicker-free)
+#   ./scripts/arachne-monitor --watch     # refresh every 1s (cached, scrollable)
 #   ./scripts/arachne-monitor --watch 5   # refresh every 5s
 #   ARACHNE_MONITOR_INTERVAL=3 ./scripts/arachne-monitor --watch   # every 3s (env)
 #   ./scripts/arachne-monitor --watch --log /tmp/mon.log   # log each redraw's timing
-#   ./scripts/arachne-monitor --watch --legacy-paint       # old clear-then-render
 #   ./scripts/arachne-monitor --no-disk   # hide the disk gauge
 #   ./scripts/arachne-monitor --demo      # synthetic sessions; no docker needed
 #
-# Watch-mode keys:  n add a note · e / Ctrl-G edit notes in nvim · q quit
+# Watch-mode keys:  j/k ↑/↓ scroll · g/G top/bottom · PgUp/PgDn (Ctrl-u/d) page
+#                   n add a note · e / Ctrl-G edit notes in nvim · q quit
 set -euo pipefail
 
 REPO_ROOT="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
@@ -58,16 +52,14 @@ print_help() {
 }
 
 # Refresh interval precedence: positional --watch <N> (set in the arg loop below)
-#   >  ARACHNE_MONITOR_INTERVAL  >  built-in default (1s). Fractional ok (sleep).
+#   >  ARACHNE_MONITOR_INTERVAL  >  built-in default (1s). Fractional ok.
 WATCH=0; INTERVAL="${ARACHNE_MONITOR_INTERVAL:-1}"; DEMO=0
 MONITOR_LOG="${ARACHNE_MONITOR_LOG:-}"        # redraw-instrumentation log (off if empty)
-PAINT_MODE="${ARACHNE_MONITOR_PAINT:-batched}"  # batched (flicker-free) | legacy
 SHOW_DISK="${ARACHNE_MONITOR_DISK:-1}"        # disk gauge on by default; --no-disk / =0 off
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --watch)        WATCH=1 ;;
         --demo)         DEMO=1 ;;          # render synthetic sessions; no docker needed
-        --legacy-paint) PAINT_MODE=legacy ;;
         --no-disk)      SHOW_DISK=0 ;;
         --log)          MONITOR_LOG="${2:-}"; shift ;;
         --log=*)        MONITOR_LOG="${1#--log=}" ;;
@@ -105,11 +97,22 @@ colorize() {  # colorize a status word
     esac
 }
 
-# ── Usage bars ────────────────────────────────────────────────────────────────
-# Render the Max-plan usage as two bars (5-hour session window + binding 7-day
-# weekly window) in the exact format the user's ~/.claude/claude-status toolbar
-# uses: a 20-cell █/░ bar (5% per cell) wrapped in faded-brown ▐ ▌ end-caps with
-# a Claude-terracotta fill, turning red once a window is at/over critical (95%).
+# vis_len -- visible (printable) length of a string, ignoring CSI colour escapes.
+# Pure bash (no subprocess) so it is cheap to call per row while composing.
+vis_len() {  # $1 = string -> char count of the ANSI-stripped text
+    local s="$1" out=""
+    while [[ "$s" == *$'\033['* ]]; do
+        out+="${s%%$'\033['*}"   # text before the escape
+        s="${s#*$'\033['}"       # drop through "ESC["
+        s="${s#*m}"              # drop the params up to and including the final 'm'
+    done
+    out+="$s"
+    printf '%s' "${#out}"
+}
+
+# ── Bars ──────────────────────────────────────────────────────────────────────
+# A 20-cell █/░ bar (5% per cell) wrapped in faded-brown ▐ ▌ end-caps with a
+# Claude-terracotta fill, matching the ~/.claude/claude-status toolbar.
 BAR_CELLS=20
 BAR_CAP=$'\033[2;38;5;130m'    # faded brown end-caps  ▐ ▌
 BAR_FILL=$'\033[38;5;173m'     # Claude terracotta fill (#da7756-ish)
@@ -118,17 +121,14 @@ BAR_WARN=$'\033[33m'           # amber fill (warning band)
 BAR_CRIT=$'\033[1;31m'         # red fill once a gauge is at/over critical
 BAR_RST=$'\033[0m'
 
-# ── Gauge alignment ───────────────────────────────────────────────────────────
-# Every gauge row (5h / 7d / Disk) shares one indent + a left-justified label
-# column so the bars, percentages, and trailing text line up vertically under
-# the pump summary line. GAUGE_SUBINDENT lands under the bar, for detail lines.
-GAUGE_INDENT='  '              # 2-space indent under the pump summary line
+# Gauge rows (5h / 7d / Disk) share one indent + a left-justified label column so
+# the bars and trailing text line up. GAUGE_SUBINDENT lands under the bar.
+GAUGE_INDENT='  '
 GAUGE_LABEL_W=4                # widest label ("Disk"); 5h/7d are padded to match
 printf -v GAUGE_SUBINDENT '%*s' "$(( ${#GAUGE_INDENT} + GAUGE_LABEL_W + 1 ))" ''
 
-# bar_glyphs -- echo just the 20-cell ▐█░▌ bar for a percent (shared by the usage
-# and disk gauges so they look identical). $2 overrides the fill colour; without
-# it the fill is terracotta, turning red at/over 95%.
+# bar_glyphs -- echo just the 20-cell ▐█░▌ bar for a percent. $2 overrides the
+# fill colour; without it the fill is terracotta, turning red at/over 95%.
 bar_glyphs() {
     local p="$1" fill="${2:-}"
     [[ "$p" =~ ^[0-9]+$ ]] || { printf '%s(n/a)%s' "$BAR_EMPTY" "$BAR_RST"; return 0; }
@@ -142,7 +142,6 @@ bar_glyphs() {
 }
 
 # render_bar -- one usage bar line. Args: label percent reset_at [date_fmt].
-#   "  5h   ▐██████████░░░░░░░░░░▌  34%  resets 19:29"
 render_bar() {
     local label="$1" pct="$2" reset_at="${3:-}" date_fmt="${4:-+%H:%M}"
     if ! [[ "$pct" =~ ^[0-9]+$ ]]; then
@@ -184,8 +183,8 @@ usage_bars() {
     return 0
 }
 
-# ── Disk gauge ──────────────────────────────────────────────────────────────
-# human_bytes -- compact IEC size for a byte count (e.g. 3.2G, 512M, 0B).
+# ── Size formatting ───────────────────────────────────────────────────────────
+# human_bytes -- compact size for a byte count (e.g. 3.2G, 512M, 0B).
 human_bytes() {
     awk -v b="${1:-0}" 'BEGIN{
         split("B K M G T P", u, " "); i=1;
@@ -193,12 +192,222 @@ human_bytes() {
         if (i == 1) printf "%d%s", b, u[i]; else printf "%.1f%s", b, u[i] }'
 }
 
-# disk_compute -- the heavy part, run in the BACKGROUND into the cache: the
-# primary checkout's footprint (excluding nested worktrees), per-worktree sizes,
-# and docker's own disk breakdown. Emits one TSV record per line:
-#   MAIN <bytes>
-#   DKR  <Type> <Size> <Reclaimable>          (only if docker is present)
-#   WT   <label> <bytes>                       (one per worktree, primary excluded)
+# fmt_docker_size -- normalise docker's verbose size strings ("21.26GB", "0B",
+# "4.396GB") to the compact human_bytes style ("21.3G", "0B", "4.4G").
+fmt_docker_size() {  # $1 = docker size string
+    local s="$1" num unit
+    [[ "$s" =~ ^([0-9.]+)([A-Za-z]+)?$ ]] || { printf '%s' "$s"; return 0; }
+    num="${BASH_REMATCH[1]}"; unit="${BASH_REMATCH[2]:-B}"
+    case "$unit" in
+        B|b)            printf '%d%s' "${num%.*}" B; return 0 ;;
+        kB|KB|K|kiB|KiB) unit=K ;;
+        MB|M|MiB)       unit=M ;;
+        GB|G|GiB)       unit=G ;;
+        TB|T|TiB)       unit=T ;;
+        PB|P|PiB)       unit=P ;;
+        *)              unit="${unit:0:1}" ;;
+    esac
+    printf '%.1f%s' "$num" "$unit"
+}
+
+# ── Generic background-refreshed cache ───────────────────────────────────────
+# cache_refresh_if_stale -- non-blocking: if CACHE is older than TTL, kick a
+# single background run of FN into the cache (atomic mkdir lock) and return at
+# once. The current frame renders from whatever the cache already holds, so a
+# slow collector (du, docker, the task scan) never blocks a paint.
+cache_refresh_if_stale() {  # $1 cache  $2 ttl  $3 compute-fn
+    local cache="$1" ttl="$2" fn="$3" age=999999
+    [[ -f "$cache" ]] && age=$(( $(date +%s) - $(stat -c %Y "$cache" 2>/dev/null || echo 0) ))
+    (( age < ttl )) && return 0
+    local lock="$cache.lock"
+    if [[ -d "$lock" ]]; then   # clear a lock left by a refresh that died
+        local lage; lage=$(( $(date +%s) - $(stat -c %Y "$lock" 2>/dev/null || echo 0) ))
+        (( lage > 300 )) && rmdir "$lock" 2>/dev/null || true
+    fi
+    if mkdir "$lock" 2>/dev/null; then
+        # Redirect the child's fds away from any inherited pipe so a frame built
+        # via `$(...)` / mapfile never blocks on EOF until the worker exits.
+        { "$fn" >| "$cache.tmp" 2>/dev/null && mv -f "$cache.tmp" "$cache"; \
+            rmdir "$lock" 2>/dev/null; } </dev/null >/dev/null 2>&1 &
+        disown 2>/dev/null || true
+    fi
+    return 0
+}
+
+cache_age() {  # $1 cache -> seconds since mtime, or empty if absent
+    [[ -f "$1" ]] || { printf ''; return 0; }
+    printf '%d' "$(( $(date +%s) - $(stat -c %Y "$1" 2>/dev/null || echo 0) ))"
+}
+
+USAGE_BIN="${ARACHNE_USAGE:-$REPO_ROOT/scripts/arachne-usage}"
+TASK_BIN="${ARACHNE_TASK:-$REPO_ROOT/scripts/arachne-task}"
+
+# MAIN_ROOT is the PRIMARY checkout (where .worktrees/ lives), resolved from git
+# so caches/keys are correct even when the monitor runs from inside a worktree.
+MAIN_ROOT="${ARACHNE_MONITOR_MAIN_ROOT:-}"
+if [[ -z "$MAIN_ROOT" ]]; then
+    MAIN_ROOT="$(git -C "$REPO_ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+    MAIN_ROOT="${MAIN_ROOT%/.git}"; MAIN_ROOT="${MAIN_ROOT%/.git/}"
+    [[ -z "$MAIN_ROOT" || ! -d "$MAIN_ROOT" ]] && MAIN_ROOT="$REPO_ROOT"
+fi
+
+# The pump state + run notes live in the PRIMARY checkout (the pump always runs
+# from main), so resolve against MAIN_ROOT — the monitor then shows the live
+# pump even when run from a worktree. Override wins.
+PUMP_STATE="${ARACHNE_PUMP_STATE_FILE:-$MAIN_ROOT/.arachne-pump.state}"
+CACHE_KEY="$(printf '%s' "$MAIN_ROOT" | cksum | cut -d' ' -f1)"
+CACHE_BASE="${TMPDIR:-/tmp}/arachne-monitor"
+
+# Disk gauge config (free-space colour thresholds mirror arachne-disk-watchdog).
+DISK_TTL="${ARACHNE_MONITOR_DISK_TTL:-60}"          # heavy-sizing cache freshness (s)
+DISK_PANIC_GB="${ARACHNE_MONITOR_DISK_PANIC_GB:-5}"
+DISK_PAUSE_GB="${ARACHNE_MONITOR_DISK_PAUSE_GB:-10}"
+DISK_CACHE="${ARACHNE_MONITOR_DISK_CACHE:-$CACHE_BASE-disk.$CACHE_KEY.tsv}"
+
+# Pump queue-count cache (the eligible-frontier scan is ~3s — far too slow to run
+# every 1s paint, so it is backgrounded on its own TTL).
+PUMP_TTL="${ARACHNE_MONITOR_PUMP_TTL:-8}"
+PUMP_CACHE="${ARACHNE_MONITOR_PUMP_CACHE:-$CACHE_BASE-pump.$CACHE_KEY.tsv}"
+
+# Docker session-table cache (docker ps + per-container log tails) — refreshed a
+# bit faster than the queue/disk since log freshness matters more.
+SESS_TTL="${ARACHNE_MONITOR_SESS_TTL:-2}"
+SESS_CACHE="${ARACHNE_MONITOR_SESS_CACHE:-$CACHE_BASE-sess.$CACHE_KEY.tsv}"
+
+TAIL_LINES="${ARACHNE_MONITOR_TAIL_LINES:-2}"   # feed lines per session (compact)
+
+# ── Notes field ──────────────────────────────────────────────────────────────
+# Scratchpad scoped to the current pump RUN (phases + started_at), so a new run
+# starts fresh. ARACHNE_MONITOR_NOTES_FILE overrides the resolved path (tests).
+NOTES_DIR="${ARACHNE_MONITOR_NOTES_DIR:-$MAIN_ROOT/.arachne-monitor-notes}"
+NOTES_TAIL="${ARACHNE_MONITOR_NOTES_TAIL:-3}"    # note lines shown in the panel
+NOTES_COLW="${ARACHNE_MONITOR_NOTES_COLW:-44}"   # max note width in the right column
+EDITOR_BIN="${VISUAL:-${EDITOR:-nvim}}"          # Ctrl-G / e popout target
+
+notes_run_key() {
+    [[ -f "$PUMP_STATE" ]] || { printf 'session'; return 0; }
+    local phases started slug ts
+    phases="$(jq -r '.phases // ""' "$PUMP_STATE" 2>/dev/null || echo '')"
+    started="$(jq -r '.started_at // ""' "$PUMP_STATE" 2>/dev/null || echo '')"
+    [[ -n "$phases$started" ]] || { printf 'session'; return 0; }
+    slug="$(printf '%s' "$phases" | tr -c 'A-Za-z0-9' '-')"; slug="${slug##-}"; slug="${slug%%-}"
+    ts="$(printf '%s' "$started" | tr -dc '0-9')"
+    printf '%s' "${slug:-run}${ts:+-$ts}"
+}
+
+notes_file() {
+    [[ -n "${ARACHNE_MONITOR_NOTES_FILE:-}" ]] && { printf '%s' "$ARACHNE_MONITOR_NOTES_FILE"; return 0; }
+    printf '%s/%s.md' "$NOTES_DIR" "$(notes_run_key)"
+}
+
+notes_label() {
+    if [[ -f "$PUMP_STATE" ]]; then
+        local phases; phases="$(jq -r '.phases // ""' "$PUMP_STATE" 2>/dev/null || echo '')"
+        [[ -n "$phases" ]] && { printf '%s' "$phases"; return 0; }
+    fi
+    printf 'session'
+}
+
+append_note() {
+    local text="$1" f; f="$(notes_file)"
+    [[ -n "${text//[[:space:]]/}" ]] || return 0
+    mkdir -p "$(dirname "$f")" 2>/dev/null || true
+    printf -- '- %s  %s\n' "$(date '+%H:%M')" "$text" >> "$f" 2>/dev/null || true
+}
+
+# notes_panel_lines -- the RIGHT column: a header naming the run scope + the most
+# recent NOTES_TAIL note lines (each truncated to NOTES_COLW), or an empty hint.
+notes_panel_lines() {
+    local f label; f="$(notes_file)"; label="$(notes_label)"
+    printf 'Notes [%s]  %s(n · C-g)%s\n' "$label" "$BAR_EMPTY" "$BAR_RST"
+    if [[ -s "$f" ]]; then
+        local ln
+        while IFS= read -r ln; do
+            [[ -n "${ln//[[:space:]]/}" ]] || continue
+            (( ${#ln} > NOTES_COLW )) && ln="${ln:0:$((NOTES_COLW - 1))}…"
+            printf '%s\n' "$ln"
+        done < <(tail -n "$NOTES_TAIL" "$f" 2>/dev/null)
+    else
+        printf '%s(no notes yet — press n)%s\n' "$BAR_EMPTY" "$BAR_RST"
+    fi
+}
+
+# ── Pump summary (cached eligible count) ─────────────────────────────────────
+# pump_compute -- BACKGROUND worker: the slow eligible-frontier scan + open count.
+pump_compute() {
+    [[ -f "$PUMP_STATE" ]] || { printf ''; return 0; }
+    local phases; phases="$(jq -r '.phases // ""' "$PUMP_STATE" 2>/dev/null || echo '')"
+    [[ -n "$phases" && -x "$TASK_BIN" ]] || { printf ''; return 0; }
+    local elig open
+    elig="$("$TASK_BIN" ready --phases "$phases" --count-eligible 2>/dev/null || true)"
+    open="$("$TASK_BIN" ready --phases "$phases" --count 2>/dev/null || true)"
+    printf 'ELIG\t%s\nOPEN\t%s\n' "${elig:-}" "${open:-}"
+}
+
+# pump_summary_line -- the pump status line (range · status · ready/open · usage
+# · reset). Eligible comes from the cached scan (background-refreshed); open
+# prefers the pump's own snapshot field, else the cache. $1 = usage json blob.
+pump_summary_line() {
+    [[ -f "$PUMP_STATE" ]] || return 0
+    local uj="${1:-{}}" phases status reason open_ct ceiling
+    # Read one field per line via mapfile — NOT `read -r a b c` on a @tsv line.
+    # Tab is IFS-whitespace, so an empty middle field (paused_reason when not
+    # paused) would collapse and shift open_tasks/ceiling over by one. Newline-
+    # delimited + mapfile preserves empty fields.
+    local _pf; mapfile -t _pf < <(jq -r \
+        '(.phases//"?"),(.status//"?"),(.paused_reason//""),((.open_tasks // "")|tostring),((.ceiling // "")|tostring)' \
+        "$PUMP_STATE" 2>/dev/null || true)
+    phases="${_pf[0]:-?}"; status="${_pf[1]:-?}"; reason="${_pf[2]:-}"
+    open_ct="${_pf[3]:-}"; ceiling="${_pf[4]:-}"
+    [[ -z "${phases:-}" ]] && phases="?"
+    [[ -z "${status:-}" ]] && status="?"
+
+    cache_refresh_if_stale "$PUMP_CACHE" "$PUMP_TTL" pump_compute
+    local eligible="…" cached_open=""
+    if [[ -f "$PUMP_CACHE" ]]; then
+        eligible="$(awk -F'\t' '$1=="ELIG"{print $2; exit}' "$PUMP_CACHE" 2>/dev/null)"
+        cached_open="$(awk -F'\t' '$1=="OPEN"{print $2; exit}' "$PUMP_CACHE" 2>/dev/null)"
+        [[ -z "$eligible" ]] && eligible="?"
+    fi
+    [[ -z "${open_ct:-}" || "$open_ct" == "null" ]] && open_ct="$cached_open"
+    [[ -z "${open_ct:-}" ]] && open_ct="?"
+
+    # usage percent + reset from the already-fetched blob (one jq, not per-window).
+    local pct reset
+    IFS=$'\t' read -r pct reset < <(jq -r \
+        '[(.bind_percent//"?"), ((.reset_at//"") | sub(".*T(?<h>[0-9]{2}:[0-9]{2}).*"; "\(.h)"))] | @tsv' \
+        <<<"$uj" 2>/dev/null || true)
+    [[ -z "${pct:-}" ]] && pct="?"
+
+    local color
+    case "$status" in
+        paused)  color='\033[33m' ;;   # yellow
+        drained) color='\033[32m' ;;   # green
+        *)       color='\033[36m' ;;   # cyan
+    esac
+    local rcolor='\033[90m'
+    if [[ "$open_ct" =~ ^[0-9]+$ && "$open_ct" -eq 0 ]]; then
+        rcolor='\033[32m'
+    elif [[ "$eligible" =~ ^[0-9]+$ && "$open_ct" =~ ^[0-9]+$ && "$eligible" -eq 0 && "$open_ct" -gt 0 ]]; then
+        rcolor='\033[31m'   # STALL: work queued, nothing launchable
+    elif [[ "$eligible" =~ ^[0-9]+$ && "$eligible" -gt 0 ]]; then
+        rcolor='\033[36m'
+    fi
+
+    local line
+    line="$(printf 'pump[%s]: %b%s\033[0m' "$phases" "$color" "$status")"
+    [[ "$status" == "paused" && -n "${reason:-}" ]] && line+=" — $reason"
+    line+="$(printf '  |  %b%s ready\033[0m · %s open' "$rcolor" "$eligible" "$open_ct")"
+    line+="  |  usage ${pct}%"
+    [[ -n "${ceiling:-}" && "$ceiling" != "null" ]] && line+="/${ceiling}%"
+    [[ -n "${reset:-}" ]] && line+="  resets ${reset}"
+    printf '%b\n' "$line"
+    return 0
+}
+
+# ── Disk gauge ───────────────────────────────────────────────────────────────
+# disk_compute -- BACKGROUND worker: primary footprint, per-worktree sizes, and
+# docker's disk breakdown. One TSV record per line (MAIN/DKR/WT).
 disk_compute() {
     local main_b
     main_b="$(du -sb --exclude="$MAIN_ROOT/.worktrees" "$MAIN_ROOT" 2>/dev/null | awk '{print $1}')"
@@ -209,54 +418,22 @@ disk_compute() {
                   [[ -n "$dt" ]] && printf 'DKR\t%s\t%s\t%s\n' "$dt" "$ds" "$dr"
               done
     fi
-    # Enumerate worktrees from git (absolute paths); the first entry is the
-    # primary checkout, already counted as MAIN, so drop it.
     git -C "$MAIN_ROOT" worktree list --porcelain 2>/dev/null \
         | awk '/^worktree /{print $2}' | tail -n +2 \
         | while IFS= read -r wt; do
               [[ -d "$wt" ]] || continue
               wb="$(du -sb "$wt" 2>/dev/null | awk '{print $1}')"
-              label="${wt#"$MAIN_ROOT/.worktrees/"}"
-              printf 'WT\t%s\t%s\n' "$label" "${wb:-0}"
+              printf 'WT\t%s\t%s\n' "${wt#"$MAIN_ROOT/.worktrees/"}" "${wb:-0}"
           done
 }
 
-# disk_refresh_if_stale -- non-blocking: if the cache is older than DISK_TTL,
-# kick a single background refresh (guarded by an atomic mkdir lock) and return
-# immediately. The current frame renders from whatever the cache already holds.
-disk_refresh_if_stale() {
-    local age=999999
-    [[ -f "$DISK_CACHE" ]] && age=$(( $(date +%s) - $(stat -c %Y "$DISK_CACHE" 2>/dev/null || echo 0) ))
-    (( age < DISK_TTL )) && return 0
-    local lock="$DISK_CACHE.lock"
-    if [[ -d "$lock" ]]; then   # clear a lock left by a refresh that died
-        local lage; lage=$(( $(date +%s) - $(stat -c %Y "$lock" 2>/dev/null || echo 0) ))
-        (( lage > 300 )) && rmdir "$lock" 2>/dev/null || true
-    fi
-    if mkdir "$lock" 2>/dev/null; then
-        # Redirect the child's stdin/out/err away from any inherited pipe — else a
-        # frame built via `frame="$(render_all)"` would block on EOF until the
-        # background du(1) exits, defeating the whole non-blocking design.
-        { disk_compute >| "$DISK_CACHE.tmp" 2>/dev/null \
-            && mv -f "$DISK_CACHE.tmp" "$DISK_CACHE"; rmdir "$lock" 2>/dev/null; } \
-            </dev/null >/dev/null 2>&1 &
-        disown 2>/dev/null || true
-    fi
-    return 0
-}
-
-# disk_section -- the visible block: a live free-space bar (df, every redraw)
-# plus a cached summary line (worktrees total/count · primary · docker) and the
-# largest worktrees, so the target/ accumulation that fills `/` is legible.
-disk_section() {
+# disk_bar_line -- the live free-space bar (df is instant, so always current).
+disk_bar_line() {
     [[ "$SHOW_DISK" -eq 1 ]] || return 0
-    # Live free-space bar — df is instant, so this is always current.
     local fields total_kb avail_kb
     fields="$(df -Pk "$MAIN_ROOT" 2>/dev/null | awk 'NR==2{print $2, $4}')"
     read -r total_kb avail_kb <<<"$fields"
-    if [[ -z "${total_kb:-}" || -z "${avail_kb:-}" || "$total_kb" -eq 0 ]]; then
-        return 0   # df unavailable — skip the gauge rather than render garbage
-    fi
+    [[ -n "${total_kb:-}" && -n "${avail_kb:-}" && "$total_kb" -ne 0 ]] || return 0
     local used_pct=$(( (total_kb - avail_kb) * 100 / total_kb ))
     local free_gb=$(( avail_kb / 1024 / 1024 ))
     local fillcol="$BAR_FILL"
@@ -266,54 +443,49 @@ disk_section() {
         "$GAUGE_INDENT" "$GAUGE_LABEL_W" "Disk" "$(bar_glyphs "$used_pct" "$fillcol")" \
         "$BAR_EMPTY" "$(human_bytes $(( avail_kb * 1024 )))" "$BAR_RST" \
         "$(human_bytes $(( total_kb * 1024 )))" "$used_pct"
+}
 
-    # Cached heavy sizing (kicks a background refresh when stale).
-    disk_refresh_if_stale
+# disk_subinfo_line -- the cached footprint summary (worktrees total · main ·
+# docker), abbreviated. Kicks the background sizing refresh when stale.
+disk_subinfo_line() {
+    [[ "$SHOW_DISK" -eq 1 ]] || return 0
+    cache_refresh_if_stale "$DISK_CACHE" "$DISK_TTL" disk_compute
     if [[ ! -f "$DISK_CACHE" ]]; then
-        printf '%s%ssizing worktrees…%s\n\n' "$GAUGE_SUBINDENT" "$BAR_EMPTY" "$BAR_RST"
+        printf '%s%ssizing worktrees…%s\n' "$GAUGE_SUBINDENT" "$BAR_EMPTY" "$BAR_RST"
         return 0
     fi
-    local age; age=$(( $(date +%s) - $(stat -c %Y "$DISK_CACHE" 2>/dev/null || echo 0) ))
-    local main_b wt_total=0 wt_count=0
+    local main_b wt_total=0 wt_count=0 wb
     main_b="$(awk -F'\t' '$1=="MAIN"{print $2; exit}' "$DISK_CACHE" 2>/dev/null)"
     while IFS=$'\t' read -r _ _ wb; do
         [[ "$wb" =~ ^[0-9]+$ ]] || continue
         wt_total=$(( wt_total + wb )); wt_count=$(( wt_count + 1 ))
     done < <(awk -F'\t' '$1=="WT"' "$DISK_CACHE" 2>/dev/null)
-    # docker one-liner from the DKR rows (short type names).
-    local dline
-    dline="$(awk -F'\t' '$1=="DKR"{
-        t=$2; sub("Images","img",t); sub("Containers","cont",t);
-        sub("Local Volumes","vol",t); sub("Build Cache","cache",t);
-        c++; printf "%s%s %s", (c>1?" · ":""), t, $3 }' "$DISK_CACHE" 2>/dev/null)"
+    local dline="" first=1 dtype dsize short
+    while IFS=$'\t' read -r _ dtype dsize _; do
+        [[ -n "$dtype" ]] || continue
+        case "$dtype" in
+            Images)          short=img ;;
+            Containers)      short=cont ;;
+            "Local Volumes") short=vol ;;
+            "Build Cache")   short=cache ;;
+            *)               short="$dtype" ;;
+        esac
+        (( first )) && first=0 || dline+=" · "
+        dline+="$short $(fmt_docker_size "$dsize")"
+    done < <(awk -F'\t' '$1=="DKR"' "$DISK_CACHE" 2>/dev/null)
+    local age; age="$(cache_age "$DISK_CACHE")"
     printf '%s%sworktrees%s %s in %d   %smain%s %s' \
         "$GAUGE_SUBINDENT" "$BAR_EMPTY" "$BAR_RST" "$(human_bytes "$wt_total")" "$wt_count" \
         "$BAR_EMPTY" "$BAR_RST" "$(human_bytes "${main_b:-0}")"
     [[ -n "$dline" ]] && printf '   %sdocker%s %s' "$BAR_EMPTY" "$BAR_RST" "$dline"
-    printf '   %s(updated %ds ago)%s\n' "$BAR_EMPTY" "$age" "$BAR_RST"
-
-    # Largest worktrees (the target/ accumulation offenders), top DISK_TOP_N.
-    if (( wt_count > 0 )); then
-        local largest
-        largest="$(awk -F'\t' '$1=="WT"{print $3"\t"$2}' "$DISK_CACHE" 2>/dev/null \
-            | sort -rn | head -n "$DISK_TOP_N")"
-        local line2="${GAUGE_SUBINDENT}largest:" name bytes
-        while IFS=$'\t' read -r bytes name; do
-            [[ -n "$name" ]] || continue
-            line2+=" $name $(human_bytes "$bytes") ·"
-        done <<<"$largest"
-        line2="${line2% ·}"
-        (( wt_count > DISK_TOP_N )) && line2+="  ${BAR_EMPTY}(+$(( wt_count - DISK_TOP_N )) more)${BAR_RST}"
-        printf '%s\n' "$line2"
-    fi
+    [[ -n "$age" ]] && printf '   %s(updated %ss ago)%s' "$BAR_EMPTY" "$age" "$BAR_RST"
     printf '\n'
     return 0
 }
 
-TAIL_LINES=4   # max log-tail lines per session (blanks are skipped, not padded)
-
+# ── Session table (cached docker ps + log tails) ─────────────────────────────
 # log_events -- up to $TAIL_LINES recent single-line meaningful events from a
-# stream-json log. Best-effort; never errors the caller (used under pipefail).
+# stream-json log. Best-effort; never errors the caller.
 log_events() {  # $1 = log file
     local logf="$1" out
     out="$(tail -200 "$logf" 2>/dev/null \
@@ -327,248 +499,30 @@ log_events() {  # $1 = log file
     printf '%s' "$out"
 }
 
-# render_session -- one header line + a fixed TAIL_LINES tail area.
-# Args: name cstate tstat task up age stale width ; stdin = log lines.
-render_session() {
-    local name="$1" cstate="$2" tstat="$3" task="$4" up="$5" age="$6" stale="$7" width="$8"
-    local dot age_c
-    case "$cstate" in
-        running) dot=$'\033[36m●\033[0m' ;;   # cyan
-        *)       dot=$'\033[90m●\033[0m' ;;    # grey
-    esac
-    if [[ "$stale" == "1" ]]; then age_c=$'\033[31m'"$age"$'\033[0m'; else age_c="$age"; fi
-    printf '%b %-11s [%s] %s  up %s  log %s\n' \
-        "$dot" "$name" "$(colorize "$cstate")" "${task}:$(colorize "$tstat")" "$up" "$age_c"
-    local -a lines=(); local ln
-    while IFS= read -r ln; do
-        [[ -z "${ln// }" ]] && continue   # skip blank lines, don't pad
-        lines+=("$ln")
-    done
-    # keep only the most recent TAIL_LINES
-    if [[ "${#lines[@]}" -gt "$TAIL_LINES" ]]; then
-        lines=("${lines[@]: -$TAIL_LINES}")
-    fi
-    if [[ "${#lines[@]}" -eq 0 ]]; then
-        printf '    \033[90m(no log output yet)\033[0m\n'
-    else
-        for ln in "${lines[@]}"; do
-            printf '    \033[90m%s\033[0m\n' "$(printf '%s' "$ln" | cut -c1-"$((width - 4))")"
-        done
-    fi
-    echo   # one blank line between sessions
-}
-
-header() {  # $1 = optional suffix tag
-    local w; w="$(tput cols 2>/dev/null || echo 100)"; [[ "$w" -lt 40 ]] && w=100
-    echo "Arachne parallel agents — $(date '+%Y-%m-%d %H:%M:%S')${1:-}"
-    printf '%*s\n' "$w" '' | tr ' ' '-'
-}
-
-USAGE_BIN="${ARACHNE_USAGE:-$REPO_ROOT/scripts/arachne-usage}"
-TASK_BIN="${ARACHNE_TASK:-$REPO_ROOT/scripts/arachne-task}"
-PUMP_STATE="${ARACHNE_PUMP_STATE_FILE:-$REPO_ROOT/.arachne-pump.state}"
-
-# ── Disk gauge config ──────────────────────────────────────────────────────────
-# MAIN_ROOT is the PRIMARY checkout (where .worktrees/ lives), resolved from git
-# so the gauge is correct even when the monitor runs from inside a worktree.
-# Heavy sizing (du across worktrees + docker df) is cached with a TTL and
-# refreshed in the BACKGROUND, so a redraw never blocks on it. Free-space colour
-# thresholds mirror arachne-disk-watchdog (panic<5G, pause<10G, recover>20G).
-MAIN_ROOT="${ARACHNE_MONITOR_MAIN_ROOT:-}"
-if [[ -z "$MAIN_ROOT" ]]; then
-    MAIN_ROOT="$(git -C "$REPO_ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
-    MAIN_ROOT="${MAIN_ROOT%/.git}"; MAIN_ROOT="${MAIN_ROOT%/.git/}"
-    [[ -z "$MAIN_ROOT" || ! -d "$MAIN_ROOT" ]] && MAIN_ROOT="$REPO_ROOT"
-fi
-DISK_TTL="${ARACHNE_MONITOR_DISK_TTL:-60}"          # heavy-sizing cache freshness (s)
-DISK_TOP_N="${ARACHNE_MONITOR_DISK_TOP_N:-5}"       # largest worktrees to list
-DISK_PANIC_GB="${ARACHNE_MONITOR_DISK_PANIC_GB:-5}"
-DISK_PAUSE_GB="${ARACHNE_MONITOR_DISK_PAUSE_GB:-10}"
-DISK_RECOVER_GB="${ARACHNE_MONITOR_DISK_RECOVER_GB:-20}"
-DISK_CACHE="${ARACHNE_MONITOR_DISK_CACHE:-${TMPDIR:-/tmp}/arachne-monitor-disk.$(printf '%s' "$MAIN_ROOT" | cksum | cut -d' ' -f1).tsv}"
-
-# ── Notes field config ──────────────────────────────────────────────────────────
-# A free-text scratchpad scoped to the current pump RUN: keyed by the pump's
-# phase-range + start time, so a new run starts fresh (old runs' notes linger as
-# separate files, never clobbered). Falls back to a single "session" file when no
-# pump is running. ARACHNE_MONITOR_NOTES_FILE overrides the resolved path directly
-# (tests / power users); otherwise it is NOTES_DIR/<run>.md.
-NOTES_DIR="${ARACHNE_MONITOR_NOTES_DIR:-$MAIN_ROOT/.arachne-monitor-notes}"
-NOTES_TAIL="${ARACHNE_MONITOR_NOTES_TAIL:-4}"    # most recent note lines shown in the panel
-EDITOR_BIN="${VISUAL:-${EDITOR:-nvim}}"          # Ctrl-G / e popout target
-
-# notes_run_key -- a filesystem-safe slug identifying the current pump run, or
-# "session" when no pump state exists. Built from phases + started_at so the file
-# rotates (appears fresh) when a new run begins.
-notes_run_key() {
-    [[ -f "$PUMP_STATE" ]] || { printf 'session'; return 0; }
-    local phases started slug ts
-    phases="$(jq -r '.phases // ""' "$PUMP_STATE" 2>/dev/null || echo '')"
-    started="$(jq -r '.started_at // ""' "$PUMP_STATE" 2>/dev/null || echo '')"
-    [[ -n "$phases$started" ]] || { printf 'session'; return 0; }
-    slug="$(printf '%s' "$phases" | tr -c 'A-Za-z0-9' '-')"; slug="${slug##-}"; slug="${slug%%-}"
-    ts="$(printf '%s' "$started" | tr -dc '0-9')"
-    printf '%s' "${slug:-run}${ts:+-$ts}"
-}
-
-# notes_file -- resolved path to the current run's notes file (override wins).
-notes_file() {
-    [[ -n "${ARACHNE_MONITOR_NOTES_FILE:-}" ]] && { printf '%s' "$ARACHNE_MONITOR_NOTES_FILE"; return 0; }
-    printf '%s/%s.md' "$NOTES_DIR" "$(notes_run_key)"
-}
-
-# notes_label -- the run-scope label shown in the panel header.
-notes_label() {
-    if [[ -f "$PUMP_STATE" ]]; then
-        local phases; phases="$(jq -r '.phases // ""' "$PUMP_STATE" 2>/dev/null || echo '')"
-        [[ -n "$phases" ]] && { printf '%s' "$phases"; return 0; }
-    fi
-    printf 'session'
-}
-
-# append_note -- append one timestamped note line to the current run's file.
-append_note() {
-    local text="$1" f; f="$(notes_file)"
-    [[ -n "${text//[[:space:]]/}" ]] || return 0
-    mkdir -p "$(dirname "$f")" 2>/dev/null || true
-    printf -- '- %s  %s\n' "$(date '+%H:%M')" "$text" >> "$f" 2>/dev/null || true
-}
-
-# notes_section -- the visible Notes panel: a header naming the run scope + the
-# editing keys, then the most recent NOTES_TAIL lines (or a hint when empty).
-notes_section() {
-    local f label; f="$(notes_file)"; label="$(notes_label)"
-    printf 'Notes [%s]   %s(n add · e/C-g nvim)%s\n' "$label" "$BAR_EMPTY" "$BAR_RST"
-    if [[ -s "$f" ]]; then
-        local ln
-        while IFS= read -r ln; do
-            [[ -n "${ln//[[:space:]]/}" ]] || continue
-            printf '%s%s\n' "$GAUGE_INDENT" "$ln"
-        done < <(tail -n "$NOTES_TAIL" "$f" 2>/dev/null)
-    else
-        printf '%s%s(no notes yet — press n to add one)%s\n' "$GAUGE_INDENT" "$BAR_EMPTY" "$BAR_RST"
-    fi
-    printf '\n'
-    return 0
-}
-
-# pump_status_line -- when the usage-governed pump (scripts/arachne-pump) is
-# running, show its range + status + (if paused) the reason, the queue depth
-# (eligible frontier vs open-in-range), plus the live Max-plan utilization and
-# the reset time. Silent when no pump state exists, so the monitor is unchanged
-# for plain manifest runs. Best-effort (never errors the caller under the watch
-# loop's set -e).
-#
-# Queue legibility (the A7 fix): "ready" must mean the ELIGIBLE FRONTIER — tasks
-# that can launch right now (open ∧ blockers done ∧ unclaimed) — not open-in-range
-# (the drain test). They diverge during a stall: work is queued but a cross-phase
-# blocker or orphaned claim leaves nothing launchable. Showing both, and colouring
-# "0 ready · N open" distinctly, makes that stall legible at a glance.
-pump_status_line() {
-    [[ -f "$PUMP_STATE" ]] || return 0
-    local phases status reason pct reset
-    phases="$(jq -r '.phases // "?"' "$PUMP_STATE" 2>/dev/null || echo '?')"
-    status="$(jq -r '.status // "?"' "$PUMP_STATE" 2>/dev/null || echo '?')"
-    reason="$(jq -r '.paused_reason // ""' "$PUMP_STATE" 2>/dev/null || echo '')"
-
-    # Eligible frontier (ready) vs open-in-range. Prefer the pump's own snapshot
-    # fields when present; otherwise query the canonical ledger live (the pump on
-    # this branch persists open_tasks but not eligible_tasks, so eligible is
-    # computed here — which is also a real-time count, not a post-tick snapshot).
-    local eligible open_ct
-    eligible="$(jq -r '.eligible_tasks // empty' "$PUMP_STATE" 2>/dev/null || true)"
-    open_ct="$(jq -r '.open_tasks // empty' "$PUMP_STATE" 2>/dev/null || true)"
-    if [[ -x "$TASK_BIN" && -n "$phases" && "$phases" != "?" ]]; then
-        if [[ -z "$eligible" ]]; then
-            eligible="$("$TASK_BIN" ready --phases "$phases" --count-eligible 2>/dev/null || true)"
-        fi
-        if [[ -z "$open_ct" ]]; then
-            open_ct="$("$TASK_BIN" ready --phases "$phases" --count 2>/dev/null || true)"
-        fi
-    fi
-    [[ -z "$eligible" ]] && eligible="?"
-    [[ -z "$open_ct" ]] && open_ct="?"
-
-    # One usage fetch per redraw: derive the binding percent, the reset clock, and
-    # the per-window bars all from a single --json payload (was two subprocess
-    # calls — --percent and --json — every paint).
-    pct="?"; reset=""
-    local usage_json="{}"
-    if [[ -x "$USAGE_BIN" ]]; then
-        usage_json="$("$USAGE_BIN" --json 2>/dev/null || echo '{}')"
-        pct="$(jq -r '.bind_percent // "?"' <<<"$usage_json" 2>/dev/null || echo '?')"
-        reset="$(jq -r '.reset_at // empty' <<<"$usage_json" 2>/dev/null \
-                  | sed -E 's/.*T([0-9]{2}:[0-9]{2}).*/\1/' || true)"
-    fi
-    local color line
-    case "$status" in
-        paused)  color='\033[33m' ;;   # yellow
-        drained) color='\033[32m' ;;   # green
-        *)       color='\033[36m' ;;   # cyan
-    esac
-
-    # Colour the ready count by queue health: green when fully drained
-    # (open == 0), red when stalled (0 eligible while open > 0), cyan when there
-    # is an actionable frontier, grey when the count is unknown.
-    local rcolor='\033[90m'
-    if [[ "$open_ct" =~ ^[0-9]+$ && "$open_ct" -eq 0 ]]; then
-        rcolor='\033[32m'   # drained: no open work left
-    elif [[ "$eligible" =~ ^[0-9]+$ && "$open_ct" =~ ^[0-9]+$ && "$eligible" -eq 0 && "$open_ct" -gt 0 ]]; then
-        rcolor='\033[31m'   # STALL: work queued, nothing launchable
-    elif [[ "$eligible" =~ ^[0-9]+$ && "$eligible" -gt 0 ]]; then
-        rcolor='\033[36m'   # actionable frontier
-    fi
-
-    # Pull the ceiling from the pump's own state so the summary shows headroom.
-    local ceiling; ceiling="$(jq -r '.ceiling // empty' "$PUMP_STATE" 2>/dev/null || true)"
-
-    line="$(printf 'pump[%s]: %b%s\033[0m' "$phases" "$color" "$status")"
-    [[ "$status" == "paused" && -n "$reason" ]] && line+=" — $reason"
-    line+="$(printf '  |  %b%s ready\033[0m · %s open' "$rcolor" "$eligible" "$open_ct")"
-    line+="  |  usage ${pct}%"
-    [[ -n "$ceiling" ]] && line+="/${ceiling}%"
-    [[ -n "$reset" ]] && line+="  resets ${reset}"
-    printf '%b\n' "$line"
-    # The two usage bars, in the toolbar's format, directly under the summary.
-    usage_bars "$usage_json"
-    printf '\n'
-    return 0
-}
-
-term_width() { local w; w="$(tput cols 2>/dev/null || echo 100)"; [[ "$w" -lt 40 ]] && w=100; echo "$w"; }
-
-snapshot() {
-    local width; width="$(term_width)"
-    header
-    if [[ -f "$PUMP_STATE" ]]; then
-        pump_status_line
-    else
-        # No pump running (e.g. a manifest run): still surface the usage bars.
-        local ub; ub="$(usage_bars)"
-        [[ -n "$ub" ]] && printf '%s\n\n' "$ub"
-    fi
-    disk_section
-    notes_section
-    local found=0
+# sessions_compute -- BACKGROUND worker: docker ps + per-container metadata + log
+# tails, plus flagged epics. Emits records for sessions_lines to format cheaply:
+#   S <name> <cstate> <tstat> <task> <up> <age> <stale>
+#   L <logline>                      (belongs to the most recent S)
+#   N 1                              (no containers)
+#   F <task> <name> <status>         (blocked/stuck/needs-review epic)
+sessions_compute() {
+    local found=0 cname state status
     while IFS='|' read -r cname state status; do
-        [[ -z "$cname" ]] && continue
-        [[ "$cname" == arachne-agent* ]] || continue
+        [[ -z "$cname" || "$cname" != arachne-agent* ]] && continue
         found=1
         local slug="${cname#arachne-agent-}"
         local name="${SLUG_NAME[$slug]:-$slug}"
         local task="${SLUG_TASK[$slug]:-—}"
         local tstat="-"; [[ "$task" != "—" ]] && tstat="$(task_status "$task")"
         local cstate="running"; [[ "$state" != "running" ]] && cstate="exited"
-        local up; up="$(echo "$status" | sed -E 's/^(Up|Exited[^ ]*) //; s/ ago$//' | cut -c1-11)"
-        # Resolve the log path from the BRANCH (worktrees with '/' in the branch
-        # are nested dirs). Fall back to a find for off-manifest slugs.
+        local up; up="$(printf '%s' "$status" | sed -E 's/^(Up|Exited[^ ]*) //; s/ ago$//' | cut -c1-11)"
         local logf="" branch="${SLUG_BRANCH[$slug]:-}"
         if [[ -n "$branch" ]]; then
             logf="$REPO_ROOT/.worktrees/$branch/.arachne-agent.log"
         else
-            local cand
+            local cand d
             while IFS= read -r cand; do
-                local d; d="$(dirname "$cand")"; d="${d#"$REPO_ROOT/.worktrees/"}"
+                d="$(dirname "$cand")"; d="${d#"$REPO_ROOT/.worktrees/"}"
                 [[ "${d//\//-}" == "$slug" ]] && { logf="$cand"; break; }
             done < <(find "$REPO_ROOT/.worktrees" -name .arachne-agent.log 2>/dev/null)
         fi
@@ -580,204 +534,343 @@ snapshot() {
                 [[ "$cstate" == running && "$secs" -gt 120 ]] && stale=1
             fi
         fi
-        log_events "$logf" \
-            | render_session "$name" "$cstate" "$tstat" "$task" "$up" "$age" "$stale" "$width"
+        printf 'S\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$cstate" "$tstat" "$task" "$up" "$age" "$stale"
+        local ln
+        while IFS= read -r ln; do
+            [[ -z "${ln// }" ]] && continue
+            printf 'L\t%s\n' "$ln"
+        done < <(log_events "$logf")
     done < <(docker ps -a --filter 'name=arachne-agent' --format '{{.Names}}|{{.State}}|{{.Status}}' 2>/dev/null)
-    [[ "$found" -eq 0 ]] && echo "(no arachne-agent containers running or recently exited)"
-    # Surface blocked/stuck/needs-review epics regardless of container state.
-    local flagged=""
+    [[ "$found" -eq 0 ]] && printf 'N\t1\n'
+    local slug t s
     for slug in "${!SLUG_TASK[@]}"; do
-        local t="${SLUG_TASK[$slug]}"; local s; s="$(task_status "$t")"
-        case "$s" in blocked|stuck|needs-review) flagged+="  $t (${SLUG_NAME[$slug]}): $s\n" ;; esac
+        t="${SLUG_TASK[$slug]}"; s="$(task_status "$t")"
+        case "$s" in blocked|stuck|needs-review) printf 'F\t%s\t%s\t%s\n' "$t" "${SLUG_NAME[$slug]}" "$s" ;; esac
     done
-    [[ -n "$flagged" ]] && { echo "Needs attention:"; printf "$flagged"; }
-    return 0   # never let a false trailing conditional abort the watch loop (set -e)
-}
-
-# demo -- synthetic sessions exercising every state, for iterating on the UI
-# without launching containers. Pure rendering; touches no docker, no logs.
-demo() {
-    local width; width="$(term_width)"
-    header "   [DEMO — synthetic data]"
-    # The red "0 ready" against "42 open" is the stall signature A7 makes legible.
-    printf 'pump[F55..F63]: \033[33mpaused\033[0m — bind_percent 95%% ≥ ceiling 95%%  |  \033[31m0 ready\033[0m · 42 open  |  usage 95%%/95%%  resets 21:00\n'
-    # Synthetic usage bars exercising the terracotta fill and the red critical fill.
-    render_bar "5h" 95 "" ""        # critical → red fill
-    render_bar "7d" 62 "" ""        # normal   → terracotta fill
-    printf '\n'
-    # Synthetic disk gauge: a near-full disk (amber free-space warning) plus the
-    # cached worktree/main/docker summary and the largest-worktree offenders.
-    printf '%s%-*s %s  %s8.4G free%s / 100G  (92%% used)\n' \
-        "$GAUGE_INDENT" "$GAUGE_LABEL_W" "Disk" "$(bar_glyphs 92 "$BAR_WARN")" "$BAR_EMPTY" "$BAR_RST"
-    printf '%s%sworktrees%s 22.4G in 14   %smain%s 4.1G   %sdocker%s img 6.2GB · cont 1.4GB · cache 1.4GB   %s(updated 18s ago)%s\n' \
-        "$GAUGE_SUBINDENT" "$BAR_EMPTY" "$BAR_RST" "$BAR_EMPTY" "$BAR_RST" "$BAR_EMPTY" "$BAR_RST" "$BAR_EMPTY" "$BAR_RST"
-    printf '%slargest: feat/f45 3.2G · feat/f43 3.0G · feat/f64 2.9G · feat/f53 2.8G · feat/f44 2.7G  %s(+9 more)%s\n\n' \
-        "$GAUGE_SUBINDENT" "$BAR_EMPTY" "$BAR_RST"
-    # Synthetic notes panel (the run-scoped scratchpad).
-    printf 'Notes [F55..F63]   %s(n add · e/C-g nvim)%s\n' "$BAR_EMPTY" "$BAR_RST"
-    printf '%s- 14:31  f55 disk 34.9G — cargo clean before the canary\n' "$GAUGE_INDENT"
-    printf '%s- 14:33  F41.9 comms blocked on creds — follow up\n\n' "$GAUGE_INDENT"
-    printf '%s\n' \
-        "Reading ops/planning/2026-04-13 - Integrations Roadmap.md" \
-        "⚙ Read crates/arachne-connectors/src/email/mod.rs" \
-        "Adding ImapSource block spec with an OAuth2 token field" \
-        "⚙ Bash cargo test -p arachne-connectors email::" \
-        "test imap::tests::parses_envelope ... ok" \
-      | render_session email running in_progress F41.1 "12 minutes" "3s" 0 "$width"
-    printf '%s\n' \
-        "⚙ Edit web/src/canvas/Node.tsx" \
-        "Wiring AgentConfidence.overall into the node confidence chip" \
-      | render_session agentic running in_progress F42.2 "47 minutes" "8s" 0 "$width"
-    printf '%s\n' \
-        "⚙ Bash cargo clippy --workspace -- -D warnings" \
-        "waiting on a long compile…" \
-      | render_session calendar running in_progress F41.2 "9 minutes" "318s" 1 "$width"
-    printf '%s\n' \
-        "✓ success" \
-        "Opened PR #214 against main" \
-        "⚙ Bash gh pr create -d -r tjmisko" \
-        "All tests green; web build green" \
-        "Marked F41.5 complete with commit shas" \
-      | render_session crm exited done F41.5 "2 minutes" "61s" 0 "$width"
-    printf '' \
-      | render_session messaging running in_progress F41.4 "20 seconds" "-" 0 "$width"
-    echo "Needs attention:"
-    printf '  %s\n' "F41.2 (calendar): running but log stale 318s"
     return 0
 }
 
-render_all() { if [[ "$DEMO" -eq 1 ]]; then demo; else snapshot; fi; }
-
-# ── Redraw instrumentation + flicker-free repaint ──────────────────────────────
-# _now_us -- microseconds since the epoch, locale-independent. EPOCHREALTIME is a
-# bash-5 builtin (no subprocess); fall back to date(1) on older shells.
-_now_us() {
-    if [[ -n "${EPOCHREALTIME:-}" ]]; then
-        printf '%s' "${EPOCHREALTIME//[^0-9]/}"
-    else
-        date +%s%6N 2>/dev/null || echo 0
-    fi
+session_header() {  # name cstate tstat task up age stale
+    local name="$1" cstate="$2" tstat="$3" task="$4" up="$5" age="$6" stale="$7" dot age_c
+    case "$cstate" in running) dot=$'\033[36m●\033[0m' ;; *) dot=$'\033[90m●\033[0m' ;; esac
+    if [[ "$stale" == "1" ]]; then age_c=$'\033[31m'"$age"$'\033[0m'; else age_c="$age"; fi
+    printf '%b %-10s [%s] %s  up %s  log %s\n' \
+        "$dot" "$name" "$(colorize "$cstate")" "${task}:$(colorize "$tstat")" "$up" "$age_c"
 }
 
-# log_redraw -- append one line per repaint to $MONITOR_LOG so the cadence and
-# cost of redraws are observable (this is what surfaces the flicker: compute_ms
-# is how long the frame takes to build — in legacy paint that whole window is a
-# blank screen; in batched paint the old frame stays up while it builds, and only
-# the tiny paint_ms touches the terminal). No-op unless --log / ARACHNE_MONITOR_LOG.
+# sessions_lines -- the SCROLLABLE region, formatted cheaply from the cache.
+sessions_lines() {  # $1 = width
+    local width="${1:-100}"
+    cache_refresh_if_stale "$SESS_CACHE" "$SESS_TTL" sessions_compute
+    if [[ ! -f "$SESS_CACHE" ]]; then
+        printf '%s(loading sessions…)%s\n' "$BAR_EMPTY" "$BAR_RST"
+        return 0
+    fi
+    local flagged="" rec a b c d e f g
+    while IFS=$'\t' read -r rec a b c d e f g; do
+        case "$rec" in
+            S) session_header "$a" "$b" "$c" "$d" "$e" "$f" "$g" ;;
+            L) printf '    \033[90m%s\033[0m\n' "${a:0:$((width - 4))}" ;;
+            N) printf '%s(no arachne-agent containers running or recently exited)%s\n' "$BAR_EMPTY" "$BAR_RST" ;;
+            F) flagged+="  $a ($b): $(colorize "$c")"$'\n' ;;
+        esac
+    done < "$SESS_CACHE"
+    if [[ -n "$flagged" ]]; then
+        printf '%sNeeds attention:%s\n' "$BAR_WARN" "$BAR_RST"
+        printf '%s' "$flagged"
+    fi
+    return 0
+}
+
+# ── Layout ───────────────────────────────────────────────────────────────────
+# Geometry: ARACHNE_MONITOR_COLS / _LINES pin the width/height (tests, or forcing
+# a layout); otherwise read the real terminal via tput, with sane fallbacks.
+term_width()  {
+    local w="${ARACHNE_MONITOR_COLS:-}"
+    [[ -z "$w" ]] && w="$(tput cols 2>/dev/null || echo 100)"
+    [[ "$w" =~ ^[0-9]+$ && "$w" -ge 40 ]] || w=100; echo "$w"
+}
+term_height() {
+    local h="${ARACHNE_MONITOR_LINES:-}"
+    [[ -z "$h" ]] && h="$(tput lines 2>/dev/null || echo 40)"
+    [[ "$h" =~ ^[0-9]+$ && "$h" -ge 6 ]] || h=40; echo "$h"
+}
+
+# hbar -- a string of W box-drawing dashes. Uses bash parameter substitution
+# (per-character, UTF-8 safe) instead of tr, which is byte-oriented and would
+# mangle the 3-byte '─' into garbage.
+hbar() { local w="$1" s; printf -v s '%*s' "$w" ''; printf '%s' "${s// /─}"; }
+
+header() {  # $1 = optional suffix tag
+    local w; w="$(term_width)"
+    echo "Arachne parallel agents — $(date '+%Y-%m-%d %H:%M:%S')${1:-}"
+    printf '%s%s%s\n' "$BAR_EMPTY" "$(hbar "$w")" "$BAR_RST"
+}
+
+# rule -- a dim full-width horizontal rule.
+rule() { local w; w="$(term_width)"; printf '%s%s%s\n' "$BAR_EMPTY" "$(hbar "$w")" "$BAR_RST"; }
+
+# compose_columns -- merge a LEFT line array and a RIGHT line array side by side,
+# right-aligning the right block to the screen edge. Falls back to stacking
+# (left lines, then right lines) when the terminal is too narrow.
+# Args: width  left-array-name  right-array-name.
+compose_columns() {
+    local W="$1"; local -n _L="$2"; local -n _R="$3"
+    local nL=${#_L[@]} nR=${#_R[@]} i vl
+    if (( nR == 0 )); then
+        for (( i=0; i<nL; i++ )); do printf '%s\n' "${_L[i]}"; done
+        return 0
+    fi
+    local left_w=0 notes_w=0
+    for (( i=0; i<nL; i++ )); do vl="$(vis_len "${_L[i]}")"; (( vl > left_w )) && left_w=$vl; done
+    for (( i=0; i<nR; i++ )); do vl="$(vis_len "${_R[i]}")"; (( vl > notes_w )) && notes_w=$vl; done
+    if (( left_w + 2 + notes_w <= W )); then
+        local notes_col=$(( W - notes_w )); (( notes_col < left_w + 2 )) && notes_col=$(( left_w + 2 ))
+        local rows=$(( nL > nR ? nL : nR )) lp rp lvl pad
+        for (( i=0; i<rows; i++ )); do
+            lp="${_L[i]:-}"; rp="${_R[i]:-}"
+            if [[ -n "$rp" ]]; then
+                lvl="$(vis_len "$lp")"; pad=$(( notes_col - lvl )); (( pad < 0 )) && pad=0
+                printf '%s%*s%s\n' "$lp" "$pad" '' "$rp"
+            else
+                printf '%s\n' "$lp"
+            fi
+        done
+    else
+        for (( i=0; i<nL; i++ )); do printf '%s\n' "${_L[i]}"; done
+        for (( i=0; i<nR; i++ )); do printf '%s\n' "${_R[i]}"; done
+    fi
+    return 0
+}
+
+# top_left_lines -- the left column: pump summary (if a pump is running) + usage
+# bars + the live Disk bar. $1 = usage json blob.
+top_left_lines() {
+    local uj="${1:-{}}"
+    [[ -f "$PUMP_STATE" ]] && pump_summary_line "$uj"
+    usage_bars "$uj"
+    disk_bar_line
+}
+
+# render_top -- the FIXED top region: title, two-column gauges/notes, disk
+# subinfo, and a closing rule. Cheap: reads caches + one usage fetch.
+render_top() {
+    local W; W="$(term_width)"
+    if (( DEMO )); then
+        header "   [DEMO — synthetic data]"
+        local -a L R
+        mapfile -t L < <(demo_left_lines)
+        mapfile -t R < <(demo_notes_lines)
+        compose_columns "$W" L R
+        demo_disk_subinfo
+        rule
+        return 0
+    fi
+    header
+    local uj='{}'
+    [[ -x "$USAGE_BIN" ]] && uj="$("$USAGE_BIN" --json 2>/dev/null || echo '{}')"
+    local -a L R
+    mapfile -t L < <(top_left_lines "$uj")
+    mapfile -t R < <(notes_panel_lines)
+    compose_columns "$W" L R
+    disk_subinfo_line
+    rule
+    return 0
+}
+
+# render_sessions -- the SCROLLABLE region.
+render_sessions() {  # $1 = width
+    local width="${1:-$(term_width)}"
+    if (( DEMO )); then demo_sessions "$width"; return 0; fi
+    sessions_lines "$width"
+}
+
+render_all() {  # one-shot / pipe: top then sessions, no viewport clipping
+    render_top
+    render_sessions "$(term_width)"
+}
+
+# ── Demo (synthetic preview; no docker, no caches) ───────────────────────────
+demo_left_lines() {
+    printf 'pump[F43..F63]: \033[36mrunning\033[0m  |  \033[36m8 ready\033[0m · 35 open  |  usage 65%%/95%%  resets 04:00\n'
+    render_bar "5h" 62 "" ""
+    render_bar "7d" 65 "" ""
+    printf '%s%-*s %s  %s60.5G free%s / 226.4G  (73%% used)\n' \
+        "$GAUGE_INDENT" "$GAUGE_LABEL_W" "Disk" "$(bar_glyphs 73 "$BAR_FILL")" "$BAR_EMPTY" "$BAR_RST"
+}
+demo_notes_lines() {
+    printf 'Notes [F43..F63]  %s(n · C-g)%s\n' "$BAR_EMPTY" "$BAR_RST"
+    printf -- '- 15:10  watch f55 disk — cargo clean\n'
+    printf -- '- 15:12  F41.9 comms blocked on creds\n'
+}
+demo_disk_subinfo() {
+    printf '%s%sworktrees%s 87.8G in 8   %smain%s 444.3M   %sdocker%s img 21.3G · cont 4.4G · vol 0B · cache 11.3G   %s(updated 8s ago)%s\n' \
+        "$GAUGE_SUBINDENT" "$BAR_EMPTY" "$BAR_RST" "$BAR_EMPTY" "$BAR_RST" "$BAR_EMPTY" "$BAR_RST" "$BAR_EMPTY" "$BAR_RST"
+}
+demo_sessions() {  # $1 = width — several sessions so scrolling is exercised
+    local width="$1" n l1 l2 cut=$(( width - 4 ))
+    l1="⚙ Edit web/src/canvas/Node.tsx"
+    l2="tsc is clean. Now run the full vitest suite to confirm no regressions."
+    for n in 56 45 57 55 54 53; do
+        session_header "feat-f$n" running in_progress "F$n.x" "$(( n - 30 )) minutes" "$(( n % 30 ))s" 0
+        printf '    \033[90m%s\033[0m\n' "${l1:0:$cut}"
+        printf '    \033[90m%s\033[0m\n' "${l2:0:$cut}"
+    done
+    printf '%sNeeds attention:%s\n' "$BAR_WARN" "$BAR_RST"
+    printf '  %s\n' "F41.9 (comms): blocked"
+    return 0
+}
+
+# ── Redraw instrumentation ───────────────────────────────────────────────────
+_now_us() {
+    if [[ -n "${EPOCHREALTIME:-}" ]]; then printf '%s' "${EPOCHREALTIME//[^0-9]/}"
+    else date +%s%6N 2>/dev/null || echo 0; fi
+}
 log_redraw() {  # n compute_us paint_us frame
     [[ -n "$MONITOR_LOG" ]] || return 0
     local n="$1" cus="$2" pus="$3" frame="$4" lines bytes ts
-    lines="$(printf '%s' "$frame" | wc -l | tr -d ' ')"
-    bytes="${#frame}"
+    lines="$(printf '%s' "$frame" | wc -l | tr -d ' ')"; bytes="${#frame}"
     ts="$(date '+%Y-%m-%dT%H:%M:%S')"
     printf '%s redraw=%-5s mode=%-7s interval=%ss compute_ms=%-5s paint_ms=%-4s lines=%-3s bytes=%s\n' \
-        "$ts" "$n" "$PAINT_MODE" "$INTERVAL" "$((cus / 1000))" "$((pus / 1000))" "$lines" "$bytes" \
+        "$ts" "$n" "batched" "$INTERVAL" "$((cus / 1000))" "$((pus / 1000))" "$lines" "$bytes" \
         >> "$MONITOR_LOG" 2>/dev/null || true
     return 0
 }
 
-# paint_frame -- repaint IN PLACE, never blanking the screen: home the cursor,
-# overwrite each row clearing any trailing chars (\033[K), then erase everything
-# below the last row (\033[J) to drop lines a taller previous frame left behind.
-# Because the screen is overwritten rather than cleared-then-filled, there is no
-# blank interval and therefore no flicker.
-paint_frame() {  # frame
-    local frame="$1" line
+# ── Scroll viewport paint ────────────────────────────────────────────────────
+SCROLL=0
+# paint_view -- repaint in place, clipped to the terminal: print the fixed top
+# region, then a scrolled window of the session lines, then a status bar. Never
+# prints more than $rows lines, so (with autowrap off) the terminal never
+# scrolls and the top never disappears. Clamps the global SCROLL.
+paint_view() {  # $1 top(text)  $2 sessions-array-name
+    local top="$1"; local -n _S="$2"
+    local rows cols; rows="$(term_height)"; cols="$(term_width)"
+    local -a T; mapfile -t T <<< "$top"
+    local top_h=${#T[@]} nS=${#_S[@]}
+    local avail=$(( rows - 1 )); (( avail < 1 )) && avail=1
+    local top_show=$(( top_h < avail ? top_h : avail ))
+    local sess_view=$(( avail - top_show )); (( sess_view < 0 )) && sess_view=0
+    local max_scroll=$(( nS - sess_view )); (( max_scroll < 0 )) && max_scroll=0
+    (( SCROLL > max_scroll )) && SCROLL=$max_scroll
+    (( SCROLL < 0 )) && SCROLL=0
+
     printf '\033[H'
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        printf '%s\033[K\n' "$line"
-    done <<< "$frame"
+    local i idx
+    for (( i=0; i<top_show; i++ )); do printf '%s\033[K\n' "${T[i]}"; done
+    for (( i=0; i<sess_view; i++ )); do
+        idx=$(( SCROLL + i ))
+        if (( idx < nS )); then printf '%s\033[K\n' "${_S[idx]}"; else printf '\033[K\n'; fi
+    done
+    # Status bar: keys + scroll position.
+    local pos=""
+    if (( nS > sess_view )); then
+        local last=$(( SCROLL + sess_view )); (( last > nS )) && last=$nS
+        pos="$(printf '  %d-%d/%d' $(( SCROLL + 1 )) "$last" "$nS")"
+        (( SCROLL < max_scroll )) && pos+=" ↓"
+        (( SCROLL > 0 )) && pos+=" ↑"
+    fi
+    printf '\033[7m %s%s \033[0m\033[K' \
+        "j/k ↑↓ scroll · g/G ends · n note · e/C-g nvim · q quit" "$pos"
     printf '\033[J'
+    return 0
 }
 
-# ── Interactive notes (watch mode) ──────────────────────────────────────────────
-# edit_in_nvim -- pop the notes file into $EDITOR (nvim), like Claude Code's
-# Ctrl-G. Leaves our alternate screen so the editor owns the terminal, then
-# re-enters and forces a clean full repaint on return.
+# ── Interactive notes (watch mode) ───────────────────────────────────────────
 edit_in_nvim() {  # file
     local f="$1"
     mkdir -p "$(dirname "$f")" 2>/dev/null || true
     [[ -e "$f" ]] || : >> "$f" 2>/dev/null || true
-    tput rmcup 2>/dev/null || true     # back to the normal screen
-    tput cnorm 2>/dev/null || true     # show the cursor for the editor
+    printf '\033[?7h' 2>/dev/null || true    # restore autowrap for the editor
+    tput rmcup 2>/dev/null || true
+    tput cnorm 2>/dev/null || true
     "$EDITOR_BIN" "$f" </dev/tty >/dev/tty 2>&1 || true
-    tput smcup 2>/dev/null || true     # re-enter our alternate screen
-    tput civis 2>/dev/null || true     # hide the cursor again
-    printf '\033[2J' 2>/dev/null || true   # next frame repaints from a clean slate
+    tput smcup 2>/dev/null || true
+    tput civis 2>/dev/null || true
+    printf '\033[?7l' 2>/dev/null || true    # autowrap off again
+    printf '\033[2J' 2>/dev/null || true
 }
 
-# notes_input_mode -- modal inline note entry at the bottom row. Printable keys
-# append, Backspace deletes, Enter saves the line, Esc cancels, Ctrl-G saves
-# what's typed so far and opens the whole notes file in nvim.
 notes_input_mode() {
     local buf="" ch rows seq
-    rows="$(tput lines 2>/dev/null || echo 24)"
-    tput cnorm 2>/dev/null || true     # show the cursor while typing
+    rows="$(term_height)"
+    printf '\033[?7h' 2>/dev/null || true     # allow the cursor to track long input
+    tput cnorm 2>/dev/null || true
     while true; do
         printf '\033[%d;1H\033[K\033[36mnote>\033[0m %s' "$rows" "$buf"
-        # read -n1 consumes a newline as its delimiter and returns an EMPTY $ch
-        # (rc 0), so an empty read IS the Enter keypress (save). A non-zero rc is
-        # EOF/closed stdin → bail. CR survives in raw ttys, so keep that case too.
         if ! IFS= read -rsn1 ch; then break; fi
-        if [[ -z "$ch" ]]; then append_note "$buf"; break; fi
+        if [[ -z "$ch" ]]; then append_note "$buf"; break; fi      # Enter (delimiter → empty)
         case "$ch" in
-            $'\r')            append_note "$buf"; break ;;       # save (raw-tty Enter)
-            $'\x7f'|$'\x08')  buf="${buf%?}" ;;                  # Backspace
-            $'\x07')          append_note "$buf"; edit_in_nvim "$(notes_file)"; break ;;  # Ctrl-G
-            $'\x1b')          # Esc, or the lead byte of an arrow/escape seq. Swallow
-                              # a trailing sequence non-blockingly; a bare Esc cancels.
-                              seq=""; IFS= read -rsn2 -t 0.002 seq || true
+            $'\r')            append_note "$buf"; break ;;
+            $'\x7f'|$'\x08')  buf="${buf%?}" ;;
+            $'\x07')          append_note "$buf"; edit_in_nvim "$(notes_file)"; break ;;   # Ctrl-G
+            $'\x1b')          seq=""; IFS= read -rsn2 -t 0.002 seq || true
                               [[ -z "$seq" ]] && break ;;
             *)                buf+="$ch" ;;
         esac
     done
-    tput civis 2>/dev/null || true     # hide the cursor again
+    tput civis 2>/dev/null || true
+    printf '\033[?7l' 2>/dev/null || true
+}
+
+# read_key -- read one key within the refresh interval, normalising arrow/page
+# keys to tokens (UP/DOWN/PGUP/PGDN/HOME/END). Empty on timeout. Honors set -e.
+read_key() {
+    local c rest tail
+    IFS= read -rsn1 -t "$INTERVAL" c || { printf ''; return 0; }
+    if [[ "$c" == $'\x1b' ]]; then
+        IFS= read -rsn2 -t 0.01 rest || rest=""
+        case "$rest" in
+            '[A') printf 'UP' ;;   '[B') printf 'DOWN' ;;
+            '[C') printf 'RIGHT' ;; '[D') printf 'LEFT' ;;
+            '[H') printf 'HOME' ;; '[F') printf 'END' ;;
+            '[5') IFS= read -rsn1 -t 0.01 tail || true; printf 'PGUP' ;;
+            '[6') IFS= read -rsn1 -t 0.01 tail || true; printf 'PGDN' ;;
+            '')   printf 'ESC' ;;
+            *)    printf '' ;;
+        esac
+        return 0
+    fi
+    printf '%s' "$c"
 }
 
 if [[ "$WATCH" -eq 1 ]]; then
-    # Take over the terminal on the alternate buffer (like top/watch), hide the
-    # cursor, and restore both when the user quits (Ctrl-C) or the loop dies for
-    # any reason. `|| true` keeps a transient render failure (e.g. a docker
-    # hiccup) from ending the watch under `set -e`.
-    restore() { tput cnorm 2>/dev/null || true; tput rmcup 2>/dev/null || true; }
+    restore() {
+        printf '\033[?7h' 2>/dev/null || true   # autowrap back on
+        tput cnorm 2>/dev/null || true
+        tput rmcup 2>/dev/null || true
+    }
     trap restore EXIT INT TERM
-    tput smcup 2>/dev/null || true   # enter alternate screen
+    tput smcup 2>/dev/null || true   # alternate screen
     tput civis 2>/dev/null || true   # hide cursor
-    __redraw=0
+    printf '\033[?7l' 2>/dev/null || true   # autowrap OFF → long lines clip, never wrap
+    SCROLL=0; __redraw=0
     while true; do
         __redraw=$((__redraw + 1))
-        if [[ "$PAINT_MODE" == "legacy" ]]; then
-            # Legacy: clear FIRST, then render straight to the screen. The whole
-            # render (docker ps + jq + usage curl) runs against a BLANK screen —
-            # this is the flicker the batched path removes. Kept for A/B.
-            __t0="$(_now_us)"
-            printf '\033[H\033[2J'
-            render_all || true
-            log_redraw "$__redraw" 0 "$(( $(_now_us) - __t0 ))" ""
-        else
-            # Batched: build the whole frame off-screen (all the slow work) while
-            # the previous frame stays visible, then repaint in place.
-            __t0="$(_now_us)"
-            __frame="$(render_all 2>/dev/null || true)"
-            __compute_us=$(( $(_now_us) - __t0 ))
-            __p0="$(_now_us)"
-            paint_frame "$__frame"
-            __paint_us=$(( $(_now_us) - __p0 ))
-            log_redraw "$__redraw" "$__compute_us" "$__paint_us" "$__frame"
-        fi
-        # Wait out the interval, but on a real terminal stay responsive to keys:
-        #   n → add a note inline · e / Ctrl-G → edit notes in nvim · q → quit.
-        # A timeout (no key) just falls through to the next repaint. When stdin is
-        # not a tty (tests, pipes), fall back to a plain sleep — same as before.
+        __t0="$(_now_us)"
+        __top="$(render_top 2>/dev/null || true)"
+        mapfile -t __SESS < <(render_sessions "$(term_width)" 2>/dev/null || true)
+        __compute_us=$(( $(_now_us) - __t0 ))
+        __p0="$(_now_us)"
+        paint_view "$__top" __SESS
+        __paint_us=$(( $(_now_us) - __p0 ))
+        log_redraw "$__redraw" "$__compute_us" "$__paint_us" "$__top"$'\n'"${__SESS[*]:-}"
         if [[ -t 0 ]]; then
-            __key=""
-            IFS= read -rsn1 -t "$INTERVAL" __key || __key=""
+            __key="$(read_key)"
+            __page=$(( $(term_height) / 2 )); (( __page < 1 )) && __page=1
             case "$__key" in
-                q|Q)            break ;;
-                n|N)            notes_input_mode ;;
-                e|E|$'\x07')    edit_in_nvim "$(notes_file)" ;;   # e or Ctrl-G
-                *)              : ;;                              # timeout / other → repaint
+                q|Q)                 break ;;
+                n|N)                 notes_input_mode ;;
+                e|E|$'\x07')         edit_in_nvim "$(notes_file)" ;;
+                j|J|DOWN)            SCROLL=$(( SCROLL + 1 )) ;;
+                k|K|UP)              SCROLL=$(( SCROLL - 1 )) ;;
+                $'\x04'|PGDN|' ')    SCROLL=$(( SCROLL + __page )) ;;
+                $'\x15'|PGUP|b)      SCROLL=$(( SCROLL - __page )) ;;
+                g|HOME)              SCROLL=0 ;;
+                G|END)               SCROLL=999999 ;;
+                *)                   : ;;
             esac
+            (( SCROLL < 0 )) && SCROLL=0
         else
             sleep "$INTERVAL"
         fi

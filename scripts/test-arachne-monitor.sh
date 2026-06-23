@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # test-arachne-monitor.sh — fixture-driven tests for scripts/arachne-monitor.
 #
-# Covers the pure-rendering surfaces added for the usage bars + flicker-free
-# repaint + redraw instrumentation: the --demo bars (cell math + critical fill),
-# the usage_bars path driven by a stubbed arachne-usage, and the --log redraw
-# instrumentation. docker is stubbed (no containers) so no real daemon is touched.
+# Covers the pure-rendering surfaces: the --demo bars (cell math + critical
+# fill), the usage_bars path driven by a stubbed arachne-usage, the --log redraw
+# instrumentation, the cached disk gauge (abbreviated sizes), the refresh
+# interval, gauge alignment, the run-scoped notes field, the two-column top
+# layout (notes side-by-side / stacked), and the height-clipped scroll viewport.
+# docker is stubbed (no containers) so no real daemon is touched. Geometry is
+# pinned via ARACHNE_MONITOR_COLS / _LINES so layout is deterministic.
 #
 # Run: ./scripts/test-arachne-monitor.sh  (exits non-zero on any failure)
 set -uo pipefail
@@ -66,15 +69,17 @@ grep -q '5h' <<<"$out" && grep -q '7d' <<<"$out" && pass "demo shows 5h and 7d l
 grep -q '▐' <<<"$out" && grep -q '▌' <<<"$out" && pass "demo bars have ▐ ▌ end-caps" || fail "demo missing end-caps"
 grep -q '█' <<<"$out" && grep -q '░' <<<"$out" && pass "demo bars use █ filled / ░ empty cells" || fail "demo missing bar glyphs"
 
-# ── Test 2: bar cell math — 95% → 19 filled cells, critical (red) fill ─────────
+# ── Test 2: bar cell math + critical fill (driven via the usage stub) ─────────
 echo "--- Test 2: bar cell math + critical fill ---"
-five_line=$(grep '5h' <<<"$out" | head -1)
+make_usage_stub 95 62        # 5h=95% (critical/red), 7d=62% (normal/terracotta)
+out2=$("$CLI" 2>/dev/null)
+five_line=$(grep '5h' <<<"$out2" | head -1)
 filled=$(grep -o '█' <<<"$five_line" | wc -l | tr -d ' ')
 [[ "$filled" == "19" ]] && pass "95% bar has 19/20 filled cells" || fail "95% expected 19 filled got $filled"
 empties=$(grep -o '░' <<<"$five_line" | wc -l | tr -d ' ')
 [[ "$empties" == "1" ]] && pass "95% bar has 1/20 empty cell" || fail "95% expected 1 empty got $empties"
 printf '%s' "$five_line" | grep -q $'\033\[1;31m' && pass "95% (critical) bar uses red fill" || fail "95% bar not red"
-seven_line=$(grep '7d' <<<"$out" | head -1)
+seven_line=$(grep '7d' <<<"$out2" | head -1)
 printf '%s' "$seven_line" | grep -q $'\033\[38;5;173m' && pass "62% (normal) bar uses terracotta fill" || fail "62% bar not terracotta"
 
 # ── Test 3: usage_bars path (no pump) reflects the stubbed percentages ─────────
@@ -102,19 +107,15 @@ LOG="$TMP/redraw.log"
 grep -qE 'redraw=1 .*compute_ms=[0-9]+ .*paint_ms=[0-9]+ .*lines=[0-9]+ .*bytes=[0-9]+' "$LOG" \
   && pass "redraw line has compute_ms/paint_ms/lines/bytes" || fail "redraw line malformed: $(cat "$LOG")"
 
-# ── Test 6: --watch batched vs --legacy-paint distinguished in the log ────────
-echo "--- Test 6: watch redraw modes ---"
-LOGB="$TMP/watch-batched.log"; LOGL="$TMP/watch-legacy.log"
-timeout 3 "$CLI" --watch 1 --log "$LOGB" >/dev/null 2>&1 || true
-timeout 3 "$CLI" --watch 1 --legacy-paint --log "$LOGL" >/dev/null 2>&1 || true
-grep -q 'mode=batched' "$LOGB" 2>/dev/null && pass "batched watch logs mode=batched" || fail "batched mode not logged: $(cat "$LOGB" 2>/dev/null)"
-grep -q 'mode=legacy'  "$LOGL" 2>/dev/null && pass "legacy watch logs mode=legacy"  || fail "legacy mode not logged: $(cat "$LOGL" 2>/dev/null)"
-# In batched mode the on-screen paint is near-instant (compute happens off-screen);
-# in legacy mode the render-to-cleared-screen time is the flicker window.
-if grep -q 'mode=batched' "$LOGB" 2>/dev/null; then
-  bp=$(grep -oE 'paint_ms=[0-9]+' "$LOGB" | head -1 | grep -oE '[0-9]+')
-  [[ "${bp:-99}" -le 30 ]] && pass "batched paint_ms is small (${bp}ms — no blank-screen flicker)" || fail "batched paint_ms unexpectedly high: ${bp}ms"
-fi
+# ── Test 6: --watch logs redraws; the cached paint is cheap ───────────────────
+echo "--- Test 6: watch redraw cadence + cost ---"
+LOGB="$TMP/watch.log"
+timeout 3 "$CLI" --watch 1 --log "$LOGB" >/dev/null 2>&1 </dev/null || true
+grep -q 'mode=batched' "$LOGB" 2>/dev/null && pass "watch logs a redraw line" || fail "no redraw logged: $(cat "$LOGB" 2>/dev/null)"
+# Compute is read-from-cache + one usage fetch, so it must stay cheap (the whole
+# point of the background-cache rework: the slow scans never run on the paint).
+cm=$(grep -oE 'compute_ms=[0-9]+' "$LOGB" | head -1 | grep -oE '[0-9]+')
+[[ "${cm:-9999}" -le 500 ]] && pass "cached paint compute is cheap (${cm}ms ≤ 500)" || fail "compute too slow: ${cm}ms"
 
 # ── Test 7: unknown arg is rejected ───────────────────────────────────────────
 echo "--- Test 7: arg handling ---"
@@ -144,8 +145,7 @@ WT	feat/tiny	30000000
 EOF
 FAKE_MAIN="$TMP/fakerepo"; mkdir -p "$FAKE_MAIN"
 run_disk() { ARACHNE_MONITOR_DISK=1 ARACHNE_MONITOR_DISK_CACHE="$DCACHE" \
-  ARACHNE_MONITOR_DISK_TTL=99999 ARACHNE_MONITOR_MAIN_ROOT="$FAKE_MAIN" \
-  ARACHNE_MONITOR_DISK_TOP_N=2 "$CLI" 2>/dev/null; }
+  ARACHNE_MONITOR_DISK_TTL=99999 ARACHNE_MONITOR_MAIN_ROOT="$FAKE_MAIN" "$CLI" 2>/dev/null; }
 
 strip_ansi() { sed -r 's/\x1b\[[0-9;]*m//g'; }   # text assertions ignore colour
 out=$(DF_AVAIL_KB=52428800 run_disk)   # 50G free
@@ -154,10 +154,10 @@ grep -qE '^[[:space:]]*Disk ' <<<"$outp" && pass "disk gauge renders a Disk line
 grep -qE '50(\.0)?G free / 100(\.0)?G' <<<"$outp" && pass "free/total shown (50G/100G)" || fail "free/total missing:\n$outp"
 grep -qE 'worktrees 11\.[0-9]G in 3' <<<"$outp" && pass "worktrees total+count (3 dirs)" || fail "worktree total wrong:\n$outp"
 grep -qE 'main 467\.[0-9]M' <<<"$outp" && pass "main footprint shown" || fail "main missing:\n$outp"
-grep -qE 'docker img 15\.4GB · cache 9\.6GB' <<<"$outp" && pass "docker breakdown (no leading separator)" || fail "docker line wrong:\n$outp"
-# largest sorted desc, capped at TOP_N=2, with a "+N more".
-grep -qE 'largest: feat/big 11\.2G · feat/small 286\.1M' <<<"$outp" && pass "largest worktrees sorted, capped at top-N" || fail "largest wrong:\n$outp"
-grep -q '(+1 more)' <<<"$outp" && pass "shows (+N more) when over top-N" || fail "+N more missing:\n$outp"
+# docker sizes abbreviated to the human_bytes style (15.4GB → 15.4G).
+grep -qE 'docker img 15\.4G · cache 9\.6G' <<<"$outp" && pass "docker breakdown abbreviated (15.4G/9.6G)" || fail "docker line wrong:\n$outp"
+# The largest-worktrees line was removed (compact, btop-ish).
+grep -q 'largest:' <<<"$outp" && fail "largest: line should be gone" || pass "largest: line removed"
 
 # Free-space colour bands (panic<5G red, pause<10G amber, else terracotta).
 fb() { DF_AVAIL_KB=$1 run_disk | grep -E '^[[:space:]]*Disk '; }
@@ -190,37 +190,70 @@ echo "--- Test 10: gauge alignment ---"
 make_usage_stub 42 73
 align_out=$(ARACHNE_MONITOR_DISK=1 ARACHNE_MONITOR_DISK_CACHE="$DCACHE" \
   ARACHNE_MONITOR_DISK_TTL=99999 ARACHNE_MONITOR_MAIN_ROOT="$FAKE_MAIN" \
-  DF_AVAIL_KB=52428800 "$CLI" 2>/dev/null | strip_ansi)
+  ARACHNE_MONITOR_COLS=200 DF_AVAIL_KB=52428800 "$CLI" 2>/dev/null | strip_ansi)
 bar_col() { awk -v lbl="$1" '$0 ~ ("^[[:space:]]*" lbl " ") { print index($0, "▐"); exit }' <<<"$align_out"; }
 c5=$(bar_col "5h"); c7=$(bar_col "7d"); cd=$(bar_col "Disk")
 [[ -n "$c5" && "$c5" == "$c7" && "$c5" == "$cd" ]] \
   && pass "5h/7d/Disk bars align at the same column ($c5)" \
   || fail "bars misaligned: 5h=$c5 7d=$c7 Disk=$cd"
 
-# ── Test 11: notes panel — header, seeded lines, empty hint ────────────────────
+# ── Test 11: notes panel — header, seeded lines, empty hint (stacked layout) ───
 echo "--- Test 11: notes field ---"
+# Narrow width → the notes column stacks UNDER the left column at column 0, so
+# header/line anchors are deterministic. (Side-by-side is exercised in Test 14.)
 NF="$TMP/notes.md"
 printf -- '- 09:00  first note\n- 09:05  second note\n' >| "$NF"
-nout=$(ARACHNE_MONITOR_NOTES_FILE="$NF" "$CLI" 2>/dev/null | strip_ansi)
+nout=$(env ARACHNE_MONITOR_COLS=60 ARACHNE_MONITOR_NOTES_FILE="$NF" "$CLI" 2>/dev/null | strip_ansi)
 grep -qE '^Notes \[' <<<"$nout" && pass "notes panel renders a header" || fail "no Notes header:\n$nout"
 grep -q 'first note'  <<<"$nout" && grep -q 'second note' <<<"$nout" && pass "notes panel shows seeded lines" || fail "seeded notes missing:\n$nout"
-grep -q '(n add · e/C-g nvim)' <<<"$nout" && pass "notes header lists the edit keys" || fail "edit-key hint missing"
+grep -q '(n · C-g)' <<<"$nout" && pass "notes header lists the edit keys" || fail "edit-key hint missing:\n$nout"
 EF="$TMP/empty-notes.md"; : >| "$EF"
-eout=$(ARACHNE_MONITOR_NOTES_FILE="$EF" "$CLI" 2>/dev/null | strip_ansi)
+eout=$(env ARACHNE_MONITOR_COLS=60 ARACHNE_MONITOR_NOTES_FILE="$EF" "$CLI" 2>/dev/null | strip_ansi)
 grep -q 'no notes yet' <<<"$eout" && pass "empty notes file shows the add hint" || fail "empty-notes hint missing:\n$eout"
 # Notes tail is bounded by NOTES_TAIL.
 printf -- '- a\n- b\n- c\n- d\n- e\n- f\n' >| "$NF"
-tout=$(ARACHNE_MONITOR_NOTES_FILE="$NF" ARACHNE_MONITOR_NOTES_TAIL=2 "$CLI" 2>/dev/null | strip_ansi)
-shown=$(grep -cE '^  - ' <<<"$tout")
-[[ "$shown" == "2" ]] && pass "notes panel honours NOTES_TAIL=2" || fail "expected 2 tail lines got $shown"
+tout=$(env ARACHNE_MONITOR_COLS=60 ARACHNE_MONITOR_NOTES_FILE="$NF" ARACHNE_MONITOR_NOTES_TAIL=2 "$CLI" 2>/dev/null | strip_ansi)
+shown=$(grep -cE '^- [a-f]$' <<<"$tout")
+[[ "$shown" == "2" ]] && pass "notes panel honours NOTES_TAIL=2" || fail "expected 2 tail lines got $shown:\n$tout"
 
 # ── Test 12: notes run-key — scoped to the pump phases + start time ────────────
 echo "--- Test 12: notes scoped to the pump run ---"
 PSTATE="$TMP/pump.state"
-printf '%s' '{"phases":"F43..F63","started_at":"2026-06-23T20:36:23Z"}' >| "$PSTATE"
+printf '%s' '{"phases":"F43..F63","started_at":"2026-06-23T20:36:23Z","status":"running","open_tasks":28,"ceiling":95}' >| "$PSTATE"
 ndir="$TMP/notesdir"
 key_out=$(ARACHNE_PUMP_STATE_FILE="$PSTATE" ARACHNE_MONITOR_NOTES_DIR="$ndir" "$CLI" 2>/dev/null | strip_ansi)
 grep -q 'Notes \[F43..F63\]' <<<"$key_out" && pass "notes header shows the pump phase-range" || fail "phase-range label missing:\n$key_out"
+
+# ── Test 13: docker-size abbreviation (21.26GB → 21.3G, 0B stays 0B) ───────────
+echo "--- Test 13: docker size formatting ---"
+DC13="$TMP/disk13.tsv"
+printf 'MAIN\t100000000\nDKR\tImages\t21.26GB\t0B\nDKR\tContainers\t4.396GB\t0B\nDKR\tLocal Volumes\t0B\t0B\nDKR\tBuild Cache\t11.33GB\t0B\n' >| "$DC13"
+d13=$(ARACHNE_MONITOR_DISK=1 ARACHNE_MONITOR_DISK_CACHE="$DC13" ARACHNE_MONITOR_DISK_TTL=99999 \
+  ARACHNE_MONITOR_MAIN_ROOT="$FAKE_MAIN" DF_AVAIL_KB=52428800 "$CLI" 2>/dev/null | strip_ansi)
+grep -qE 'img 21\.3G · cont 4\.4G · vol 0B · cache 11\.3G' <<<"$d13" \
+  && pass "docker sizes abbreviated (21.3G/4.4G/0B/11.3G)" || fail "docker abbrev wrong:\n$(grep -i worktrees <<<"$d13")"
+
+# ── Test 14: two-column top — notes side-by-side when wide, stacked when narrow ─
+echo "--- Test 14: two-column layout ---"
+make_usage_stub 40 50
+NF14="$TMP/notes14.md"; printf -- '- 12:00  a note here\n' >| "$NF14"
+wide=$(env ARACHNE_MONITOR_COLS=200 ARACHNE_MONITOR_NOTES_FILE="$NF14" "$CLI" 2>/dev/null | strip_ansi)
+# Side-by-side: the bar row and the Notes header share ONE physical line.
+grep -qE '5h .*▌.* +Notes \[' <<<"$wide" && pass "wide terminal puts Notes beside the bars" || fail "notes not side-by-side:\n$wide"
+narrow=$(env ARACHNE_MONITOR_COLS=60 ARACHNE_MONITOR_NOTES_FILE="$NF14" "$CLI" 2>/dev/null | strip_ansi)
+# Stacked: Notes header is on its own line at column 0.
+grep -qE '^Notes \[' <<<"$narrow" && pass "narrow terminal stacks Notes below" || fail "notes not stacked:\n$narrow"
+
+# ── Test 15: watch frame is clipped to the terminal height ─────────────────────
+echo "--- Test 15: height-clipped viewport ---"
+# In --watch the frame must never exceed $LINES rows (so the top never scrolls
+# away). Capture one paint, isolate the last cursor-home frame, count its rows.
+CAP="$TMP/clip.cap"
+ARACHNE_MONITOR_LINES=12 ARACHNE_MONITOR_COLS=120 timeout 2 "$CLI" --watch 1 >| "$CAP" 2>/dev/null </dev/null || true
+# Split on ESC[H (cursor home); take the last full frame; strip CSI; count lines.
+frame=$(awk 'BEGIN{RS="\033\\[H"} {last=$0} END{printf "%s", last}' "$CAP" | sed -r 's/\x1b\[[0-9;?]*[A-Za-z]//g')
+rows=$(printf '%s' "$frame" | grep -c .)
+[[ -n "$rows" && "$rows" -le 12 ]] && pass "watch frame clipped to height (${rows} ≤ 12 rows)" || fail "frame not clipped: ${rows} rows"
 
 echo
 echo "=============================================="
