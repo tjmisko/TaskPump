@@ -309,6 +309,124 @@ echo v2 >| "$GR/ops"   # ` M ops` — the submodule-pointer line, allowlisted
 g="$(apl_fs_guard "$GR")"
 [[ -z "$g" ]] && pass "allowlisted dirt (.worktrees/ + ops) is silent" || fail "allowlist not respected:\n$g"
 
+echo "--- Test 13: integration trunk — selection, build-gate, conflict (A3 v0) ---"
+# Drive reconcile_trunk through the ARACHNE_PUMP_INTEGRATE_DRYRUN seam (no real
+# git/cargo/gh): STUB_INTEGRATE_{NOBRANCH,ANCESTOR,CONFLICT} + BUILD_GATE_CMD
+# drive branch-exists / already-integrated / conflict / build-red.
+QFILE="$TMP/quarantine"; ISTATE="$TMP/ipump.state"
+itick() {  # integration dry-run --once tick: $1=phases ; extra env via caller
+  ARACHNE_NOTIFY_CMD="${ARACHNE_NOTIFY_CMD:-true}" \
+  ARACHNE_PUMP_NO_LAUNCH=1 \
+  ARACHNE_PUMP_INTEGRATE_DRYRUN=1 \
+  ARACHNE_PUMP_QUARANTINE_FILE="$QFILE" \
+  ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
+  ARACHNE_PUMP_STATE_FILE="$ISTATE" \
+  ARACHNE_POOL_CAP_FILE="$TMP/cap" \
+  ARACHNE_PUMP_LOG="$TMP/pump.log" \
+  ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+  "$PUMP" --no-health-gate --integration-trunk "${@:2}" --phases "$1" --once
+}
+
+# 13a: two quiescent phases with (assumed-present) branches → both "would integrate".
+mk F55.0 open; mk F56.0 open
+out=$(STUB_GATE_RC=0 itick F55..F56 2>&1)
+have "$out" 'would integrate F55' && pass "quiescent F55 → would integrate" || fail "F55 not integrated:\n$out"
+have "$out" 'would integrate F56' && pass "quiescent F56 → would integrate" || fail "F56 not integrated:\n$out"
+
+# 13b: a phase already an ancestor of the trunk → no integrate line.
+out=$(STUB_GATE_RC=0 STUB_INTEGRATE_ANCESTOR="F55" itick F55..F56 2>&1)
+have "$out" 'would integrate F55' && fail "already-integrated F55 re-integrated:\n$out" || pass "already-ancestor F55 skipped"
+have "$out" 'would integrate F56' && pass "F56 still integrates" || fail "F56 not integrated:\n$out"
+
+# 13c: a live container ⇒ phase not quiescent ⇒ skipped (mirrors the liveness join).
+out=$(STUB_GATE_RC=0 STUB_LIVE="arachne-agent-feat-f55" itick F55..F56 2>&1)
+have "$out" 'would integrate F55' && fail "live F55 integrated (not quiescent):\n$out" || pass "live F55 skipped (not quiescent)"
+have "$out" 'would integrate F56' && pass "quiescent F56 still integrates" || fail "F56 not integrated:\n$out"
+
+# 13d: build-gate red ⇒ quarantine; trunk not advanced; needs-review recorded; marker written.
+: >| "$QFILE"
+out=$(STUB_GATE_RC=0 ARACHNE_PUMP_BUILD_CMD='false' itick F55 2>&1)
+have "$out" 'would quarantine F55: build red' && pass "build-red → would quarantine" || fail "no build-red quarantine:\n$out"
+have "$out" 'needs-review' && pass "needs-review recorded as the quarantine action" || fail "no needs-review action:\n$out"
+have "$out" 'would integrate F55' && fail "trunk advanced despite build red:\n$out" || pass "trunk not advanced on build red"
+grep -qE '^F55 .*build red$' "$QFILE" && pass "quarantine marker written for build red" || fail "no build-red marker:\n$(cat "$QFILE")"
+
+# 13e: merge conflict ⇒ quarantine; trunk not advanced; marker written.
+: >| "$QFILE"
+out=$(STUB_GATE_RC=0 STUB_INTEGRATE_CONFLICT="F55" itick F55 2>&1)
+have "$out" 'would quarantine F55: conflict' && pass "conflict → would quarantine" || fail "no conflict quarantine:\n$out"
+have "$out" 'would integrate F55' && fail "trunk advanced despite conflict:\n$out" || pass "trunk not advanced on conflict"
+grep -qE '^F55 .*conflict$' "$QFILE" && pass "quarantine marker written for conflict" || fail "no conflict marker:\n$(cat "$QFILE")"
+
+# 13f: --integration-trunk OFF ⇒ no integration whatsoever (opt-out regression).
+: >| "$QFILE"
+out=$(STUB_GATE_RC=0 ARACHNE_PUMP_BUILD_CMD='false' \
+  ARACHNE_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 ARACHNE_PUMP_INTEGRATE_DRYRUN=1 \
+  ARACHNE_PUMP_QUARANTINE_FILE="$QFILE" ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
+  ARACHNE_PUMP_STATE_FILE="$ISTATE" ARACHNE_POOL_CAP_FILE="$TMP/cap" \
+  ARACHNE_PUMP_LOG="$TMP/pump.log" ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+  "$PUMP" --no-health-gate --phases F55 --once 2>&1)
+have "$out" 'would integrate' && fail "integration ran with flag off:\n$out" || pass "flag-off ⇒ no integration (opt-out)"
+have "$out" 'would quarantine' && fail "quarantine ran with flag off:\n$out" || pass "flag-off ⇒ no quarantine (opt-out)"
+
+echo "--- Test 14: arachne-task needs-review subcommand (A3 v0) ---"
+mk F58.0 open
+"$REAL_TASK" claim F58.0 --branch feat/f58 --turns 5 >/dev/null 2>&1
+"$REAL_TASK" needs-review F58.0 --reason "auto/trunk conflict for F58" >/dev/null 2>&1
+grep -q 'status: needs-review' "$TASKS/F58.0.md" && pass "needs-review sets status: needs-review" || fail "status not needs-review:\n$(cat "$TASKS/F58.0.md")"
+grep -q 'claimed_by: null' "$TASKS/F58.0.md" && pass "needs-review clears the claim" || fail "claim not cleared:\n$(cat "$TASKS/F58.0.md")"
+grep -qi 'Needs review' "$TASKS/F58.0.md" && pass "needs-review appends a body note" || fail "no body note:\n$(cat "$TASKS/F58.0.md")"
+grep -qF 'auto/trunk conflict for F58' "$TASKS/F58.0.md" && pass "needs-review note carries the reason" || fail "reason not in note"
+"$REAL_TASK" needs-review F58.0 >/dev/null 2>&1 && fail "needs-review without --reason should error" || pass "needs-review requires --reason"
+
+echo "--- Test 15: dependency-aware briefs expand {{DEPENDS_ON}} (A3 v1) ---"
+# A template carrying the new {{DEPENDS_ON}} placeholder; rendered via the pump's
+# TASKS_DIR override against the fixtures, gh disabled (ARACHNE_PUMP_NO_GH=1) so
+# the render is hermetic. F60.0 depends cross-phase on F55.7; F56.0 has none.
+TPL2="$TMP/_phase-drain-template-v1.md"
+cat >| "$TPL2" <<'EOF'
+# Kickoff brief — drain phase {{PHASE}}
+You are based on `auto/trunk` (an integration branch off `main`).
+
+## Depends on / builds upon
+{{DEPENDS_ON}}
+
+## Working method
+scripts/arachne-task next --phase {{PHASE}}
+EOF
+mk F60.0 open F55.7        # cross-phase blocker on F55
+rbrief() {  # $1=phase
+  ARACHNE_PUMP_NO_GH=1 ARACHNE_PUMP_TASKS_DIR="$TASKS" \
+  ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL2" "$PUMP" --render-brief "$1"
+}
+r60=$(rbrief F60)
+grep -qF '{{DEPENDS_ON}}' <<<"$r60" && fail "stray {{DEPENDS_ON}} after render:\n$r60" || pass "no stray {{DEPENDS_ON}}"
+grep -qF '{{PHASE}}' <<<"$r60" && fail "stray {{PHASE}} after render (v1):\n$r60" || pass "no stray {{PHASE}} (v1)"
+grep -qF 'Depends on / builds upon' <<<"$r60" && pass "deps section header present" || fail "no deps header:\n$r60"
+grep -qF 'feat/f55' <<<"$r60" && pass "cross-phase blocker names feat/f55" || fail "feat/f55 not named:\n$r60"
+r56=$(rbrief F56)
+grep -qF 'No cross-phase dependencies' <<<"$r56" && pass "empty-deps line for F56 (no cross-phase blockers)" || fail "no empty-deps line:\n$r56"
+grep -qF 'feat/f55' <<<"$r56" && fail "F55 leaked into F56 deps:\n$r56" || pass "F56 deps block clean"
+
+echo "--- Test 16: integration-aware launch gate — done≠integrated (A3 v2) ---"
+# F57.0 depends cross-phase on F55.1; F55.1 is done (ledger-ready) but its CODE
+# may not yet be on auto/trunk. STUB_INTEGRATED drives the ancestor check; the
+# pump reads the fixtures via ARACHNE_PUMP_TASKS_DIR so phase_deps_integrated
+# sees F57's cross-phase blocker.
+ipump() { ARACHNE_PUMP_TASKS_DIR="$TASKS" "$PUMP" --no-health-gate --dry-run --phases "$1" "${@:2}"; }
+mk F55.0 done; mk F55.1 done; mk F56.0 done; mk F57.0 open F55.1
+# 16a: --integration-trunk on, dep NOT integrated → F57 WAITS, does not LAUNCH.
+out=$(STUB_INTEGRATED="" ipump F55..F57 --integration-trunk)
+have "$out" 'WAITING +F57' && pass "F57 WAITING: dep done but not integrated" || fail "F57 not WAITING:\n$out"
+have "$out" 'LAUNCH +F57' && fail "F57 launched before dep integrated:\n$out" || pass "F57 not LAUNCH before integration"
+have "$out" 'not yet integrated' && pass "WAITING reason names the integration gap" || fail "no integration reason:\n$out"
+# 16b: flip the dep to integrated → F57 LAUNCHES.
+out=$(STUB_INTEGRATED="F55" ipump F55..F57 --integration-trunk)
+have "$out" 'LAUNCH +F57' && pass "F57 LAUNCH once F55 integrated" || fail "F57 not LAUNCH after integration:\n$out"
+# 16c: integration OFF → ledger-ready F57 LAUNCHES regardless (opt-out: no gate).
+out=$(STUB_INTEGRATED="" ipump F55..F57)
+have "$out" 'LAUNCH +F57' && pass "flag-off ⇒ F57 LAUNCH on done (no integration gate)" || fail "F57 not LAUNCH with flag off:\n$out"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"

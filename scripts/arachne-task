@@ -749,6 +749,36 @@ cmd_block() {
   echo "blocked $id"
 }
 
+cmd_needs_review() {
+  local id="" reason=""
+  while (( $# )); do
+    case $1 in
+      --reason) reason=$2; shift 2;;
+      --reason=*) reason=${1#--reason=}; shift;;
+      -*) die "unknown flag: $1";;
+      *) [[ -z "$id" ]] && id=$1 || die "too many positional args"; shift;;
+    esac
+  done
+  [[ -z "$id" ]] && die "usage: arachne-task needs-review <id> --reason \"...\""
+  [[ -z "$reason" ]] && die "--reason is required"
+  local file; file=$(task_file_required "$id")
+  local now; now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+  # Sanctioned setter for the needs-review status — the pump uses this to
+  # quarantine a phase whose auto/trunk merge conflicted or went build-red, so it
+  # never hand-edits frontmatter. The status value already exists (scrub sets it
+  # on budget exhaustion / heartbeat staleness); reuse scrub_reason so monitors
+  # surface it the same way.
+  fm_set "$file" "
+    .status = \"needs-review\" |
+    .claimed_by = null |
+    .scrub_reason = \"$reason\"
+  "
+  printf '\n## Needs review (%s)\n\n%s\n' "$now" "$reason" >> "$file"
+  git_commit_state "needs-review $id: $reason"
+  echo "needs-review $id"
+}
+
 cmd_release() {
   local id="" reason=""
   while (( $# )); do
@@ -938,6 +968,7 @@ Commands:
   heartbeat <id> [--start|--end]     Budget + failure tracking.
   complete <id> [--commits sha,sha]  Mark done; stdin → completion notes.
   block <id> --reason "..."          Mark blocked with reason.
+  needs-review <id> --reason "..."   Flag for human review (pump quarantine setter).
   release <id> --reason "..."        Relinquish a claim back to status=open.
   scrub                              Supervisor: relabel stale claims.
 
@@ -961,7 +992,7 @@ main() {
   # Mutating subcommands serialize on the cross-agent state lock for their
   # whole read-modify-write + commit. Read-only commands (next/list) skip it.
   case $cmd in
-    claim|heartbeat|complete|block|release|scrub) acquire_state_lock;;
+    claim|heartbeat|complete|block|needs-review|release|scrub) acquire_state_lock;;
   esac
   case $cmd in
     next) cmd_next "$@";;
@@ -972,6 +1003,7 @@ main() {
     heartbeat) cmd_heartbeat "$@";;
     complete) cmd_complete "$@";;
     block) cmd_block "$@";;
+    needs-review) cmd_needs_review "$@";;
     release) cmd_release "$@";;
     scrub) cmd_scrub "$@";;
     -h|--help|help) usage;;

@@ -55,7 +55,9 @@ source "$SCRIPT_DIR/arachne-pump-lib.sh"
 CLAUDE_DIR="$HOME/.claude"
 CLAUDE_JSON="$HOME/.claude.json"
 OPS_DIR="${ARACHNE_PUMP_OPS_DIR:-$REPO_ROOT/ops}"
-TASKS_DIR="$OPS_DIR/task-loop/tasks"
+# Tasks dir — overridable (independent of OPS_DIR) so phase_dependencies / brief
+# rendering can be unit-tested against a flat fixture dir.
+TASKS_DIR="${ARACHNE_PUMP_TASKS_DIR:-$OPS_DIR/task-loop/tasks}"
 
 ARACHNE_TASK="${ARACHNE_TASK:-$SCRIPT_DIR/arachne-task}"
 ARACHNE_USAGE="${ARACHNE_USAGE:-$SCRIPT_DIR/arachne-usage}"
@@ -79,6 +81,21 @@ USAGE_GATE=1
 DISK_GATE=1
 BRANCH_PREFIX="${ARACHNE_PUMP_BRANCH_PREFIX:-feat/}"
 BASE_REF="${ARACHNE_PUMP_BASE:-main}"
+BASE_GIVEN=0      # set when --base is passed explicitly (gates the trunk override)
+# ── Autonomous integration trunk (A3 / F65.6) ────────────────────────────────
+# Opt-in behind --integration-trunk (default OFF): when on, the run cuts every
+# phase worktree from a continuously-integrated auto/trunk branch instead of a
+# stale base, merges each quiescent phase into it behind a build gate, and
+# graduates the whole drain as one auto/trunk → main PR. Flag off ⇒ byte-for-byte
+# the prior pump.
+INTEGRATION=0
+INTEGRATION_TRUNK="${ARACHNE_PUMP_TRUNK:-auto/trunk}"
+INTEGRATION_BASE="${ARACHNE_PUMP_INTEGRATION_BASE:-main}"
+# Build gate run on each merge into the trunk (empty ⇒ default cargo check +
+# smoke). Overridable for tests (ARACHNE_PUMP_BUILD_CMD='false' forces red).
+BUILD_GATE_CMD="${ARACHNE_PUMP_BUILD_CMD:-}"
+TRUNK_LOCK_FILE="${ARACHNE_PUMP_TRUNK_LOCK_FILE:-$REPO_ROOT/.auto-trunk.lock}"
+QUARANTINE_FILE="${ARACHNE_PUMP_QUARANTINE_FILE:-$REPO_ROOT/.auto-trunk-quarantine}"
 MAX_TURNS="${MAX_TURNS:-600}"
 AGENT_MODEL="${AGENT_MODEL:-opus}"
 CAP_FILE="${ARACHNE_POOL_CAP_FILE:-$REPO_ROOT/.arachne-pool-cap}"
@@ -92,6 +109,9 @@ PUMP_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 warn() { printf 'arachne-pump: %s\n' "$*" >&2; }
 die()  { warn "$*"; exit 1; }
 log()  { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
+# Quiet per-tick skip traces (e.g. "already integrated") — off unless
+# ARACHNE_PUMP_DEBUG=1, so reconcile doesn't spam the log every TICK seconds.
+dbg_log() { [[ "${ARACHNE_PUMP_DEBUG:-0}" -eq 1 ]] && log "$*"; return 0; }
 
 # Keep the verbatim argv so --detach can re-exec the same command minus --detach.
 ORIG_ARGS=("$@")
@@ -115,7 +135,10 @@ while [[ $# -gt 0 ]]; do
       [[ "${2:-}" =~ ^[0-9]+$ ]] || die "--tick needs an integer (seconds)"
       TICK="$2"; shift 2;;
     --branch-prefix) BRANCH_PREFIX="$2"; shift 2;;
-    --base) BASE_REF="$2"; shift 2;;
+    --base) BASE_REF="$2"; BASE_GIVEN=1; shift 2;;
+    --integration-trunk) INTEGRATION=1; shift;;
+    --integration-base) INTEGRATION_BASE="$2"; shift 2;;
+    --integration-base=*) INTEGRATION_BASE="${1#--integration-base=}"; shift;;
     --no-health-gate) HEALTH_GATE=0; shift;;
     --no-usage-gate)  USAGE_GATE=0; shift;;
     --no-disk-gate)   DISK_GATE=0; shift;;
@@ -143,6 +166,13 @@ case "$GRAIN" in
   *) die "unknown grain '$GRAIN' (phase|task|chain)";;
 esac
 
+# When integration is on and the operator did not pin a base, cut worktrees from
+# the continuously-integrated trunk rather than the (stale) base branch. An
+# explicit --base always wins (e.g. a canary cutting from a throwaway base).
+if [[ "$INTEGRATION" -eq 1 && "$BASE_GIVEN" -eq 0 ]]; then
+  BASE_REF="$INTEGRATION_TRUNK"
+fi
+
 # ── Phase-range expansion (mirrors arachne-task's expand_phases for display) ───
 # Numeric ranges + comma lists; non-numeric tokens pass through uppercased.
 pump_expand_phases() {
@@ -165,6 +195,16 @@ pump_expand_phases() {
 phase_branch()    { printf '%s%s' "$BRANCH_PREFIX" "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"; }
 branch_slug()     { printf '%s' "${1//\//-}"; }
 phase_container() { printf 'arachne-agent-%s' "$(branch_slug "$(phase_branch "$1")")"; }
+# Host worktree the integration trunk is checked out into (A3): auto/trunk →
+# <worktrees>/auto-trunk, sharing the configurable worktrees base with phases.
+trunk_worktree()  { printf '%s/%s' "$WORKTREES_DIR" "$(branch_slug "$INTEGRATION_TRUNK")"; }
+# pump_in_list <needle> <space-separated-haystack> — membership test for the
+# dry-run integration stubs (STUB_INTEGRATE_*).
+pump_in_list() {
+  local needle="$1" item
+  for item in ${2:-}; do [[ "$item" == "$needle" ]] && return 0; done
+  return 1
+}
 
 # Distinct phases present in the live eligible frontier (have ≥1 launchable task).
 frontier_phases() {
@@ -225,20 +265,121 @@ feed_gate() {
   return 0
 }
 
-# ── Brief rendering (D6 / F64.4) ───────────────────────────────────────────────
-# Render the parameterized phase-drain template with $PHASE substituted to a
-# transient per-phase file; echo its path. Errors clearly if the template is
-# absent (F64.4 builds it).
+# ── Dependency-aware briefs (A3 v1 / F65.6) ────────────────────────────────────
+# dep_pr_number <branch> — the open draft-PR number for a dependency branch, or
+# empty. Fail-open: empty when gh is absent / disabled (ARACHNE_PUMP_NO_GH=1, for
+# hermetic tests) / errors.
+dep_pr_number() {
+  local branch="$1"
+  [[ "${ARACHNE_PUMP_NO_GH:-0}" -eq 1 ]] && return 0
+  command -v gh >/dev/null 2>&1 || return 0
+  gh pr list --head "$branch" --base main --json number -q '.[0].number // empty' 2>/dev/null || true
+}
+
+# phase_cross_blockers <FN> — the unique set of OTHER phases this phase's tasks
+# are blocked on (in-phase blockers are the pump's own serial concern), one phase
+# token per line. The single source of truth for both the dependency brief (v1)
+# and the integration launch gate (v2).
+phase_cross_blockers() {
+  local phase="$1"
+  local -A seen=()
+  local f blk bphase
+  shopt -s nullglob
+  for f in "$TASKS_DIR/$phase."*.md; do
+    while IFS= read -r blk; do
+      [[ -z "$blk" ]] && continue
+      bphase="${blk%%.*}"
+      [[ "$bphase" == "$phase" ]] && continue       # in-phase dep — pump-internal
+      [[ -n "${seen[$bphase]:-}" ]] && continue
+      seen[$bphase]=1
+      printf '%s\n' "$bphase"
+    done < <(yq --front-matter=extract '.blockers[]?' "$f" 2>/dev/null || true)
+  done
+  shopt -u nullglob
+}
+
+# phase_deps_integrated <FN> — true (0) when EVERY cross-phase blocker's branch is
+# already an ancestor of the integration trunk (its code is physically present on
+# the base downstream is cut from). The v2 launch gate: a frontier phase whose
+# blocker is `done` in the ledger but whose CODE is not yet on auto/trunk stays
+# WAITING. Vacuously true with no cross-phase blockers. Test seam: when
+# STUB_INTEGRATED is set, only its space-separated phases count as integrated.
+phase_deps_integrated() {
+  local phase="$1" dp dbranch
+  while IFS= read -r dp; do
+    [[ -z "$dp" ]] && continue
+    dbranch="$(phase_branch "$dp")"
+    if [[ -n "${STUB_INTEGRATED+x}" ]]; then
+      pump_in_list "$dp" "$STUB_INTEGRATED" || return 1
+    else
+      apl_phase_integrated "$REPO_ROOT" "$dbranch" "$INTEGRATION_TRUNK" || return 1
+    fi
+  done < <(phase_cross_blockers "$phase")
+  return 0
+}
+
+# phase_dependencies <FN> — emit a markdown "Depends on / builds upon" block
+# naming this phase's CROSS-PHASE blockers, each resolved to branch / integration
+# state / draft PR, so the launched agent learns its lineage instead of
+# re-deriving upstream work. No cross-phase blockers ⇒ a single explanatory line.
+# Pure-ish: the branch name is string-derived (always present); sha/PR are
+# best-effort enrichment.
+phase_dependencies() {
+  local phase="$1"
+  local deps=() dp
+  while IFS= read -r dp; do [[ -n "$dp" ]] && deps+=("$dp"); done < <(phase_cross_blockers "$phase")
+
+  if (( ${#deps[@]} == 0 )); then
+    printf 'No cross-phase dependencies.\n'
+    return 0
+  fi
+
+  printf 'This phase builds upon work from other phases. Their code is integrated\n'
+  printf 'into the `%s` branch you are based on — do not re-derive it:\n\n' "$INTEGRATION_TRUNK"
+  local dp dbranch dstate dpr
+  for dp in "${deps[@]}"; do
+    dbranch="$(phase_branch "$dp")"
+    if apl_phase_integrated "$REPO_ROOT" "$dbranch" "$INTEGRATION_TRUNK"; then
+      dstate="integrated @ $(git -C "$REPO_ROOT" rev-parse --short "$dbranch" 2>/dev/null || echo '?')"
+    elif git -C "$REPO_ROOT" rev-parse --verify "refs/heads/$dbranch" >/dev/null 2>&1; then
+      dstate="not yet integrated"
+    else
+      dstate="not yet started"
+    fi
+    dpr="$(dep_pr_number "$dbranch")"
+    if [[ -n "$dpr" ]]; then dpr="PR #$dpr"; else dpr="no PR yet"; fi
+    printf -- '- **%s** (`%s`) — %s, %s\n' "$dp" "$dbranch" "$dstate" "$dpr"
+  done
+}
+
+# ── Brief rendering (D6 / F64.4; deps A3 v1) ───────────────────────────────────
+# render_brief_stream <phase> — render the parameterized phase-drain template to
+# stdout: substitute {{PHASE}} (plain sed — no envsubst, no clash with the
+# `$PHASE` / `$(…)` shell examples the brief contains; phase tokens FNN are
+# sed-safe) and expand the {{DEPENDS_ON}} placeholder line with the dependency
+# block (awk by literal `index()` — avoids multi-line inline sed and the awk
+# brace-interval pitfall).
+render_brief_stream() {
+  local phase="$1"
+  local depfile; depfile="$(mktemp)"
+  phase_dependencies "$phase" >| "$depfile"
+  sed "s/{{PHASE}}/$phase/g" "$ARACHNE_PHASE_BRIEF_TEMPLATE" \
+    | awk -v df="$depfile" '
+        index($0, "{{DEPENDS_ON}}") { while ((getline line < df) > 0) print line; close(df); next }
+        { print }
+      '
+  rm -f "$depfile" 2>/dev/null || true
+}
+
+# render_brief <phase> — write the rendered brief to a transient per-phase file
+# and echo its path (the launcher passes the path to the container).
 render_brief() {
   local phase="$1"
   [[ -f "$ARACHNE_PHASE_BRIEF_TEMPLATE" ]] \
     || die "phase-drain brief template not found: $ARACHNE_PHASE_BRIEF_TEMPLATE (built by F64.4)"
   local out="$WORKTREES_DIR/$(phase_branch "$phase")/.arachne-phase-brief.md"
   mkdir -p "$(dirname "$out")" 2>/dev/null || true
-  # The template's sole placeholder is {{PHASE}} — substituted by plain sed so
-  # there is no envsubst dependency and no clash with the `$PHASE` / `$(…)` shell
-  # examples the brief contains. Phase tokens (FNN) are sed-safe.
-  sed "s/{{PHASE}}/$phase/g" "$ARACHNE_PHASE_BRIEF_TEMPLATE" >| "$out"
+  render_brief_stream "$phase" >| "$out"
   printf '%s' "$out"
 }
 
@@ -270,6 +411,21 @@ launch_phase() {
     warn "worktree still gitignored: $wt — fix .gitignore; skipping $phase"; return 1
   fi
 
+  # v2: refresh a reused/stale worktree with newly-integrated upstream deps. A
+  # worktree cut from auto/trunk BEFORE a dependency integrated will not contain
+  # it; merging the current trunk in makes a relaunch inherit upstream (a first
+  # launch from BASE_REF=trunk is already up to date → no-op). Conflict → abort,
+  # skip the launch, and quarantine (same gate as reconcile_trunk). Integration
+  # off ⇒ untouched.
+  if [[ "$INTEGRATION" -eq 1 ]] && git -C "$REPO_ROOT" rev-parse --verify "refs/heads/$INTEGRATION_TRUNK" >/dev/null 2>&1; then
+    if ! git -C "$wt" merge --no-ff --no-edit "$INTEGRATION_TRUNK" >/dev/null 2>&1; then
+      git -C "$wt" merge --abort >/dev/null 2>&1 || true
+      warn "worktree $wt conflicts with $INTEGRATION_TRUNK; skipping launch of $phase"
+      quarantine_phase "$phase" "$(git -C "$wt" rev-parse HEAD 2>/dev/null)" "worktree merge conflict"
+      return 1
+    fi
+  fi
+
   local brief; brief="$(render_brief "$phase")"
 
   "$DOCKER" rm -f "$cname" >/dev/null 2>&1 || true
@@ -299,11 +455,195 @@ launch_phase() {
   return 0
 }
 
+# ── Autonomous integration trunk (A3 / F65.6) ──────────────────────────────────
+# ensure_trunk — startup, real-run only: create auto/trunk from INTEGRATION_BASE
+# if absent and materialise its dedicated host worktree (idempotent). The host —
+# not a container — owns the trunk worktree (decision 1): the merge/build runs on
+# the host's fresh auth, never inside a dying container.
+ensure_trunk() {
+  [[ "$INTEGRATION" -eq 1 ]] || return 0
+  if ! git -C "$REPO_ROOT" rev-parse --verify "refs/heads/$INTEGRATION_TRUNK" >/dev/null 2>&1; then
+    git -C "$REPO_ROOT" branch "$INTEGRATION_TRUNK" "$INTEGRATION_BASE" \
+      || die "cannot create $INTEGRATION_TRUNK from $INTEGRATION_BASE"
+    log "created integration trunk $INTEGRATION_TRUNK from $INTEGRATION_BASE"
+  fi
+  local twt; twt="$(trunk_worktree)"
+  if [[ ! -d "$twt" ]]; then
+    git -C "$REPO_ROOT" worktree add "$twt" "$INTEGRATION_TRUNK" >/dev/null \
+      || die "cannot add trunk worktree $twt"
+    log "integration trunk worktree at $twt"
+  fi
+  [[ -f "$twt/ops/planning/STATUS.md" ]] || git -C "$twt" submodule update --init --recursive 2>&1 | tail -1 || true
+  apl_repair_worktree_gitignore "$REPO_ROOT"
+}
+
+# run_build_gate <worktree> — the gate every merge into the trunk must pass. A
+# configured BUILD_GATE_CMD (tests / advanced) wholly replaces the default
+# (cargo check --workspace, then smoke_test.sh if present). Returns the gate's
+# exit status; 0 == green.
+run_build_gate() {
+  local wt="$1"
+  if [[ -n "$BUILD_GATE_CMD" ]]; then
+    ( cd "$wt" && WORKSPACE_PATH="$wt" eval "$BUILD_GATE_CMD" ) >/dev/null 2>&1
+    return $?
+  fi
+  ( cd "$wt" && cargo check --workspace ) >/dev/null 2>&1 || return 1
+  if [[ -x "$wt/smoke_test.sh" ]]; then
+    ( cd "$wt" && WORKSPACE_PATH="$wt" ./smoke_test.sh ) >/dev/null 2>&1 || return 1
+  fi
+  return 0
+}
+
+# run_build_gate_dry — the dry-run build gate: run ONLY an explicitly-configured
+# BUILD_GATE_CMD (so a test's `false` forces red) and never the real cargo. No
+# command configured ⇒ assume green.
+run_build_gate_dry() {
+  [[ -n "$BUILD_GATE_CMD" ]] || return 0
+  ( eval "$BUILD_GATE_CMD" ) >/dev/null 2>&1
+}
+
+# quarantine_phase <phase> <pre-sha> <reason> — a conflicting or build-red merge
+# does NOT advance the trunk; the phase is flagged needs-review (real run) and a
+# host quarantine marker is appended so a human can reconcile feat/fN later. The
+# un-integrated branch simply stops propagating. Honors the dry-run seam.
+quarantine_phase() {
+  local phase="$1" sha="$2" reason="$3"
+  local lead; lead="$(phase_lead_task "$phase")"
+  [[ -z "$lead" ]] && lead="$phase.0"
+  if [[ "${ARACHNE_PUMP_INTEGRATE_DRYRUN:-0}" -eq 1 ]]; then
+    log "would quarantine $phase: $reason"
+    log "would needs-review $lead: $reason"
+  else
+    log "quarantine $phase: $reason — not advancing $INTEGRATION_TRUNK; $lead → needs-review"
+    "$ARACHNE_TASK" needs-review "$lead" --reason "auto/trunk integration $reason ($phase)" >/dev/null 2>&1 \
+      || warn "needs-review $lead failed"
+    pump_notify "auto/trunk: quarantined $phase ($reason); $lead flagged needs-review"
+  fi
+  printf '%s %s %s\n' "$phase" "${sha:-?}" "$reason" >> "$QUARANTINE_FILE" 2>/dev/null || true
+}
+
+# integrate_one_phase <phase> — merge a single quiescent phase branch into the
+# trunk under the merge lock + build gate. Returns 0 always (fail-open).
+integrate_one_phase() {
+  local phase="$1" branch; branch="$(phase_branch "$phase")"
+  # Never merge a tree an agent is mid-edit on (decision 3, quiescence proxy).
+  if phase_live "$phase"; then
+    dbg_log "skip integrate $phase: live container (not quiescent)"
+    return 0
+  fi
+  if [[ "${ARACHNE_PUMP_INTEGRATE_DRYRUN:-0}" -eq 1 ]]; then
+    integrate_one_phase_dryrun "$phase" "$branch"
+  else
+    integrate_one_phase_real "$phase" "$branch"
+  fi
+  return 0
+}
+
+# Dry-run integration: no git/cargo. STUB_INTEGRATE_NOBRANCH / _ANCESTOR /
+# _CONFLICT (space-separated phase lists) drive branch-exists / already-integrated
+# / merge-conflict; BUILD_GATE_CMD drives the gate. Logs would-integrate /
+# would-quarantine lines for the harness to assert.
+integrate_one_phase_dryrun() {
+  local phase="$1"
+  if pump_in_list "$phase" "${STUB_INTEGRATE_NOBRANCH:-}"; then
+    dbg_log "skip integrate $phase: branch absent (stub)"; return 0
+  fi
+  if pump_in_list "$phase" "${STUB_INTEGRATE_ANCESTOR:-}"; then
+    dbg_log "skip integrate $phase: already an ancestor of $INTEGRATION_TRUNK (stub)"; return 0
+  fi
+  if pump_in_list "$phase" "${STUB_INTEGRATE_CONFLICT:-}"; then
+    quarantine_phase "$phase" "stub" "conflict"; return 0
+  fi
+  if ! run_build_gate_dry; then
+    quarantine_phase "$phase" "stub" "build red"; return 0
+  fi
+  log "would integrate $phase"
+}
+
+# Real integration: under the trunk flock, merge feat/fN --no-ff into the trunk
+# worktree; conflict → abort + quarantine; build-red → reset --hard + quarantine;
+# green → keep, log, optionally push.
+integrate_one_phase_real() {
+  local phase="$1" branch="$2"
+  git -C "$REPO_ROOT" rev-parse --verify "refs/heads/$branch" >/dev/null 2>&1 \
+    || { dbg_log "skip integrate $phase: no branch $branch"; return 0; }
+  if apl_phase_integrated "$REPO_ROOT" "$branch" "$INTEGRATION_TRUNK"; then
+    dbg_log "skip integrate $phase: $branch already an ancestor of $INTEGRATION_TRUNK"; return 0
+  fi
+  local twt; twt="$(trunk_worktree)"
+  [[ -d "$twt" ]] || { warn "trunk worktree missing ($twt); skipping $phase"; return 0; }
+  (
+    apl_acquire_trunk_lock "$TRUNK_LOCK_FILE" || { warn "trunk lock busy; deferring $phase to next tick"; exit 0; }
+    local pre; pre="$(git -C "$twt" rev-parse HEAD 2>/dev/null)"
+    if ! git -C "$twt" merge --no-ff --no-edit "$branch" >/dev/null 2>&1; then
+      git -C "$twt" merge --abort >/dev/null 2>&1 || true
+      quarantine_phase "$phase" "$pre" "conflict"
+      exit 0
+    fi
+    if ! run_build_gate "$twt"; then
+      git -C "$twt" reset --hard "$pre" >/dev/null 2>&1 || true
+      quarantine_phase "$phase" "$pre" "build red"
+      exit 0
+    fi
+    local post; post="$(git -C "$twt" rev-parse HEAD 2>/dev/null)"
+    log "integrated $phase @ $(printf '%s' "$post" | cut -c1-12)"
+    [[ "${ARACHNE_PUMP_TRUNK_PUSH:-0}" -eq 1 ]] && git -C "$twt" push >/dev/null 2>&1 || true
+    exit 0
+  ) || true
+}
+
+# reconcile_trunk — the host integration step (decision 1): walk every phase in
+# range and integrate each quiescent, not-yet-integrated branch. Wired into
+# do_tick AFTER scrub and BEFORE feed_gate so finished work keeps propagating
+# even while LAUNCHING is usage-paused (integration is local compute, no tokens).
+# Guarded on INTEGRATION=1; returns 0 always (fail-open — a wedged merge delays
+# integration, never the tick).
+reconcile_trunk() {
+  [[ "$INTEGRATION" -eq 1 ]] || return 0
+  local p
+  while IFS= read -r p; do
+    [[ -z "$p" ]] && continue
+    integrate_one_phase "$p" || true
+  done < <(pump_expand_phases "$PHASES")
+  return 0
+}
+
+# graduate_trunk — drain tail (real run only): open exactly one auto/trunk → main
+# PR (idempotent: refresh if it exists). main receives no direct commits — the
+# separate trunk buffer keeps integration continuous while review stays batched.
+graduate_trunk() {
+  [[ "$INTEGRATION" -eq 1 ]] || return 0
+  command -v gh >/dev/null 2>&1 || { warn "gh absent; cannot graduate $INTEGRATION_TRUNK → main"; return 0; }
+  local twt; twt="$(trunk_worktree)"
+  local existing
+  existing="$(gh pr list --head "$INTEGRATION_TRUNK" --base main --json number -q '.[0].number // empty' 2>/dev/null || true)"
+  if [[ -n "$existing" ]]; then
+    log "graduation PR #$existing already open for $INTEGRATION_TRUNK; left as-is"
+    return 0
+  fi
+  [[ -d "$twt" ]] && git -C "$twt" push -u origin "$INTEGRATION_TRUNK" >/dev/null 2>&1 \
+    || warn "push $INTEGRATION_TRUNK failed (continuing to PR)"
+  local quarantined=""
+  [[ -f "$QUARANTINE_FILE" ]] && quarantined="$(cat "$QUARANTINE_FILE" 2>/dev/null || true)"
+  local body
+  body="$(printf 'Autonomous integration of phases %s via %s.\n' "$PHASES" "$INTEGRATION_TRUNK")"
+  if [[ -n "$quarantined" ]]; then
+    body="$(printf '%s\nQuarantined (needs human reconciliation):\n%s\n' "$body" "$quarantined")"
+  fi
+  if gh pr create --base main --head "$INTEGRATION_TRUNK" \
+      --title "auto: integrate $PHASES" --body "$body" >/dev/null 2>&1; then
+    log "opened graduation PR $INTEGRATION_TRUNK → main"
+  else
+    warn "gh pr create for $INTEGRATION_TRUNK → main failed"
+  fi
+}
+
 # ── Planning pass: classify every phase in range ───────────────────────────────
 # Sets arrays LAUNCH/RUNNING/WAITING/DONEP. Returns the plan via globals.
 declare -a PLAN_LAUNCH PLAN_RUNNING PLAN_WAITING PLAN_DONE
+declare -A PLAN_WAIT_REASON
 compute_plan() {
-  PLAN_LAUNCH=(); PLAN_RUNNING=(); PLAN_WAITING=(); PLAN_DONE=()
+  PLAN_LAUNCH=(); PLAN_RUNNING=(); PLAN_WAITING=(); PLAN_DONE=(); PLAN_WAIT_REASON=()
   local -A in_frontier=()
   local p
   while IFS= read -r p; do [[ -n "$p" ]] && in_frontier["$p"]=1; done < <(frontier_phases)
@@ -311,11 +651,26 @@ compute_plan() {
     [[ -z "$p" ]] && continue
     local oc; oc="$(phase_open_count "$p")"
     if [[ -n "${in_frontier[$p]:-}" ]]; then
-      if phase_live "$p"; then PLAN_RUNNING+=("$p"); else PLAN_LAUNCH+=("$p"); fi
+      if phase_live "$p"; then
+        PLAN_RUNNING+=("$p")
+      elif [[ "$INTEGRATION" -eq 1 ]] && ! phase_deps_integrated "$p"; then
+        # v2: ledger says ready, but a cross-phase dep's CODE is not yet on the
+        # trunk this phase would be cut from. Hold until the merge lands so the
+        # worktree physically contains its dependencies (RC-3 closure).
+        PLAN_WAITING+=("$p")
+        PLAN_WAIT_REASON["$p"]="deps done but not yet integrated into $INTEGRATION_TRUNK"
+      else
+        PLAN_LAUNCH+=("$p")
+      fi
     elif [[ "$oc" -gt 0 ]]; then
       # Has open tasks but none eligible — gated on incomplete cross-phase deps,
       # unless a live container is already draining it.
-      if phase_live "$p"; then PLAN_RUNNING+=("$p"); else PLAN_WAITING+=("$p"); fi
+      if phase_live "$p"; then
+        PLAN_RUNNING+=("$p")
+      else
+        PLAN_WAITING+=("$p")
+        PLAN_WAIT_REASON["$p"]="$oc open, none eligible — cross-phase blockers pending"
+      fi
     else
       PLAN_DONE+=("$p")
     fi
@@ -330,7 +685,7 @@ print_plan() {
   local p
   for p in "${PLAN_LAUNCH[@]:-}";  do [[ -n "$p" ]] && printf '  LAUNCH   %-6s -> %s\n' "$p" "$(phase_branch "$p")"; done
   for p in "${PLAN_RUNNING[@]:-}"; do [[ -n "$p" ]] && printf '  RUNNING  %-6s -> %s (live container)\n' "$p" "$(phase_branch "$p")"; done
-  for p in "${PLAN_WAITING[@]:-}"; do [[ -n "$p" ]] && printf '  WAITING  %-6s (%s open, none eligible — cross-phase blockers pending)\n' "$p" "$(phase_open_count "$p")"; done
+  for p in "${PLAN_WAITING[@]:-}"; do [[ -n "$p" ]] && printf '  WAITING  %-6s (%s)\n' "$p" "${PLAN_WAIT_REASON[$p]:-cross-phase blockers pending}"; done
   for p in "${PLAN_DONE[@]:-}";    do [[ -n "$p" ]] && printf '  DONE     %-6s (no open tasks)\n' "$p"; done
   echo "frontier: ${#PLAN_LAUNCH[@]} launchable, ${#PLAN_RUNNING[@]} running, ${#PLAN_WAITING[@]} waiting | open tasks in range: $(open_count)"
 }
@@ -386,6 +741,12 @@ do_tick() {
   else
     rm -f "$fsg_mark" 2>/dev/null || true   # clean again → re-arm for next time
   fi
+
+  # Integrate finished phases into auto/trunk (A3). Runs after scrub and BEFORE
+  # feed_gate: integration is local compute (no API tokens), so finished work
+  # keeps propagating even while LAUNCHING is usage-paused. No-op when the
+  # integration trunk is off (INTEGRATION=0).
+  reconcile_trunk
 
   # Plan + reclaim run before the gate: classification is read-only and reclaim
   # frees disk for DONE phases even while feeding is paused (e.g. on the disk gate).
@@ -485,9 +846,10 @@ detach_and_exit() {
 case "$MODE" in
   render)
     # Print the phase-drain brief rendered for $PHASES to stdout (debug / test).
+    # Goes through render_brief_stream so {{DEPENDS_ON}} is expanded too (v1).
     [[ -f "$ARACHNE_PHASE_BRIEF_TEMPLATE" ]] \
       || die "phase-drain brief template not found: $ARACHNE_PHASE_BRIEF_TEMPLATE (built by F64.4)"
-    sed "s/{{PHASE}}/$PHASES/g" "$ARACHNE_PHASE_BRIEF_TEMPLATE"
+    render_brief_stream "$PHASES"
     exit 0
     ;;
   dry)
@@ -532,6 +894,13 @@ if [[ "${ARACHNE_PUMP_NO_LAUNCH:-0}" -ne 1 ]]; then
   "$DOCKER" build -t arachne "$REPO_ROOT" >/dev/null || die "image build failed"
 fi
 
+# Materialise auto/trunk + its worktree once, before the loop (A3). Real run
+# only — skipped under NO_LAUNCH (tests / read-only validation) and a no-op when
+# --integration-trunk is off.
+if [[ "${ARACHNE_PUMP_NO_LAUNCH:-0}" -ne 1 ]]; then
+  ensure_trunk
+fi
+
 # Belt-and-suspenders disk discipline (A4): auto-start the disk watchdog like
 # run-parallel.sh does, so disk pressure also drops the live pool cap (cap-file
 # path) on top of the feed gate. --auto-exit retires it once no agents remain.
@@ -562,6 +931,9 @@ while true; do
   sleep "$TICK"
 done
 
+# Graduate the integration trunk as one auto/trunk → main PR (A3, no-op when
+# --integration-trunk is off), then push canonical ops/.
+graduate_trunk
 git -C "$OPS_DIR" push >/dev/null 2>&1 || warn "final ops push failed"
 write_state drained ""
 # Tally non-done terminal states that need a human (blocked / stuck / needs-review).
