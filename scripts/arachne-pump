@@ -237,6 +237,54 @@ phase_lead_task() {
   "$ARACHNE_TASK" ready --phase "$1" --json 2>/dev/null | jq -r '.[0].id // empty' 2>/dev/null
 }
 
+# ── Liveness-based reclaim (D3 applied to the eligibility path) ─────────────────
+# A task left `in_progress` by a DEAD container (no live `arachne-agent` for its
+# claimed branch) silently starves the frontier: `ready` excludes claimed tasks,
+# so the phase's lead task — and everything blocked behind it — becomes ineligible
+# and the pump can neither launch nor drain. (Root cause of the 2026-06-23 F43..F63
+# stall: agents 401'd on an expired token and died; the entrypoint's safety-net
+# `claim --turns 9999` meant scrub's turn-budget tripwire never reclaimed them.)
+#
+# D3 says liveness comes from `docker ps`, never task status. The launch path
+# already honors this; this closes the gap on the *reclaim* path. Each tick, for
+# every in_progress task claimed by a branch THIS pump owns (claimed_by ==
+# phase_branch of the task's phase) whose container is dead:
+#   * 0 commits ahead of base → `release` to `open` (clean, safe re-attempt).
+#   * commits ahead          → leave parked, warn (a human/PR decision; the pump
+#                              never auto-loops over committed work).
+# The branch/worktree is never touched, so a released task resumes its prior work.
+reclaim_orphaned_claims() {
+  local -A live=()
+  local s; while IFS= read -r s; do [[ -n "$s" ]] && live["$s"]=1; done < <(apl_live_agent_slugs)
+  local reclaimed=0 parked=0 id status branch _rest
+  while read -r id status branch _rest; do
+    [[ "$id" == "ID" || "$status" != "in_progress" ]] && continue
+    [[ -z "$branch" || "$branch" == "-" ]] && continue
+    # Only touch claims on a branch this pump's naming scheme owns; skip human
+    # branches and any other claimant.
+    local phase="${id%%.*}"
+    [[ "$branch" == "$(phase_branch "$phase")" ]] || continue
+    # Live container for this branch ⇒ a legitimate, in-flight claim. Leave it.
+    [[ -n "${live["$(branch_slug "$branch")"]:-}" ]] && continue
+    # Orphaned claim. Preserve committed work; only auto-reopen clean orphans.
+    local ahead; ahead="$(git -C "$REPO_ROOT" rev-list --count "$BASE_REF..$branch" 2>/dev/null || echo 0)"
+    if [[ "$ahead" -gt 0 ]]; then
+      warn "orphaned claim with committed work: $id ($branch, $ahead commit(s), container dead) — parked for review, not auto-reopened"
+      parked=$((parked + 1))
+      continue
+    fi
+    if "$ARACHNE_TASK" release "$id" \
+        --reason "Auto-reclaimed by pump: container for $branch is dead and the branch has 0 commits (D3 liveness reclaim)." \
+        >/dev/null 2>&1; then
+      log "reclaimed orphaned claim $id ($branch — container dead, 0 commits) → open"
+      reclaimed=$((reclaimed + 1))
+    fi
+  done < <("$ARACHNE_TASK" list --status in_progress 2>/dev/null)
+  [[ "$reclaimed" -gt 0 ]] && log "liveness reclaim: $reclaimed task(s) released to open"
+  [[ "$parked" -gt 0 ]] && warn "liveness reclaim: $parked orphaned claim(s) with committed work need review"
+  return 0
+}
+
 # ── Feed gate ──────────────────────────────────────────────────────────────────
 # Echoes a one-line reason and returns 10 to pause feeding, or returns 0 to feed.
 GATE_REASON=""
@@ -724,6 +772,7 @@ reclaim_done_targets() {
 do_tick() {
   git -C "$OPS_DIR" pull --ff-only >/dev/null 2>&1 || warn "ops pull --ff-only failed (continuing)"
   "$ARACHNE_TASK" scrub >/dev/null 2>&1 || warn "scrub failed (continuing)"
+  reclaim_orphaned_claims   # D3: free tasks parked by dead containers before planning
 
   # RC-4 contamination guard (A8 / F65.5): flag any primary-source dirtiness an
   # agent slipped past the read-only mount. Clean under normal operation. Always
