@@ -150,7 +150,7 @@ run_disk() { ARACHNE_MONITOR_DISK=1 ARACHNE_MONITOR_DISK_CACHE="$DCACHE" \
 strip_ansi() { sed -r 's/\x1b\[[0-9;]*m//g'; }   # text assertions ignore colour
 out=$(DF_AVAIL_KB=52428800 run_disk)   # 50G free
 outp=$(strip_ansi <<<"$out")
-grep -q '^Disk ' <<<"$outp" && pass "disk gauge renders a Disk line" || fail "no Disk line:\n$outp"
+grep -qE '^[[:space:]]*Disk ' <<<"$outp" && pass "disk gauge renders a Disk line" || fail "no Disk line:\n$outp"
 grep -qE '50(\.0)?G free / 100(\.0)?G' <<<"$outp" && pass "free/total shown (50G/100G)" || fail "free/total missing:\n$outp"
 grep -qE 'worktrees 11\.[0-9]G in 3' <<<"$outp" && pass "worktrees total+count (3 dirs)" || fail "worktree total wrong:\n$outp"
 grep -qE 'main 467\.[0-9]M' <<<"$outp" && pass "main footprint shown" || fail "main missing:\n$outp"
@@ -160,14 +160,67 @@ grep -qE 'largest: feat/big 11\.2G · feat/small 286\.1M' <<<"$outp" && pass "la
 grep -q '(+1 more)' <<<"$outp" && pass "shows (+N more) when over top-N" || fail "+N more missing:\n$outp"
 
 # Free-space colour bands (panic<5G red, pause<10G amber, else terracotta).
-fb() { DF_AVAIL_KB=$1 run_disk | grep '^Disk '; }
+fb() { DF_AVAIL_KB=$1 run_disk | grep -E '^[[:space:]]*Disk '; }
 printf '%s' "$(fb 52428800)" | grep -q $'\033\[38;5;173m' && pass "50G free → terracotta bar" || fail "50G not terracotta"
 printf '%s' "$(fb 8388608)"  | grep -q $'\033\[33m'      && pass "8G free → amber (pause band)"  || fail "8G not amber"
 printf '%s' "$(fb 3145728)"  | grep -q $'\033\[1;31m'    && pass "3G free → red (panic band)"    || fail "3G not red"
 
 # --no-disk suppresses the gauge entirely.
 nd=$(ARACHNE_MONITOR_DISK=1 ARACHNE_MONITOR_DISK_CACHE="$DCACHE" ARACHNE_MONITOR_MAIN_ROOT="$FAKE_MAIN" "$CLI" --no-disk 2>/dev/null)
-grep -q '^Disk ' <<<"$nd" && fail "--no-disk still drew the gauge" || pass "--no-disk suppresses the gauge"
+grep -qE '^[[:space:]]*Disk ' <<<"$nd" && fail "--no-disk still drew the gauge" || pass "--no-disk suppresses the gauge"
+
+# ── Test 9: refresh interval — default 1s, env var, positional precedence ──────
+echo "--- Test 9: refresh interval (#155) ---"
+make_usage_stub 30 40
+LOGI="$TMP/interval.log"
+# Default: --watch with no number logs interval=1.
+timeout 2 "$CLI" --watch --log "$LOGI" >/dev/null 2>&1 </dev/null || true
+grep -qE 'interval=1s ' "$LOGI" 2>/dev/null && pass "default --watch interval is 1s" || fail "default interval not 1s: $(head -1 "$LOGI" 2>/dev/null)"
+# Env var sets the interval.
+LOGE="$TMP/interval-env.log"
+ARACHNE_MONITOR_INTERVAL=3 timeout 2 "$CLI" --watch --log "$LOGE" >/dev/null 2>&1 </dev/null || true
+grep -qE 'interval=3s ' "$LOGE" 2>/dev/null && pass "ARACHNE_MONITOR_INTERVAL=3 honoured" || fail "env interval not 3s: $(head -1 "$LOGE" 2>/dev/null)"
+# Positional arg wins over the env var.
+LOGP="$TMP/interval-pos.log"
+ARACHNE_MONITOR_INTERVAL=3 timeout 2 "$CLI" --watch 5 --log "$LOGP" >/dev/null 2>&1 </dev/null || true
+grep -qE 'interval=5s ' "$LOGP" 2>/dev/null && pass "positional --watch 5 beats env var" || fail "positional did not win: $(head -1 "$LOGP" 2>/dev/null)"
+
+# ── Test 10: gauge alignment — 5h / 7d / Disk bars start at the same column ─────
+echo "--- Test 10: gauge alignment ---"
+make_usage_stub 42 73
+align_out=$(ARACHNE_MONITOR_DISK=1 ARACHNE_MONITOR_DISK_CACHE="$DCACHE" \
+  ARACHNE_MONITOR_DISK_TTL=99999 ARACHNE_MONITOR_MAIN_ROOT="$FAKE_MAIN" \
+  DF_AVAIL_KB=52428800 "$CLI" 2>/dev/null | strip_ansi)
+bar_col() { awk -v lbl="$1" '$0 ~ ("^[[:space:]]*" lbl " ") { print index($0, "▐"); exit }' <<<"$align_out"; }
+c5=$(bar_col "5h"); c7=$(bar_col "7d"); cd=$(bar_col "Disk")
+[[ -n "$c5" && "$c5" == "$c7" && "$c5" == "$cd" ]] \
+  && pass "5h/7d/Disk bars align at the same column ($c5)" \
+  || fail "bars misaligned: 5h=$c5 7d=$c7 Disk=$cd"
+
+# ── Test 11: notes panel — header, seeded lines, empty hint ────────────────────
+echo "--- Test 11: notes field ---"
+NF="$TMP/notes.md"
+printf -- '- 09:00  first note\n- 09:05  second note\n' >| "$NF"
+nout=$(ARACHNE_MONITOR_NOTES_FILE="$NF" "$CLI" 2>/dev/null | strip_ansi)
+grep -qE '^Notes \[' <<<"$nout" && pass "notes panel renders a header" || fail "no Notes header:\n$nout"
+grep -q 'first note'  <<<"$nout" && grep -q 'second note' <<<"$nout" && pass "notes panel shows seeded lines" || fail "seeded notes missing:\n$nout"
+grep -q '(n add · e/C-g nvim)' <<<"$nout" && pass "notes header lists the edit keys" || fail "edit-key hint missing"
+EF="$TMP/empty-notes.md"; : >| "$EF"
+eout=$(ARACHNE_MONITOR_NOTES_FILE="$EF" "$CLI" 2>/dev/null | strip_ansi)
+grep -q 'no notes yet' <<<"$eout" && pass "empty notes file shows the add hint" || fail "empty-notes hint missing:\n$eout"
+# Notes tail is bounded by NOTES_TAIL.
+printf -- '- a\n- b\n- c\n- d\n- e\n- f\n' >| "$NF"
+tout=$(ARACHNE_MONITOR_NOTES_FILE="$NF" ARACHNE_MONITOR_NOTES_TAIL=2 "$CLI" 2>/dev/null | strip_ansi)
+shown=$(grep -cE '^  - ' <<<"$tout")
+[[ "$shown" == "2" ]] && pass "notes panel honours NOTES_TAIL=2" || fail "expected 2 tail lines got $shown"
+
+# ── Test 12: notes run-key — scoped to the pump phases + start time ────────────
+echo "--- Test 12: notes scoped to the pump run ---"
+PSTATE="$TMP/pump.state"
+printf '%s' '{"phases":"F43..F63","started_at":"2026-06-23T20:36:23Z"}' >| "$PSTATE"
+ndir="$TMP/notesdir"
+key_out=$(ARACHNE_PUMP_STATE_FILE="$PSTATE" ARACHNE_MONITOR_NOTES_DIR="$ndir" "$CLI" 2>/dev/null | strip_ansi)
+grep -q 'Notes \[F43..F63\]' <<<"$key_out" && pass "notes header shows the pump phase-range" || fail "phase-range label missing:\n$key_out"
 
 echo
 echo "=============================================="

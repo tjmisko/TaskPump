@@ -23,14 +23,29 @@
 # screen is never blanked between frames. `--legacy-paint` restores the old
 # clear-then-render behaviour for an A/B comparison of the flicker.
 #
+# Below the gauges is a Notes field — a free-text scratchpad scoped to the
+# current pump run (keyed by the pump's phase-range + start time, so a new run
+# starts fresh). In --watch it is interactive: press `n` to type a note line
+# inline, Enter to save it, and `e` / Ctrl-G to pop the whole notes buffer into
+# $EDITOR (nvim) — exactly like Claude Code's Ctrl-G — returning to the monitor
+# on save+quit. `q` quits the watch. Notes persist in
+# .arachne-monitor-notes/<run>.md (gitignored).
+#
+# Refresh cadence: --watch defaults to 1s. Set ARACHNE_MONITOR_INTERVAL to change
+# it once in your shell/config; a positional --watch <N> still wins. Fractional
+# seconds are accepted (coreutils sleep), e.g. --watch 0.5.
+#
 # Usage:
 #   ./scripts/arachne-monitor             # one paint
-#   ./scripts/arachne-monitor --watch     # refresh every 10s (batched, flicker-free)
+#   ./scripts/arachne-monitor --watch     # refresh every 1s (batched, flicker-free)
 #   ./scripts/arachne-monitor --watch 5   # refresh every 5s
+#   ARACHNE_MONITOR_INTERVAL=3 ./scripts/arachne-monitor --watch   # every 3s (env)
 #   ./scripts/arachne-monitor --watch --log /tmp/mon.log   # log each redraw's timing
 #   ./scripts/arachne-monitor --watch --legacy-paint       # old clear-then-render
 #   ./scripts/arachne-monitor --no-disk   # hide the disk gauge
 #   ./scripts/arachne-monitor --demo      # synthetic sessions; no docker needed
+#
+# Watch-mode keys:  n add a note · e / Ctrl-G edit notes in nvim · q quit
 set -euo pipefail
 
 REPO_ROOT="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
@@ -42,7 +57,9 @@ print_help() {
     awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$0"
 }
 
-WATCH=0; INTERVAL=10; DEMO=0
+# Refresh interval precedence: positional --watch <N> (set in the arg loop below)
+#   >  ARACHNE_MONITOR_INTERVAL  >  built-in default (1s). Fractional ok (sleep).
+WATCH=0; INTERVAL="${ARACHNE_MONITOR_INTERVAL:-1}"; DEMO=0
 MONITOR_LOG="${ARACHNE_MONITOR_LOG:-}"        # redraw-instrumentation log (off if empty)
 PAINT_MODE="${ARACHNE_MONITOR_PAINT:-batched}"  # batched (flicker-free) | legacy
 SHOW_DISK="${ARACHNE_MONITOR_DISK:-1}"        # disk gauge on by default; --no-disk / =0 off
@@ -101,6 +118,14 @@ BAR_WARN=$'\033[33m'           # amber fill (warning band)
 BAR_CRIT=$'\033[1;31m'         # red fill once a gauge is at/over critical
 BAR_RST=$'\033[0m'
 
+# ── Gauge alignment ───────────────────────────────────────────────────────────
+# Every gauge row (5h / 7d / Disk) shares one indent + a left-justified label
+# column so the bars, percentages, and trailing text line up vertically under
+# the pump summary line. GAUGE_SUBINDENT lands under the bar, for detail lines.
+GAUGE_INDENT='  '              # 2-space indent under the pump summary line
+GAUGE_LABEL_W=4                # widest label ("Disk"); 5h/7d are padded to match
+printf -v GAUGE_SUBINDENT '%*s' "$(( ${#GAUGE_INDENT} + GAUGE_LABEL_W + 1 ))" ''
+
 # bar_glyphs -- echo just the 20-cell ▐█░▌ bar for a percent (shared by the usage
 # and disk gauges so they look identical). $2 overrides the fill colour; without
 # it the fill is terracotta, turning red at/over 95%.
@@ -117,11 +142,12 @@ bar_glyphs() {
 }
 
 # render_bar -- one usage bar line. Args: label percent reset_at [date_fmt].
-#   "    5h ▐██████████░░░░░░░░░░▌  34%  resets 19:29"
+#   "  5h   ▐██████████░░░░░░░░░░▌  34%  resets 19:29"
 render_bar() {
     local label="$1" pct="$2" reset_at="${3:-}" date_fmt="${4:-+%H:%M}"
     if ! [[ "$pct" =~ ^[0-9]+$ ]]; then
-        printf '    %-2s %s(window unavailable)%s\n' "$label" "$BAR_EMPTY" "$BAR_RST"
+        printf '%s%-*s %s(window unavailable)%s\n' \
+            "$GAUGE_INDENT" "$GAUGE_LABEL_W" "$label" "$BAR_EMPTY" "$BAR_RST"
         return 0
     fi
     local p="$pct"; (( p > 100 )) && p=100
@@ -129,7 +155,7 @@ render_bar() {
     if [[ -n "$reset_at" && "$reset_at" != "null" && "$reset_at" != "-" ]]; then
         reset_str="$(date -d "$reset_at" "$date_fmt" 2>/dev/null || true)"
     fi
-    printf '    %-2s %s %3d%%' "$label" "$(bar_glyphs "$p")" "$p"
+    printf '%s%-*s %s %3d%%' "$GAUGE_INDENT" "$GAUGE_LABEL_W" "$label" "$(bar_glyphs "$p")" "$p"
     [[ -n "$reset_str" ]] && printf '  %sresets %s%s' "$BAR_EMPTY" "$reset_str" "$BAR_RST"
     printf '\n'
     return 0
@@ -236,15 +262,15 @@ disk_section() {
     local fillcol="$BAR_FILL"
     (( free_gb < DISK_PAUSE_GB )) && fillcol="$BAR_WARN"
     (( free_gb < DISK_PANIC_GB )) && fillcol="$BAR_CRIT"
-    printf 'Disk  %s  %s%s free%s / %s  (%d%% used)\n' \
-        "$(bar_glyphs "$used_pct" "$fillcol")" \
+    printf '%s%-*s %s  %s%s free%s / %s  (%d%% used)\n' \
+        "$GAUGE_INDENT" "$GAUGE_LABEL_W" "Disk" "$(bar_glyphs "$used_pct" "$fillcol")" \
         "$BAR_EMPTY" "$(human_bytes $(( avail_kb * 1024 )))" "$BAR_RST" \
         "$(human_bytes $(( total_kb * 1024 )))" "$used_pct"
 
     # Cached heavy sizing (kicks a background refresh when stale).
     disk_refresh_if_stale
     if [[ ! -f "$DISK_CACHE" ]]; then
-        printf '    %ssizing worktrees…%s\n\n' "$BAR_EMPTY" "$BAR_RST"
+        printf '%s%ssizing worktrees…%s\n\n' "$GAUGE_SUBINDENT" "$BAR_EMPTY" "$BAR_RST"
         return 0
     fi
     local age; age=$(( $(date +%s) - $(stat -c %Y "$DISK_CACHE" 2>/dev/null || echo 0) ))
@@ -260,8 +286,8 @@ disk_section() {
         t=$2; sub("Images","img",t); sub("Containers","cont",t);
         sub("Local Volumes","vol",t); sub("Build Cache","cache",t);
         c++; printf "%s%s %s", (c>1?" · ":""), t, $3 }' "$DISK_CACHE" 2>/dev/null)"
-    printf '    %sworktrees%s %s in %d   %smain%s %s' \
-        "$BAR_EMPTY" "$BAR_RST" "$(human_bytes "$wt_total")" "$wt_count" \
+    printf '%s%sworktrees%s %s in %d   %smain%s %s' \
+        "$GAUGE_SUBINDENT" "$BAR_EMPTY" "$BAR_RST" "$(human_bytes "$wt_total")" "$wt_count" \
         "$BAR_EMPTY" "$BAR_RST" "$(human_bytes "${main_b:-0}")"
     [[ -n "$dline" ]] && printf '   %sdocker%s %s' "$BAR_EMPTY" "$BAR_RST" "$dline"
     printf '   %s(updated %ds ago)%s\n' "$BAR_EMPTY" "$age" "$BAR_RST"
@@ -271,7 +297,7 @@ disk_section() {
         local largest
         largest="$(awk -F'\t' '$1=="WT"{print $3"\t"$2}' "$DISK_CACHE" 2>/dev/null \
             | sort -rn | head -n "$DISK_TOP_N")"
-        local line2="    largest:" name bytes
+        local line2="${GAUGE_SUBINDENT}largest:" name bytes
         while IFS=$'\t' read -r bytes name; do
             [[ -n "$name" ]] || continue
             line2+=" $name $(human_bytes "$bytes") ·"
@@ -360,6 +386,71 @@ DISK_PANIC_GB="${ARACHNE_MONITOR_DISK_PANIC_GB:-5}"
 DISK_PAUSE_GB="${ARACHNE_MONITOR_DISK_PAUSE_GB:-10}"
 DISK_RECOVER_GB="${ARACHNE_MONITOR_DISK_RECOVER_GB:-20}"
 DISK_CACHE="${ARACHNE_MONITOR_DISK_CACHE:-${TMPDIR:-/tmp}/arachne-monitor-disk.$(printf '%s' "$MAIN_ROOT" | cksum | cut -d' ' -f1).tsv}"
+
+# ── Notes field config ──────────────────────────────────────────────────────────
+# A free-text scratchpad scoped to the current pump RUN: keyed by the pump's
+# phase-range + start time, so a new run starts fresh (old runs' notes linger as
+# separate files, never clobbered). Falls back to a single "session" file when no
+# pump is running. ARACHNE_MONITOR_NOTES_FILE overrides the resolved path directly
+# (tests / power users); otherwise it is NOTES_DIR/<run>.md.
+NOTES_DIR="${ARACHNE_MONITOR_NOTES_DIR:-$MAIN_ROOT/.arachne-monitor-notes}"
+NOTES_TAIL="${ARACHNE_MONITOR_NOTES_TAIL:-4}"    # most recent note lines shown in the panel
+EDITOR_BIN="${VISUAL:-${EDITOR:-nvim}}"          # Ctrl-G / e popout target
+
+# notes_run_key -- a filesystem-safe slug identifying the current pump run, or
+# "session" when no pump state exists. Built from phases + started_at so the file
+# rotates (appears fresh) when a new run begins.
+notes_run_key() {
+    [[ -f "$PUMP_STATE" ]] || { printf 'session'; return 0; }
+    local phases started slug ts
+    phases="$(jq -r '.phases // ""' "$PUMP_STATE" 2>/dev/null || echo '')"
+    started="$(jq -r '.started_at // ""' "$PUMP_STATE" 2>/dev/null || echo '')"
+    [[ -n "$phases$started" ]] || { printf 'session'; return 0; }
+    slug="$(printf '%s' "$phases" | tr -c 'A-Za-z0-9' '-')"; slug="${slug##-}"; slug="${slug%%-}"
+    ts="$(printf '%s' "$started" | tr -dc '0-9')"
+    printf '%s' "${slug:-run}${ts:+-$ts}"
+}
+
+# notes_file -- resolved path to the current run's notes file (override wins).
+notes_file() {
+    [[ -n "${ARACHNE_MONITOR_NOTES_FILE:-}" ]] && { printf '%s' "$ARACHNE_MONITOR_NOTES_FILE"; return 0; }
+    printf '%s/%s.md' "$NOTES_DIR" "$(notes_run_key)"
+}
+
+# notes_label -- the run-scope label shown in the panel header.
+notes_label() {
+    if [[ -f "$PUMP_STATE" ]]; then
+        local phases; phases="$(jq -r '.phases // ""' "$PUMP_STATE" 2>/dev/null || echo '')"
+        [[ -n "$phases" ]] && { printf '%s' "$phases"; return 0; }
+    fi
+    printf 'session'
+}
+
+# append_note -- append one timestamped note line to the current run's file.
+append_note() {
+    local text="$1" f; f="$(notes_file)"
+    [[ -n "${text//[[:space:]]/}" ]] || return 0
+    mkdir -p "$(dirname "$f")" 2>/dev/null || true
+    printf -- '- %s  %s\n' "$(date '+%H:%M')" "$text" >> "$f" 2>/dev/null || true
+}
+
+# notes_section -- the visible Notes panel: a header naming the run scope + the
+# editing keys, then the most recent NOTES_TAIL lines (or a hint when empty).
+notes_section() {
+    local f label; f="$(notes_file)"; label="$(notes_label)"
+    printf 'Notes [%s]   %s(n add · e/C-g nvim)%s\n' "$label" "$BAR_EMPTY" "$BAR_RST"
+    if [[ -s "$f" ]]; then
+        local ln
+        while IFS= read -r ln; do
+            [[ -n "${ln//[[:space:]]/}" ]] || continue
+            printf '%s%s\n' "$GAUGE_INDENT" "$ln"
+        done < <(tail -n "$NOTES_TAIL" "$f" 2>/dev/null)
+    else
+        printf '%s%s(no notes yet — press n to add one)%s\n' "$GAUGE_INDENT" "$BAR_EMPTY" "$BAR_RST"
+    fi
+    printf '\n'
+    return 0
+}
 
 # pump_status_line -- when the usage-governed pump (scripts/arachne-pump) is
 # running, show its range + status + (if paused) the reason, the queue depth
@@ -457,6 +548,7 @@ snapshot() {
         [[ -n "$ub" ]] && printf '%s\n\n' "$ub"
     fi
     disk_section
+    notes_section
     local found=0
     while IFS='|' read -r cname state status; do
         [[ -z "$cname" ]] && continue
@@ -515,12 +607,16 @@ demo() {
     printf '\n'
     # Synthetic disk gauge: a near-full disk (amber free-space warning) plus the
     # cached worktree/main/docker summary and the largest-worktree offenders.
-    printf 'Disk  %s  %s8.4G free%s / 100G  (92%% used)\n' \
-        "$(bar_glyphs 92 "$BAR_WARN")" "$BAR_EMPTY" "$BAR_RST"
-    printf '    %sworktrees%s 22.4G in 14   %smain%s 4.1G   %sdocker%s img 6.2GB · cont 1.4GB · cache 1.4GB   %s(updated 18s ago)%s\n' \
-        "$BAR_EMPTY" "$BAR_RST" "$BAR_EMPTY" "$BAR_RST" "$BAR_EMPTY" "$BAR_RST" "$BAR_EMPTY" "$BAR_RST"
-    printf '    largest: feat/f45 3.2G · feat/f43 3.0G · feat/f64 2.9G · feat/f53 2.8G · feat/f44 2.7G  %s(+9 more)%s\n\n' \
-        "$BAR_EMPTY" "$BAR_RST"
+    printf '%s%-*s %s  %s8.4G free%s / 100G  (92%% used)\n' \
+        "$GAUGE_INDENT" "$GAUGE_LABEL_W" "Disk" "$(bar_glyphs 92 "$BAR_WARN")" "$BAR_EMPTY" "$BAR_RST"
+    printf '%s%sworktrees%s 22.4G in 14   %smain%s 4.1G   %sdocker%s img 6.2GB · cont 1.4GB · cache 1.4GB   %s(updated 18s ago)%s\n' \
+        "$GAUGE_SUBINDENT" "$BAR_EMPTY" "$BAR_RST" "$BAR_EMPTY" "$BAR_RST" "$BAR_EMPTY" "$BAR_RST" "$BAR_EMPTY" "$BAR_RST"
+    printf '%slargest: feat/f45 3.2G · feat/f43 3.0G · feat/f64 2.9G · feat/f53 2.8G · feat/f44 2.7G  %s(+9 more)%s\n\n' \
+        "$GAUGE_SUBINDENT" "$BAR_EMPTY" "$BAR_RST"
+    # Synthetic notes panel (the run-scoped scratchpad).
+    printf 'Notes [F55..F63]   %s(n add · e/C-g nvim)%s\n' "$BAR_EMPTY" "$BAR_RST"
+    printf '%s- 14:31  f55 disk 34.9G — cargo clean before the canary\n' "$GAUGE_INDENT"
+    printf '%s- 14:33  F41.9 comms blocked on creds — follow up\n\n' "$GAUGE_INDENT"
     printf '%s\n' \
         "Reading ops/planning/2026-04-13 - Integrations Roadmap.md" \
         "⚙ Read crates/arachne-connectors/src/email/mod.rs" \
@@ -594,6 +690,50 @@ paint_frame() {  # frame
     printf '\033[J'
 }
 
+# ── Interactive notes (watch mode) ──────────────────────────────────────────────
+# edit_in_nvim -- pop the notes file into $EDITOR (nvim), like Claude Code's
+# Ctrl-G. Leaves our alternate screen so the editor owns the terminal, then
+# re-enters and forces a clean full repaint on return.
+edit_in_nvim() {  # file
+    local f="$1"
+    mkdir -p "$(dirname "$f")" 2>/dev/null || true
+    [[ -e "$f" ]] || : >> "$f" 2>/dev/null || true
+    tput rmcup 2>/dev/null || true     # back to the normal screen
+    tput cnorm 2>/dev/null || true     # show the cursor for the editor
+    "$EDITOR_BIN" "$f" </dev/tty >/dev/tty 2>&1 || true
+    tput smcup 2>/dev/null || true     # re-enter our alternate screen
+    tput civis 2>/dev/null || true     # hide the cursor again
+    printf '\033[2J' 2>/dev/null || true   # next frame repaints from a clean slate
+}
+
+# notes_input_mode -- modal inline note entry at the bottom row. Printable keys
+# append, Backspace deletes, Enter saves the line, Esc cancels, Ctrl-G saves
+# what's typed so far and opens the whole notes file in nvim.
+notes_input_mode() {
+    local buf="" ch rows seq
+    rows="$(tput lines 2>/dev/null || echo 24)"
+    tput cnorm 2>/dev/null || true     # show the cursor while typing
+    while true; do
+        printf '\033[%d;1H\033[K\033[36mnote>\033[0m %s' "$rows" "$buf"
+        # read -n1 consumes a newline as its delimiter and returns an EMPTY $ch
+        # (rc 0), so an empty read IS the Enter keypress (save). A non-zero rc is
+        # EOF/closed stdin → bail. CR survives in raw ttys, so keep that case too.
+        if ! IFS= read -rsn1 ch; then break; fi
+        if [[ -z "$ch" ]]; then append_note "$buf"; break; fi
+        case "$ch" in
+            $'\r')            append_note "$buf"; break ;;       # save (raw-tty Enter)
+            $'\x7f'|$'\x08')  buf="${buf%?}" ;;                  # Backspace
+            $'\x07')          append_note "$buf"; edit_in_nvim "$(notes_file)"; break ;;  # Ctrl-G
+            $'\x1b')          # Esc, or the lead byte of an arrow/escape seq. Swallow
+                              # a trailing sequence non-blockingly; a bare Esc cancels.
+                              seq=""; IFS= read -rsn2 -t 0.002 seq || true
+                              [[ -z "$seq" ]] && break ;;
+            *)                buf+="$ch" ;;
+        esac
+    done
+    tput civis 2>/dev/null || true     # hide the cursor again
+}
+
 if [[ "$WATCH" -eq 1 ]]; then
     # Take over the terminal on the alternate buffer (like top/watch), hide the
     # cursor, and restore both when the user quits (Ctrl-C) or the loop dies for
@@ -625,7 +765,22 @@ if [[ "$WATCH" -eq 1 ]]; then
             __paint_us=$(( $(_now_us) - __p0 ))
             log_redraw "$__redraw" "$__compute_us" "$__paint_us" "$__frame"
         fi
-        sleep "$INTERVAL"
+        # Wait out the interval, but on a real terminal stay responsive to keys:
+        #   n → add a note inline · e / Ctrl-G → edit notes in nvim · q → quit.
+        # A timeout (no key) just falls through to the next repaint. When stdin is
+        # not a tty (tests, pipes), fall back to a plain sleep — same as before.
+        if [[ -t 0 ]]; then
+            __key=""
+            IFS= read -rsn1 -t "$INTERVAL" __key || __key=""
+            case "$__key" in
+                q|Q)            break ;;
+                n|N)            notes_input_mode ;;
+                e|E|$'\x07')    edit_in_nvim "$(notes_file)" ;;   # e or Ctrl-G
+                *)              : ;;                              # timeout / other → repaint
+            esac
+        else
+            sleep "$INTERVAL"
+        fi
     done
 else
     if [[ -n "$MONITOR_LOG" ]]; then
