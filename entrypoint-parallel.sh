@@ -303,7 +303,7 @@ DEV_SESSION_SCRIPT="
     # Safety-net claim of the epic task (the agent re-claims/sub-claims as the
     # brief directs). Harmless if already claimed by this branch (idempotent).
     if [ -n '$TASK_ID' ]; then
-        '$WORKSPACE_PATH/scripts/arachne-task' claim '$TASK_ID' --branch \"\$CURRENT_BRANCH\" --turns 9999 2>&1 | tee -a '$LOG_FILE' || true
+        '$WORKSPACE_PATH/scripts/arachne-task' claim '$TASK_ID' --branch \"\$CURRENT_BRANCH\" --turns 3 2>&1 | tee -a '$LOG_FILE' || true
         '$WORKSPACE_PATH/scripts/arachne-task' heartbeat '$TASK_ID' --start 2>&1 | tee -a '$LOG_FILE' || true
     fi
 

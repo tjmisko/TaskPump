@@ -590,10 +590,17 @@ cmd_heartbeat() {
   fi
 
   local head_now; head_now=$(code_head_sha)
+  # Wall-clock liveness stamp, distinct from last_heartbeat_head_sha (which is a
+  # productivity marker, cleared to null each cycle). scrub's staleness tripwire
+  # reads last_heartbeat_ts to reclaim claims that stopped beating.
+  local now; now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
   if [[ "$mode" == "start" ]]; then
-    # Record the starting HEAD so --end can compare.
-    fm_set "$file" ".last_heartbeat_head_sha = \"$head_now\""
+    # Record the starting HEAD so --end can compare; stamp liveness.
+    fm_set "$file" "
+      .last_heartbeat_head_sha = \"$head_now\" |
+      .last_heartbeat_ts = \"$now\"
+    "
     git_commit_state "heartbeat start $id (head=$head_now)"
     echo "heartbeat start $id"
     return 0
@@ -665,7 +672,8 @@ cmd_heartbeat() {
   fm_set "$file" "
     .turn_budget_remaining = $new_budget |
     .consecutive_failed_iterations = $new_failures |
-    .last_heartbeat_head_sha = null
+    .last_heartbeat_head_sha = null |
+    .last_heartbeat_ts = \"$now\"
   "
   git_commit_state "heartbeat end $id (budget=$new_budget failures=$new_failures productive=$productive)"
   echo "heartbeat end $id: budget=$new_budget failures=$new_failures productive=$productive"
@@ -773,6 +781,25 @@ cmd_release() {
   echo "released $id"
 }
 
+# Convert an ISO-8601 UTC timestamp (YYYY-MM-DDTHH:MM:SSZ) to epoch seconds.
+# Portable across GNU coreutils date (-d), BSD/macOS date (-j -f), and a
+# python3 fallback. Prints empty string if the timestamp can't be parsed.
+iso_to_epoch() {
+  local ts=$1 epoch
+  [[ -z "$ts" ]] && { printf ''; return; }
+  if epoch=$(date -u -d "$ts" +%s 2>/dev/null); then
+    printf '%s' "$epoch"; return
+  fi
+  if epoch=$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$ts" +%s 2>/dev/null); then
+    printf '%s' "$epoch"; return
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    epoch=$(python3 -c 'import sys,datetime; print(int(datetime.datetime.strptime(sys.argv[1], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc).timestamp()))' "$ts" 2>/dev/null) \
+      && { printf '%s' "$epoch"; return; }
+  fi
+  printf ''
+}
+
 cmd_scrub() {
   local scrubbed=0
   local file id budget failures
@@ -782,9 +809,30 @@ cmd_scrub() {
     local status; status=$(fm_get "$file" '.status')
     [[ "$status" != "in_progress" ]] && continue
     budget=$(fm_get "$file" '.turn_budget_remaining')
-    [[ -z "$budget" ]] && budget=9999
+    # Fallback for a null budget (pre-A5 claims, or tooling that skipped
+    # --turns) is 3, not 9999: a small ceiling so an immune claim can still be
+    # reclaimed, but not 0 — that would scrub a legitimate in-flight null-budget
+    # claim on the very next pass.
+    [[ -z "$budget" ]] && budget=3
     failures=$(fm_get "$file" '.consecutive_failed_iterations')
     [[ -z "$failures" ]] && failures=0
+
+    # Heartbeat-staleness: reclaim a claim whose last beat (or claim time, if it
+    # never beat) is older than ARACHNE_CLAIM_STALE_HOURS (default 24h). This
+    # catches an alive-but-hung container that never fires another heartbeat —
+    # the residual gap A1's dead-container check cannot reach.
+    local stale_hours stale=0 ts ts_epoch now_epoch
+    stale_hours="${ARACHNE_CLAIM_STALE_HOURS:-24}"
+    [[ "$stale_hours" =~ ^[0-9]+$ ]] || stale_hours=24
+    ts=$(fm_get "$file" '.last_heartbeat_ts')
+    [[ -z "$ts" ]] && ts=$(fm_get "$file" '.claimed_at')
+    if [[ -n "$ts" ]]; then
+      ts_epoch=$(iso_to_epoch "$ts")
+      now_epoch=$(date -u +%s)
+      if [[ -n "$ts_epoch" ]] && (( now_epoch - ts_epoch > stale_hours * 3600 )); then
+        stale=1
+      fi
+    fi
 
     if (( budget <= 0 )); then
       fm_set "$file" "
@@ -801,6 +849,14 @@ cmd_scrub() {
         .scrub_reason = \"consecutive_failed_iterations=$failures\"
       "
       echo "scrub: $id → stuck (failures=$failures)"
+      scrubbed=$((scrubbed + 1))
+    elif (( stale == 1 )); then
+      fm_set "$file" "
+        .status = \"needs-review\" |
+        .claimed_by = null |
+        .scrub_reason = \"heartbeat_staleness\"
+      "
+      echo "scrub: $id → needs-review (heartbeat_staleness, last=$ts, threshold=${stale_hours}h)"
       scrubbed=$((scrubbed + 1))
     fi
   done < <(list_all_files)
