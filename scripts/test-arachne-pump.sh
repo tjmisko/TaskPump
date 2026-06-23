@@ -36,12 +36,23 @@ if [[ "$1" == "--gate" ]]; then
 fi
 exit 0
 EOF
-chmod +x "$BIN/docker" "$BIN/arachne-usage"
+# arachne-disk-watchdog: only --gate matters here; exit $STUB_DISK_GATE_RC
+# (0 feed / 10 pause). Defaults feed-ok so Tests 1-8 are unaffected by host disk.
+cat >| "$BIN/arachne-disk-watchdog" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "--gate" ]]; then
+  [[ "${STUB_DISK_GATE_RC:-0}" -eq 10 ]] && { echo "/ free=3GB < 10GiB (disk gate)" >&2; exit 10; }
+  exit 0
+fi
+exit 0
+EOF
+chmod +x "$BIN/docker" "$BIN/arachne-usage" "$BIN/arachne-disk-watchdog"
 
 export ARACHNE_TASKS_DIR="$TASKS"
 export ARACHNE_TASK_NOCOMMIT=1
 export ARACHNE_TASK="$REAL_TASK"
 export ARACHNE_USAGE="$BIN/arachne-usage"
+export ARACHNE_DISK_WATCHDOG="$BIN/arachne-disk-watchdog"
 export DOCKER="$BIN/docker"
 
 mk() {  # mk <id> <status> [blockers_csv]
@@ -137,6 +148,10 @@ NOTIFY="$TMP/notify.txt"; : >| "$NOTIFY"
 # Hermetic tick: no worktrees/containers (NO_LAUNCH), ops/git ops point at a
 # non-repo (fail-open), state/cap/log/template/usage all redirected.
 pump_tick() {  # $1=phases ; extra env via caller
+  # Suppress real desktop notifications by default (the fs-guard now runs in
+  # do_tick and would notify-send against this dirty worktree); a caller can
+  # still override ARACHNE_NOTIFY_CMD to capture, as the drain test does.
+  ARACHNE_NOTIFY_CMD="${ARACHNE_NOTIFY_CMD:-true}" \
   ARACHNE_PUMP_NO_LAUNCH=1 \
   ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
   ARACHNE_PUMP_STATE_FILE="$STATE" \
@@ -166,6 +181,251 @@ grep -qi 'drained' "$NOTIFY" && pass "drain notification fired via ARACHNE_NOTIF
 # 8d: restart detection logs a resume for the same range.
 out=$(STUB_GATE_RC=0 pump_tick F55..F57 --once 2>&1 >/dev/null; STUB_GATE_RC=0 pump_tick F55..F57 --once 2>&1)
 grep -qi "resuming pump for F55..F57" <<<"$out" && pass "restart detection logs resume for same range" || fail "no resume log:\n$out"
+
+echo "--- Test 9: disk feed-gate pauses launching (A4 / F65.3) ---"
+# Reset fixtures to a live frontier (the gate line prints regardless of fixtures).
+mk F55.0 open; mk F55.1 open F55.0; mk F56.0 open; mk F57.0 open F55.1
+# 9a: disk gate trips (watchdog --gate exits 10) → GATE: PAUSED in the plan.
+out=$(STUB_DISK_GATE_RC=10 pump F55..F57)
+have "$out" 'GATE: PAUSED' && pass "disk gate pause surfaced when watchdog --gate returns 10" || fail "disk pause not shown:\n$out"
+have "$out" 'disk gate' && pass "pause reason names the disk gate" || fail "disk-gate reason missing:\n$out"
+# 9b: disk gate clears → feed-ok.
+out=$(STUB_DISK_GATE_RC=0 pump F55..F57)
+have "$out" 'GATE: feed-ok' && pass "disk gate feed-ok when watchdog --gate returns 0" || fail "disk feed-ok not shown:\n$out"
+# 9c: --no-disk-gate bypasses the disk check even when it would trip.
+out=$(STUB_DISK_GATE_RC=10 "$PUMP" --no-health-gate --no-disk-gate --dry-run --phases F55..F57)
+have "$out" 'GATE: feed-ok' && pass "--no-disk-gate bypasses the disk gate" || fail "disk gate not bypassed:\n$out"
+
+# 9d: a disk-gated --once tick writes status=paused with the disk reason.
+mk F55.0 open; mk F55.1 open F55.0; mk F56.0 open; mk F57.0 open F55.1
+STUB_GATE_RC=0 STUB_DISK_GATE_RC=10 pump_tick F55..F57 --once >/dev/null 2>&1
+[[ "$(jq -r '.status' "$STATE" 2>/dev/null)" == "paused" ]] && pass "disk gate trip writes status=paused" || fail "status not paused on disk gate: $(cat "$STATE" 2>/dev/null)"
+have "$(jq -r '.paused_reason // empty' "$STATE" 2>/dev/null)" 'disk gate' && pass "paused_reason names the disk gate" || fail "paused_reason missing disk gate: $(jq -r '.paused_reason' "$STATE" 2>/dev/null)"
+
+echo "--- Test 10: reclaim sweep cleans completed-phase target/ dirs (A4 / F65.3) ---"
+WT="$TMP/wt"; STATE10="$TMP/pump10.state"
+# Stub cargo so `clean --manifest-path X` removes $(dirname X)/target with no real
+# build (honours the no-real-cargo test seam). Shadowed onto PATH for the tick.
+cat >| "$BIN/cargo" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "clean" ]]; then
+  shift; mp=""
+  while (($#)); do
+    case "$1" in
+      --manifest-path) mp="$2"; shift 2;;
+      --manifest-path=*) mp="${1#--manifest-path=}"; shift;;
+      *) shift;;
+    esac
+  done
+  [[ -n "$mp" ]] && rm -rf "$(dirname "$mp")/target"
+  exit 0
+fi
+exit 0
+EOF
+chmod +x "$BIN/cargo"
+
+plant_target() {  # fake done-phase worktree with a target/ dir + sentinel
+  rm -rf "$WT"; mkdir -p "$WT/feat/f56/target"
+  : >| "$WT/feat/f56/Cargo.toml"
+  echo sentinel >| "$WT/feat/f56/target/sentinel"
+}
+reclaim_tick() {  # one real tick with the reclaim sweep active, fixture-wired
+  PATH="$BIN:$PATH" \
+  ARACHNE_NOTIFY_CMD="${ARACHNE_NOTIFY_CMD:-true}" \
+  ARACHNE_PUMP_WORKTREES_DIR="$WT" \
+  ARACHNE_PUMP_NO_LAUNCH=1 \
+  ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
+  ARACHNE_PUMP_STATE_FILE="$STATE10" \
+  ARACHNE_POOL_CAP_FILE="$TMP/cap" \
+  ARACHNE_PUMP_LOG="$TMP/pump.log" \
+  ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+  "$PUMP" --no-health-gate "$@"
+}
+
+# 10a: a PLAN_DONE phase (all tasks done) with no live container → target reclaimed.
+mk F56.0 done; plant_target
+out=$(STUB_GATE_RC=0 ARACHNE_DISK_RECLAIM=1 reclaim_tick --phases F56 --once 2>&1)
+[[ ! -d "$WT/feat/f56/target" ]] && pass "reclaim removed F56 target/ on a DONE tick" || fail "F56 target/ survived reclaim:\n$out"
+have "$out" 'reclaimed F56' && pass "reclaim logged 'reclaimed F56'" || fail "no reclaim log line:\n$out"
+
+# 10b: ARACHNE_DISK_RECLAIM=0 → reclaim disabled, target survives.
+plant_target
+STUB_GATE_RC=0 ARACHNE_DISK_RECLAIM=0 reclaim_tick --phases F56 --once >/dev/null 2>&1
+[[ -d "$WT/feat/f56/target" ]] && pass "ARACHNE_DISK_RECLAIM=0 leaves target/ intact" || fail "target removed despite RECLAIM=0"
+
+# 10c: a live container for F56 → target survives even though open_count=0.
+plant_target
+STUB_GATE_RC=0 ARACHNE_DISK_RECLAIM=1 STUB_LIVE="arachne-agent-feat-f56" reclaim_tick --phases F56 --once >/dev/null 2>&1
+[[ -d "$WT/feat/f56/target" ]] && pass "live-phase target/ never reclaimed (phase_live guard)" || fail "live phase target/ was reclaimed"
+
+echo "--- Test 11: A8 read-only-primary mount set in both launchers (F65.5) ---"
+# Static guard against a future blanket-RW $REPO_ROOT regression (RC-4). Each
+# launcher must carry the :ro parent plus the three RW overlays, and must NOT
+# carry an un-suffixed `-v "$REPO_ROOT":"$REPO_ROOT"` (blanket read-write).
+assert_mounts() {  # <launcher-path> <label>
+  local f="$1" label="$2"
+  grep -qF -- '-v "$REPO_ROOT":"$REPO_ROOT":ro' "$f" \
+    && pass "$label: :ro primary mount present" || fail "$label: missing :ro primary mount"
+  grep -qF -- '-v "$REPO_ROOT/.git":"$REPO_ROOT/.git"' "$f" \
+    && pass "$label: .git RW overlay present" || fail "$label: missing .git RW overlay"
+  grep -qF -- '-v "$wt":"$wt"' "$f" \
+    && pass "$label: worktree RW overlay present" || fail "$label: missing worktree RW overlay"
+  grep -qF -- '-v "$REPO_ROOT/ops":"$REPO_ROOT/ops"' "$f" \
+    && pass "$label: ops RW overlay present" || fail "$label: missing ops RW overlay"
+  # Regression: a blanket `-v "$REPO_ROOT":"$REPO_ROOT"` not followed by `:` (so
+  # not the `:ro` line, and distinct from the /.git and /ops overlays).
+  if grep -Eq -- '-v "\$REPO_ROOT":"\$REPO_ROOT"[^:]' "$f"; then
+    fail "$label: blanket RW \$REPO_ROOT mount re-introduced (A8 regression)"
+  else
+    pass "$label: no blanket RW \$REPO_ROOT mount"
+  fi
+}
+assert_mounts "$PUMP" "arachne-pump"
+assert_mounts "$SCRIPT_DIR/run-parallel.sh" "run-parallel.sh"
+
+echo "--- Test 12: apl_fs_guard flags primary-source dirt, ignores allowlist (F65.5) ---"
+# shellcheck source=scripts/arachne-pump-lib.sh
+source "$SCRIPT_DIR/arachne-pump-lib.sh"
+GR="$TMP/guardrepo"; mkdir -p "$GR"
+git -C "$GR" init -q
+git -C "$GR" config user.email t@t.t
+git -C "$GR" config user.name t
+# `ops` modelled as a tracked path (the submodule-pointer line is ` M ops`); a
+# tracked source file models the RC-4 incident (an uncommitted edit to plan.rs).
+echo v1 >| "$GR/ops"; echo seed >| "$GR/seed.txt"
+mkdir -p "$GR/crates/arachne-core/src"; echo fn_main >| "$GR/crates/arachne-core/src/plan.rs"
+git -C "$GR" add -A >/dev/null 2>&1
+git -C "$GR" commit -qm seed
+# 12a: an edit to a tracked primary-source file (outside the allowlist) is flagged
+# with its full path (` M crates/...` — the literal F56.2 footgun).
+echo edited >> "$GR/crates/arachne-core/src/plan.rs"
+g="$(apl_fs_guard "$GR")"
+have "$g" 'FS-GUARD' && pass "primary-source dirt is flagged" || fail "primary-source dirt not flagged:\n$g"
+have "$g" 'crates/arachne-core/src/plan.rs' && pass "flagged path named" || fail "flagged path not named:\n$g"
+git -C "$GR" checkout -- crates/arachne-core/src/plan.rs
+# 12b: only .worktrees/ scratch + the ops pointer dirty → silent (allowlisted).
+mkdir -p "$GR/.worktrees/feat/x"; echo scratch >| "$GR/.worktrees/feat/x/scratch"
+echo v2 >| "$GR/ops"   # ` M ops` — the submodule-pointer line, allowlisted
+g="$(apl_fs_guard "$GR")"
+[[ -z "$g" ]] && pass "allowlisted dirt (.worktrees/ + ops) is silent" || fail "allowlist not respected:\n$g"
+
+echo "--- Test 13: integration trunk — selection, build-gate, conflict (A3 v0) ---"
+# Drive reconcile_trunk through the ARACHNE_PUMP_INTEGRATE_DRYRUN seam (no real
+# git/cargo/gh): STUB_INTEGRATE_{NOBRANCH,ANCESTOR,CONFLICT} + BUILD_GATE_CMD
+# drive branch-exists / already-integrated / conflict / build-red.
+QFILE="$TMP/quarantine"; ISTATE="$TMP/ipump.state"
+itick() {  # integration dry-run --once tick: $1=phases ; extra env via caller
+  ARACHNE_NOTIFY_CMD="${ARACHNE_NOTIFY_CMD:-true}" \
+  ARACHNE_PUMP_NO_LAUNCH=1 \
+  ARACHNE_PUMP_INTEGRATE_DRYRUN=1 \
+  ARACHNE_PUMP_QUARANTINE_FILE="$QFILE" \
+  ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
+  ARACHNE_PUMP_STATE_FILE="$ISTATE" \
+  ARACHNE_POOL_CAP_FILE="$TMP/cap" \
+  ARACHNE_PUMP_LOG="$TMP/pump.log" \
+  ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+  "$PUMP" --no-health-gate --integration-trunk "${@:2}" --phases "$1" --once
+}
+
+# 13a: two quiescent phases with (assumed-present) branches → both "would integrate".
+mk F55.0 open; mk F56.0 open
+out=$(STUB_GATE_RC=0 itick F55..F56 2>&1)
+have "$out" 'would integrate F55' && pass "quiescent F55 → would integrate" || fail "F55 not integrated:\n$out"
+have "$out" 'would integrate F56' && pass "quiescent F56 → would integrate" || fail "F56 not integrated:\n$out"
+
+# 13b: a phase already an ancestor of the trunk → no integrate line.
+out=$(STUB_GATE_RC=0 STUB_INTEGRATE_ANCESTOR="F55" itick F55..F56 2>&1)
+have "$out" 'would integrate F55' && fail "already-integrated F55 re-integrated:\n$out" || pass "already-ancestor F55 skipped"
+have "$out" 'would integrate F56' && pass "F56 still integrates" || fail "F56 not integrated:\n$out"
+
+# 13c: a live container ⇒ phase not quiescent ⇒ skipped (mirrors the liveness join).
+out=$(STUB_GATE_RC=0 STUB_LIVE="arachne-agent-feat-f55" itick F55..F56 2>&1)
+have "$out" 'would integrate F55' && fail "live F55 integrated (not quiescent):\n$out" || pass "live F55 skipped (not quiescent)"
+have "$out" 'would integrate F56' && pass "quiescent F56 still integrates" || fail "F56 not integrated:\n$out"
+
+# 13d: build-gate red ⇒ quarantine; trunk not advanced; needs-review recorded; marker written.
+: >| "$QFILE"
+out=$(STUB_GATE_RC=0 ARACHNE_PUMP_BUILD_CMD='false' itick F55 2>&1)
+have "$out" 'would quarantine F55: build red' && pass "build-red → would quarantine" || fail "no build-red quarantine:\n$out"
+have "$out" 'needs-review' && pass "needs-review recorded as the quarantine action" || fail "no needs-review action:\n$out"
+have "$out" 'would integrate F55' && fail "trunk advanced despite build red:\n$out" || pass "trunk not advanced on build red"
+grep -qE '^F55 .*build red$' "$QFILE" && pass "quarantine marker written for build red" || fail "no build-red marker:\n$(cat "$QFILE")"
+
+# 13e: merge conflict ⇒ quarantine; trunk not advanced; marker written.
+: >| "$QFILE"
+out=$(STUB_GATE_RC=0 STUB_INTEGRATE_CONFLICT="F55" itick F55 2>&1)
+have "$out" 'would quarantine F55: conflict' && pass "conflict → would quarantine" || fail "no conflict quarantine:\n$out"
+have "$out" 'would integrate F55' && fail "trunk advanced despite conflict:\n$out" || pass "trunk not advanced on conflict"
+grep -qE '^F55 .*conflict$' "$QFILE" && pass "quarantine marker written for conflict" || fail "no conflict marker:\n$(cat "$QFILE")"
+
+# 13f: --integration-trunk OFF ⇒ no integration whatsoever (opt-out regression).
+: >| "$QFILE"
+out=$(STUB_GATE_RC=0 ARACHNE_PUMP_BUILD_CMD='false' \
+  ARACHNE_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 ARACHNE_PUMP_INTEGRATE_DRYRUN=1 \
+  ARACHNE_PUMP_QUARANTINE_FILE="$QFILE" ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
+  ARACHNE_PUMP_STATE_FILE="$ISTATE" ARACHNE_POOL_CAP_FILE="$TMP/cap" \
+  ARACHNE_PUMP_LOG="$TMP/pump.log" ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+  "$PUMP" --no-health-gate --phases F55 --once 2>&1)
+have "$out" 'would integrate' && fail "integration ran with flag off:\n$out" || pass "flag-off ⇒ no integration (opt-out)"
+have "$out" 'would quarantine' && fail "quarantine ran with flag off:\n$out" || pass "flag-off ⇒ no quarantine (opt-out)"
+
+echo "--- Test 14: arachne-task needs-review subcommand (A3 v0) ---"
+mk F58.0 open
+"$REAL_TASK" claim F58.0 --branch feat/f58 --turns 5 >/dev/null 2>&1
+"$REAL_TASK" needs-review F58.0 --reason "auto/trunk conflict for F58" >/dev/null 2>&1
+grep -q 'status: needs-review' "$TASKS/F58.0.md" && pass "needs-review sets status: needs-review" || fail "status not needs-review:\n$(cat "$TASKS/F58.0.md")"
+grep -q 'claimed_by: null' "$TASKS/F58.0.md" && pass "needs-review clears the claim" || fail "claim not cleared:\n$(cat "$TASKS/F58.0.md")"
+grep -qi 'Needs review' "$TASKS/F58.0.md" && pass "needs-review appends a body note" || fail "no body note:\n$(cat "$TASKS/F58.0.md")"
+grep -qF 'auto/trunk conflict for F58' "$TASKS/F58.0.md" && pass "needs-review note carries the reason" || fail "reason not in note"
+"$REAL_TASK" needs-review F58.0 >/dev/null 2>&1 && fail "needs-review without --reason should error" || pass "needs-review requires --reason"
+
+echo "--- Test 15: dependency-aware briefs expand {{DEPENDS_ON}} (A3 v1) ---"
+# A template carrying the new {{DEPENDS_ON}} placeholder; rendered via the pump's
+# TASKS_DIR override against the fixtures, gh disabled (ARACHNE_PUMP_NO_GH=1) so
+# the render is hermetic. F60.0 depends cross-phase on F55.7; F56.0 has none.
+TPL2="$TMP/_phase-drain-template-v1.md"
+cat >| "$TPL2" <<'EOF'
+# Kickoff brief — drain phase {{PHASE}}
+You are based on `auto/trunk` (an integration branch off `main`).
+
+## Depends on / builds upon
+{{DEPENDS_ON}}
+
+## Working method
+scripts/arachne-task next --phase {{PHASE}}
+EOF
+mk F60.0 open F55.7        # cross-phase blocker on F55
+rbrief() {  # $1=phase
+  ARACHNE_PUMP_NO_GH=1 ARACHNE_PUMP_TASKS_DIR="$TASKS" \
+  ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL2" "$PUMP" --render-brief "$1"
+}
+r60=$(rbrief F60)
+grep -qF '{{DEPENDS_ON}}' <<<"$r60" && fail "stray {{DEPENDS_ON}} after render:\n$r60" || pass "no stray {{DEPENDS_ON}}"
+grep -qF '{{PHASE}}' <<<"$r60" && fail "stray {{PHASE}} after render (v1):\n$r60" || pass "no stray {{PHASE}} (v1)"
+grep -qF 'Depends on / builds upon' <<<"$r60" && pass "deps section header present" || fail "no deps header:\n$r60"
+grep -qF 'feat/f55' <<<"$r60" && pass "cross-phase blocker names feat/f55" || fail "feat/f55 not named:\n$r60"
+r56=$(rbrief F56)
+grep -qF 'No cross-phase dependencies' <<<"$r56" && pass "empty-deps line for F56 (no cross-phase blockers)" || fail "no empty-deps line:\n$r56"
+grep -qF 'feat/f55' <<<"$r56" && fail "F55 leaked into F56 deps:\n$r56" || pass "F56 deps block clean"
+
+echo "--- Test 16: integration-aware launch gate — done≠integrated (A3 v2) ---"
+# F57.0 depends cross-phase on F55.1; F55.1 is done (ledger-ready) but its CODE
+# may not yet be on auto/trunk. STUB_INTEGRATED drives the ancestor check; the
+# pump reads the fixtures via ARACHNE_PUMP_TASKS_DIR so phase_deps_integrated
+# sees F57's cross-phase blocker.
+ipump() { ARACHNE_PUMP_TASKS_DIR="$TASKS" "$PUMP" --no-health-gate --dry-run --phases "$1" "${@:2}"; }
+mk F55.0 done; mk F55.1 done; mk F56.0 done; mk F57.0 open F55.1
+# 16a: --integration-trunk on, dep NOT integrated → F57 WAITS, does not LAUNCH.
+out=$(STUB_INTEGRATED="" ipump F55..F57 --integration-trunk)
+have "$out" 'WAITING +F57' && pass "F57 WAITING: dep done but not integrated" || fail "F57 not WAITING:\n$out"
+have "$out" 'LAUNCH +F57' && fail "F57 launched before dep integrated:\n$out" || pass "F57 not LAUNCH before integration"
+have "$out" 'not yet integrated' && pass "WAITING reason names the integration gap" || fail "no integration reason:\n$out"
+# 16b: flip the dep to integrated → F57 LAUNCHES.
+out=$(STUB_INTEGRATED="F55" ipump F55..F57 --integration-trunk)
+have "$out" 'LAUNCH +F57' && pass "F57 LAUNCH once F55 integrated" || fail "F57 not LAUNCH after integration:\n$out"
+# 16c: integration OFF → ledger-ready F57 LAUNCHES regardless (opt-out: no gate).
+out=$(STUB_INTEGRATED="" ipump F55..F57)
+have "$out" 'LAUNCH +F57' && pass "flag-off ⇒ F57 LAUNCH on done (no integration gate)" || fail "F57 not LAUNCH with flag off:\n$out"
 
 echo
 echo "=============================================="

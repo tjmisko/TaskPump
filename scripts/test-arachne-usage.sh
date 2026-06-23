@@ -53,6 +53,12 @@ js=$("$CLI" --json)
 [[ "$(jq -r '.seven_day' <<<"$js")" == "21" ]] && pass "--json seven_day=21" || fail "json seven_day: $js"
 [[ "$(jq -r '.severity' <<<"$js")" == "normal" ]] && pass "--json severity=normal (77<80)" || fail "json severity: $js"
 [[ "$(jq -r '.reset_epoch' <<<"$js")" =~ ^[0-9]+$ ]] && pass "--json reset_epoch is an epoch" || fail "json reset_epoch: $js"
+# windows[] feeds the monitor's per-window bars: exactly 5h + binding 7d.
+[[ "$(jq -r '.windows | length' <<<"$js")" == "2" ]] && pass "--json windows has 2 entries" || fail "json windows length: $js"
+[[ "$(jq -r '.windows[0] | "\(.label):\(.percent)"' <<<"$js")" == "5h:77" ]] && pass "--json windows[5h]=77" || fail "json windows 5h: $js"
+[[ "$(jq -r '.windows[1] | "\(.label):\(.percent)"' <<<"$js")" == "7d:21" ]] && pass "--json windows[7d]=21 (seven_day, Opus null)" || fail "json windows 7d: $js"
+[[ "$(jq -r '.windows[1].reset_at' <<<"$js")" == "2026-06-24T04:00:00+00:00" ]] && pass "--json windows[7d] carries seven_day reset" || fail "json 7d reset: $js"
+[[ "$(jq -r '.five_hour_reset_at' <<<"$js")" == "2026-06-22T21:00:00+00:00" ]] && pass "--json five_hour_reset_at present" || fail "json 5h reset: $js"
 
 echo "--- Test 2: gate below ceiling feeds ---"
 "$CLI" --gate --ceiling 95 2>/dev/null; rc=$?
@@ -75,6 +81,9 @@ seed '{"five_hour":{"utilization":10,"resets_at":"2026-06-22T21:00:00+00:00"},
        "limits":[]}'
 got=$("$CLI" --percent)
 [[ "$got" == "97" ]] && pass "Opus weekly 97% binds over 5h/7d 10%" || fail "opus-bind expected 97 got '$got'"
+wj=$("$CLI" --json)
+[[ "$(jq -r '.windows[1] | "\(.percent)"' <<<"$wj")" == "97" ]] && pass "windows[7d]=97 (Opus weekly binds the 7d bar)" || fail "7d window not Opus: $wj"
+[[ "$(jq -r '.windows[1].reset_at' <<<"$wj")" == "2026-06-25T00:00:00+00:00" ]] && pass "windows[7d] carries the Opus weekly reset" || fail "7d reset not Opus: $wj"
 
 echo "--- Test 5: Sonnet-scoped cap does NOT gate an Opus run ---"
 seed '{"five_hour":{"utilization":12,"resets_at":"2026-06-22T21:00:00+00:00"},

@@ -10,7 +10,8 @@
 # Usage:
 #   ./scripts/arachne-cleanup --status        # what would be cleaned (read-only)
 #   ./scripts/arachne-cleanup --stuck         # stop hung containers, release tasks
-#   ./scripts/arachne-cleanup --targets       # wipe cargo target/ in worktrees
+#   ./scripts/arachne-cleanup --targets       # cargo clean worktree target/ (skips live agents)
+#   ./scripts/arachne-cleanup --targets --include-primary  # ...and Arachne's own target/
 #   ./scripts/arachne-cleanup --docker        # builder prune + system prune
 #   ./scripts/arachne-cleanup --all           # all three, in that order
 #   ./scripts/arachne-cleanup --all --dry-run # preview the full --all sweep
@@ -29,13 +30,21 @@
 #   DOCKER_GRACE_SEC     -- docker stop grace period (default 30)
 set -uo pipefail
 
-REPO_ROOT="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
+# REPO_ROOT is normally the parent of this script's dir; overridable so the
+# target-reclaim sweep can be unit-tested against a fixture tree.
+_default_repo_root="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
+REPO_ROOT="${ARACHNE_CLEANUP_REPO_ROOT:-$_default_repo_root}"
 MANIFEST="${MANIFEST:-$REPO_ROOT/ops/task-loop/parallel-manifest.tsv}"
 STUCK_THRESHOLD_MIN="${STUCK_THRESHOLD_MIN:-15}"
 DOCKER_GRACE_SEC="${DOCKER_GRACE_SEC:-30}"
 
 DRY_RUN=0
 MODE=""
+# --include-primary / RECLAIM_PRIMARY=1: also reclaim the PRIMARY checkout's
+# target/ (Arachne itself), not just worktrees. Off by default so a human's
+# in-progress build in the primary checkout is never wiped without asking; the
+# disk watchdog turns it on under PANIC to buy maximum space.
+INCLUDE_PRIMARY="${RECLAIM_PRIMARY:-0}"
 
 usage() {
     cat <<EOF
@@ -44,16 +53,21 @@ usage: arachne-cleanup <mode> [--dry-run]
 Modes (exactly one):
   --status     Read-only: print what would be cleaned. Implies --dry-run.
   --stuck      Stop hung agent containers and release their tasks.
-  --targets    Wipe cargo target/ in every .worktrees/*/.
+  --targets    cargo clean every .worktrees/*/ target/ (skipping any with a
+               live agent container); add --include-primary to also clean
+               Arachne's own target/.
   --docker     docker builder prune -af + docker system prune -f.
   --all        --stuck, then --targets, then --docker.
 
 Flags:
-  --dry-run    Print actions, don't perform them.
+  --dry-run          Print actions, don't perform them.
+  --include-primary  With --targets/--all, also reclaim the primary checkout's
+                     target/ (RECLAIM_PRIMARY=1 env does the same).
 
 Env:
   STUCK_THRESHOLD_MIN (default 15) — log-stale cutoff, minutes.
   DOCKER_GRACE_SEC    (default 30) — docker stop grace period.
+  RECLAIM_PRIMARY     (default 0)  — same as --include-primary.
 EOF
 }
 
@@ -64,6 +78,7 @@ for a in "$@"; do
         --targets)  [[ -z "$MODE" ]] && MODE="targets"  || { echo "ERROR: only one mode allowed"; exit 2; } ;;
         --docker)   [[ -z "$MODE" ]] && MODE="docker"   || { echo "ERROR: only one mode allowed"; exit 2; } ;;
         --all)      [[ -z "$MODE" ]] && MODE="all"      || { echo "ERROR: only one mode allowed"; exit 2; } ;;
+        --include-primary) INCLUDE_PRIMARY=1 ;;
         --dry-run)  DRY_RUN=1 ;;
         -h|--help)  usage; exit 0 ;;
         *)          echo "ERROR: unknown arg '$a'" >&2; usage; exit 2 ;;
@@ -164,28 +179,68 @@ do_stuck() {
     fi
 }
 
-# ── do_targets -- wipe cargo target/ in every worktree. Cheap to rebuild;
-#    each is typically 2-6 GB.
+# ── busy_worktrees -- emit the .worktrees paths that currently host a live
+#    arachne-agent-* container (one per line). Used to skip a worktree whose
+#    agent is mid-build, so reclaiming target/ never yanks the rug from a
+#    running session. Empty when docker is absent or no agents run.
+busy_worktrees() {
+    local cname
+    while IFS= read -r cname; do
+        [[ -z "$cname" ]] && continue
+        worktree_for_container "$cname"
+    done < <(list_agent_containers)
+}
+
+# ── reclaim_target <dir> <label> -- free a Rust build dir's target/. Prefers
+#    `cargo clean` (respects the workspace layout / CARGO_TARGET_DIR); falls
+#    back to rm -rf when cargo or the manifest is absent. Honours --dry-run via
+#    act(). Returns 1 (no-op) when there is no target/ to reclaim.
+reclaim_target() {
+    local dir="$1" label="$2"
+    [[ -d "$dir/target" ]] || return 1
+    local size; size="$(du -sh "$dir/target" 2>/dev/null | cut -f1)"
+    log "  $label: $dir/target ($size)"
+    if command -v cargo >/dev/null 2>&1 && [[ -f "$dir/Cargo.toml" ]]; then
+        act "cargo clean --manifest-path '$dir/Cargo.toml'"
+    else
+        act "rm -rf '$dir/target'"
+    fi
+    return 0
+}
+
+# ── do_targets -- cargo clean target/ in every worktree (cheap to rebuild,
+#    typically 2-6 GB each), SKIPPING any worktree that currently hosts a live
+#    agent container so an in-flight build is never broken. With
+#    --include-primary it also reclaims the primary checkout's own target/.
 do_targets() {
-    log "wiping worktree cargo target/ dirs (dry-run=$DRY_RUN)"
-    local found=0
+    log "reclaiming cargo target/ dirs (dry-run=$DRY_RUN, include-primary=$INCLUDE_PRIMARY)"
+    local busy; busy="$(busy_worktrees)"
+    local found=0 skipped=0
     local wt
     for wt in "$REPO_ROOT"/.worktrees/*/*; do
         [[ -d "$wt/target" ]] || continue
-        local size; size="$(du -sh "$wt/target" 2>/dev/null | cut -f1)"
-        log "  $wt/target ($size)"
-        act "rm -rf '$wt/target'"
-        found=$((found + 1))
+        if printf '%s\n' "$busy" | grep -Fxq "$wt"; then
+            log "  skip: $wt/target — live agent container"
+            skipped=$((skipped + 1))
+            continue
+        fi
+        reclaim_target "$wt" "worktree" && found=$((found + 1))
     done
-    if (( found == 0 )); then
-        log "no worktree target dirs to wipe."
+    if (( found == 0 && skipped == 0 )); then
+        log "no worktree target dirs to reclaim."
     else
-        log "wiped $found target dir(s)."
+        log "reclaimed $found worktree target dir(s); skipped $skipped live."
     fi
-    # Also offer the primary checkout's target if huge.
+    # The primary checkout's own target/ — only when explicitly requested, since
+    # a human may be building there. The watchdog passes --include-primary under
+    # PANIC to buy the most space.
     if [[ -d "$REPO_ROOT/target" ]]; then
-        local size; size="$(du -sh "$REPO_ROOT/target" 2>/dev/null | cut -f1)"
-        log "primary checkout target: $REPO_ROOT/target ($size) — left alone (not a worktree)"
+        if [[ "$INCLUDE_PRIMARY" -eq 1 ]]; then
+            reclaim_target "$REPO_ROOT" "primary"
+        else
+            local size; size="$(du -sh "$REPO_ROOT/target" 2>/dev/null | cut -f1)"
+            log "primary checkout target: $REPO_ROOT/target ($size) — left alone (pass --include-primary to reclaim)"
+        fi
     fi
 }
 

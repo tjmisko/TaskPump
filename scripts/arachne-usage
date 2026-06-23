@@ -22,7 +22,12 @@
 # Modes:
 #   arachne-usage --percent            integer bind_percent, or "unknown"
 #   arachne-usage --json               {bind_percent,reset_epoch,reset_at,
-#                                        five_hour,seven_day,seven_day_opus,severity}
+#                                        five_hour,seven_day,seven_day_opus,
+#                                        five_hour_reset_at,seven_day_reset_at,
+#                                        seven_day_opus_reset_at,
+#                                        windows:[{label,percent,reset_at},…],severity}
+#                                       (windows = the two bars the monitor draws:
+#                                        5h session + binding 7d weekly)
 #   arachne-usage --gate --ceiling 95  exit 0 = feed OK, exit 10 = pause
 #                                       (at/over ceiling, OR inside a reset-backstop
 #                                       window); one-line reason on stderr
@@ -132,9 +137,24 @@ PARSE_JQ='
        {u:$o, r:.seven_day_opus.resets_at} ]
       | map(select(.u != null and $bind != null and .u == $bind and .r != null))
       | map(.r) | sort | (.[0] // null)) as $reset
+  # Binding weekly window for the "7d" bar: whichever of seven_day / seven_day_opus
+  # is higher (Opus runs can bind on the Opus weekly), carrying its own reset time.
+  | ([ {label:"7d", percent:$o, reset_at:.seven_day_opus.resets_at},
+       {label:"7d", percent:$s, reset_at:.seven_day.resets_at} ]
+      | map(select(.percent != null)) | sort_by(.percent)
+      | (.[-1] // {label:"7d", percent:null, reset_at:null})) as $weekly
   | { bind_percent: $bind,
       reset_at: $reset,
       five_hour: $f, seven_day: $s, seven_day_opus: $o,
+      five_hour_reset_at: (.five_hour.resets_at // null),
+      seven_day_reset_at: (.seven_day.resets_at // null),
+      seven_day_opus_reset_at: (.seven_day_opus.resets_at // null),
+      # Exactly the two windows the monitor renders as bars: the 5-hour session
+      # window and the binding 7-day weekly window. {label,percent,reset_at} each.
+      windows: [
+        {label:"5h", percent:$f, reset_at:(.five_hour.resets_at // null)},
+        {label:"7d", percent:$weekly.percent, reset_at:$weekly.reset_at}
+      ],
       severity: (if $bind == null then "unknown"
                  elif $bind >= 95 then "critical"
                  elif $bind >= 80 then "warning"
@@ -153,13 +173,13 @@ iso_to_epoch() {  # $1 = ISO8601 → unix epoch, or empty on failure / empty inp
 build_decision() {
   REPLY_BIND="unknown"
   if ! fetch_usage; then
-    printf '{"bind_percent":null,"reset_epoch":null,"reset_at":null,"five_hour":null,"seven_day":null,"seven_day_opus":null,"severity":"unknown"}'
+    printf '{"bind_percent":null,"reset_epoch":null,"reset_at":null,"five_hour":null,"seven_day":null,"seven_day_opus":null,"five_hour_reset_at":null,"seven_day_reset_at":null,"seven_day_opus_reset_at":null,"windows":[],"severity":"unknown"}'
     return 0
   fi
   local parsed bind reset_at reset_epoch
   parsed="$(jq -c "$PARSE_JQ" "$ARACHNE_USAGE_CACHE" 2>/dev/null || echo '')"
   if [[ -z "$parsed" ]]; then
-    printf '{"bind_percent":null,"reset_epoch":null,"reset_at":null,"five_hour":null,"seven_day":null,"seven_day_opus":null,"severity":"unknown"}'
+    printf '{"bind_percent":null,"reset_epoch":null,"reset_at":null,"five_hour":null,"seven_day":null,"seven_day_opus":null,"five_hour_reset_at":null,"seven_day_reset_at":null,"seven_day_opus_reset_at":null,"windows":[],"severity":"unknown"}'
     return 0
   fi
   bind="$(jq -r '.bind_percent // "null"' <<<"$parsed")"
@@ -267,7 +287,9 @@ Modes:
   --percent                 Print integer bind_percent (Max-plan utilization of the
                             binding window), or "unknown" if the meter is unreachable.
   --json                    {bind_percent,reset_epoch,reset_at,five_hour,seven_day,
-                            seven_day_opus,severity}.
+                            seven_day_opus,five_hour_reset_at,seven_day_reset_at,
+                            seven_day_opus_reset_at,windows[],severity}. windows is
+                            the two bars the monitor draws (5h session + binding 7d).
   --gate [--ceiling N]      Exit 0 = feed OK; exit 10 = pause (bind_percent ≥ N, or
                             inside a reset-backstop window). One-line reason on stderr.
                             Fails open (exit 0) when the meter is unreachable.

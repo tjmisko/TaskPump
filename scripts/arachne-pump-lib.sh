@@ -68,3 +68,73 @@ apl_count_live_agents() {
   done < <(apl_live_agent_slugs)
   echo "$n"
 }
+
+# apl_disk_low — one-shot disk-pressure gate for the pump's feed loop, parallel to
+# apl_network_unhealthy. Delegates to `arachne-disk-watchdog --gate` (the single
+# source of the free-space threshold, so run-parallel.sh's cap-file path and the
+# pump's feed-gate path share one knob — PAUSE_THRESHOLD_GB, inherited via env).
+# Echoes the watchdog's one-line reason to stdout and returns 10 when free disk
+# is below the floor. Graceful: returns 0 (feed OK, no output) when the gate is
+# disabled (ARACHNE_DISK_GATE != 1) or the watchdog binary is absent / not
+# executable — a missing tool never blocks launches.
+apl_disk_low() {
+  [[ "${ARACHNE_DISK_GATE:-1}" -eq 1 ]] || return 0
+  local wd="${ARACHNE_DISK_WATCHDOG:-}"
+  [[ -n "$wd" && -x "$wd" ]] || return 0
+  local reason rc
+  reason="$("$wd" --gate 2>&1)"; rc=$?
+  if [[ "$rc" -eq 10 ]]; then
+    printf '%s' "$reason"
+    return 10
+  fi
+  return 0
+}
+
+# ── Autonomous integration trunk (A3 / F65.6) ─────────────────────────────────
+# apl_acquire_trunk_lock <lockfile> [wait_seconds] — acquire an flock on the trunk
+# merge lock via FD 8 for the lifetime of the calling (sub)shell, mirroring
+# arachne-task's acquire_state_lock (FD 9) on a DISTINCT fd + file so the two
+# locks never alias. Because every container and the host share the bind-mounted
+# repo, an flock on a file under the repo is shared by inode — the "merge queue":
+# only one integration holds it; others wait their turn. Degrades to a no-op
+# (returns 0) where flock is unavailable, falling back on the singular-pump
+# serialization. Returns 0 on success / no-flock; non-zero only on lock timeout.
+apl_acquire_trunk_lock() {
+  local lockfile="$1" wait="${2:-${ARACHNE_TRUNK_LOCK_WAIT:-300}}"
+  command -v flock >/dev/null 2>&1 || return 0
+  { exec 8>"$lockfile"; } 2>/dev/null || return 0
+  flock -w "$wait" 8 || return 1
+  return 0
+}
+
+# apl_phase_integrated <repo> <branch> <trunk> — 0 (true) when <branch>'s tip is
+# reachable from <trunk> (already integrated). This is the git-graph read that
+# keeps integration status out of the ledger (design decision 3): code-true,
+# self-healing (a dead agent's committed work still integrates on a later tick),
+# and decoupled from arachne-task. Quiet false (non-zero) when the branch or
+# trunk is missing.
+apl_phase_integrated() {
+  local repo="$1" branch="$2" trunk="$3"
+  git -C "$repo" merge-base --is-ancestor "$branch" "$trunk" 2>/dev/null
+}
+
+# apl_fs_guard <repo_root> — RC-4 contamination detector (A8 / F65.5). With the
+# read-only primary mount in place, a container can no longer write the primary
+# source tree, so this guard should always be clean; it is the regression
+# detector that catches a future mount change re-introducing a blanket RW
+# `$REPO_ROOT`. Greps `git status --porcelain` for any dirty path OUTSIDE the
+# allowlist {.worktrees/, ops, ops/} — i.e. a primary *source* edit (crates/,
+# web/, scripts/, Cargo.*, root files) that should have landed in a worktree.
+# `$NF` tolerates `R old -> new` rename rows; the `ops` submodule-pointer line is
+# allowlisted (agents are told to leave it). Echoes a `FS-GUARD:` line when dirty,
+# nothing when clean. Graceful: silent when the repo can't be read.
+apl_fs_guard() {
+  local repo_root="$1" dirty
+  dirty=$(git -C "$repo_root" status --porcelain 2>/dev/null \
+          | awk '{print $NF}' \
+          | grep -Ev '^(\.worktrees/|ops$|ops/)' || true)
+  [[ -n "$dirty" ]] && printf 'FS-GUARD: primary checkout dirty outside allowlist:\n%s\n' "$dirty"
+  # Always succeed: callers assign via $(...) under `set -e`, where a non-zero
+  # return on the clean (no-dirt) path would abort the tick.
+  return 0
+}
