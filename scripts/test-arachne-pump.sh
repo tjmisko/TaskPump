@@ -427,6 +427,74 @@ have "$out" 'LAUNCH +F57' && pass "F57 LAUNCH once F55 integrated" || fail "F57 
 out=$(STUB_INTEGRATED="" ipump F55..F57)
 have "$out" 'LAUNCH +F57' && pass "flag-off ⇒ F57 LAUNCH on done (no integration gate)" || fail "F57 not LAUNCH with flag off:\n$out"
 
+echo "--- Test 17: liveness-based reclaim of orphaned claims (A1, D3 eligibility path) ---"
+# An in_progress task whose claiming container is DEAD starves the frontier
+# (`ready` excludes claimed tasks). reclaim_orphaned_claims (run in do_tick after
+# scrub) releases clean orphans (0 commits) and parks ones with committed work. A
+# PATH-injected git stub makes the commits-ahead check hermetic; F95 has no real
+# branch so nothing here touches the working repo. Staleness reclaim is disabled
+# (ARACHNE_CLAIM_STALE_HOURS huge) so this isolates reclaim_orphaned_claims.
+cat >| "$BIN/git" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  *rev-list*--count*) echo "${STUB_AHEAD:-0}";;
+  *) : ;;
+esac
+exit 0
+EOF
+chmod +x "$BIN/git"
+mkdir -p "$TMP/noops"
+STATE17="$TMP/pump17.state"
+mkclaim() {  # mkclaim <id> <claimed_by_branch> — an in_progress, claimed fixture
+  cat >| "$TASKS/$1.md" <<EOF
+---
+id: $1
+phase: ${1%%.*}
+title: fixture $1
+status: in_progress
+claimed_by: $2
+claimed_at: "2026-06-23T00:00:00Z"
+turn_budget_remaining: 9999
+consecutive_failed_iterations: 0
+blockers: []
+completed_by_commits: []
+files: []
+goal: drain $1
+---
+# $1
+EOF
+}
+status_of() { sed -n 's/^status: *//p' "$TASKS/$1.md" | head -1; }
+claim_tick() {  # $1 = phases ; STUB_LIVE/STUB_AHEAD supplied by caller
+  PATH="$BIN:$PATH" ARACHNE_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 \
+  ARACHNE_CLAIM_STALE_HOURS=99999 ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
+  ARACHNE_PUMP_STATE_FILE="$STATE17" ARACHNE_POOL_CAP_FILE="$TMP/cap" \
+  ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+  "$PUMP" --no-health-gate --once --phases "$1"
+}
+
+# 17a: dead container + 0 commits → released to open (the core stall fix).
+rm -f "$TASKS"/*.md; mk F95.0 done; mkclaim F95.1 feat/f95
+out=$(STUB_LIVE="" STUB_AHEAD=0 claim_tick F95 2>/dev/null)
+[[ "$(status_of F95.1)" == "open" ]] && pass "orphaned claim (dead container, 0 commits) released to open" || fail "F95.1 not reopened: status=$(status_of F95.1)"
+have "$out" 'reclaimed orphaned claim F95.1' && pass "reclaim logged for F95.1" || fail "no reclaim log:\n$out"
+
+# 17b: LIVE container → claim is legitimate, left untouched.
+mkclaim F95.1 feat/f95
+STUB_LIVE="arachne-agent-feat-f95" STUB_AHEAD=0 claim_tick F95 >/dev/null 2>&1
+[[ "$(status_of F95.1)" == "in_progress" ]] && pass "live container ⇒ claim left in_progress" || fail "F95.1 wrongly reclaimed while live: $(status_of F95.1)"
+
+# 17c: claim on a branch this pump does NOT own → untouched.
+mkclaim F95.1 feat/somebody-else
+STUB_LIVE="" STUB_AHEAD=0 claim_tick F95 >/dev/null 2>&1
+[[ "$(status_of F95.1)" == "in_progress" ]] && pass "foreign-branch claim left untouched" || fail "F95.1 wrongly reclaimed (foreign branch): $(status_of F95.1)"
+
+# 17d: dead container but commits present → parked for review, NOT auto-reopened.
+mkclaim F95.1 feat/f95
+err=$(STUB_LIVE="" STUB_AHEAD=3 claim_tick F95 2>&1 >/dev/null)
+[[ "$(status_of F95.1)" == "in_progress" ]] && pass "orphan with commits left parked (not reopened)" || fail "F95.1 wrongly reopened despite commits: $(status_of F95.1)"
+have "$err" 'committed work' && pass "parked-with-commits surfaced via warn" || fail "no committed-work warning:\n$err"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"
