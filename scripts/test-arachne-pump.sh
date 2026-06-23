@@ -253,6 +253,57 @@ plant_target
 STUB_GATE_RC=0 ARACHNE_DISK_RECLAIM=1 STUB_LIVE="arachne-agent-feat-f56" reclaim_tick --phases F56 --once >/dev/null 2>&1
 [[ -d "$WT/feat/f56/target" ]] && pass "live-phase target/ never reclaimed (phase_live guard)" || fail "live phase target/ was reclaimed"
 
+echo "--- Test 11: A8 read-only-primary mount set in both launchers (F65.5) ---"
+# Static guard against a future blanket-RW $REPO_ROOT regression (RC-4). Each
+# launcher must carry the :ro parent plus the three RW overlays, and must NOT
+# carry an un-suffixed `-v "$REPO_ROOT":"$REPO_ROOT"` (blanket read-write).
+assert_mounts() {  # <launcher-path> <label>
+  local f="$1" label="$2"
+  grep -qF -- '-v "$REPO_ROOT":"$REPO_ROOT":ro' "$f" \
+    && pass "$label: :ro primary mount present" || fail "$label: missing :ro primary mount"
+  grep -qF -- '-v "$REPO_ROOT/.git":"$REPO_ROOT/.git"' "$f" \
+    && pass "$label: .git RW overlay present" || fail "$label: missing .git RW overlay"
+  grep -qF -- '-v "$wt":"$wt"' "$f" \
+    && pass "$label: worktree RW overlay present" || fail "$label: missing worktree RW overlay"
+  grep -qF -- '-v "$REPO_ROOT/ops":"$REPO_ROOT/ops"' "$f" \
+    && pass "$label: ops RW overlay present" || fail "$label: missing ops RW overlay"
+  # Regression: a blanket `-v "$REPO_ROOT":"$REPO_ROOT"` not followed by `:` (so
+  # not the `:ro` line, and distinct from the /.git and /ops overlays).
+  if grep -Eq -- '-v "\$REPO_ROOT":"\$REPO_ROOT"[^:]' "$f"; then
+    fail "$label: blanket RW \$REPO_ROOT mount re-introduced (A8 regression)"
+  else
+    pass "$label: no blanket RW \$REPO_ROOT mount"
+  fi
+}
+assert_mounts "$PUMP" "arachne-pump"
+assert_mounts "$SCRIPT_DIR/run-parallel.sh" "run-parallel.sh"
+
+echo "--- Test 12: apl_fs_guard flags primary-source dirt, ignores allowlist (F65.5) ---"
+# shellcheck source=scripts/arachne-pump-lib.sh
+source "$SCRIPT_DIR/arachne-pump-lib.sh"
+GR="$TMP/guardrepo"; mkdir -p "$GR"
+git -C "$GR" init -q
+git -C "$GR" config user.email t@t.t
+git -C "$GR" config user.name t
+# `ops` modelled as a tracked path (the submodule-pointer line is ` M ops`); a
+# tracked source file models the RC-4 incident (an uncommitted edit to plan.rs).
+echo v1 >| "$GR/ops"; echo seed >| "$GR/seed.txt"
+mkdir -p "$GR/crates/arachne-core/src"; echo fn_main >| "$GR/crates/arachne-core/src/plan.rs"
+git -C "$GR" add -A >/dev/null 2>&1
+git -C "$GR" commit -qm seed
+# 12a: an edit to a tracked primary-source file (outside the allowlist) is flagged
+# with its full path (` M crates/...` — the literal F56.2 footgun).
+echo edited >> "$GR/crates/arachne-core/src/plan.rs"
+g="$(apl_fs_guard "$GR")"
+have "$g" 'FS-GUARD' && pass "primary-source dirt is flagged" || fail "primary-source dirt not flagged:\n$g"
+have "$g" 'crates/arachne-core/src/plan.rs' && pass "flagged path named" || fail "flagged path not named:\n$g"
+git -C "$GR" checkout -- crates/arachne-core/src/plan.rs
+# 12b: only .worktrees/ scratch + the ops pointer dirty → silent (allowlisted).
+mkdir -p "$GR/.worktrees/feat/x"; echo scratch >| "$GR/.worktrees/feat/x/scratch"
+echo v2 >| "$GR/ops"   # ` M ops` — the submodule-pointer line, allowlisted
+g="$(apl_fs_guard "$GR")"
+[[ -z "$g" ]] && pass "allowlisted dirt (.worktrees/ + ops) is silent" || fail "allowlist not respected:\n$g"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"
