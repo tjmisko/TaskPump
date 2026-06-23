@@ -112,19 +112,46 @@ header() {  # $1 = optional suffix tag
 }
 
 USAGE_BIN="$REPO_ROOT/scripts/arachne-usage"
+TASK_BIN="$REPO_ROOT/scripts/arachne-task"
 PUMP_STATE="${ARACHNE_PUMP_STATE_FILE:-$REPO_ROOT/.arachne-pump.state}"
 
 # pump_status_line -- when the usage-governed pump (scripts/arachne-pump) is
-# running, show its range + status + (if paused) the reason, plus the live
-# Max-plan utilization and the reset time. Silent when no pump state exists, so
-# the monitor is unchanged for plain manifest runs. Best-effort (never errors
-# the caller under the watch loop's set -e).
+# running, show its range + status + (if paused) the reason, the queue depth
+# (eligible frontier vs open-in-range), plus the live Max-plan utilization and
+# the reset time. Silent when no pump state exists, so the monitor is unchanged
+# for plain manifest runs. Best-effort (never errors the caller under the watch
+# loop's set -e).
+#
+# Queue legibility (the A7 fix): "ready" must mean the ELIGIBLE FRONTIER — tasks
+# that can launch right now (open ∧ blockers done ∧ unclaimed) — not open-in-range
+# (the drain test). They diverge during a stall: work is queued but a cross-phase
+# blocker or orphaned claim leaves nothing launchable. Showing both, and colouring
+# "0 ready · N open" distinctly, makes that stall legible at a glance.
 pump_status_line() {
     [[ -f "$PUMP_STATE" ]] || return 0
     local phases status reason pct reset
     phases="$(jq -r '.phases // "?"' "$PUMP_STATE" 2>/dev/null || echo '?')"
     status="$(jq -r '.status // "?"' "$PUMP_STATE" 2>/dev/null || echo '?')"
     reason="$(jq -r '.paused_reason // ""' "$PUMP_STATE" 2>/dev/null || echo '')"
+
+    # Eligible frontier (ready) vs open-in-range. Prefer the pump's own snapshot
+    # fields when present; otherwise query the canonical ledger live (the pump on
+    # this branch persists open_tasks but not eligible_tasks, so eligible is
+    # computed here — which is also a real-time count, not a post-tick snapshot).
+    local eligible open_ct
+    eligible="$(jq -r '.eligible_tasks // empty' "$PUMP_STATE" 2>/dev/null || true)"
+    open_ct="$(jq -r '.open_tasks // empty' "$PUMP_STATE" 2>/dev/null || true)"
+    if [[ -x "$TASK_BIN" && -n "$phases" && "$phases" != "?" ]]; then
+        if [[ -z "$eligible" ]]; then
+            eligible="$("$TASK_BIN" ready --phases "$phases" --count-eligible 2>/dev/null || true)"
+        fi
+        if [[ -z "$open_ct" ]]; then
+            open_ct="$("$TASK_BIN" ready --phases "$phases" --count 2>/dev/null || true)"
+        fi
+    fi
+    [[ -z "$eligible" ]] && eligible="?"
+    [[ -z "$open_ct" ]] && open_ct="?"
+
     pct="?"; reset=""
     if [[ -x "$USAGE_BIN" ]]; then
         pct="$("$USAGE_BIN" --percent 2>/dev/null || echo '?')"
@@ -137,8 +164,22 @@ pump_status_line() {
         drained) color='\033[32m' ;;   # green
         *)       color='\033[36m' ;;   # cyan
     esac
+
+    # Colour the ready count by queue health: green when fully drained
+    # (open == 0), red when stalled (0 eligible while open > 0), cyan when there
+    # is an actionable frontier, grey when the count is unknown.
+    local rcolor='\033[90m'
+    if [[ "$open_ct" =~ ^[0-9]+$ && "$open_ct" -eq 0 ]]; then
+        rcolor='\033[32m'   # drained: no open work left
+    elif [[ "$eligible" =~ ^[0-9]+$ && "$open_ct" =~ ^[0-9]+$ && "$eligible" -eq 0 && "$open_ct" -gt 0 ]]; then
+        rcolor='\033[31m'   # STALL: work queued, nothing launchable
+    elif [[ "$eligible" =~ ^[0-9]+$ && "$eligible" -gt 0 ]]; then
+        rcolor='\033[36m'   # actionable frontier
+    fi
+
     line="$(printf 'pump[%s]: %b%s\033[0m' "$phases" "$color" "$status")"
     [[ "$status" == "paused" && -n "$reason" ]] && line+=" — $reason"
+    line+="$(printf '  |  %b%s ready\033[0m · %s open' "$rcolor" "$eligible" "$open_ct")"
     line+="  |  usage ${pct}%"
     [[ -n "$reset" ]] && line+="  resets ${reset}"
     printf '%b\n\n' "$line"
@@ -201,7 +242,8 @@ snapshot() {
 demo() {
     local width; width="$(term_width)"
     header "   [DEMO — synthetic data]"
-    printf 'pump[F55..F63]: \033[33mpaused\033[0m — bind_percent 95%% ≥ ceiling 95%%  |  usage 95%%  resets 21:00\n\n'
+    # The red "0 ready" against "42 open" is the stall signature A7 makes legible.
+    printf 'pump[F55..F63]: \033[33mpaused\033[0m — bind_percent 95%% ≥ ceiling 95%%  |  \033[31m0 ready\033[0m · 42 open  |  usage 95%%  resets 21:00\n\n'
     printf '%s\n' \
         "Reading ops/planning/2026-04-13 - Integrations Roadmap.md" \
         "⚙ Read crates/arachne-connectors/src/email/mod.rs" \
