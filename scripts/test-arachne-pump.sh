@@ -309,6 +309,76 @@ echo v2 >| "$GR/ops"   # ` M ops` — the submodule-pointer line, allowlisted
 g="$(apl_fs_guard "$GR")"
 [[ -z "$g" ]] && pass "allowlisted dirt (.worktrees/ + ops) is silent" || fail "allowlist not respected:\n$g"
 
+echo "--- Test 13: integration trunk — selection, build-gate, conflict (A3 v0) ---"
+# Drive reconcile_trunk through the ARACHNE_PUMP_INTEGRATE_DRYRUN seam (no real
+# git/cargo/gh): STUB_INTEGRATE_{NOBRANCH,ANCESTOR,CONFLICT} + BUILD_GATE_CMD
+# drive branch-exists / already-integrated / conflict / build-red.
+QFILE="$TMP/quarantine"; ISTATE="$TMP/ipump.state"
+itick() {  # integration dry-run --once tick: $1=phases ; extra env via caller
+  ARACHNE_NOTIFY_CMD="${ARACHNE_NOTIFY_CMD:-true}" \
+  ARACHNE_PUMP_NO_LAUNCH=1 \
+  ARACHNE_PUMP_INTEGRATE_DRYRUN=1 \
+  ARACHNE_PUMP_QUARANTINE_FILE="$QFILE" \
+  ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
+  ARACHNE_PUMP_STATE_FILE="$ISTATE" \
+  ARACHNE_POOL_CAP_FILE="$TMP/cap" \
+  ARACHNE_PUMP_LOG="$TMP/pump.log" \
+  ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+  "$PUMP" --no-health-gate --integration-trunk "${@:2}" --phases "$1" --once
+}
+
+# 13a: two quiescent phases with (assumed-present) branches → both "would integrate".
+mk F55.0 open; mk F56.0 open
+out=$(STUB_GATE_RC=0 itick F55..F56 2>&1)
+have "$out" 'would integrate F55' && pass "quiescent F55 → would integrate" || fail "F55 not integrated:\n$out"
+have "$out" 'would integrate F56' && pass "quiescent F56 → would integrate" || fail "F56 not integrated:\n$out"
+
+# 13b: a phase already an ancestor of the trunk → no integrate line.
+out=$(STUB_GATE_RC=0 STUB_INTEGRATE_ANCESTOR="F55" itick F55..F56 2>&1)
+have "$out" 'would integrate F55' && fail "already-integrated F55 re-integrated:\n$out" || pass "already-ancestor F55 skipped"
+have "$out" 'would integrate F56' && pass "F56 still integrates" || fail "F56 not integrated:\n$out"
+
+# 13c: a live container ⇒ phase not quiescent ⇒ skipped (mirrors the liveness join).
+out=$(STUB_GATE_RC=0 STUB_LIVE="arachne-agent-feat-f55" itick F55..F56 2>&1)
+have "$out" 'would integrate F55' && fail "live F55 integrated (not quiescent):\n$out" || pass "live F55 skipped (not quiescent)"
+have "$out" 'would integrate F56' && pass "quiescent F56 still integrates" || fail "F56 not integrated:\n$out"
+
+# 13d: build-gate red ⇒ quarantine; trunk not advanced; needs-review recorded; marker written.
+: >| "$QFILE"
+out=$(STUB_GATE_RC=0 ARACHNE_PUMP_BUILD_CMD='false' itick F55 2>&1)
+have "$out" 'would quarantine F55: build red' && pass "build-red → would quarantine" || fail "no build-red quarantine:\n$out"
+have "$out" 'needs-review' && pass "needs-review recorded as the quarantine action" || fail "no needs-review action:\n$out"
+have "$out" 'would integrate F55' && fail "trunk advanced despite build red:\n$out" || pass "trunk not advanced on build red"
+grep -qE '^F55 .*build red$' "$QFILE" && pass "quarantine marker written for build red" || fail "no build-red marker:\n$(cat "$QFILE")"
+
+# 13e: merge conflict ⇒ quarantine; trunk not advanced; marker written.
+: >| "$QFILE"
+out=$(STUB_GATE_RC=0 STUB_INTEGRATE_CONFLICT="F55" itick F55 2>&1)
+have "$out" 'would quarantine F55: conflict' && pass "conflict → would quarantine" || fail "no conflict quarantine:\n$out"
+have "$out" 'would integrate F55' && fail "trunk advanced despite conflict:\n$out" || pass "trunk not advanced on conflict"
+grep -qE '^F55 .*conflict$' "$QFILE" && pass "quarantine marker written for conflict" || fail "no conflict marker:\n$(cat "$QFILE")"
+
+# 13f: --integration-trunk OFF ⇒ no integration whatsoever (opt-out regression).
+: >| "$QFILE"
+out=$(STUB_GATE_RC=0 ARACHNE_PUMP_BUILD_CMD='false' \
+  ARACHNE_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 ARACHNE_PUMP_INTEGRATE_DRYRUN=1 \
+  ARACHNE_PUMP_QUARANTINE_FILE="$QFILE" ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
+  ARACHNE_PUMP_STATE_FILE="$ISTATE" ARACHNE_POOL_CAP_FILE="$TMP/cap" \
+  ARACHNE_PUMP_LOG="$TMP/pump.log" ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+  "$PUMP" --no-health-gate --phases F55 --once 2>&1)
+have "$out" 'would integrate' && fail "integration ran with flag off:\n$out" || pass "flag-off ⇒ no integration (opt-out)"
+have "$out" 'would quarantine' && fail "quarantine ran with flag off:\n$out" || pass "flag-off ⇒ no quarantine (opt-out)"
+
+echo "--- Test 14: arachne-task needs-review subcommand (A3 v0) ---"
+mk F58.0 open
+"$REAL_TASK" claim F58.0 --branch feat/f58 --turns 5 >/dev/null 2>&1
+"$REAL_TASK" needs-review F58.0 --reason "auto/trunk conflict for F58" >/dev/null 2>&1
+grep -q 'status: needs-review' "$TASKS/F58.0.md" && pass "needs-review sets status: needs-review" || fail "status not needs-review:\n$(cat "$TASKS/F58.0.md")"
+grep -q 'claimed_by: null' "$TASKS/F58.0.md" && pass "needs-review clears the claim" || fail "claim not cleared:\n$(cat "$TASKS/F58.0.md")"
+grep -qi 'Needs review' "$TASKS/F58.0.md" && pass "needs-review appends a body note" || fail "no body note:\n$(cat "$TASKS/F58.0.md")"
+grep -qF 'auto/trunk conflict for F58' "$TASKS/F58.0.md" && pass "needs-review note carries the reason" || fail "reason not in note"
+"$REAL_TASK" needs-review F58.0 >/dev/null 2>&1 && fail "needs-review without --reason should error" || pass "needs-review requires --reason"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"

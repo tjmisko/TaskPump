@@ -90,6 +90,34 @@ apl_disk_low() {
   return 0
 }
 
+# ── Autonomous integration trunk (A3 / F65.6) ─────────────────────────────────
+# apl_acquire_trunk_lock <lockfile> [wait_seconds] — acquire an flock on the trunk
+# merge lock via FD 8 for the lifetime of the calling (sub)shell, mirroring
+# arachne-task's acquire_state_lock (FD 9) on a DISTINCT fd + file so the two
+# locks never alias. Because every container and the host share the bind-mounted
+# repo, an flock on a file under the repo is shared by inode — the "merge queue":
+# only one integration holds it; others wait their turn. Degrades to a no-op
+# (returns 0) where flock is unavailable, falling back on the singular-pump
+# serialization. Returns 0 on success / no-flock; non-zero only on lock timeout.
+apl_acquire_trunk_lock() {
+  local lockfile="$1" wait="${2:-${ARACHNE_TRUNK_LOCK_WAIT:-300}}"
+  command -v flock >/dev/null 2>&1 || return 0
+  { exec 8>"$lockfile"; } 2>/dev/null || return 0
+  flock -w "$wait" 8 || return 1
+  return 0
+}
+
+# apl_phase_integrated <repo> <branch> <trunk> — 0 (true) when <branch>'s tip is
+# reachable from <trunk> (already integrated). This is the git-graph read that
+# keeps integration status out of the ledger (design decision 3): code-true,
+# self-healing (a dead agent's committed work still integrates on a later tick),
+# and decoupled from arachne-task. Quiet false (non-zero) when the branch or
+# trunk is missing.
+apl_phase_integrated() {
+  local repo="$1" branch="$2" trunk="$3"
+  git -C "$repo" merge-base --is-ancestor "$branch" "$trunk" 2>/dev/null
+}
+
 # apl_fs_guard <repo_root> — RC-4 contamination detector (A8 / F65.5). With the
 # read-only primary mount in place, a container can no longer write the primary
 # source tree, so this guard should always be clean; it is the regression
