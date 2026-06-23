@@ -371,9 +371,21 @@ do_tick() {
   "$ARACHNE_TASK" scrub >/dev/null 2>&1 || warn "scrub failed (continuing)"
 
   # RC-4 contamination guard (A8 / F65.5): flag any primary-source dirtiness an
-  # agent slipped past the read-only mount. Clean under normal operation.
-  local fs_dirt; fs_dirt="$(apl_fs_guard "$REPO_ROOT")"
-  [[ -n "$fs_dirt" ]] && pump_notify "$fs_dirt"
+  # agent slipped past the read-only mount. Clean under normal operation. Always
+  # log it, but desktop-notify only when the contamination CHANGES — otherwise a
+  # persistent dirty tree spams a notification every tick (TICK seconds). The
+  # fingerprint persists in a gitignored marker so dedup survives restarts.
+  local fs_dirt fsg_mark="$REPO_ROOT/.arachne-fsguard.notified"
+  fs_dirt="$(apl_fs_guard "$REPO_ROOT")"
+  if [[ -n "$fs_dirt" ]]; then
+    log "$fs_dirt"
+    if [[ "$fs_dirt" != "$(cat "$fsg_mark" 2>/dev/null)" ]]; then
+      pump_notify "$fs_dirt"
+      printf '%s' "$fs_dirt" >"$fsg_mark" 2>/dev/null || true
+    fi
+  else
+    rm -f "$fsg_mark" 2>/dev/null || true   # clean again → re-arm for next time
+  fi
 
   # Plan + reclaim run before the gate: classification is read-only and reclaim
   # frees disk for DONE phases even while feeding is paused (e.g. on the disk gate).

@@ -148,6 +148,10 @@ NOTIFY="$TMP/notify.txt"; : >| "$NOTIFY"
 # Hermetic tick: no worktrees/containers (NO_LAUNCH), ops/git ops point at a
 # non-repo (fail-open), state/cap/log/template/usage all redirected.
 pump_tick() {  # $1=phases ; extra env via caller
+  # Suppress real desktop notifications by default (the fs-guard now runs in
+  # do_tick and would notify-send against this dirty worktree); a caller can
+  # still override ARACHNE_NOTIFY_CMD to capture, as the drain test does.
+  ARACHNE_NOTIFY_CMD="${ARACHNE_NOTIFY_CMD:-true}" \
   ARACHNE_PUMP_NO_LAUNCH=1 \
   ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
   ARACHNE_PUMP_STATE_FILE="$STATE" \
@@ -227,6 +231,7 @@ plant_target() {  # fake done-phase worktree with a target/ dir + sentinel
 }
 reclaim_tick() {  # one real tick with the reclaim sweep active, fixture-wired
   PATH="$BIN:$PATH" \
+  ARACHNE_NOTIFY_CMD="${ARACHNE_NOTIFY_CMD:-true}" \
   ARACHNE_PUMP_WORKTREES_DIR="$WT" \
   ARACHNE_PUMP_NO_LAUNCH=1 \
   ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
