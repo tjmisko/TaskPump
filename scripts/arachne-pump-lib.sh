@@ -68,3 +68,24 @@ apl_count_live_agents() {
   done < <(apl_live_agent_slugs)
   echo "$n"
 }
+
+# apl_disk_low — one-shot disk-pressure gate for the pump's feed loop, parallel to
+# apl_network_unhealthy. Delegates to `arachne-disk-watchdog --gate` (the single
+# source of the free-space threshold, so run-parallel.sh's cap-file path and the
+# pump's feed-gate path share one knob — PAUSE_THRESHOLD_GB, inherited via env).
+# Echoes the watchdog's one-line reason to stdout and returns 10 when free disk
+# is below the floor. Graceful: returns 0 (feed OK, no output) when the gate is
+# disabled (ARACHNE_DISK_GATE != 1) or the watchdog binary is absent / not
+# executable — a missing tool never blocks launches.
+apl_disk_low() {
+  [[ "${ARACHNE_DISK_GATE:-1}" -eq 1 ]] || return 0
+  local wd="${ARACHNE_DISK_WATCHDOG:-}"
+  [[ -n "$wd" && -x "$wd" ]] || return 0
+  local reason rc
+  reason="$("$wd" --gate 2>&1)"; rc=$?
+  if [[ "$rc" -eq 10 ]]; then
+    printf '%s' "$reason"
+    return 10
+  fi
+  return 0
+}

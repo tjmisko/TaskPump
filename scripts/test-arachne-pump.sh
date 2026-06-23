@@ -36,12 +36,23 @@ if [[ "$1" == "--gate" ]]; then
 fi
 exit 0
 EOF
-chmod +x "$BIN/docker" "$BIN/arachne-usage"
+# arachne-disk-watchdog: only --gate matters here; exit $STUB_DISK_GATE_RC
+# (0 feed / 10 pause). Defaults feed-ok so Tests 1-8 are unaffected by host disk.
+cat >| "$BIN/arachne-disk-watchdog" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "--gate" ]]; then
+  [[ "${STUB_DISK_GATE_RC:-0}" -eq 10 ]] && { echo "/ free=3GB < 10GiB (disk gate)" >&2; exit 10; }
+  exit 0
+fi
+exit 0
+EOF
+chmod +x "$BIN/docker" "$BIN/arachne-usage" "$BIN/arachne-disk-watchdog"
 
 export ARACHNE_TASKS_DIR="$TASKS"
 export ARACHNE_TASK_NOCOMMIT=1
 export ARACHNE_TASK="$REAL_TASK"
 export ARACHNE_USAGE="$BIN/arachne-usage"
+export ARACHNE_DISK_WATCHDOG="$BIN/arachne-disk-watchdog"
 export DOCKER="$BIN/docker"
 
 mk() {  # mk <id> <status> [blockers_csv]
@@ -166,6 +177,81 @@ grep -qi 'drained' "$NOTIFY" && pass "drain notification fired via ARACHNE_NOTIF
 # 8d: restart detection logs a resume for the same range.
 out=$(STUB_GATE_RC=0 pump_tick F55..F57 --once 2>&1 >/dev/null; STUB_GATE_RC=0 pump_tick F55..F57 --once 2>&1)
 grep -qi "resuming pump for F55..F57" <<<"$out" && pass "restart detection logs resume for same range" || fail "no resume log:\n$out"
+
+echo "--- Test 9: disk feed-gate pauses launching (A4 / F65.3) ---"
+# Reset fixtures to a live frontier (the gate line prints regardless of fixtures).
+mk F55.0 open; mk F55.1 open F55.0; mk F56.0 open; mk F57.0 open F55.1
+# 9a: disk gate trips (watchdog --gate exits 10) → GATE: PAUSED in the plan.
+out=$(STUB_DISK_GATE_RC=10 pump F55..F57)
+have "$out" 'GATE: PAUSED' && pass "disk gate pause surfaced when watchdog --gate returns 10" || fail "disk pause not shown:\n$out"
+have "$out" 'disk gate' && pass "pause reason names the disk gate" || fail "disk-gate reason missing:\n$out"
+# 9b: disk gate clears → feed-ok.
+out=$(STUB_DISK_GATE_RC=0 pump F55..F57)
+have "$out" 'GATE: feed-ok' && pass "disk gate feed-ok when watchdog --gate returns 0" || fail "disk feed-ok not shown:\n$out"
+# 9c: --no-disk-gate bypasses the disk check even when it would trip.
+out=$(STUB_DISK_GATE_RC=10 "$PUMP" --no-health-gate --no-disk-gate --dry-run --phases F55..F57)
+have "$out" 'GATE: feed-ok' && pass "--no-disk-gate bypasses the disk gate" || fail "disk gate not bypassed:\n$out"
+
+# 9d: a disk-gated --once tick writes status=paused with the disk reason.
+mk F55.0 open; mk F55.1 open F55.0; mk F56.0 open; mk F57.0 open F55.1
+STUB_GATE_RC=0 STUB_DISK_GATE_RC=10 pump_tick F55..F57 --once >/dev/null 2>&1
+[[ "$(jq -r '.status' "$STATE" 2>/dev/null)" == "paused" ]] && pass "disk gate trip writes status=paused" || fail "status not paused on disk gate: $(cat "$STATE" 2>/dev/null)"
+have "$(jq -r '.paused_reason // empty' "$STATE" 2>/dev/null)" 'disk gate' && pass "paused_reason names the disk gate" || fail "paused_reason missing disk gate: $(jq -r '.paused_reason' "$STATE" 2>/dev/null)"
+
+echo "--- Test 10: reclaim sweep cleans completed-phase target/ dirs (A4 / F65.3) ---"
+WT="$TMP/wt"; STATE10="$TMP/pump10.state"
+# Stub cargo so `clean --manifest-path X` removes $(dirname X)/target with no real
+# build (honours the no-real-cargo test seam). Shadowed onto PATH for the tick.
+cat >| "$BIN/cargo" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "clean" ]]; then
+  shift; mp=""
+  while (($#)); do
+    case "$1" in
+      --manifest-path) mp="$2"; shift 2;;
+      --manifest-path=*) mp="${1#--manifest-path=}"; shift;;
+      *) shift;;
+    esac
+  done
+  [[ -n "$mp" ]] && rm -rf "$(dirname "$mp")/target"
+  exit 0
+fi
+exit 0
+EOF
+chmod +x "$BIN/cargo"
+
+plant_target() {  # fake done-phase worktree with a target/ dir + sentinel
+  rm -rf "$WT"; mkdir -p "$WT/feat/f56/target"
+  : >| "$WT/feat/f56/Cargo.toml"
+  echo sentinel >| "$WT/feat/f56/target/sentinel"
+}
+reclaim_tick() {  # one real tick with the reclaim sweep active, fixture-wired
+  PATH="$BIN:$PATH" \
+  ARACHNE_PUMP_WORKTREES_DIR="$WT" \
+  ARACHNE_PUMP_NO_LAUNCH=1 \
+  ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
+  ARACHNE_PUMP_STATE_FILE="$STATE10" \
+  ARACHNE_POOL_CAP_FILE="$TMP/cap" \
+  ARACHNE_PUMP_LOG="$TMP/pump.log" \
+  ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+  "$PUMP" --no-health-gate "$@"
+}
+
+# 10a: a PLAN_DONE phase (all tasks done) with no live container → target reclaimed.
+mk F56.0 done; plant_target
+out=$(STUB_GATE_RC=0 ARACHNE_DISK_RECLAIM=1 reclaim_tick --phases F56 --once 2>&1)
+[[ ! -d "$WT/feat/f56/target" ]] && pass "reclaim removed F56 target/ on a DONE tick" || fail "F56 target/ survived reclaim:\n$out"
+have "$out" 'reclaimed F56' && pass "reclaim logged 'reclaimed F56'" || fail "no reclaim log line:\n$out"
+
+# 10b: ARACHNE_DISK_RECLAIM=0 → reclaim disabled, target survives.
+plant_target
+STUB_GATE_RC=0 ARACHNE_DISK_RECLAIM=0 reclaim_tick --phases F56 --once >/dev/null 2>&1
+[[ -d "$WT/feat/f56/target" ]] && pass "ARACHNE_DISK_RECLAIM=0 leaves target/ intact" || fail "target removed despite RECLAIM=0"
+
+# 10c: a live container for F56 → target survives even though open_count=0.
+plant_target
+STUB_GATE_RC=0 ARACHNE_DISK_RECLAIM=1 STUB_LIVE="arachne-agent-feat-f56" reclaim_tick --phases F56 --once >/dev/null 2>&1
+[[ -d "$WT/feat/f56/target" ]] && pass "live-phase target/ never reclaimed (phase_live guard)" || fail "live phase target/ was reclaimed"
 
 echo
 echo "=============================================="
