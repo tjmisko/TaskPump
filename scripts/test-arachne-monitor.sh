@@ -55,6 +55,9 @@ export ARACHNE_USAGE="$BIN/arachne-usage"
 # no-pump (usage_bars fallback) branch runs hermetically.
 export ARACHNE_PUMP_STATE_FILE="$TMP/no-such-pump.state"
 export MANIFEST="$TMP/empty-manifest.tsv"; : >| "$MANIFEST"
+# Disk gauge runs du/git/df on the real tree — disable it for the generic tests;
+# the dedicated disk test (Test 8) re-enables it against stubs + a seeded cache.
+export ARACHNE_MONITOR_DISK=0
 
 # ── Test 1: --demo renders both window bars with the toolbar glyphs ────────────
 echo "--- Test 1: demo bars render ---"
@@ -118,6 +121,53 @@ echo "--- Test 7: arg handling ---"
 "$CLI" --bogus >/dev/null 2>&1; rc=$?
 [[ "$rc" -ne 0 ]] && pass "unknown arg exits non-zero" || fail "unknown arg accepted"
 "$CLI" --help >/dev/null 2>&1 && pass "--help exits 0" || fail "--help failed"
+
+# ── Test 8: disk gauge (stubbed df + seeded cache, no real du/git) ────────────
+echo "--- Test 8: disk gauge ---"
+# df stub: 100G total; available comes from $DF_AVAIL_KB so colour bands can be
+# exercised. Field layout matches `df -Pk` (avail is field 4).
+cat >| "$BIN/df" <<'EOF'
+#!/usr/bin/env bash
+echo "Filesystem 1024-blocks Used Available Capacity Mounted-on"
+echo "/dev/stub 104857600 $((104857600 - ${DF_AVAIL_KB:-52428800})) ${DF_AVAIL_KB:-52428800} 50% /"
+EOF
+chmod +x "$BIN/df"
+# Seed the heavy-sizing cache so disk_refresh_if_stale never shells out to du/git.
+DCACHE="$TMP/disk.tsv"
+cat >| "$DCACHE" <<'EOF'
+MAIN	490000000
+DKR	Images	15.4GB	7.9GB (51%)
+DKR	Build Cache	9.6GB	1.7GB
+WT	feat/big	12000000000
+WT	feat/small	300000000
+WT	feat/tiny	30000000
+EOF
+FAKE_MAIN="$TMP/fakerepo"; mkdir -p "$FAKE_MAIN"
+run_disk() { ARACHNE_MONITOR_DISK=1 ARACHNE_MONITOR_DISK_CACHE="$DCACHE" \
+  ARACHNE_MONITOR_DISK_TTL=99999 ARACHNE_MONITOR_MAIN_ROOT="$FAKE_MAIN" \
+  ARACHNE_MONITOR_DISK_TOP_N=2 "$CLI" 2>/dev/null; }
+
+strip_ansi() { sed -r 's/\x1b\[[0-9;]*m//g'; }   # text assertions ignore colour
+out=$(DF_AVAIL_KB=52428800 run_disk)   # 50G free
+outp=$(strip_ansi <<<"$out")
+grep -q '^Disk ' <<<"$outp" && pass "disk gauge renders a Disk line" || fail "no Disk line:\n$outp"
+grep -qE '50(\.0)?G free / 100(\.0)?G' <<<"$outp" && pass "free/total shown (50G/100G)" || fail "free/total missing:\n$outp"
+grep -qE 'worktrees 11\.[0-9]G in 3' <<<"$outp" && pass "worktrees total+count (3 dirs)" || fail "worktree total wrong:\n$outp"
+grep -qE 'main 467\.[0-9]M' <<<"$outp" && pass "main footprint shown" || fail "main missing:\n$outp"
+grep -qE 'docker img 15\.4GB · cache 9\.6GB' <<<"$outp" && pass "docker breakdown (no leading separator)" || fail "docker line wrong:\n$outp"
+# largest sorted desc, capped at TOP_N=2, with a "+N more".
+grep -qE 'largest: feat/big 11\.2G · feat/small 286\.1M' <<<"$outp" && pass "largest worktrees sorted, capped at top-N" || fail "largest wrong:\n$outp"
+grep -q '(+1 more)' <<<"$outp" && pass "shows (+N more) when over top-N" || fail "+N more missing:\n$outp"
+
+# Free-space colour bands (panic<5G red, pause<10G amber, else terracotta).
+fb() { DF_AVAIL_KB=$1 run_disk | grep '^Disk '; }
+printf '%s' "$(fb 52428800)" | grep -q $'\033\[38;5;173m' && pass "50G free → terracotta bar" || fail "50G not terracotta"
+printf '%s' "$(fb 8388608)"  | grep -q $'\033\[33m'      && pass "8G free → amber (pause band)"  || fail "8G not amber"
+printf '%s' "$(fb 3145728)"  | grep -q $'\033\[1;31m'    && pass "3G free → red (panic band)"    || fail "3G not red"
+
+# --no-disk suppresses the gauge entirely.
+nd=$(ARACHNE_MONITOR_DISK=1 ARACHNE_MONITOR_DISK_CACHE="$DCACHE" ARACHNE_MONITOR_MAIN_ROOT="$FAKE_MAIN" "$CLI" --no-disk 2>/dev/null)
+grep -q '^Disk ' <<<"$nd" && fail "--no-disk still drew the gauge" || pass "--no-disk suppresses the gauge"
 
 echo
 echo "=============================================="
