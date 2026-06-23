@@ -10,24 +10,45 @@
 # most recent meaningful log events. In --watch the whole view repaints on the
 # interval.
 #
+# In --watch the view is repainted flicker-free: each frame is built off-screen
+# (all the docker/jq/usage work) while the previous frame stays visible, then
+# painted IN PLACE (cursor-home + erase-to-EOL per row + erase-below) so the
+# screen is never blanked between frames. `--legacy-paint` restores the old
+# clear-then-render behaviour for an A/B comparison of the flicker.
+#
 # Usage:
-#   ./scripts/arachne-monitor            # one paint
-#   ./scripts/arachne-monitor --watch    # refresh every 10s
-#   ./scripts/arachne-monitor --watch 5  # refresh every 5s
+#   ./scripts/arachne-monitor             # one paint
+#   ./scripts/arachne-monitor --watch     # refresh every 10s (batched, flicker-free)
+#   ./scripts/arachne-monitor --watch 5   # refresh every 5s
+#   ./scripts/arachne-monitor --watch --log /tmp/mon.log   # log each redraw's timing
+#   ./scripts/arachne-monitor --watch --legacy-paint       # old clear-then-render
+#   ./scripts/arachne-monitor --demo      # synthetic sessions; no docker needed
 set -euo pipefail
 
 REPO_ROOT="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
 MANIFEST="${MANIFEST:-$REPO_ROOT/ops/task-loop/parallel-manifest.tsv}"
 TASKS_DIR="$REPO_ROOT/ops/task-loop/tasks"
 
+print_help() {
+    # Print the leading comment block (minus the shebang), stripping "# ".
+    awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$0"
+}
+
 WATCH=0; INTERVAL=10; DEMO=0
-for a in "$@"; do
-    case "$a" in
-        --watch)  WATCH=1 ;;
-        --demo)   DEMO=1 ;;        # render synthetic sessions; no docker needed
-        [0-9]*)   INTERVAL="$a" ;;
-        *)        echo "ERROR: unknown arg '$a'" >&2; exit 1 ;;
+MONITOR_LOG="${ARACHNE_MONITOR_LOG:-}"        # redraw-instrumentation log (off if empty)
+PAINT_MODE="${ARACHNE_MONITOR_PAINT:-batched}"  # batched (flicker-free) | legacy
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --watch)        WATCH=1 ;;
+        --demo)         DEMO=1 ;;          # render synthetic sessions; no docker needed
+        --legacy-paint) PAINT_MODE=legacy ;;
+        --log)          MONITOR_LOG="${2:-}"; shift ;;
+        --log=*)        MONITOR_LOG="${1#--log=}" ;;
+        [0-9]*)         INTERVAL="$1" ;;
+        -h|--help)      print_help; exit 0 ;;
+        *)              echo "ERROR: unknown arg '$1'" >&2; exit 1 ;;
     esac
+    shift
 done
 
 # branch-slug -> "name<TAB>epic_task" lookup from the manifest.
@@ -55,6 +76,66 @@ colorize() {  # colorize a status word
         exited)         printf '\033[90m%s\033[0m' "$1" ;;        # grey
         *)              printf '%s' "$1" ;;
     esac
+}
+
+# ── Usage bars ────────────────────────────────────────────────────────────────
+# Render the Max-plan usage as two bars (5-hour session window + binding 7-day
+# weekly window) in the exact format the user's ~/.claude/claude-status toolbar
+# uses: a 20-cell █/░ bar (5% per cell) wrapped in faded-brown ▐ ▌ end-caps with
+# a Claude-terracotta fill, turning red once a window is at/over critical (95%).
+BAR_CELLS=20
+BAR_CAP=$'\033[2;38;5;130m'    # faded brown end-caps  ▐ ▌
+BAR_FILL=$'\033[38;5;173m'     # Claude terracotta fill (#da7756-ish)
+BAR_EMPTY=$'\033[38;5;245m'    # grey empty cells / labels
+BAR_CRIT=$'\033[1;31m'         # red fill once a window is at/over critical
+BAR_RST=$'\033[0m'
+
+# render_bar -- one usage bar line. Args: label percent reset_at [date_fmt].
+#   "    5h ▐██████████░░░░░░░░░░▌  34%  resets 19:29"
+render_bar() {
+    local label="$1" pct="$2" reset_at="${3:-}" date_fmt="${4:-+%H:%M}"
+    if ! [[ "$pct" =~ ^[0-9]+$ ]]; then
+        printf '    %-2s %s(window unavailable)%s\n' "$label" "$BAR_EMPTY" "$BAR_RST"
+        return 0
+    fi
+    local p="$pct"; (( p > 100 )) && p=100
+    local filled=$(( p * BAR_CELLS / 100 )); (( filled > BAR_CELLS )) && filled=$BAR_CELLS
+    local empty=$(( BAR_CELLS - filled )) i bar="" gap=""
+    for (( i=0; i<filled; i++ )); do bar+="█"; done
+    for (( i=0; i<empty;  i++ )); do gap+="░"; done
+    local fill_col="$BAR_FILL"; (( p >= 95 )) && fill_col="$BAR_CRIT"
+    local reset_str=""
+    if [[ -n "$reset_at" && "$reset_at" != "null" && "$reset_at" != "-" ]]; then
+        reset_str="$(date -d "$reset_at" "$date_fmt" 2>/dev/null || true)"
+    fi
+    printf '    %-2s %s▐%s%s%s%s%s▌%s %3d%%' \
+        "$label" "$BAR_CAP" "$fill_col" "$bar" "$BAR_EMPTY" "$gap" "$BAR_CAP" "$BAR_RST" "$p"
+    [[ -n "$reset_str" ]] && printf '  %sresets %s%s' "$BAR_EMPTY" "$reset_str" "$BAR_RST"
+    printf '\n'
+    return 0
+}
+
+# usage_bars -- render both window bars from an arachne-usage --json blob. Pass
+# the blob as $1 to reuse an already-fetched payload; omit to fetch fresh. Prints
+# nothing when the meter is unreachable (no windows). Never errors the caller.
+usage_bars() {
+    [[ -x "$USAGE_BIN" ]] || return 0
+    local usage_json="${1:-}"
+    [[ -n "$usage_json" ]] || usage_json="$("$USAGE_BIN" --json 2>/dev/null || echo '{}')"
+    local fivep fiver sevenp sevenr
+    IFS=$'\t' read -r fivep fiver sevenp sevenr < <(jq -r '
+        ([.windows[]? | select(.label=="5h")] | .[0]) as $a
+      | ([.windows[]? | select(.label=="7d")] | .[0]) as $b
+      | [ ($a.percent // "-"), ($a.reset_at // "-"),
+          ($b.percent // "-"), ($b.reset_at // "-") ] | @tsv' \
+        <<<"$usage_json" 2>/dev/null || true)
+    [[ "${fivep:-}" == "-" || "${fivep:-}" == "null" ]] && fivep=""
+    [[ "${sevenp:-}" == "-" || "${sevenp:-}" == "null" ]] && sevenp=""
+    if [[ -n "${fivep:-}" || -n "${sevenp:-}" ]]; then
+        render_bar "5h" "${fivep:-?}" "${fiver:-}" "+%H:%M"
+        render_bar "7d" "${sevenp:-?}" "${sevenr:-}" "+%a %H:%M"
+    fi
+    return 0
 }
 
 TAIL_LINES=4   # max log-tail lines per session (blanks are skipped, not padded)
@@ -111,8 +192,8 @@ header() {  # $1 = optional suffix tag
     printf '%*s\n' "$w" '' | tr ' ' '-'
 }
 
-USAGE_BIN="$REPO_ROOT/scripts/arachne-usage"
-TASK_BIN="$REPO_ROOT/scripts/arachne-task"
+USAGE_BIN="${ARACHNE_USAGE:-$REPO_ROOT/scripts/arachne-usage}"
+TASK_BIN="${ARACHNE_TASK:-$REPO_ROOT/scripts/arachne-task}"
 PUMP_STATE="${ARACHNE_PUMP_STATE_FILE:-$REPO_ROOT/.arachne-pump.state}"
 
 # pump_status_line -- when the usage-governed pump (scripts/arachne-pump) is
@@ -152,10 +233,15 @@ pump_status_line() {
     [[ -z "$eligible" ]] && eligible="?"
     [[ -z "$open_ct" ]] && open_ct="?"
 
+    # One usage fetch per redraw: derive the binding percent, the reset clock, and
+    # the per-window bars all from a single --json payload (was two subprocess
+    # calls — --percent and --json — every paint).
     pct="?"; reset=""
+    local usage_json="{}"
     if [[ -x "$USAGE_BIN" ]]; then
-        pct="$("$USAGE_BIN" --percent 2>/dev/null || echo '?')"
-        reset="$("$USAGE_BIN" --json 2>/dev/null | jq -r '.reset_at // empty' 2>/dev/null \
+        usage_json="$("$USAGE_BIN" --json 2>/dev/null || echo '{}')"
+        pct="$(jq -r '.bind_percent // "?"' <<<"$usage_json" 2>/dev/null || echo '?')"
+        reset="$(jq -r '.reset_at // empty' <<<"$usage_json" 2>/dev/null \
                   | sed -E 's/.*T([0-9]{2}:[0-9]{2}).*/\1/' || true)"
     fi
     local color line
@@ -177,12 +263,19 @@ pump_status_line() {
         rcolor='\033[36m'   # actionable frontier
     fi
 
+    # Pull the ceiling from the pump's own state so the summary shows headroom.
+    local ceiling; ceiling="$(jq -r '.ceiling // empty' "$PUMP_STATE" 2>/dev/null || true)"
+
     line="$(printf 'pump[%s]: %b%s\033[0m' "$phases" "$color" "$status")"
     [[ "$status" == "paused" && -n "$reason" ]] && line+=" — $reason"
     line+="$(printf '  |  %b%s ready\033[0m · %s open' "$rcolor" "$eligible" "$open_ct")"
     line+="  |  usage ${pct}%"
+    [[ -n "$ceiling" ]] && line+="/${ceiling}%"
     [[ -n "$reset" ]] && line+="  resets ${reset}"
-    printf '%b\n\n' "$line"
+    printf '%b\n' "$line"
+    # The two usage bars, in the toolbar's format, directly under the summary.
+    usage_bars "$usage_json"
+    printf '\n'
     return 0
 }
 
@@ -191,7 +284,13 @@ term_width() { local w; w="$(tput cols 2>/dev/null || echo 100)"; [[ "$w" -lt 40
 snapshot() {
     local width; width="$(term_width)"
     header
-    pump_status_line
+    if [[ -f "$PUMP_STATE" ]]; then
+        pump_status_line
+    else
+        # No pump running (e.g. a manifest run): still surface the usage bars.
+        local ub; ub="$(usage_bars)"
+        [[ -n "$ub" ]] && printf '%s\n\n' "$ub"
+    fi
     local found=0
     while IFS='|' read -r cname state status; do
         [[ -z "$cname" ]] && continue
@@ -243,7 +342,11 @@ demo() {
     local width; width="$(term_width)"
     header "   [DEMO — synthetic data]"
     # The red "0 ready" against "42 open" is the stall signature A7 makes legible.
-    printf 'pump[F55..F63]: \033[33mpaused\033[0m — bind_percent 95%% ≥ ceiling 95%%  |  \033[31m0 ready\033[0m · 42 open  |  usage 95%%  resets 21:00\n\n'
+    printf 'pump[F55..F63]: \033[33mpaused\033[0m — bind_percent 95%% ≥ ceiling 95%%  |  \033[31m0 ready\033[0m · 42 open  |  usage 95%%/95%%  resets 21:00\n'
+    # Synthetic usage bars exercising the terracotta fill and the red critical fill.
+    render_bar "5h" 95 "" ""        # critical → red fill
+    render_bar "7d" 62 "" ""        # normal   → terracotta fill
+    printf '\n'
     printf '%s\n' \
         "Reading ops/planning/2026-04-13 - Integrations Roadmap.md" \
         "⚙ Read crates/arachne-connectors/src/email/mod.rs" \
@@ -275,20 +378,87 @@ demo() {
 
 render_all() { if [[ "$DEMO" -eq 1 ]]; then demo; else snapshot; fi; }
 
+# ── Redraw instrumentation + flicker-free repaint ──────────────────────────────
+# _now_us -- microseconds since the epoch, locale-independent. EPOCHREALTIME is a
+# bash-5 builtin (no subprocess); fall back to date(1) on older shells.
+_now_us() {
+    if [[ -n "${EPOCHREALTIME:-}" ]]; then
+        printf '%s' "${EPOCHREALTIME//[^0-9]/}"
+    else
+        date +%s%6N 2>/dev/null || echo 0
+    fi
+}
+
+# log_redraw -- append one line per repaint to $MONITOR_LOG so the cadence and
+# cost of redraws are observable (this is what surfaces the flicker: compute_ms
+# is how long the frame takes to build — in legacy paint that whole window is a
+# blank screen; in batched paint the old frame stays up while it builds, and only
+# the tiny paint_ms touches the terminal). No-op unless --log / ARACHNE_MONITOR_LOG.
+log_redraw() {  # n compute_us paint_us frame
+    [[ -n "$MONITOR_LOG" ]] || return 0
+    local n="$1" cus="$2" pus="$3" frame="$4" lines bytes ts
+    lines="$(printf '%s' "$frame" | wc -l | tr -d ' ')"
+    bytes="${#frame}"
+    ts="$(date '+%Y-%m-%dT%H:%M:%S')"
+    printf '%s redraw=%-5s mode=%-7s interval=%ss compute_ms=%-5s paint_ms=%-4s lines=%-3s bytes=%s\n' \
+        "$ts" "$n" "$PAINT_MODE" "$INTERVAL" "$((cus / 1000))" "$((pus / 1000))" "$lines" "$bytes" \
+        >> "$MONITOR_LOG" 2>/dev/null || true
+    return 0
+}
+
+# paint_frame -- repaint IN PLACE, never blanking the screen: home the cursor,
+# overwrite each row clearing any trailing chars (\033[K), then erase everything
+# below the last row (\033[J) to drop lines a taller previous frame left behind.
+# Because the screen is overwritten rather than cleared-then-filled, there is no
+# blank interval and therefore no flicker.
+paint_frame() {  # frame
+    local frame="$1" line
+    printf '\033[H'
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        printf '%s\033[K\n' "$line"
+    done <<< "$frame"
+    printf '\033[J'
+}
+
 if [[ "$WATCH" -eq 1 ]]; then
-    # Full-screen repaint on the alternate buffer, like top/watch: take over the
-    # terminal, hide the cursor, and restore both when the user quits (Ctrl-C) or
-    # the loop dies for any reason. `|| true` keeps a transient render failure
-    # (e.g. a docker hiccup) from ending the watch under `set -e`.
+    # Take over the terminal on the alternate buffer (like top/watch), hide the
+    # cursor, and restore both when the user quits (Ctrl-C) or the loop dies for
+    # any reason. `|| true` keeps a transient render failure (e.g. a docker
+    # hiccup) from ending the watch under `set -e`.
     restore() { tput cnorm 2>/dev/null || true; tput rmcup 2>/dev/null || true; }
     trap restore EXIT INT TERM
     tput smcup 2>/dev/null || true   # enter alternate screen
     tput civis 2>/dev/null || true   # hide cursor
+    __redraw=0
     while true; do
-        printf '\033[H\033[2J'       # home cursor + clear screen (flicker-free in alt buffer)
-        render_all || true
+        __redraw=$((__redraw + 1))
+        if [[ "$PAINT_MODE" == "legacy" ]]; then
+            # Legacy: clear FIRST, then render straight to the screen. The whole
+            # render (docker ps + jq + usage curl) runs against a BLANK screen —
+            # this is the flicker the batched path removes. Kept for A/B.
+            __t0="$(_now_us)"
+            printf '\033[H\033[2J'
+            render_all || true
+            log_redraw "$__redraw" 0 "$(( $(_now_us) - __t0 ))" ""
+        else
+            # Batched: build the whole frame off-screen (all the slow work) while
+            # the previous frame stays visible, then repaint in place.
+            __t0="$(_now_us)"
+            __frame="$(render_all 2>/dev/null || true)"
+            __compute_us=$(( $(_now_us) - __t0 ))
+            __p0="$(_now_us)"
+            paint_frame "$__frame"
+            __paint_us=$(( $(_now_us) - __p0 ))
+            log_redraw "$__redraw" "$__compute_us" "$__paint_us" "$__frame"
+        fi
         sleep "$INTERVAL"
     done
 else
-    render_all
+    if [[ -n "$MONITOR_LOG" ]]; then
+        __t0="$(_now_us)"; __frame="$(render_all 2>/dev/null || true)"
+        log_redraw 1 "$(( $(_now_us) - __t0 ))" 0 "$__frame"
+        printf '%s\n' "$__frame"
+    else
+        render_all
+    fi
 fi
