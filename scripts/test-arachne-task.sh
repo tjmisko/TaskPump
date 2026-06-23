@@ -426,6 +426,87 @@ got=$("$CLI" ready --phases F30..F31 --json | jq -r '[.[].id] | join(",")')
 [[ "$got" == "F31.1" ]] && pass "ready frontier excludes task claimed by other branch" \
   || fail "ready frontier after F30.2 claimed-by-other expected 'F31.1' got '$got'"
 
+# ── Test 12: ready --count-eligible + the stall fixture (open>0, eligible==0) ──
+# The gap Test 11 never covered: a range where open work EXISTS but NOTHING is
+# eligible to launch (the C-2 stall signature). Exercises --count-eligible's
+# frontier semantics, its --branch sensitivity, the drain-vs-frontier divergence,
+# and --count's precedence when both flags are passed.
+echo
+echo "--- Test 12: ready --count-eligible + stall visibility ---"
+
+# 12a (AC7 mirror): one root + two dependents (one cross-phase). Only the root is
+# eligible until it completes, then the whole frontier lifts.
+make_task "$TASKS" F33.1 F33 open "Frontier root (no blockers)"
+make_task "$TASKS" F33.2 F33 open "Depends on F33.1" null "F33.1"
+make_task "$TASKS" F34.1 F34 open "Cross-phase depends on F33.1" null "F33.1"
+git -C "$TASKS_REPO" add -A; git -C "$TASKS_REPO" -c user.name=test -c user.email=t@e commit -q -m "add count-eligible fixtures" || true
+
+got=$("$CLI" ready --phases F33..F34 --count-eligible)
+[[ "$got" == "1" ]] && pass "ready --count-eligible = 1 (only the unblocked root)" \
+  || fail "ready --count-eligible expected 1 got '$got'"
+got=$("$CLI" ready --phases F33..F34 --count)
+[[ "$got" == "3" ]] && pass "ready --count = 3 (all open; blockers ignored)" \
+  || fail "ready --count expected 3 got '$got'"
+
+echo "done" | "$CLI" complete F33.1 >/dev/null
+got=$("$CLI" ready --phases F33..F34 --count-eligible)
+[[ "$got" == "2" ]] && pass "ready --count-eligible = 2 after root completes (frontier lifts)" \
+  || fail "ready --count-eligible after F33.1 done expected 2 got '$got'"
+got=$("$CLI" ready --phases F33..F34 --count)
+[[ "$got" == "2" ]] && pass "ready --count = 2 after root completes (F33.1 now done)" \
+  || fail "ready --count after F33.1 done expected 2 got '$got'"
+
+# 12b (THE STALL): all open tasks in range are blocked by an out-of-range,
+# not-yet-done task → open-in-range > 0 but eligible-frontier == 0. This is the
+# exact divergence (cross-phase blocker unsatisfied) that masked the live stall.
+make_task "$TASKS" F36.1 F36 open "Out-of-range root blocker"
+make_task "$TASKS" F35.1 F35 open "Stalled by out-of-range F36.1" null "F36.1"
+make_task "$TASKS" F35.2 F35 open "Also stalled by out-of-range F36.1" null "F36.1"
+git -C "$TASKS_REPO" add -A; git -C "$TASKS_REPO" -c user.name=test -c user.email=t@e commit -q -m "add stall fixtures" || true
+
+got=$("$CLI" ready --phases F35 --count)
+[[ "$got" == "2" ]] && pass "stall: ready --count = 2 (open work exists in range)" \
+  || fail "stall: ready --count expected 2 got '$got'"
+got=$("$CLI" ready --phases F35 --count-eligible)
+[[ "$got" == "0" ]] && pass "stall: ready --count-eligible = 0 (nothing launchable — open>0, eligible==0)" \
+  || fail "stall: ready --count-eligible expected 0 got '$got'"
+
+# Clearing the cross-phase blocker lifts the stalled frontier.
+echo "done" | "$CLI" complete F36.1 >/dev/null
+got=$("$CLI" ready --phases F35 --count-eligible)
+[[ "$got" == "2" ]] && pass "stall clears: ready --count-eligible = 2 once out-of-range blocker done" \
+  || fail "stall clears: ready --count-eligible expected 2 got '$got'"
+
+# 12c: --count-eligible respects --branch (claimed-by-other is excluded), while
+# --count ignores claim state entirely. An open task claimed by another branch is
+# the orphaned-claim flavour of a stall.
+make_task "$TASKS" F37.1 F37 open "Open but claimed by another branch" "feat/other"
+git -C "$TASKS_REPO" add -A; git -C "$TASKS_REPO" -c user.name=test -c user.email=t@e commit -q -m "add branch-sensitivity fixture" || true
+
+got=$("$CLI" ready --phases F37 --count-eligible --branch feat/mine)
+[[ "$got" == "0" ]] && pass "ready --count-eligible excludes task claimed by another branch" \
+  || fail "ready --count-eligible --branch feat/mine expected 0 got '$got'"
+got=$("$CLI" ready --phases F37 --count-eligible --branch feat/other)
+[[ "$got" == "1" ]] && pass "ready --count-eligible includes task claimed by the asking branch" \
+  || fail "ready --count-eligible --branch feat/other expected 1 got '$got'"
+got=$("$CLI" ready --phases F37 --count)
+[[ "$got" == "1" ]] && pass "ready --count ignores claim state (counts the open task)" \
+  || fail "ready --count --phases F37 expected 1 got '$got'"
+
+# 12d: --count wins when both --count and --count-eligible are passed (drain test
+# takes precedence, regardless of flag order).
+got=$("$CLI" ready --phases F35 --count --count-eligible)
+[[ "$got" == "2" ]] && pass "ready --count --count-eligible returns the --count value (drain wins)" \
+  || fail "ready --count --count-eligible expected 2 got '$got'"
+got=$("$CLI" ready --phases F35 --count-eligible --count)
+[[ "$got" == "2" ]] && pass "ready --count-eligible --count returns the --count value (order-independent)" \
+  || fail "ready --count-eligible --count expected 2 got '$got'"
+
+# 12e: --count-eligible without a --phases filter is global and must not error.
+got=$("$CLI" ready --count-eligible)
+[[ "$got" =~ ^[0-9]+$ ]] && pass "ready --count-eligible (no --phases) returns a global integer ($got)" \
+  || fail "ready --count-eligible without --phases expected an integer got '$got'"
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo
 echo "=============================================="

@@ -339,8 +339,12 @@ cmd_next() {
 #
 # --count is deliberately BROADER: the number of `status: open` tasks in range
 # regardless of blocker state — the pump's drain test ("no open work remains").
+# --count-eligible is the NARROWER companion: the size of that eligible frontier
+# (open ∧ blockers done ∧ unclaimed-or-own-branch) — "how many can launch now".
+# The two diverge exactly when a cross-phase blocker or orphaned claim stalls the
+# queue (open > 0 while eligible == 0); only then does the drain count mislead.
 cmd_ready() {
-  local branch="" phases="" json=0 count=0
+  local branch="" phases="" json=0 count=0 count_eligible=0
   while (( $# )); do
     case $1 in
       --branch) branch=$2; shift 2;;
@@ -350,6 +354,7 @@ cmd_ready() {
       --phase=*) phases=${1#--phase=}; shift;;
       --json) json=1; shift;;
       --count) count=1; shift;;
+      --count-eligible) count_eligible=1; shift;;
       *) die "unknown arg to ready: $1";;
     esac
   done
@@ -365,7 +370,8 @@ cmd_ready() {
     done < <(expand_phases "$phases")
   fi
 
-  # --count: number of status:open tasks in range, blocker/claim state ignored.
+  # --count (DRAIN TEST): number of status:open tasks in range, blocker/claim
+  # state ignored — answers "is there any open work left?", not "what can run?".
   if (( count )); then
     local n=0 file id status iphase
     while IFS= read -r file; do
@@ -380,7 +386,8 @@ cmd_ready() {
     return 0
   fi
 
-  # Frontier: collect eligible (sort_key|id|file), same predicate as cmd_next.
+  # Eligible FRONTIER: collect eligible (sort_key|id|file), same predicate as
+  # cmd_next (open ∧ blockers done ∧ unclaimed-or-own-branch) — "what can launch".
   local candidates=() file id status claimed_by sort_key iphase
   while IFS= read -r file; do
     [[ -z "$file" ]] && continue
@@ -405,6 +412,15 @@ cmd_ready() {
     sort_key=$(phase_sort_key "$id")
     candidates+=("$sort_key|$id|$file")
   done < <(list_all_files)
+
+  # --count-eligible: size of the frontier just collected. Reuses the exact same
+  # candidate walk as --json / next, so the count can never drift from them. No
+  # sort needed — the cardinality is order-independent. If both --count and
+  # --count-eligible are passed, --count already returned above (drain test wins).
+  if (( count_eligible )); then
+    printf '%s\n' "${#candidates[@]}"
+    return 0
+  fi
 
   # Sort by numeric phase then within-phase number (same key as cmd_next).
   local sorted=""
@@ -847,10 +863,17 @@ usage: arachne-task <command> [args]
 Commands:
   next [--branch <b>] [--phase <FN>] Emit next ready task as JSON (incl. goal).
                                      --phase scopes to one epic (e.g. F51).
-  ready [--phases A..B] [--branch <b>] [--json|--count]
-                                     Emit the WHOLE eligible frontier across a
-                                     phase range (default/--json), or --count of
-                                     open tasks in range (the pump's drain test).
+  ready [--phases A..B] [--branch <b>] [--json|--count|--count-eligible]
+                                     --json/default: the WHOLE eligible frontier
+                                       (open + blockers done + unclaimed or own
+                                       branch) as JSON / a human table.
+                                     --count: ALL open tasks in range, ignoring
+                                       blocker and claim state — the pump's drain
+                                       test ("is any open work left?").
+                                     --count-eligible: size of the --json frontier
+                                       — "how many tasks can launch now?". 0 while
+                                       --count > 0 signals a stall (work, none
+                                       ready). --count wins if both are given.
                                      --phases accepts FN, FN..FM, and comma lists.
   list [--status <s>]                Human-readable listing (flags missing goals).
   goal <id> [--set "text"]           Read or set a task's one-line outcome goal.
