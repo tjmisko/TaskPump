@@ -6,11 +6,12 @@
 #
 # Layout (top is FIXED, sessions SCROLL):
 #   ┌ title + rule
-#   │ pump summary · usage bars (5h/7d) · Disk bar          Notes (right column)
-#   │ disk subinfo (worktrees · main · docker)              ─ wraps under if narrow
+#   │ pump summary (range · status · ready/open)            Notes (right column)
+#   │ usage bars (5h/7d) · Disk bar — padded above/below    ─ stacks under if narrow
+#   │ disk subinfo as a vertical list (worktrees / main / docker / updated)
 #   ├ rule
 #   │ ● session …   (scrollable viewport; 2 feed lines each)
-#   └ status bar (keys + scroll position)
+#   └ status bar (scroll position only; keys are in --help)
 #
 # All expensive data (the eligible-task scan, the docker session table, disk
 # sizing) is refreshed in BACKGROUND workers on their own TTLs and read from
@@ -280,8 +281,8 @@ TAIL_LINES="${ARACHNE_MONITOR_TAIL_LINES:-2}"   # feed lines per session (compac
 # Scratchpad scoped to the current pump RUN (phases + started_at), so a new run
 # starts fresh. ARACHNE_MONITOR_NOTES_FILE overrides the resolved path (tests).
 NOTES_DIR="${ARACHNE_MONITOR_NOTES_DIR:-$MAIN_ROOT/.arachne-monitor-notes}"
-NOTES_TAIL="${ARACHNE_MONITOR_NOTES_TAIL:-3}"    # note lines shown in the panel
-NOTES_COLW="${ARACHNE_MONITOR_NOTES_COLW:-44}"   # max note width in the right column
+NOTES_TAIL="${ARACHNE_MONITOR_NOTES_TAIL:-6}"    # note lines shown in the panel
+NOTES_COLW="${ARACHNE_MONITOR_NOTES_COLW:-60}"   # max note width in the right column
 EDITOR_BIN="${VISUAL:-${EDITOR:-nvim}}"          # Ctrl-G / e popout target
 
 notes_run_key() {
@@ -344,9 +345,10 @@ pump_compute() {
     printf 'ELIG\t%s\nOPEN\t%s\n' "${elig:-}" "${open:-}"
 }
 
-# pump_summary_line -- the pump status line (range · status · ready/open · usage
-# · reset). Eligible comes from the cached scan (background-refreshed); open
-# prefers the pump's own snapshot field, else the cache. $1 = usage json blob.
+# pump_summary_line -- the pump status line (range · status · ready/open).
+# Eligible comes from the cached scan (background-refreshed); open prefers the
+# pump's own snapshot field, else the cache. Usage/reset are shown by the gauge
+# bars below, not repeated here. $1 = usage json blob (unused; kept for caller).
 pump_summary_line() {
     [[ -f "$PUMP_STATE" ]] || return 0
     local uj="${1:-{}}" phases status reason open_ct ceiling
@@ -372,13 +374,6 @@ pump_summary_line() {
     [[ -z "${open_ct:-}" || "$open_ct" == "null" ]] && open_ct="$cached_open"
     [[ -z "${open_ct:-}" ]] && open_ct="?"
 
-    # usage percent + reset from the already-fetched blob (one jq, not per-window).
-    local pct reset
-    IFS=$'\t' read -r pct reset < <(jq -r \
-        '[(.bind_percent//"?"), ((.reset_at//"") | sub(".*T(?<h>[0-9]{2}:[0-9]{2}).*"; "\(.h)"))] | @tsv' \
-        <<<"$uj" 2>/dev/null || true)
-    [[ -z "${pct:-}" ]] && pct="?"
-
     local color
     case "$status" in
         paused)  color='\033[33m' ;;   # yellow
@@ -398,9 +393,6 @@ pump_summary_line() {
     line="$(printf 'pump[%s]: %b%s\033[0m' "$phases" "$color" "$status")"
     [[ "$status" == "paused" && -n "${reason:-}" ]] && line+=" — $reason"
     line+="$(printf '  |  %b%s ready\033[0m · %s open' "$rcolor" "$eligible" "$open_ct")"
-    line+="  |  usage ${pct}%"
-    [[ -n "${ceiling:-}" && "$ceiling" != "null" ]] && line+="/${ceiling}%"
-    [[ -n "${reset:-}" ]] && line+="  resets ${reset}"
     printf '%b\n' "$line"
     return 0
 }
@@ -445,8 +437,9 @@ disk_bar_line() {
         "$(human_bytes $(( total_kb * 1024 )))" "$used_pct"
 }
 
-# disk_subinfo_line -- the cached footprint summary (worktrees total · main ·
-# docker), abbreviated. Kicks the background sizing refresh when stale.
+# disk_subinfo_line -- the cached footprint summary as a vertical list (worktrees
+# total / main / docker breakdown / updated-age). Kicks the background sizing
+# refresh when stale.
 disk_subinfo_line() {
     [[ "$SHOW_DISK" -eq 1 ]] || return 0
     cache_refresh_if_stale "$DISK_CACHE" "$DISK_TTL" disk_compute
@@ -474,12 +467,15 @@ disk_subinfo_line() {
         dline+="$short $(fmt_docker_size "$dsize")"
     done < <(awk -F'\t' '$1=="DKR"' "$DISK_CACHE" 2>/dev/null)
     local age; age="$(cache_age "$DISK_CACHE")"
-    printf '%s%sworktrees%s %s in %d   %smain%s %s' \
-        "$GAUGE_SUBINDENT" "$BAR_EMPTY" "$BAR_RST" "$(human_bytes "$wt_total")" "$wt_count" \
-        "$BAR_EMPTY" "$BAR_RST" "$(human_bytes "${main_b:-0}")"
-    [[ -n "$dline" ]] && printf '   %sdocker%s %s' "$BAR_EMPTY" "$BAR_RST" "$dline"
-    [[ -n "$age" ]] && printf '   %s(updated %ss ago)%s' "$BAR_EMPTY" "$age" "$BAR_RST"
-    printf '\n'
+    # Vertical list — one footprint area per line, indented under the bars.
+    printf '%s%sworktrees%s %s in %d\n' \
+        "$GAUGE_SUBINDENT" "$BAR_EMPTY" "$BAR_RST" "$(human_bytes "$wt_total")" "$wt_count"
+    printf '%s%smain%s %s\n' \
+        "$GAUGE_SUBINDENT" "$BAR_EMPTY" "$BAR_RST" "$(human_bytes "${main_b:-0}")"
+    [[ -n "$dline" ]] && printf '%s%sdocker%s %s\n' \
+        "$GAUGE_SUBINDENT" "$BAR_EMPTY" "$BAR_RST" "$dline"
+    [[ -n "$age" ]] && printf '%s%s(updated %ss ago)%s\n' \
+        "$GAUGE_SUBINDENT" "$BAR_EMPTY" "$age" "$BAR_RST"
     return 0
 }
 
@@ -648,8 +644,10 @@ compose_columns() {
 top_left_lines() {
     local uj="${1:-{}}"
     [[ -f "$PUMP_STATE" ]] && pump_summary_line "$uj"
+    printf '\n'              # padding above the gauge bars
     usage_bars "$uj"
     disk_bar_line
+    printf '\n'              # padding below the gauge bars
 }
 
 # render_top -- the FIXED top region: title, two-column gauges/notes, disk
@@ -692,20 +690,26 @@ render_all() {  # one-shot / pipe: top then sessions, no viewport clipping
 
 # ── Demo (synthetic preview; no docker, no caches) ───────────────────────────
 demo_left_lines() {
-    printf 'pump[F43..F63]: \033[36mrunning\033[0m  |  \033[36m8 ready\033[0m · 35 open  |  usage 65%%/95%%  resets 04:00\n'
+    printf 'pump[F43..F63]: \033[36mrunning\033[0m  |  \033[36m8 ready\033[0m · 35 open\n'
+    printf '\n'
     render_bar "5h" 62 "" ""
     render_bar "7d" 65 "" ""
     printf '%s%-*s %s  %s60.5G free%s / 226.4G  (73%% used)\n' \
         "$GAUGE_INDENT" "$GAUGE_LABEL_W" "Disk" "$(bar_glyphs 73 "$BAR_FILL")" "$BAR_EMPTY" "$BAR_RST"
+    printf '\n'
 }
 demo_notes_lines() {
     printf 'Notes [F43..F63]  %s(n · C-g)%s\n' "$BAR_EMPTY" "$BAR_RST"
     printf -- '- 15:10  watch f55 disk — cargo clean\n'
     printf -- '- 15:12  F41.9 comms blocked on creds\n'
+    printf -- '- 15:18  PR #150/#151 merged to main\n'
+    printf -- '- 15:34  Issue: authentication and stale oauth tokens\n'
 }
 demo_disk_subinfo() {
-    printf '%s%sworktrees%s 87.8G in 8   %smain%s 444.3M   %sdocker%s img 21.3G · cont 4.4G · vol 0B · cache 11.3G   %s(updated 8s ago)%s\n' \
-        "$GAUGE_SUBINDENT" "$BAR_EMPTY" "$BAR_RST" "$BAR_EMPTY" "$BAR_RST" "$BAR_EMPTY" "$BAR_RST" "$BAR_EMPTY" "$BAR_RST"
+    printf '%s%sworktrees%s 87.8G in 8\n' "$GAUGE_SUBINDENT" "$BAR_EMPTY" "$BAR_RST"
+    printf '%s%smain%s 444.3M\n' "$GAUGE_SUBINDENT" "$BAR_EMPTY" "$BAR_RST"
+    printf '%s%sdocker%s img 21.3G · cont 4.4G · vol 0B · cache 11.3G\n' "$GAUGE_SUBINDENT" "$BAR_EMPTY" "$BAR_RST"
+    printf '%s%s(updated 8s ago)%s\n' "$GAUGE_SUBINDENT" "$BAR_EMPTY" "$BAR_RST"
 }
 demo_sessions() {  # $1 = width — several sessions so scrolling is exercised
     local width="$1" n l1 l2 cut=$(( width - 4 ))
@@ -770,8 +774,13 @@ paint_view() {  # $1 top(text)  $2 sessions-array-name
         (( SCROLL < max_scroll )) && pos+=" ↓"
         (( SCROLL > 0 )) && pos+=" ↑"
     fi
-    printf '\033[7m %s%s \033[0m\033[K' \
-        "j/k ↑↓ scroll · g/G ends · n note · e/C-g nvim · q quit" "$pos"
+    # Keys are documented in --help; show only the scroll position (when there is
+    # something to scroll), otherwise reclaim the line.
+    if [[ -n "$pos" ]]; then
+        printf '\033[7m%s \033[0m\033[K' "$pos"
+    else
+        printf '\033[K'
+    fi
     printf '\033[J'
     return 0
 }

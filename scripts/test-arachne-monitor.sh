@@ -238,8 +238,8 @@ echo "--- Test 14: two-column layout ---"
 make_usage_stub 40 50
 NF14="$TMP/notes14.md"; printf -- '- 12:00  a note here\n' >| "$NF14"
 wide=$(env ARACHNE_MONITOR_COLS=200 ARACHNE_MONITOR_NOTES_FILE="$NF14" "$CLI" 2>/dev/null | strip_ansi)
-# Side-by-side: the bar row and the Notes header share ONE physical line.
-grep -qE '5h .*▌.* +Notes \[' <<<"$wide" && pass "wide terminal puts Notes beside the bars" || fail "notes not side-by-side:\n$wide"
+# Side-by-side: the Notes header sits in the right column (indented), not at col 0.
+grep -qE '^ +Notes \[' <<<"$wide" && pass "wide terminal puts Notes beside the gauges" || fail "notes not side-by-side:\n$wide"
 narrow=$(env ARACHNE_MONITOR_COLS=60 ARACHNE_MONITOR_NOTES_FILE="$NF14" "$CLI" 2>/dev/null | strip_ansi)
 # Stacked: Notes header is on its own line at column 0.
 grep -qE '^Notes \[' <<<"$narrow" && pass "narrow terminal stacks Notes below" || fail "notes not stacked:\n$narrow"
