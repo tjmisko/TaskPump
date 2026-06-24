@@ -811,6 +811,43 @@ cmd_release() {
   echo "released $id"
 }
 
+# Reopen a blocked task back to status=open. Distinct from release (which
+# relinquishes a live claim): a blocked task carries no claim. Use when a
+# blocker was a transient/environment issue rather than a genuine feature gap.
+cmd_reopen() {
+  local id="" reason=""
+  while (( $# )); do
+    case $1 in
+      --reason) reason=$2; shift 2;;
+      --reason=*) reason=${1#--reason=}; shift;;
+      -*) die "unknown flag: $1";;
+      *) [[ -z "$id" ]] && id=$1 || die "too many positional args"; shift;;
+    esac
+  done
+  [[ -z "$id" ]] && die "usage: arachne-task reopen <id> --reason \"...\""
+  [[ -z "$reason" ]] && die "--reason is required"
+  local file; file=$(task_file_required "$id")
+
+  local status; status=$(fm_get "$file" '.status')
+  if [[ "$status" != "blocked" ]]; then
+    die "cannot reopen $id: status=$status (must be blocked)"
+  fi
+
+  local now; now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  fm_set "$file" "
+    .status = \"open\" |
+    .blocked_at = null |
+    .blocked_reason = null |
+    .claimed_by = null |
+    .claimed_at = null |
+    .turn_budget_remaining = null |
+    .last_heartbeat_head_sha = null
+  "
+  printf '\n## Reopened (%s)\n\n%s\n' "$now" "$reason" >> "$file"
+  git_commit_state "reopen $id: $reason"
+  echo "reopened $id"
+}
+
 # Convert an ISO-8601 UTC timestamp (YYYY-MM-DDTHH:MM:SSZ) to epoch seconds.
 # Portable across GNU coreutils date (-d), BSD/macOS date (-j -f), and a
 # python3 fallback. Prints empty string if the timestamp can't be parsed.
@@ -970,6 +1007,7 @@ Commands:
   block <id> --reason "..."          Mark blocked with reason.
   needs-review <id> --reason "..."   Flag for human review (pump quarantine setter).
   release <id> --reason "..."        Relinquish a claim back to status=open.
+  reopen <id> --reason "..."         Reopen a blocked task to status=open.
   scrub                              Supervisor: relabel stale claims.
 
 Env:
@@ -992,7 +1030,7 @@ main() {
   # Mutating subcommands serialize on the cross-agent state lock for their
   # whole read-modify-write + commit. Read-only commands (next/list) skip it.
   case $cmd in
-    claim|heartbeat|complete|block|needs-review|release|scrub) acquire_state_lock;;
+    claim|heartbeat|complete|block|needs-review|release|reopen|scrub) acquire_state_lock;;
   esac
   case $cmd in
     next) cmd_next "$@";;
@@ -1005,6 +1043,7 @@ main() {
     block) cmd_block "$@";;
     needs-review) cmd_needs_review "$@";;
     release) cmd_release "$@";;
+    reopen) cmd_reopen "$@";;
     scrub) cmd_scrub "$@";;
     -h|--help|help) usage;;
     *) die "unknown command: $cmd";;
