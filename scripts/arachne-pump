@@ -774,6 +774,14 @@ do_tick() {
   "$ARACHNE_TASK" scrub >/dev/null 2>&1 || warn "scrub failed (continuing)"
   reclaim_orphaned_claims   # D3: free tasks parked by dead containers before planning
 
+  # Strip any `.worktrees/` ignore line the `gh worktree` extension auto-appended
+  # since the last tick BEFORE the FS-GUARD reads the tree. The repair is also
+  # called inside launch_phase, but launches don't run while feeding is paused
+  # (usage ceiling, disk, WiFi) — so without this every-tick call a stray append
+  # would leave .gitignore dirty and the FS-GUARD would idle-loop on it (the
+  # 2026-06-24 incident). Idempotent: a no-op unless the bad line is present.
+  apl_repair_worktree_gitignore "$REPO_ROOT"
+
   # RC-4 contamination guard (A8 / F65.5): flag any primary-source dirtiness an
   # agent slipped past the read-only mount. Clean under normal operation. Always
   # log it, but desktop-notify only when the contamination CHANGES — otherwise a
