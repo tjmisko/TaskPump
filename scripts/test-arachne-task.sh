@@ -296,6 +296,66 @@ else
   pass "release requires --reason"
 fi
 
+# ── Test 9b: needs-review flags a live claim for human inspection ─────────────
+# Sanctioned setter for status=needs-review (the pump uses it to quarantine a
+# phase whose auto/trunk merge conflicted). Records the reason in scrub_reason so
+# monitors surface it like a scrub-driven quarantine.
+echo
+echo "--- Test 9b: needs-review ---"
+make_task "$TASKS" F18.4 F18 open "Needs-review-test task"
+git -C "$TASKS_REPO" add -A; git -C "$TASKS_REPO" -c user.name=test -c user.email=t@e commit -q -m "add needs-review fixture" || true
+"$CLI" claim F18.4 --branch feat/mine --turns 25 >/dev/null
+"$CLI" needs-review F18.4 --reason "auto/trunk merge conflicted" >/dev/null
+assert_fm "$TASKS/F18.4.md" '.status' 'needs-review'
+assert_fm "$TASKS/F18.4.md" '.claimed_by' 'null'
+assert_fm "$TASKS/F18.4.md" '.scrub_reason' 'auto/trunk merge conflicted'
+if grep -q "Needs review" "$TASKS/F18.4.md" && grep -q "auto/trunk merge conflicted" "$TASKS/F18.4.md"; then
+  pass "F18.4 needs-review reason appended to body"
+else
+  fail "F18.4 needs-review reason missing from body"
+fi
+# Reason is required.
+if "$CLI" needs-review F18.4 >/dev/null 2>&1; then
+  fail "needs-review should require --reason"
+else
+  pass "needs-review requires --reason"
+fi
+
+# ── Test 9c: reopen returns a blocked task to status=open ─────────────────────
+# Distinct from release (which relinquishes a LIVE claim on an in_progress task):
+# a blocked task carries no claim. Use reopen when a blocker turns out to have
+# been a transient/environment issue rather than a genuine feature gap.
+echo
+echo "--- Test 9c: reopen ---"
+make_task "$TASKS" F18.5 F18 open "Reopen-test task"
+git -C "$TASKS_REPO" add -A; git -C "$TASKS_REPO" -c user.name=test -c user.email=t@e commit -q -m "add reopen fixture" || true
+"$CLI" block F18.5 --reason "waiting on flaky external dep" >/dev/null
+assert_fm "$TASKS/F18.5.md" '.status' 'blocked'
+assert_fm "$TASKS/F18.5.md" '.blocked_reason' 'waiting on flaky external dep'
+"$CLI" reopen F18.5 --reason "dep was transient; re-queueing" >/dev/null
+assert_fm "$TASKS/F18.5.md" '.status' 'open'
+assert_fm "$TASKS/F18.5.md" '.claimed_by' 'null'
+assert_fm "$TASKS/F18.5.md" '.blocked_reason' 'null'
+assert_fm "$TASKS/F18.5.md" '.blocked_at' 'null'
+if grep -q "Reopened" "$TASKS/F18.5.md" && grep -q "dep was transient" "$TASKS/F18.5.md"; then
+  pass "F18.5 reopen reason appended to body"
+else
+  fail "F18.5 reopen reason missing from body"
+fi
+# Cannot reopen a non-blocked task (it is now open).
+if "$CLI" reopen F18.5 --reason "second try" >/dev/null 2>&1; then
+  fail "reopen should reject a task whose status != blocked"
+else
+  pass "reopen rejects task with status != blocked"
+fi
+# Reason is required.
+"$CLI" block F18.5 --reason "re-block for the reason test" >/dev/null
+if "$CLI" reopen F18.5 >/dev/null 2>&1; then
+  fail "reopen should require --reason"
+else
+  pass "reopen requires --reason"
+fi
+
 # ── Test 10: heartbeat lenient+alarm — ambiguous attribution refused ─────────
 echo
 echo "--- Test 10: heartbeat ambiguous productivity ---"
