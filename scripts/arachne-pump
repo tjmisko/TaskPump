@@ -39,6 +39,13 @@
 #   ARACHNE_USAGE   path to arachne-usage  (default: alongside this script)
 #   ARACHNE_DISK_WATCHDOG  path to arachne-disk-watchdog (default: alongside this script)
 #   ARACHNE_DISK_RECLAIM   1/0 — cargo-clean a phase's target/ once done (default 1)
+#   ARACHNE_TOKEN_GATE     1/0 — pause LAUNCHING when the HOST OAuth access token is
+#                   stale (default 1). Containers are access-token-only (they cannot
+#                   rotate the shared refresh token — that would log the host out;
+#                   see entrypoint-parallel.sh), so they cannot self-refresh: the
+#                   host must keep its token fresh (a live host `claude` session, or
+#                   a manual refresh). Running agents are never killed.
+#   ARACHNE_TOKEN_MARGIN_S  seconds before host-token expiry to start pausing (600)
 #   ARACHNE_PUMP_WORKTREES_DIR  worktrees base (default: <repo>/.worktrees; tests)
 #   DOCKER          docker binary          (default: docker)
 #   ARACHNE_PHASE_BRIEF_TEMPLATE  phase-drain brief template (default:
@@ -292,6 +299,16 @@ feed_gate() {
   GATE_REASON=""
   if apl_network_unhealthy; then
     GATE_REASON="brcmfmac wedge signature in last ${HEALTH_WINDOW}s"
+    return 10
+  fi
+  # Host OAuth token freshness (access-token-only container model): containers can
+  # no longer self-refresh, so launching one with an already-expired host token
+  # just 401s and dies. Pause launching until the host token is refreshed. Cheap
+  # local check; self-contained (honors ARACHNE_TOKEN_GATE); fail-open.
+  local treason trc
+  treason="$(apl_host_token_stale "$CLAUDE_DIR/.credentials.json")"; trc=$?
+  if [[ "$trc" -eq 10 ]]; then
+    GATE_REASON="$treason"
     return 10
   fi
   if [[ "$USAGE_GATE" -eq 1 ]]; then

@@ -90,6 +90,40 @@ apl_disk_low() {
   return 0
 }
 
+# apl_host_token_stale <credentials_file> [margin_seconds] — feed-gate predicate
+# for the access-token-only container model (entrypoint-parallel.sh strips the
+# refreshToken, so a container can no longer self-refresh; the HOST owns OAuth
+# token rotation). Pauses LAUNCHING — running agents are untouched — when the host
+# access token is within <margin> seconds of (or past) its expiry, because a
+# container launched then would 401 immediately and burn a relaunch cycle. The
+# gate clears once a host-side `claude` writes a fresh token back. Echoes a
+# one-line reason and returns 10 when stale; silent + 0 when fresh. Fail-open:
+# returns 0 (feed) when disabled (ARACHNE_TOKEN_GATE != 1), jq is absent, or the
+# file / expiresAt can't be read — a meter we can't read never wedges the pump.
+# `expiresAt` is epoch MILLISECONDS in Claude Code's credentials file.
+# ARACHNE_NOW_S overrides "now" (epoch seconds) for tests.
+apl_host_token_stale() {
+  [[ "${ARACHNE_TOKEN_GATE:-1}" -eq 1 ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  local cred="$1" margin="${2:-${ARACHNE_TOKEN_MARGIN_S:-600}}"
+  [[ -f "$cred" ]] || return 0
+  local exp_ms exp_s now left
+  exp_ms="$(jq -r '.claudeAiOauth.expiresAt // empty' "$cred" 2>/dev/null || true)"
+  [[ "$exp_ms" =~ ^[0-9]+$ ]] || return 0
+  exp_s=$(( exp_ms / 1000 ))
+  now="${ARACHNE_NOW_S:-$(date +%s)}"
+  left=$(( exp_s - now ))
+  if (( left <= margin )); then
+    if (( left < 0 )); then
+      printf 'host OAuth access token expired %ds ago; refresh by running any `claude` command on the host (containers are access-token-only and cannot self-refresh)' "$(( -left ))"
+    else
+      printf 'host OAuth access token expires in %ds (≤%ds margin); refresh by running any `claude` command on the host' "$left" "$margin"
+    fi
+    return 10
+  fi
+  return 0
+}
+
 # ── Autonomous integration trunk (A3 / F65.6) ─────────────────────────────────
 # apl_acquire_trunk_lock <lockfile> [wait_seconds] — acquire an flock on the trunk
 # merge lock via FD 8 for the lifetime of the calling (sub)shell, mirroring

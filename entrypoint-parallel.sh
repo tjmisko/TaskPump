@@ -63,47 +63,67 @@ iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
 iptables -A OUTPUT -j DROP
 echo "Firewall configured" | tee -a "$LOG_FILE"
 
-# ── Credential refresher (RC-1 fix, F65.1 / A2) ────────────────────────────────
+# ── Credential handler: ACCESS-TOKEN-ONLY (RC-1 / F65.1 / A2; hardened 2026-06-24)
 # The host ~/.claude is bind-mounted READ-ONLY at /tmp/claude-home, so
 # /tmp/claude-home/.credentials.json always reflects the LIVE host token (the
-# host's Claude Code auth daemon rewrites it in place). But the per-container copy
-# at /home/dev/.claude/.credentials.json is a frozen snapshot taken once at
-# startup — once that access token's TTL (~6h, observed 2026-06-23) elapses every
-# API call 401s and the session dies. refresh_credentials() re-copies the live
-# token (and .claude.json) into the dev home with a JSON-validity guard and an
-# atomic temp-file swap, so a long-running container tracks host refreshes.
+# host's Claude Code auth daemon rewrites it in place). We copy it into the dev
+# home — but with the refreshToken STRIPPED.
 #
-# SPEC_GAP: it is unknown (and undocumented) whether `claude -p` re-reads
-# .credentials.json per API request (Case A) or caches the token in memory at
-# startup (Case B). This is designed for BOTH: under Case A the periodic re-copy
-# rescues the in-flight session as soon as a fresh token lands; under Case B the
-# re-copy cannot rescue an already-started session, but it still leaves a valid
-# token for the NEXT container (the pump's A1 liveness-reclaim relaunches dead
-# containers) and the optional AGENT_WALL_TIMEOUT_S backstop bounds the damage
-# window. The refresh can never do worse than today's single-copy behavior. A
-# live run crossing a real host token refresh is the only proof of which case
-# holds — see the F64 canary runbook.
-refresh_credentials() {
-    local src="/tmp/claude-home/.credentials.json"
-    local dst="/home/dev/.claude/.credentials.json"
-    local tmp="${dst}.tmp.$$"
+# WHY strip it: the OAuth refresh token ROTATES on every refresh (Anthropic issues
+# a new one and invalidates the old). If a container performed a refresh it could
+# not write the new refresh token back across the READ-ONLY mount, so the host —
+# and every other client sharing the token, including the user's own interactive
+# sessions — would be left holding a dead refresh token and be forced to log in
+# again. (Reported 2026-06-24: host sessions logged out whenever the pump ran.)
+# Removing the refresh token makes a container PHYSICALLY UNABLE to rotate it: the
+# HOST owns rotation, and the container tracks it by re-copying the host's
+# freshly-issued accessToken each tick.
+#
+# CONSEQUENCE: a container can no longer self-refresh, so it depends on the host
+# keeping its token fresh (a live host `claude` session, or a host-side refresh).
+# If the ~6h access-token TTL elapses with no host refresh, API calls 401 and the
+# session dies — recoverable: the pump's A1 liveness-reclaim relaunches it with
+# the next fresh token, and the pump's feed gate (apl_host_token_stale) pauses
+# LAUNCHING while the host token is stale so dead containers aren't churned.
+#
+# SPEC_GAP: whether `claude -p` re-reads .credentials.json per request (Case A:
+# the periodic re-copy rescues the in-flight session) or caches the token at
+# startup (Case B: the re-copy only helps the NEXT container) is still unproven —
+# see the F64 canary runbook. The access-token-only model is correct under both;
+# only the in-flight-rescue benefit depends on Case A.
 
-    # .credentials.json — copy to temp, validate, atomic-swap. On any failure
+# install_access_only_credentials <src> <dst> — write <dst> as an access-token-only
+# copy of <src> (drop .claudeAiOauth.refreshToken) via a validated atomic swap.
+# Requires the accessToken to survive the transform. Returns non-zero (leaving any
+# previous <dst> intact) when the source is unreadable or the transform fails.
+install_access_only_credentials() {
+    local src="$1" dst="$2" tmp="${2}.tmp.$$"
+    [[ -f "$src" ]] || return 0
+    if jq 'del(.claudeAiOauth.refreshToken)' "$src" > "$tmp" 2>/dev/null \
+       && jq -e '.claudeAiOauth.accessToken' "$tmp" >/dev/null 2>&1; then
+        mv "$tmp" "$dst"
+        chown dev:dev "$dst" 2>/dev/null || true
+        chmod u+rw "$dst" 2>/dev/null || true
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
+refresh_credentials() {
+    # .credentials.json — re-copy the host's freshly-rotated accessToken with the
+    # refreshToken stripped (see install_access_only_credentials). On any failure
     # leave the previous (stale-but-valid) copy in place and retry next tick.
-    if [[ -f "$src" ]]; then
-        if cp "$src" "$tmp" 2>/dev/null && jq -e '.claudeAiOauth.accessToken' "$tmp" >/dev/null 2>&1; then
-            mv "$tmp" "$dst"
-            chown dev:dev "$dst" 2>/dev/null || true
-            chmod u+rw "$dst" 2>/dev/null || true
-            echo "$(date -u) [cred-refresh] .credentials.json refreshed" >> "$LOG_FILE"
-        else
-            echo "$(date -u) [cred-refresh] WARNING: .credentials.json invalid after copy; keeping previous" >> "$LOG_FILE"
-            rm -f "$tmp"
-            return 1
-        fi
+    if install_access_only_credentials \
+         "/tmp/claude-home/.credentials.json" \
+         "/home/dev/.claude/.credentials.json"; then
+        echo "$(date -u) [cred-refresh] .credentials.json refreshed (access-token-only)" >> "$LOG_FILE"
+    else
+        echo "$(date -u) [cred-refresh] WARNING: .credentials.json invalid after transform; keeping previous" >> "$LOG_FILE"
     fi
 
-    # .claude.json — same validated atomic-swap pattern as the startup copy.
+    # .claude.json — config/telemetry only (no OAuth refresh token), copied whole
+    # via the same validated atomic-swap pattern as the startup copy.
     local src_cj="/tmp/claude-home-json/.claude.json"
     local dst_cj="/home/dev/.claude.json"
     local tmp_cj="${dst_cj}.tmp.$$"
@@ -124,6 +144,15 @@ refresh_credentials() {
 mkdir -p /home/dev/.claude
 if [[ -d /tmp/claude-home ]]; then
     cp -a /tmp/claude-home/. /home/dev/.claude/
+    # The blanket copy above brought the host's full .credentials.json (with the
+    # refreshToken). Immediately replace it with an access-token-only copy so the
+    # container is non-rotating from t=0 — otherwise a refresh inside the first
+    # CRED_REFRESH_INTERVAL_S window would rotate the host's shared token and log
+    # the host out (see install_access_only_credentials).
+    install_access_only_credentials \
+        "/tmp/claude-home/.credentials.json" \
+        "/home/dev/.claude/.credentials.json" \
+        || echo "WARNING: could not strip refreshToken from startup credentials; refresher will retry" | tee -a "$LOG_FILE"
 fi
 # Merge MCP config + Auto Mode settings into one settings.json so MCP servers
 # and the auto permission mode + allow rules coexist. Auto settings win on

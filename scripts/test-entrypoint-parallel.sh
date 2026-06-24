@@ -80,6 +80,31 @@ else
   fail "entrypoint-parallel.sh does not run smoke_test.sh"
 fi
 
+# ── Access-token-only credentials (no refresh-token rotation by containers) ─────
+# The container must strip .claudeAiOauth.refreshToken from its credential copy so
+# it can never rotate the host's shared OAuth token and log the host out.
+echo "--- access-token-only credentials ---"
+if grep -q "del(.claudeAiOauth.refreshToken)" "$EP"; then
+  pass "strips refreshToken from the container credential copy (access-token-only)"
+else
+  fail "entrypoint-parallel.sh never strips .claudeAiOauth.refreshToken"
+fi
+# The strip must happen at STARTUP, not only in the periodic refresher — otherwise
+# a refresh in the first CRED_REFRESH_INTERVAL_S window rotates the host token.
+if grep -c "install_access_only_credentials" "$EP" | awk '{exit !($1>=2)}'; then
+  pass "install_access_only_credentials used at startup AND in the refresher"
+else
+  fail "install_access_only_credentials must be called at startup and in the refresher"
+fi
+# The full host credentials.json must never be plain-copied into the dev home as
+# the live token (that would carry the refresh token). The only cp of a
+# .credentials.json path would be a regression.
+if grep -vE '^[[:space:]]*#' "$EP" | grep -E 'cp[[:space:]].*\.credentials\.json'; then
+  fail "an executable line plain-copies .credentials.json (carries the refresh token)"
+else
+  pass "no plain cp of .credentials.json (only the stripped install path)"
+fi
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"

@@ -140,6 +140,54 @@ got=$(DOCKER="$BIN/docker" STUB_NAMES="$names" apl_count_live_agents "feat-a")
 [[ "$got" == "1" ]] && pass "slug filter counts only matching containers" \
   || fail "expected 1 filtered agent got '$got'"
 
+# ── Host OAuth token freshness gate (access-token-only container model) ─────────
+echo "--- host token gate: apl_host_token_stale ---"
+CRED="$TMP/.credentials.json"
+# expiresAt is epoch MILLISECONDS; pin "now" via ARACHNE_NOW_S for determinism.
+NOW=1700000000
+mk_cred() { printf '{"claudeAiOauth":{"accessToken":"a","expiresAt":%s}}' "$1" >| "$CRED"; }
+
+# Fresh token (2h out, default 600s margin) → feed (0), silent.
+mk_cred "$(( (NOW + 7200) * 1000 ))"
+out=$(ARACHNE_NOW_S=$NOW apl_host_token_stale "$CRED"); rc=$?
+{ [[ "$rc" -eq 0 && -z "$out" ]]; } && pass "fresh token → feed (silent)" \
+  || fail "fresh token should feed silently; rc=$rc out='$out'"
+
+# Within margin (5 min out, 600s margin) → pause (10) with reason.
+mk_cred "$(( (NOW + 300) * 1000 ))"
+out=$(ARACHNE_NOW_S=$NOW apl_host_token_stale "$CRED"); rc=$?
+{ [[ "$rc" -eq 10 ]] && grep -q 'expires in 300s' <<<"$out"; } \
+  && pass "near-expiry token → pause with countdown reason" \
+  || fail "near-expiry should pause; rc=$rc out='$out'"
+
+# Already expired → pause (10), reason names elapsed time.
+mk_cred "$(( (NOW - 120) * 1000 ))"
+out=$(ARACHNE_NOW_S=$NOW apl_host_token_stale "$CRED"); rc=$?
+{ [[ "$rc" -eq 10 ]] && grep -q 'expired 120s ago' <<<"$out"; } \
+  && pass "expired token → pause naming elapsed time" \
+  || fail "expired should pause; rc=$rc out='$out'"
+
+# Gate disabled → always feed (fail-open by config).
+mk_cred "$(( (NOW - 120) * 1000 ))"
+out=$(ARACHNE_TOKEN_GATE=0 ARACHNE_NOW_S=$NOW apl_host_token_stale "$CRED"); rc=$?
+{ [[ "$rc" -eq 0 && -z "$out" ]]; } && pass "ARACHNE_TOKEN_GATE=0 → feed (disabled)" \
+  || fail "disabled gate should feed; rc=$rc out='$out'"
+
+# Missing file / unparseable expiresAt → feed (fail-open, never wedge the pump).
+out=$(ARACHNE_NOW_S=$NOW apl_host_token_stale "$TMP/nope.json"); rc=$?
+{ [[ "$rc" -eq 0 && -z "$out" ]]; } && pass "missing credentials file → feed (fail-open)" \
+  || fail "missing file should feed; rc=$rc out='$out'"
+printf '{"claudeAiOauth":{"accessToken":"a"}}' >| "$CRED"   # no expiresAt
+out=$(ARACHNE_NOW_S=$NOW apl_host_token_stale "$CRED"); rc=$?
+{ [[ "$rc" -eq 0 && -z "$out" ]]; } && pass "absent expiresAt → feed (fail-open)" \
+  || fail "absent expiresAt should feed; rc=$rc out='$out'"
+
+# Custom margin overrides default: 5 min out with a 900s margin → pause.
+mk_cred "$(( (NOW + 300) * 1000 ))"
+out=$(ARACHNE_NOW_S=$NOW apl_host_token_stale "$CRED" 900); rc=$?
+[[ "$rc" -eq 10 ]] && pass "custom margin (900s) widens the pause window" \
+  || fail "custom margin should pause; rc=$rc out='$out'"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"
