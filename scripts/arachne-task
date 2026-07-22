@@ -680,16 +680,18 @@ cmd_heartbeat() {
 }
 
 cmd_complete() {
-  local id="" commits=""
+  local id="" commits="" defer_note=""
   while (( $# )); do
     case $1 in
       --commits) commits=$2; shift 2;;
       --commits=*) commits=${1#--commits=}; shift;;
+      --defer-wiring) defer_note=$2; shift 2;;
+      --defer-wiring=*) defer_note=${1#--defer-wiring=}; shift;;
       -*) die "unknown flag: $1";;
       *) [[ -z "$id" ]] && id=$1 || die "too many positional args"; shift;;
     esac
   done
-  [[ -z "$id" ]] && die "usage: arachne-task complete <id> [--commits <sha,sha>]"
+  [[ -z "$id" ]] && die "usage: arachne-task complete <id> [--commits <sha,sha>] [--defer-wiring \"note\"]"
   local file; file=$(task_file_required "$id")
 
   local now; now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -711,6 +713,16 @@ cmd_complete() {
     .last_heartbeat_head_sha = null
   "
 
+  # Optionally mark that production wiring was deliberately deferred (foundation
+  # shipped + tests green, but no real runtime caller yet). Surfaced by `deferred`.
+  if [[ -n "$defer_note" ]]; then
+    fm_set "$file" "
+      .wiring_deferred = true |
+      .wiring_deferred_note = \"$defer_note\"
+    "
+    printf '\n## Wiring deferred (%s)\n\n%s\n' "$now" "$defer_note" >> "$file"
+  fi
+
   # Optionally append completion notes from stdin.
   if ! [ -t 0 ]; then
     local notes; notes=$(cat)
@@ -720,7 +732,7 @@ cmd_complete() {
   fi
 
   git_commit_state "complete $id"
-  echo "completed $id"
+  echo "completed $id${defer_note:+ (wiring deferred)}"
 }
 
 cmd_block() {
@@ -811,9 +823,14 @@ cmd_release() {
   echo "released $id"
 }
 
-# Reopen a blocked task back to status=open. Distinct from release (which
-# relinquishes a live claim): a blocked task carries no claim. Use when a
-# blocker was a transient/environment issue rather than a genuine feature gap.
+# Reopen a task back to status=open, from either `blocked` or `done`.
+#  - from blocked: a blocker was a transient/environment issue (e.g. an upstream
+#    branch that has since merged) rather than a genuine remaining feature gap.
+#  - from done: the task was falsely-done / partial — marked complete on green
+#    unit tests but its production wiring was never landed (see `defer`). The
+#    completion + wiring-deferred markers are dropped so it re-enters the queue
+#    as fresh work; the prior completion commits are preserved in the body note.
+# Distinct from release (which relinquishes a live in_progress claim).
 cmd_reopen() {
   local id="" reason=""
   while (( $# )); do
@@ -829,11 +846,24 @@ cmd_reopen() {
   local file; file=$(task_file_required "$id")
 
   local status; status=$(fm_get "$file" '.status')
-  if [[ "$status" != "blocked" ]]; then
-    die "cannot reopen $id: status=$status (must be blocked)"
+  if [[ "$status" != "blocked" && "$status" != "done" ]]; then
+    die "cannot reopen $id: status=$status (must be blocked or done)"
   fi
 
   local now; now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  # A done task reopened as falsely-done/partial: shed its completion markers so
+  # the pump treats it as open work again. Capture the prior commits for the note.
+  local prior_commits=""
+  if [[ "$status" == "done" ]]; then
+    prior_commits=$(yq --front-matter=extract '.completed_by_commits | join(",")' "$file" 2>/dev/null || echo "")
+    [[ "$prior_commits" == "null" ]] && prior_commits=""
+    fm_set "$file" "
+      .completed_at = null |
+      .completed_by_commits = [] |
+      .wiring_deferred = false |
+      .wiring_deferred_note = null
+    "
+  fi
   fm_set "$file" "
     .status = \"open\" |
     .blocked_at = null |
@@ -843,9 +873,75 @@ cmd_reopen() {
     .turn_budget_remaining = null |
     .last_heartbeat_head_sha = null
   "
-  printf '\n## Reopened (%s)\n\n%s\n' "$now" "$reason" >> "$file"
+  local note="$reason"
+  [[ "$status" == "done" && -n "$prior_commits" ]] && note="$reason (prior completion commits: $prior_commits)"
+  printf '\n## Reopened (%s, from %s)\n\n%s\n' "$now" "$status" "$note" >> "$file"
   git_commit_state "reopen $id: $reason"
-  echo "reopened $id"
+  echo "reopened $id (was $status)"
+}
+
+# Mark a task's production wiring as deliberately deferred: the foundation
+# primitive shipped and its unit tests pass, but the first REAL (non-test)
+# caller — the thing that makes the feature do its job at runtime — was left for
+# a follow-up. Does NOT change status (the task can still go `done`). This is the
+# sanctioned opt-out from the "wire to production before done" default; `deferred`
+# collects these so they can be turned into new follow-up tasks. See also
+# `complete --defer-wiring`, the inline form used at completion time.
+cmd_defer() {
+  local id="" reason=""
+  while (( $# )); do
+    case $1 in
+      --reason) reason=$2; shift 2;;
+      --reason=*) reason=${1#--reason=}; shift;;
+      -*) die "unknown flag: $1";;
+      *) [[ -z "$id" ]] && id=$1 || die "too many positional args"; shift;;
+    esac
+  done
+  [[ -z "$id" ]] && die "usage: arachne-task defer <id> --reason \"what wiring was deferred\""
+  [[ -z "$reason" ]] && die "--reason is required"
+  local file; file=$(task_file_required "$id")
+  local now; now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  fm_set "$file" "
+    .wiring_deferred = true |
+    .wiring_deferred_note = \"$reason\"
+  "
+  printf '\n## Wiring deferred (%s)\n\n%s\n' "$now" "$reason" >> "$file"
+  git_commit_state "defer $id: $reason"
+  echo "deferred-wiring $id"
+}
+
+# List tasks whose production wiring was marked deferred (via `defer` or
+# `complete --defer-wiring`). The collection step: these are shipped-but-unwired
+# foundations to fold back into the queue as new follow-up tasks.
+cmd_deferred() {
+  local as_json=0
+  while (( $# )); do
+    case $1 in
+      --json) as_json=1; shift;;
+      *) die "unknown arg to deferred: $1";;
+    esac
+  done
+  local file id status note
+  if (( as_json )); then
+    local first=1
+    printf '['
+    while IFS= read -r file; do
+      [[ -z "$file" ]] && continue
+      [[ "$(fm_get "$file" '.wiring_deferred')" == "true" ]] || continue
+      id=$(fm_get "$file" '.id'); status=$(fm_get "$file" '.status'); note=$(fm_get "$file" '.wiring_deferred_note')
+      (( first )) || printf ','; first=0
+      jq -cn --arg id "$id" --arg status "$status" --arg note "$note" '{id:$id,status:$status,note:$note}'
+    done < <(list_all_files)
+    printf ']\n'
+    return
+  fi
+  printf '%-10s %-10s %s\n' "ID" "STATUS" "DEFERRED-WIRING NOTE"
+  while IFS= read -r file; do
+    [[ -z "$file" ]] && continue
+    [[ "$(fm_get "$file" '.wiring_deferred')" == "true" ]] || continue
+    id=$(fm_get "$file" '.id'); status=$(fm_get "$file" '.status'); note=$(fm_get "$file" '.wiring_deferred_note')
+    printf '%-10s %-10s %s\n' "$id" "$status" "$note"
+  done < <(list_all_files)
 }
 
 # Convert an ISO-8601 UTC timestamp (YYYY-MM-DDTHH:MM:SSZ) to epoch seconds.
@@ -1003,11 +1099,17 @@ Commands:
   goal --missing                     List open/in_progress tasks with no goal.
   claim <id> --branch <b> [--turns N]  Atomically claim a task.
   heartbeat <id> [--start|--end]     Budget + failure tracking.
-  complete <id> [--commits sha,sha]  Mark done; stdin → completion notes.
+  complete <id> [--commits sha,sha] [--defer-wiring "note"]
+                                     Mark done; stdin → completion notes.
+                                     --defer-wiring flags that the runtime wiring
+                                       (first real caller) was left for a follow-up.
   block <id> --reason "..."          Mark blocked with reason.
   needs-review <id> --reason "..."   Flag for human review (pump quarantine setter).
   release <id> --reason "..."        Relinquish a claim back to status=open.
-  reopen <id> --reason "..."         Reopen a blocked task to status=open.
+  reopen <id> --reason "..."         Reopen a blocked OR done task to status=open
+                                       (done → sheds completion markers: falsely-done).
+  defer <id> --reason "..."          Mark production wiring deferred (status unchanged).
+  deferred [--json]                  List tasks with deferred wiring (collect follow-ups).
   scrub                              Supervisor: relabel stale claims.
 
 Env:
@@ -1030,7 +1132,7 @@ main() {
   # Mutating subcommands serialize on the cross-agent state lock for their
   # whole read-modify-write + commit. Read-only commands (next/list) skip it.
   case $cmd in
-    claim|heartbeat|complete|block|needs-review|release|reopen|scrub) acquire_state_lock;;
+    claim|heartbeat|complete|block|needs-review|release|reopen|defer|scrub) acquire_state_lock;;
   esac
   case $cmd in
     next) cmd_next "$@";;
@@ -1044,6 +1146,8 @@ main() {
     needs-review) cmd_needs_review "$@";;
     release) cmd_release "$@";;
     reopen) cmd_reopen "$@";;
+    defer) cmd_defer "$@";;
+    deferred) cmd_deferred "$@";;
     scrub) cmd_scrub "$@";;
     -h|--help|help) usage;;
     *) die "unknown command: $cmd";;
