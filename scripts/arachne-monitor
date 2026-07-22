@@ -503,6 +503,7 @@ log_events() {  # $1 = log file
 #   F <task> <name> <status>         (blocked/stuck/needs-review epic)
 sessions_compute() {
     local found=0 cname state status
+    local flagged=""
     while IFS='|' read -r cname state status; do
         [[ -z "$cname" || "$cname" != arachne-agent* ]] && continue
         found=1
@@ -536,13 +537,16 @@ sessions_compute() {
             [[ -z "${ln// }" ]] && continue
             printf 'L\t%s\n' "$ln"
         done < <(log_events "$logf")
+        # Flag a session for "Needs attention" only when it has a real container
+        # in this sweep (docker ps -a includes recently-exited ones) and its task
+        # is in a bad state. Keyed off live sessions, NOT the frozen launch
+        # manifest — otherwise every long-blocked roster task nags forever.
+        case "$tstat" in
+            blocked|stuck|needs-review) flagged+=$'F\t'"$task"$'\t'"$name"$'\t'"$tstat"$'\n' ;;
+        esac
     done < <(docker ps -a --filter 'name=arachne-agent' --format '{{.Names}}|{{.State}}|{{.Status}}' 2>/dev/null)
     [[ "$found" -eq 0 ]] && printf 'N\t1\n'
-    local slug t s
-    for slug in "${!SLUG_TASK[@]}"; do
-        t="${SLUG_TASK[$slug]}"; s="$(task_status "$t")"
-        case "$s" in blocked|stuck|needs-review) printf 'F\t%s\t%s\t%s\n' "$t" "${SLUG_NAME[$slug]}" "$s" ;; esac
-    done
+    printf '%s' "$flagged"
     return 0
 }
 
@@ -701,7 +705,7 @@ demo_left_lines() {
 demo_notes_lines() {
     printf 'Notes [F43..F63]  %s(n · C-g)%s\n' "$BAR_EMPTY" "$BAR_RST"
     printf -- '- 15:10  watch f55 disk — cargo clean\n'
-    printf -- '- 15:12  F41.9 comms blocked on creds\n'
+    printf -- '- 15:12  F00.0 example blocked on creds\n'
     printf -- '- 15:18  PR #150/#151 merged to main\n'
     printf -- '- 15:34  Issue: authentication and stale oauth tokens\n'
 }
@@ -721,7 +725,7 @@ demo_sessions() {  # $1 = width — several sessions so scrolling is exercised
         printf '    \033[90m%s\033[0m\n' "${l2:0:$cut}"
     done
     printf '%sNeeds attention:%s\n' "$BAR_WARN" "$BAR_RST"
-    printf '  %s\n' "F41.9 (comms): blocked"
+    printf '  %s\n' "F00.0 (example): blocked"
     return 0
 }
 
