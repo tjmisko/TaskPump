@@ -648,6 +648,59 @@ ARACHNE_CLAIM_STALE_HOURS=0 "$CLI" scrub >/dev/null
 assert_fm "$TASKS/F20.5.md" '.status' 'needs-review'
 assert_fm "$TASKS/F20.5.md" '.scrub_reason' 'heartbeat_staleness'
 
+# ── Test 18: reopen a DONE task (falsely-done) sheds completion markers ───────
+echo
+echo "--- Test 18: reopen done -> open ---"
+make_task "$TASKS" F21.1 F21 done "Falsely-done task"
+yq -i --front-matter=process '.completed_at = "2026-01-01T00:00:00Z" | .completed_by_commits = ["abc1234","def5678"] | .wiring_deferred = true | .wiring_deferred_note = "no caller"' "$TASKS/F21.1.md"
+git -C "$TASKS_REPO" add -A; git -C "$TASKS_REPO" -c user.name=test -c user.email=t@e commit -q -m "add F21.1 fixture" || true
+"$CLI" reopen F21.1 --reason "falsely-done: no production caller" >/dev/null
+assert_fm "$TASKS/F21.1.md" '.status' 'open'
+assert_fm "$TASKS/F21.1.md" '.completed_at' 'null'
+assert_fm "$TASKS/F21.1.md" '.completed_by_commits' '[]'
+assert_fm "$TASKS/F21.1.md" '.wiring_deferred' 'false'
+if grep -q 'prior completion commits: abc1234,def5678' "$TASKS/F21.1.md"; then
+  pass "reopen-from-done preserved prior commits in body note"
+else
+  fail "reopen-from-done did not record prior commits"
+fi
+
+# ── Test 19: defer marks wiring_deferred without changing status ──────────────
+echo
+echo "--- Test 19: defer ---"
+make_task "$TASKS" F21.2 F21 done "Foundation-only task"
+git -C "$TASKS_REPO" add -A; git -C "$TASKS_REPO" -c user.name=test -c user.email=t@e commit -q -m "add F21.2 fixture" || true
+"$CLI" defer F21.2 --reason "offload not wired into state-store" >/dev/null
+assert_fm "$TASKS/F21.2.md" '.status' 'done'
+assert_fm "$TASKS/F21.2.md" '.wiring_deferred' 'true'
+assert_fm "$TASKS/F21.2.md" '.wiring_deferred_note' 'offload not wired into state-store'
+if "$CLI" defer F21.2 >/dev/null 2>&1; then fail "defer should require --reason"; else pass "defer requires --reason"; fi
+
+# ── Test 20: complete --defer-wiring marks done + deferred ────────────────────
+echo
+echo "--- Test 20: complete --defer-wiring ---"
+make_task "$TASKS" F21.3 F21 in_progress "Task completed with deferral" feat/mine
+git -C "$TASKS_REPO" add -A; git -C "$TASKS_REPO" -c user.name=test -c user.email=t@e commit -q -m "add F21.3 fixture" || true
+"$CLI" complete F21.3 --commits aaa1111 --defer-wiring "runtime caller left for follow-up" >/dev/null
+assert_fm "$TASKS/F21.3.md" '.status' 'done'
+assert_fm "$TASKS/F21.3.md" '.wiring_deferred' 'true'
+assert_fm "$TASKS/F21.3.md" '.completed_by_commits[0]' 'aaa1111'
+
+# ── Test 21: deferred lists both, --json is valid ────────────────────────────
+echo
+echo "--- Test 21: deferred lister ---"
+deferred_out=$("$CLI" deferred)
+if grep -q 'F21.2' <<<"$deferred_out" && grep -q 'F21.3' <<<"$deferred_out"; then
+  pass "deferred lists both deferred tasks"
+else
+  fail "deferred missing a task: $deferred_out"
+fi
+if "$CLI" deferred --json | jq -e 'map(.id) | index("F21.2") and index("F21.3")' >/dev/null 2>&1; then
+  pass "deferred --json is valid and contains both"
+else
+  fail "deferred --json invalid or incomplete"
+fi
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo
 echo "=============================================="
