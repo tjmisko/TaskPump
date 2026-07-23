@@ -910,6 +910,40 @@ cmd_defer() {
   echo "deferred-wiring $id"
 }
 
+# Clear a task's deferred-wiring flag because the wiring HAS since landed —
+# typically by a follow-up task that owned it (F70.3's wiring landed in F70.6,
+# F73.5's in F73.9, …). The inverse of `defer`. Status is untouched; this only
+# says "the first real caller now exists", so `deferred` stops collecting it as
+# outstanding follow-up work.
+#
+# --caller is required and must name the non-test call site (file:line), so the
+# ledger records the EVIDENCE for the claim rather than an unbacked assertion.
+# If the wiring did not actually land, use `reopen` instead.
+cmd_undefer() {
+  local id="" caller=""
+  while (( $# )); do
+    case $1 in
+      --caller) caller=$2; shift 2;;
+      --caller=*) caller=${1#--caller=}; shift;;
+      -*) die "unknown flag: $1";;
+      *) [[ -z "$id" ]] && id=$1 || die "too many positional args"; shift;;
+    esac
+  done
+  [[ -z "$id" ]] && die "usage: arachne-task undefer <id> --caller \"<file:line> — what wired it\""
+  [[ -z "$caller" ]] && die "--caller is required (name the non-test call site)"
+  local file; file=$(task_file_required "$id")
+  [[ "$(fm_get "$file" '.wiring_deferred')" == "true" ]] \
+    || die "cannot undefer $id: wiring_deferred is not set"
+  local now; now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  fm_set "$file" "
+    .wiring_deferred = false |
+    .wiring_deferred_note = null
+  "
+  printf '\n## Wiring landed (%s)\n\n%s\n' "$now" "$caller" >> "$file"
+  git_commit_state "undefer $id: $caller"
+  echo "wiring-landed $id"
+}
+
 # List tasks whose production wiring was marked deferred (via `defer` or
 # `complete --defer-wiring`). The collection step: these are shipped-but-unwired
 # foundations to fold back into the queue as new follow-up tasks.
@@ -1109,6 +1143,9 @@ Commands:
   reopen <id> --reason "..."         Reopen a blocked OR done task to status=open
                                        (done → sheds completion markers: falsely-done).
   defer <id> --reason "..."          Mark production wiring deferred (status unchanged).
+  undefer <id> --caller "file:line"  Clear the deferred flag: the wiring HAS landed
+                                       (usually via a follow-up task). --caller must
+                                       name the non-test call site as evidence.
   deferred [--json]                  List tasks with deferred wiring (collect follow-ups).
   scrub                              Supervisor: relabel stale claims.
 
@@ -1147,6 +1184,7 @@ main() {
     release) cmd_release "$@";;
     reopen) cmd_reopen "$@";;
     defer) cmd_defer "$@";;
+    undefer) cmd_undefer "$@";;
     deferred) cmd_deferred "$@";;
     scrub) cmd_scrub "$@";;
     -h|--help|help) usage;;

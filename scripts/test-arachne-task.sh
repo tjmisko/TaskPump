@@ -701,6 +701,35 @@ else
   fail "deferred --json invalid or incomplete"
 fi
 
+# ── Test 22: undefer clears the flag and drops the task from `deferred` ───────
+echo
+echo "--- Test 22: undefer ---"
+if "$CLI" undefer F21.2 >/dev/null 2>&1; then
+  fail "undefer should require --caller"
+else
+  pass "undefer requires --caller"
+fi
+"$CLI" undefer F21.2 --caller "state_store.rs:406 — F70.6 wired the persist path" >/dev/null
+assert_fm "$TASKS/F21.2.md" '.wiring_deferred' 'false'
+assert_fm "$TASKS/F21.2.md" '.status' 'done'
+if grep -q 'Wiring landed' "$TASKS/F21.2.md"; then
+  pass "undefer appends a 'Wiring landed' note with the caller evidence"
+else
+  fail "undefer did not append the caller evidence to the body"
+fi
+if "$CLI" deferred | grep -q 'F21.2'; then
+  fail "undefer'd task still listed by deferred"
+else
+  pass "undefer'd task no longer collected by deferred"
+fi
+# Undeferring a task that was never deferred is an error, not a silent no-op —
+# it would otherwise mask a typo'd id.
+if "$CLI" undefer F21.2 --caller "x:1" >/dev/null 2>&1; then
+  fail "undefer should reject a task whose wiring_deferred is not set"
+else
+  pass "undefer rejects a non-deferred task"
+fi
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo
 echo "=============================================="
