@@ -98,6 +98,14 @@ out="$(ARACHNE_DISK_REPO_ROOT="$FIX" FREE_GB_OVERRIDE=7 PANIC_THRESHOLD_GB=5 PAU
 assert_has "paused state entered (5 < 7 < 10)"      "$out" "HEALTHY → PAUSED"
 assert_no  "no target reclaim while merely paused"  "$out" "STUB-CLEANUP-CALLED"
 
+echo "--- Test 7: EXTRA_BUSY_DIRS skips listed worktrees and the primary ---"
+out="$(ARACHNE_CLEANUP_REPO_ROOT="$FIX" STUB_LIVE="" EXTRA_BUSY_DIRS="$FIX/.worktrees/feat/a" "$CLEANUP" --targets --dry-run 2>&1)"
+assert_has "feat/a skipped via EXTRA_BUSY_DIRS"  "$out" "skip: $FIX/.worktrees/feat/a/target — busy (EXTRA_BUSY_DIRS)"
+assert_has "feat/b still reclaimed"              "$out" "worktree: $FIX/.worktrees/feat/b/target"
+out="$(ARACHNE_CLEANUP_REPO_ROOT="$FIX" STUB_LIVE="" EXTRA_BUSY_DIRS="$FIX" "$CLEANUP" --targets --include-primary --dry-run 2>&1)"
+assert_has "busy primary skipped despite --include-primary" "$out" "skip: $FIX/target — busy (EXTRA_BUSY_DIRS)"
+assert_no  "busy primary not reclaimed"          "$out" "primary: $FIX/target"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"
