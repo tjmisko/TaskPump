@@ -28,6 +28,10 @@
 #   STUCK_THRESHOLD_MIN  -- log-stale cutoff, minutes (default 15)
 #   MANIFEST             -- manifest path (default ops/task-loop/parallel-manifest.tsv)
 #   DOCKER_GRACE_SEC     -- docker stop grace period (default 30)
+#   EXTRA_BUSY_DIRS      -- newline-separated workspace roots --targets must
+#                           also skip (arachne-disk-guard passes compiler-busy
+#                           workspaces here; a listed primary root skips the
+#                           primary even under --include-primary)
 set -uo pipefail
 
 # REPO_ROOT is normally the parent of this script's dir; overridable so the
@@ -224,6 +228,11 @@ do_targets() {
             skipped=$((skipped + 1))
             continue
         fi
+        if [[ -n "${EXTRA_BUSY_DIRS:-}" ]] && printf '%s\n' "$EXTRA_BUSY_DIRS" | grep -Fxq "$wt"; then
+            log "  skip: $wt/target — busy (EXTRA_BUSY_DIRS)"
+            skipped=$((skipped + 1))
+            continue
+        fi
         reclaim_target "$wt" "worktree" && found=$((found + 1))
     done
     if (( found == 0 && skipped == 0 )); then
@@ -235,7 +244,9 @@ do_targets() {
     # a human may be building there. The watchdog passes --include-primary under
     # PANIC to buy the most space.
     if [[ -d "$REPO_ROOT/target" ]]; then
-        if [[ "$INCLUDE_PRIMARY" -eq 1 ]]; then
+        if [[ -n "${EXTRA_BUSY_DIRS:-}" ]] && printf '%s\n' "$EXTRA_BUSY_DIRS" | grep -Fxq "$REPO_ROOT"; then
+            log "  skip: $REPO_ROOT/target — busy (EXTRA_BUSY_DIRS)"
+        elif [[ "$INCLUDE_PRIMARY" -eq 1 ]]; then
             reclaim_target "$REPO_ROOT" "primary"
         else
             local size; size="$(du -sh "$REPO_ROOT/target" 2>/dev/null | cut -f1)"
