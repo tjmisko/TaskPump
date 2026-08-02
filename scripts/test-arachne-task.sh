@@ -730,6 +730,76 @@ else
   pass "undefer rejects a non-deferred task"
 fi
 
+# ── Workspace resolution ──────────────────────────────────────────────────────
+# Every worktree carries its own scripts/arachne-task AND its own ops/ checkout.
+# Invoking one workspace's copy of the CLI while standing in another must write
+# to the workspace the caller is standing in, not the one the script lives in —
+# otherwise a claim made from a worktree lands in the primary's ledger and both
+# silently drift apart. These cases run the CLI with no ARACHNE_TASKS_DIR set,
+# so they exercise the default-resolution path the rest of the suite overrides.
+resolution_root_of() {
+  # Print the tasks dir the CLI resolves when run from $1, with no env override.
+  ( cd "$1" && env -u ARACHNE_TASKS_DIR -u ARACHNE_TASK_OUT -u ARACHNE_CODE_REPO \
+      ARACHNE_TASK_NOCOMMIT=1 "$2" resolve --tasks-dir 2>/dev/null )
+}
+
+WS_A="$TMPDIR_TEST/ws-a"
+WS_B="$TMPDIR_TEST/ws-b"
+for ws in "$WS_A" "$WS_B"; do
+  mkdir -p "$ws/scripts" "$ws/ops/task-loop/tasks"
+  git -C "$ws" init -q
+  cp "$CLI" "$ws/scripts/arachne-task"
+  chmod +x "$ws/scripts/arachne-task"
+  git -C "$ws" -c user.name=test -c user.email=t@e add -A
+  git -C "$ws" -c user.name=test -c user.email=t@e commit -q -m "init $ws"
+done
+
+# Standing in workspace B but invoking workspace A's copy of the CLI: the
+# ledger written must be B's. This is the regression — it used to resolve to A.
+got=$(resolution_root_of "$WS_B" "$WS_A/scripts/arachne-task")
+if [[ "$got" == "$WS_B/ops/task-loop/tasks" ]]; then
+  pass "cross-workspace invocation resolves to the caller's workspace"
+else
+  fail "cross-workspace invocation resolved to '$got', expected '$WS_B/ops/task-loop/tasks'"
+fi
+
+# Standing in its own workspace still resolves to itself.
+got=$(resolution_root_of "$WS_A" "$WS_A/scripts/arachne-task")
+if [[ "$got" == "$WS_A/ops/task-loop/tasks" ]]; then
+  pass "same-workspace invocation resolves to that workspace"
+else
+  fail "same-workspace invocation resolved to '$got', expected '$WS_A/ops/task-loop/tasks'"
+fi
+
+# Outside any git repo — and inside a git repo with no ops/ checkout — there is
+# no caller workspace to prefer, so it must fall back to the script's own root
+# rather than resolving to nothing.
+NO_OPS="$TMPDIR_TEST/no-ops"
+mkdir -p "$NO_OPS"
+git -C "$NO_OPS" init -q
+got=$(resolution_root_of "$NO_OPS" "$WS_A/scripts/arachne-task")
+if [[ "$got" == "$WS_A/ops/task-loop/tasks" ]]; then
+  pass "git repo without an ops/ checkout falls back to the script's workspace"
+else
+  fail "no-ops fallback resolved to '$got', expected '$WS_A/ops/task-loop/tasks'"
+fi
+
+got=$(resolution_root_of "$TMPDIR_TEST" "$WS_A/scripts/arachne-task")
+if [[ "$got" == "$WS_A/ops/task-loop/tasks" ]]; then
+  pass "outside any git repo falls back to the script's workspace"
+else
+  fail "non-repo fallback resolved to '$got', expected '$WS_A/ops/task-loop/tasks'"
+fi
+
+# An explicit ARACHNE_TASKS_DIR still wins over both.
+got=$( cd "$WS_B" && ARACHNE_TASKS_DIR="$TASKS" ARACHNE_TASK_NOCOMMIT=1 \
+        "$WS_A/scripts/arachne-task" resolve --tasks-dir )
+if [[ "$got" == "$TASKS" ]]; then
+  pass "ARACHNE_TASKS_DIR overrides workspace resolution"
+else
+  fail "env override resolved to '$got', expected '$TASKS'"
+fi
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo
 echo "=============================================="

@@ -6,7 +6,10 @@
 # check-the-logs-from-floofy-tarjan.md Layer 3 for the contract.
 #
 # Env vars:
-#   ARACHNE_TASKS_DIR      Path to tasks directory. Default: $PWD/ops/task-loop/tasks
+#   ARACHNE_TASKS_DIR      Path to tasks directory. Default: <workspace>/ops/task-loop/tasks,
+#                          where <workspace> is $PWD's git worktree when that
+#                          worktree has an ops/ checkout, else the directory
+#                          above this script.
 #   ARACHNE_TASK_OUT       Path to the JSON "next task" surface file.
 #                          Default: $(dirname $ARACHNE_TASKS_DIR)/.next-task
 #   ARACHNE_TASK_PUSH      If "1", `git push` after each state-mutating commit.
@@ -17,10 +20,24 @@
 set -euo pipefail
 
 # ── Config ────────────────────────────────────────────────────────────────────
-# Derive defaults from the script's own location (resolving symlinks) so the
-# CLI works regardless of cwd. Env vars still override.
+# Resolve the workspace whose ledger we operate on. Env vars still override.
+#
+# The caller's workspace wins over the script's own location. Both the primary
+# checkout and every worktree carry their own `scripts/arachne-task` and their
+# own `ops/` checkout, so deriving the root from the script alone means
+# `/primary/scripts/arachne-task claim F78.8` run while standing in a worktree
+# writes the claim into the *primary's* ledger — the worktree's own ops never
+# learns about it, and the primary's silently drifts. Preferring $PWD's
+# worktree makes task state follow the workspace the work is happening in,
+# which is what every caller means.
 _arachne_script_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
-_arachne_repo_root="$(cd "$_arachne_script_dir/.." && pwd)"
+_arachne_script_root="$(cd "$_arachne_script_dir/.." && pwd)"
+
+_arachne_repo_root="$_arachne_script_root"
+_arachne_cwd_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [[ -n "$_arachne_cwd_root" && -d "$_arachne_cwd_root/ops/task-loop/tasks" ]]; then
+  _arachne_repo_root="$_arachne_cwd_root"
+fi
 
 : "${ARACHNE_TASKS_DIR:=$_arachne_repo_root/ops/task-loop/tasks}"
 : "${ARACHNE_TASK_OUT:=$(dirname "$ARACHNE_TASKS_DIR")/.next-task}"
@@ -1109,6 +1126,26 @@ cmd_goal() {
   fi
 }
 
+cmd_resolve() {
+  # Print where this invocation would read and write task state. Worth having
+  # as a real verb rather than a test hook: with one checkout per worktree,
+  # "which ledger am I about to touch?" is otherwise only answerable by
+  # re-deriving the resolution rules by hand.
+  local what=${1:---all}
+  case $what in
+    --tasks-dir) printf '%s\n' "$ARACHNE_TASKS_DIR";;
+    --code-repo) printf '%s\n' "$ARACHNE_CODE_REPO";;
+    --all)
+      printf 'tasks_dir  %s\n' "$ARACHNE_TASKS_DIR"
+      printf 'task_out   %s\n' "$ARACHNE_TASK_OUT"
+      printf 'code_repo  %s\n' "$ARACHNE_CODE_REPO"
+      printf 'script     %s\n' "$_arachne_script_root"
+      printf 'cwd_root   %s\n' "${_arachne_cwd_root:-<none>}"
+      ;;
+    *) die "usage: arachne-task resolve [--tasks-dir|--code-repo|--all]";;
+  esac
+}
+
 usage() {
   cat <<'EOF'
 usage: arachne-task <command> [args]
@@ -1148,6 +1185,10 @@ Commands:
                                        name the non-test call site as evidence.
   deferred [--json]                  List tasks with deferred wiring (collect follow-ups).
   scrub                              Supervisor: relabel stale claims.
+  resolve [--tasks-dir|--code-repo|--all]
+                                     Print which workspace's ledger this
+                                       invocation resolves to. Use it when a
+                                       worktree's task state looks wrong.
 
 Env:
   ARACHNE_TASKS_DIR   tasks dir (default: <repo-root>/ops/task-loop/tasks)
@@ -1157,8 +1198,11 @@ Env:
   ARACHNE_TASK_DEBUG=1 print debug traces
   ARACHNE_CODE_REPO   code repo root (default: <repo-root>) — used by heartbeat
 
-Repo root is derived from the script's own location, so the CLI works
-regardless of cwd. The env vars above still override.
+The workspace is $PWD's git worktree when that worktree has an ops/ checkout,
+otherwise the directory above this script. Since each worktree carries both its
+own copy of this CLI and its own ops/, preferring the caller's workspace keeps a
+claim made inside a worktree out of the primary checkout's ledger. The env vars
+above still override; `resolve` prints what a given invocation picked.
 EOF
 }
 
@@ -1187,6 +1231,7 @@ main() {
     undefer) cmd_undefer "$@";;
     deferred) cmd_deferred "$@";;
     scrub) cmd_scrub "$@";;
+    resolve) cmd_resolve "$@";;
     -h|--help|help) usage;;
     *) die "unknown command: $cmd";;
   esac
