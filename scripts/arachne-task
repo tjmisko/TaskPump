@@ -1126,6 +1126,196 @@ cmd_goal() {
   fi
 }
 
+cmd_title() {
+  local id="" set_text="" do_set=0
+  while (( $# )); do
+    case $1 in
+      --set) set_text=$2; do_set=1; shift 2;;
+      --set=*) set_text=${1#--set=}; do_set=1; shift;;
+      -*) die "unknown flag to title: $1";;
+      *) [[ -z "$id" ]] && id=$1 || die "too many positional args to title"; shift;;
+    esac
+  done
+
+  [[ -z "$id" ]] && die "usage: arachne-task title <id> [--set \"text\"]"
+  local file; file=$(task_file_required "$id")
+
+  if (( do_set )); then
+    [[ -z "$set_text" ]] && die "title --set requires non-empty text"
+    acquire_state_lock
+    TITLE="$set_text" yq -i --front-matter=process '.title = strenv(TITLE)' "$file"
+    git_commit_state "title: set $id"
+    echo "title set for $id: $set_text"
+  else
+    printf '%s\n' "$(fm_get "$file" '.title')"
+  fi
+}
+
+# Read or rewrite a task's `blockers:` list. Mutating forms validate that every
+# referenced id resolves to a real task file — a typo'd blocker is worse than no
+# blocker, because `next`/`ready` silently treat it as unsatisfied forever and
+# the task drops out of the frontier with no diagnostic.
+cmd_blockers() {
+  local id="" mode="" arg=""
+  while (( $# )); do
+    case $1 in
+      --set) mode=set; arg=$2; shift 2;;
+      --set=*) mode=set; arg=${1#--set=}; shift;;
+      --add) mode=add; arg=$2; shift 2;;
+      --add=*) mode=add; arg=${1#--add=}; shift;;
+      --remove) mode=remove; arg=$2; shift 2;;
+      --remove=*) mode=remove; arg=${1#--remove=}; shift;;
+      --clear) mode=clear; shift;;
+      -*) die "unknown flag to blockers: $1";;
+      *) [[ -z "$id" ]] && id=$1 || die "too many positional args to blockers"; shift;;
+    esac
+  done
+
+  [[ -z "$id" ]] && die "usage: arachne-task blockers <id> [--set A,B | --add X | --remove X | --clear]"
+  local file; file=$(task_file_required "$id")
+
+  # Read form.
+  if [[ -z "$mode" ]]; then
+    yq --front-matter=extract '.blockers[]?' "$file" 2>/dev/null || true
+    return 0
+  fi
+
+  local -a next=()
+  case $mode in
+    clear) next=();;
+    set)
+      [[ -z "$arg" ]] && die "blockers --set requires ids (use --clear to empty)"
+      IFS=',' read -r -a next <<<"$arg"
+      ;;
+    add|remove)
+      [[ -z "$arg" ]] && die "blockers --$mode requires an id"
+      local cur
+      while IFS= read -r cur; do
+        [[ -z "$cur" ]] && continue
+        [[ "$mode" == "remove" && "$cur" == "$arg" ]] && continue
+        next+=("$cur")
+      done < <(yq --front-matter=extract '.blockers[]?' "$file" 2>/dev/null || true)
+      if [[ "$mode" == "add" ]]; then
+        local seen=0 e
+        for e in "${next[@]-}"; do [[ "$e" == "$arg" ]] && seen=1; done
+        (( seen )) || next+=("$arg")
+      fi
+      ;;
+  esac
+
+  # Validate: every id exists, and nothing blocks on itself.
+  local b trimmed
+  local -a cleaned=()
+  for b in "${next[@]-}"; do
+    trimmed=$(printf '%s' "$b" | tr -d '[:space:]')
+    [[ -z "$trimmed" ]] && continue
+    [[ "$trimmed" == "$id" ]] && die "a task cannot block on itself: $id"
+    task_file_required "$trimmed" >/dev/null
+    cleaned+=("$trimmed")
+  done
+
+  acquire_state_lock
+  if (( ${#cleaned[@]} == 0 )); then
+    fm_set "$file" '.blockers = []'
+  else
+    local json; json=$(printf '%s\n' "${cleaned[@]}" | jq -R . | jq -s -c .)
+    BLOCKERS="$json" yq -i --front-matter=process '.blockers = (strenv(BLOCKERS) | from_json)' "$file"
+  fi
+  git_commit_state "blockers: $mode $id"
+  echo "blockers for $id: ${cleaned[*]-(none)}"
+}
+
+# Create a new task file. Exists so that filing work never requires hand-authoring
+# frontmatter — the same reason every other field mutation is a verb.
+cmd_create() {
+  local id="" title="" phase="" goal="" files="" blockers="" milestone=""
+  while (( $# )); do
+    case $1 in
+      --title) title=$2; shift 2;;
+      --title=*) title=${1#--title=}; shift;;
+      --phase) phase=$2; shift 2;;
+      --phase=*) phase=${1#--phase=}; shift;;
+      --goal) goal=$2; shift 2;;
+      --goal=*) goal=${1#--goal=}; shift;;
+      --files) files=$2; shift 2;;
+      --files=*) files=${1#--files=}; shift;;
+      --blockers) blockers=$2; shift 2;;
+      --blockers=*) blockers=${1#--blockers=}; shift;;
+      --milestone) milestone=$2; shift 2;;
+      --milestone=*) milestone=${1#--milestone=}; shift;;
+      -*) die "unknown flag to create: $1";;
+      *) [[ -z "$id" ]] && id=$1 || die "too many positional args to create"; shift;;
+    esac
+  done
+
+  [[ -z "$id" ]] && die "usage: arachne-task create <id> --title \"...\" [--phase FN] [--goal \"...\"] [--files a,b] [--blockers X,Y] [--milestone m]"
+  [[ -z "$title" ]] && die "create requires --title"
+  # Phase-anchored ids only (FN.M) — see the anti-pattern against a parallel #N scheme.
+  [[ "$id" =~ ^F[0-9]+(\.[0-9]+)?$ ]] || die "id must be phase-anchored (e.g. F45.23), got: $id"
+  [[ -n "$(task_file "$id")" ]] && die "task already exists: $id"
+  [[ -z "$phase" ]] && phase=${id%%.*}
+
+  local b
+  local -a blist=()
+  if [[ -n "$blockers" ]]; then
+    IFS=',' read -r -a blist <<<"$blockers"
+    for b in "${blist[@]-}"; do
+      b=$(printf '%s' "$b" | tr -d '[:space:]')
+      [[ -z "$b" ]] && continue
+      task_file_required "$b" >/dev/null
+    done
+  fi
+
+  acquire_state_lock
+  local file="$ARACHNE_TASKS_DIR/$id.md"
+  {
+    printf -- '---\n'
+    printf 'id: %s\n' "$id"
+    printf 'phase: %s\n' "$phase"
+    printf 'title: %s\n' "$(printf '%s' "$title" | jq -R .)"
+    printf 'status: open\n'
+    printf 'claimed_by: null\n'
+    printf 'claimed_at: null\n'
+    printf 'turn_budget_remaining: null\n'
+    printf 'consecutive_failed_iterations: 0\n'
+    if (( ${#blist[@]} )); then
+      printf 'blockers:\n'
+      for b in "${blist[@]}"; do
+        b=$(printf '%s' "$b" | tr -d '[:space:]')
+        [[ -z "$b" ]] && continue
+        printf -- '  - %s\n' "$b"
+      done
+    else
+      printf 'blockers: []\n'
+    fi
+    printf 'completed_by_commits: []\n'
+    if [[ -n "$milestone" ]]; then printf 'milestone: %s\n' "$milestone"; else printf 'milestone: null\n'; fi
+    if [[ -n "$files" ]]; then
+      printf 'files:\n'
+      local f
+      while IFS= read -r f; do
+        f=$(printf '%s' "$f" | tr -d '[:space:]')
+        [[ -z "$f" ]] && continue
+        printf -- '  - %s\n' "$f"
+      done < <(printf '%s\n' "$files" | tr ',' '\n')
+    else
+      printf 'files: []\n'
+    fi
+    printf 'last_heartbeat_head_sha: null\n'
+    printf 'completed_at: null\n'
+    if [[ -n "$goal" ]]; then printf 'goal: %s\n' "$(printf '%s' "$goal" | jq -R .)"; else printf 'goal: null\n'; fi
+    printf 'last_heartbeat_ts: null\n'
+    printf 'blocked_at: null\n'
+    printf 'blocked_reason: null\n'
+    printf -- '---\n\n'
+    printf '# %s — %s\n\n' "$id" "$title"
+    printf '## Spec\n\n_TODO_\n\n## Scope\n\n_TODO_\n\n## Acceptance\n\n_TODO_\n'
+  } >"$file"
+
+  git_commit_state "create $id"
+  echo "created $id at $file"
+}
+
 cmd_resolve() {
   # Print where this invocation would read and write task state. Worth having
   # as a real verb rather than a test hook: with one checkout per worktree,
@@ -1168,6 +1358,18 @@ Commands:
   list [--status <s>]                Human-readable listing (flags missing goals).
   goal <id> [--set "text"]           Read or set a task's one-line outcome goal.
   goal --missing                     List open/in_progress tasks with no goal.
+  title <id> [--set "text"]          Read or set a task's title.
+  blockers <id> [--set A,B | --add X | --remove X | --clear]
+                                     Read or rewrite the blockers list. Mutating
+                                       forms validate that each id exists and
+                                       reject self-blocking — an unresolvable
+                                       blocker silently removes a task from the
+                                       frontier with no diagnostic.
+  create <id> --title "..." [--phase FN] [--goal "..."] [--files a,b]
+         [--blockers X,Y] [--milestone m]
+                                     Author a new task file. Ids must be
+                                       phase-anchored (FN.M). Refuses to
+                                       overwrite an existing task.
   claim <id> --branch <b> [--turns N]  Atomically claim a task.
   heartbeat <id> [--start|--end]     Budget + failure tracking.
   complete <id> [--commits sha,sha] [--defer-wiring "note"]
@@ -1220,6 +1422,9 @@ main() {
     ready) cmd_ready "$@";;
     list) cmd_list "$@";;
     goal) cmd_goal "$@";;
+    title) cmd_title "$@";;
+    blockers) cmd_blockers "$@";;
+    create) cmd_create "$@";;
     claim) cmd_claim "$@";;
     heartbeat) cmd_heartbeat "$@";;
     complete) cmd_complete "$@";;

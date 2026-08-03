@@ -800,6 +800,142 @@ else
   fail "env override resolved to '$got', expected '$TASKS'"
 fi
 
+# ── title / blockers / create verbs ──────────────────────────────────────────
+# These three exist so that retiring, re-pointing, and filing tasks never
+# requires hand-editing frontmatter (a documented anti-pattern). Each fixture
+# below is isolated in its own tasks dir so it cannot perturb the shared ones.
+VERB_TASKS="$TMPDIR_TEST/verbs/task-loop/tasks"
+mkdir -p "$VERB_TASKS"
+git -C "$TMPDIR_TEST/verbs" init -q
+git -C "$TMPDIR_TEST/verbs" -c user.name=test -c user.email=t@e commit --allow-empty -q -m "init verbs"
+
+make_task "$VERB_TASKS" F90.1 F90 done "Done prerequisite"
+make_task "$VERB_TASKS" F90.2 F90 open "Original title" null "F90.1"
+make_task "$VERB_TASKS" F90.3 F90 open "Another task"
+
+vcli() { ARACHNE_TASKS_DIR="$VERB_TASKS" ARACHNE_TASK_NOCOMMIT=1 "$CLI" "$@"; }
+
+# title — read then set.
+got=$(vcli title F90.2)
+[[ "$got" == "Original title" ]] && pass "title reads the current title" \
+  || fail "title read got '$got'"
+
+vcli title F90.2 --set "Rewritten title" >/dev/null
+assert_fm "$VERB_TASKS/F90.2.md" '.title' "Rewritten title"
+
+# A title containing a colon must survive the round trip — bare YAML would break.
+vcli title F90.2 --set "fix: colons: everywhere" >/dev/null
+assert_fm "$VERB_TASKS/F90.2.md" '.title' "fix: colons: everywhere"
+
+vcli title F90.2 --set "Original title" >/dev/null
+
+if vcli title F90.2 --set "" 2>/dev/null; then
+  fail "title --set accepted empty text"
+else
+  pass "title --set rejects empty text"
+fi
+
+# blockers — read, add, remove, set, clear.
+got=$(vcli blockers F90.2)
+[[ "$got" == "F90.1" ]] && pass "blockers reads the current list" \
+  || fail "blockers read got '$got'"
+
+vcli blockers F90.2 --add F90.3 >/dev/null
+got=$(vcli blockers F90.2 | tr '\n' ',')
+[[ "$got" == "F90.1,F90.3," ]] && pass "blockers --add appends" \
+  || fail "blockers --add produced '$got'"
+
+# Adding twice must not duplicate.
+vcli blockers F90.2 --add F90.3 >/dev/null
+got=$(vcli blockers F90.2 | wc -l | tr -d ' ')
+[[ "$got" == "2" ]] && pass "blockers --add is idempotent" \
+  || fail "blockers --add duplicated, list length $got"
+
+vcli blockers F90.2 --remove F90.1 >/dev/null
+got=$(vcli blockers F90.2 | tr '\n' ',')
+[[ "$got" == "F90.3," ]] && pass "blockers --remove drops the id" \
+  || fail "blockers --remove produced '$got'"
+
+vcli blockers F90.2 --set "F90.1,F90.3" >/dev/null
+got=$(vcli blockers F90.2 | tr '\n' ',')
+[[ "$got" == "F90.1,F90.3," ]] && pass "blockers --set replaces the list" \
+  || fail "blockers --set produced '$got'"
+
+vcli blockers F90.2 --clear >/dev/null
+got=$(vcli blockers F90.2)
+[[ -z "$got" ]] && pass "blockers --clear empties the list" \
+  || fail "blockers --clear left '$got'"
+
+# The whole point of validating: a typo'd blocker silently removes a task from
+# the frontier forever, with no diagnostic anywhere.
+if vcli blockers F90.2 --add F99.9 2>/dev/null; then
+  fail "blockers --add accepted a nonexistent id"
+else
+  pass "blockers --add rejects a nonexistent id"
+fi
+
+if vcli blockers F90.2 --add F90.2 2>/dev/null; then
+  fail "blockers --add accepted a self-blocker"
+else
+  pass "blockers --add rejects self-blocking"
+fi
+
+# A rejected mutation must not have partially written.
+got=$(vcli blockers F90.2)
+[[ -z "$got" ]] && pass "a rejected blockers mutation leaves the list untouched" \
+  || fail "rejected mutation wrote '$got'"
+
+# create — happy path, then each guard.
+vcli create F90.10 --title "Newly filed task" --goal "Prove create works." \
+  --files "crates/a/src/lib.rs,web/src/b.ts" --blockers "F90.1" >/dev/null
+NEW="$VERB_TASKS/F90.10.md"
+[[ -f "$NEW" ]] && pass "create writes the task file" || fail "create wrote no file"
+assert_fm "$NEW" '.id' "F90.10"
+assert_fm "$NEW" '.phase' "F90"
+assert_fm "$NEW" '.status' "open"
+assert_fm "$NEW" '.title' "Newly filed task"
+assert_fm "$NEW" '.goal' "Prove create works."
+assert_fm "$NEW" '.consecutive_failed_iterations' "0"
+assert_fm "$NEW" '.blockers[0]' "F90.1"
+assert_fm "$NEW" '.files[0]' "crates/a/src/lib.rs"
+assert_fm "$NEW" '.files[1]' "web/src/b.ts"
+
+# A freshly created task must be legible to the rest of the CLI, not just on disk.
+got=$(vcli title F90.10)
+[[ "$got" == "Newly filed task" ]] && pass "create output round-trips through title" \
+  || fail "title on a created task got '$got'"
+
+# F90.1 is done, so F90.10's blocker is satisfied and it should be eligible.
+got=$(vcli ready --count-eligible)
+[[ "$got" =~ ^[0-9]+$ ]] && pass "created task keeps ready parseable (got $got)" \
+  || fail "ready --count-eligible returned '$got' after create"
+
+if vcli create F90.10 --title "Duplicate" 2>/dev/null; then
+  fail "create overwrote an existing task"
+else
+  pass "create refuses to overwrite an existing task"
+fi
+
+if vcli create 91.1 --title "Bad id" 2>/dev/null; then
+  fail "create accepted a non-phase-anchored id"
+else
+  pass "create rejects a non-phase-anchored id"
+fi
+
+if vcli create F90.11 2>/dev/null; then
+  fail "create accepted a missing --title"
+else
+  pass "create requires --title"
+fi
+
+if vcli create F90.12 --title "Bad blocker" --blockers "F99.9" 2>/dev/null; then
+  fail "create accepted a nonexistent blocker"
+else
+  pass "create rejects a nonexistent blocker"
+fi
+[[ ! -f "$VERB_TASKS/F90.12.md" ]] && pass "create leaves no file behind when it rejects" \
+  || fail "create wrote a file despite rejecting"
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo
 echo "=============================================="
