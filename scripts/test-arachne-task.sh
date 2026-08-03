@@ -936,6 +936,50 @@ fi
 [[ ! -f "$VERB_TASKS/F90.12.md" ]] && pass "create leaves no file behind when it rejects" \
   || fail "create wrote a file despite rejecting"
 
+# ── Regression: YAML-hostile values must never produce an unparseable file ────
+# A task file whose frontmatter yq cannot parse is read as empty by fm_get and
+# silently vanishes from next/ready. F45.15 sat unreachable for nine weeks that
+# way. Every scalar `create` writes must survive a value containing ": ".
+echo
+echo "--- YAML-hostile create values ---"
+
+vcli create F90.20 --title "fix: colons: everywhere" --goal "goal: with a colon" \
+  --milestone "2026-Q3: integration" --files "crates/a:b.rs,c.rs" --blockers "F90.1" >/dev/null
+HOSTILE="$VERB_TASKS/F90.20.md"
+
+if yq --front-matter=extract '.id' "$HOSTILE" >/dev/null 2>&1; then
+  pass "create with colon-bearing values produces parseable frontmatter"
+else
+  fail "create with colon-bearing values produced UNPARSEABLE frontmatter"
+fi
+assert_fm "$HOSTILE" '.title' "fix: colons: everywhere"
+assert_fm "$HOSTILE" '.goal' "goal: with a colon"
+assert_fm "$HOSTILE" '.milestone' "2026-Q3: integration"
+assert_fm "$HOSTILE" '.files[0]' "crates/a:b.rs"
+assert_fm "$HOSTILE" '.phase' "F90"
+
+# The created task must be reachable through the CLI, not merely on disk —
+# that is the property that actually failed for F45.15.
+got=$(vcli title F90.20)
+[[ "$got" == "fix: colons: everywhere" ]] && pass "colon-bearing task is readable back through the CLI" \
+  || fail "title on a colon-bearing task got '$got'"
+
+# ── Regression: create and blockers must agree on list normalization ──────────
+echo
+echo "--- create/blockers normalization parity ---"
+
+vcli create F90.21 --title "Dup blockers" --blockers "F90.1,F90.1, F90.3 " >/dev/null
+got=$(yq --front-matter=extract '.blockers | length' "$VERB_TASKS/F90.21.md")
+[[ "$got" == "2" ]] && pass "create --blockers de-duplicates like blockers --add" \
+  || fail "create --blockers kept $got entries, expected 2 after dedup"
+assert_fm "$VERB_TASKS/F90.21.md" '.blockers[1]' "F90.3"
+
+if vcli create F90.22 --title "Self block" --blockers "F90.22" 2>/dev/null; then
+  fail "create --blockers accepted a self-blocker"
+else
+  pass "create --blockers rejects self-blocking like blockers --add"
+fi
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo
 echo "=============================================="
