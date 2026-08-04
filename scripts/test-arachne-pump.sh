@@ -495,6 +495,45 @@ err=$(STUB_LIVE="" STUB_AHEAD=3 claim_tick F95 2>&1 >/dev/null)
 [[ "$(status_of F95.1)" == "in_progress" ]] && pass "orphan with commits left parked (not reopened)" || fail "F95.1 wrongly reopened despite commits: $(status_of F95.1)"
 have "$err" 'committed work' && pass "parked-with-commits surfaced via warn" || fail "no committed-work warning:\n$err"
 
+echo "--- Test 18: scrub integrity findings reach the pump log with their paths ---"
+# do_tick used to run `scrub >/dev/null 2>&1 || warn "scrub failed (continuing)"`,
+# which threw away the only actionable detail — which file is invisible — and
+# could not tell a corrupt ledger from scrub itself crashing.
+STATE18="$TMP/pump18.state"
+tick18() {
+  ARACHNE_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 \
+  ARACHNE_PUMP_OPS_DIR="$TMP/noops" ARACHNE_PUMP_STATE_FILE="$STATE18" \
+  ARACHNE_POOL_CAP_FILE="$TMP/cap" ARACHNE_PUMP_LOG="$TMP/pump18.log" \
+  ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+  "$PUMP" --no-health-gate --once --phases F96
+}
+
+# 18a: an unparseable file is named in the warning, not swallowed.
+rm -f "$TASKS"/*.md; mk F96.0 open
+cat >| "$TASKS/F96.9.md" <<'BROKEN18'
+---
+id: F96.9
+status: open
+goal: Verify the thing: a colon that breaks yq.
+---
+# F96.9
+BROKEN18
+err=$(STUB_LIVE="" STUB_GATE_RC=0 tick18 2>&1 >/dev/null)
+have "$err" 'ledger integrity' && pass "pump warns about ledger integrity (not a generic failure)" || fail "no integrity warning:\n$err"
+have "$err" 'F96\.9\.md' && pass "pump names the offending file path" || fail "path not surfaced in pump warning:\n$err"
+have "$err" 'scrub failed \(continuing\)' && fail "integrity finding mislabelled as a scrub crash:\n$err" || pass "integrity finding not conflated with a scrub crash"
+
+# 18b: a healthy ledger stays silent — this runs every tick for days.
+rm -f "$TASKS/F96.9.md"
+err=$(STUB_LIVE="" STUB_GATE_RC=0 tick18 2>&1 >/dev/null)
+have "$err" 'ledger integrity' && fail "pump warned about integrity on a healthy ledger:\n$err" || pass "pump silent on a healthy ledger"
+
+# 18c: scrub genuinely failing still reports as a failure, not an integrity finding.
+STUB_TASK="$BIN/arachne-task-broken"
+printf '#!/usr/bin/env bash\nexit 1\n' >| "$STUB_TASK"; chmod +x "$STUB_TASK"
+err=$(STUB_LIVE="" STUB_GATE_RC=0 ARACHNE_TASK="$STUB_TASK" tick18 2>&1 >/dev/null)
+have "$err" 'scrub failed \(continuing\)' && pass "a crashing scrub still warns 'scrub failed'" || fail "scrub crash not reported:\n$err"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"

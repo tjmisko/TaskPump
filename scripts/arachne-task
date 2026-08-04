@@ -77,17 +77,28 @@ fm_set() {
   yq -i --front-matter=process "$expr" "$file"
 }
 
-# True if <file>'s frontmatter parses as YAML.
+# Read <file>'s `.id` and `.status` in one pass, one per line, and fail if the
+# frontmatter does not parse as YAML.
 #
-# Worth checking explicitly because every other read path fails *silently*:
-# `fm_get` swallows yq's error and returns "", so an unparseable file reads as
-# a task with no id and no status. It then matches no status filter, never
-# enters the `next`/`ready` frontier, and produces no diagnostic anywhere —
-# the work is in the ledger, committed, and unreachable. F45.15 sat that way
-# for nine weeks after being authored with an unquoted `goal:` containing a
-# colon.
-fm_parses() {
-  yq --front-matter=extract '.' "$1" >/dev/null 2>&1
+# The parse check has to be explicit because every other read path fails
+# *silently*: `fm_get` swallows yq's error and returns "", so an unparseable
+# file reads as a task with no id and no status. It then matches no status
+# filter, never enters the `next`/`ready` frontier, and produces no diagnostic
+# anywhere — the work is in the ledger, committed, and unreachable. F45.15 sat
+# that way for nine weeks after being authored with an unquoted `goal:`
+# containing a colon.
+#
+# Both fields come back from a single yq invocation because scrub runs this
+# over every task file on every pump tick, and process spawns dominate its
+# runtime. The integrity check rides along for free — yq fails before it
+# evaluates the expression — so guarding costs nothing over the read scrub
+# already had to do.
+#
+# Line-delimited, not @tsv: a tab is an IFS *whitespace* character, so `read`
+# silently collapses a leading empty field and an id-less file would parse as
+# id="<status>" — defeating the NO-ID check this feeds.
+fm_id_status() {
+  yq --front-matter=extract '.id // "", .status // ""' "$1" 2>/dev/null
 }
 
 # Path to a task file by id. Returns empty if not found.
@@ -1028,24 +1039,35 @@ iso_to_epoch() {
 }
 
 cmd_scrub() {
-  local scrubbed=0 unparseable=0
-  local file id budget failures
+  local scrubbed=0 broken=0
+  local file id budget failures meta
   while IFS= read -r file; do
     [[ -z "$file" ]] && continue
 
-    # Integrity check first: a file whose frontmatter yq cannot parse is
-    # invisible to every other verb, so scrub is the only place that will ever
-    # notice it. It cannot be repaired here — `fm_set` also goes through yq, so
-    # the CLI cannot write to a file it cannot read — hence report, don't relabel.
-    if ! fm_parses "$file"; then
+    # Integrity check first: a file the frontier cannot see is invisible to
+    # every other verb, so scrub is the only place that will ever notice it.
+    # Neither case is repaired here — `fm_set` also goes through yq, so the CLI
+    # cannot write to a file it cannot read — hence report, don't relabel.
+    #
+    # Two distinct ways a file goes invisible, both reported:
+    #   UNPARSEABLE — the frontmatter is not valid YAML (F45.15's failure).
+    #   NO-ID       — it parses, but carries no `id`, so it can never be named
+    #                 by any verb. Caught separately because valid-but-idless
+    #                 YAML is just as unreachable and yq is perfectly happy
+    #                 with it (a file with no frontmatter at all parses fine).
+    local status
+    if ! meta=$(fm_id_status "$file"); then
       echo "scrub: UNPARSEABLE $file (invisible to next/ready — repair the frontmatter by hand)"
-      printf 'arachne-task: unparseable frontmatter in %s; the task is silently absent from the frontier\n' "$file" >&2
-      unparseable=$((unparseable + 1))
+      broken=$((broken + 1))
+      continue
+    fi
+    { IFS= read -r id; IFS= read -r status || true; } <<<"$meta"
+    if [[ -z "$id" ]]; then
+      echo "scrub: NO-ID $file (invisible to next/ready — add an 'id:' or move the file out of the tasks dir)"
+      broken=$((broken + 1))
       continue
     fi
 
-    id=$(fm_get "$file" '.id')
-    local status; status=$(fm_get "$file" '.status')
     [[ "$status" != "in_progress" ]] && continue
     budget=$(fm_get "$file" '.turn_budget_remaining')
     # Fallback for a null budget (pre-A5 claims, or tooling that skipped
@@ -1102,12 +1124,16 @@ cmd_scrub() {
   if (( scrubbed > 0 )); then
     git_commit_state "scrub: $scrubbed task(s) relabeled"
   fi
-  # Non-zero so a supervisor notices. The pump runs scrub as
-  # `scrub >/dev/null 2>&1 || warn "scrub failed (continuing)"`, so this
-  # surfaces as a warning in the pump log without interrupting the run.
-  if (( unparseable > 0 )); then
-    printf 'arachne-task: %d task file(s) have unparseable frontmatter\n' "$unparseable" >&2
-    return 1
+  # Exit 3, not 1, so a supervisor can tell "the ledger has invisible files"
+  # (actionable: go repair them) from "scrub itself failed" (a crash, a missing
+  # yq, a bad tasks dir). The pump keys off this to name the offending paths
+  # instead of logging a generic failure every tick.
+  #
+  # The per-file lines above already went to stdout; this summary is the only
+  # thing on stderr, so `scrub 2>&1 | tee` does not double-report each path.
+  if (( broken > 0 )); then
+    printf 'arachne-task: %d task file(s) invisible to the frontier (see UNPARSEABLE/NO-ID above)\n' "$broken" >&2
+    return 3
   fi
   return 0
 }
@@ -1461,10 +1487,11 @@ Commands:
                                        name the non-test call site as evidence.
   deferred [--json]                  List tasks with deferred wiring (collect follow-ups).
   scrub                              Supervisor: relabel stale claims. Also
-                                       reports task files whose frontmatter is
-                                       unparseable — those are invisible to
-                                       next/ready with no other diagnostic —
-                                       and exits non-zero if any are found.
+                                       reports task files invisible to the
+                                       frontier — UNPARSEABLE frontmatter, or
+                                       NO-ID — which have no other diagnostic.
+                                       Exit 3 if any are found (1 = scrub
+                                       itself failed).
   resolve [--tasks-dir|--code-repo|--all]
                                      Print which workspace's ledger this
                                        invocation resolves to. Use it when a
