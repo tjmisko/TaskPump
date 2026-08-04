@@ -1022,16 +1022,63 @@ if [[ "$out" == *"UNPARSEABLE"*"F91.2.md"* ]]; then
 else
   fail "scrub did not report F91.2; output: '$out'"
 fi
-[[ "$scrub_rc" -ne 0 ]] && pass "scrub exits non-zero when a file is unparseable" \
-  || fail "scrub exited 0 despite an unparseable file"
+# Exit 3 specifically, not just non-zero: the pump keys off it to distinguish a
+# corrupt ledger (name the paths) from scrub itself crashing (generic warning).
+[[ "$scrub_rc" -eq 3 ]] && pass "scrub exits 3 when a file is unparseable" \
+  || fail "expected exit 3 for an unparseable file, got $scrub_rc"
+
+# The path must appear exactly once across stdout+stderr combined — entrypoint.sh
+# runs `scrub 2>&1 | tee`, which double-reported every file when the diagnostic
+# was written to both streams.
+merged=$(scrubcli scrub 2>&1) || true
+n=$(grep -c 'F91.2.md' <<<"$merged" || true)
+[[ "$n" -eq 1 ]] && pass "unparseable path reported once under 2>&1 (no tee duplication)" \
+  || fail "expected F91.2.md once in merged output, got $n: '$merged'"
+
+# A file that parses but has no id is equally unreachable — no verb can name it.
+# yq is perfectly happy with it, so the parse check alone would let it through.
+rm "$SCRUB_TASKS/F91.2.md"
+cat >| "$SCRUB_TASKS/F91.3.md" <<'NOID'
+---
+phase: F91
+title: Task with no id
+status: open
+---
+
+# F91.3 — no id
+NOID
+out=$(scrubcli scrub 2>/dev/null) && scrub_rc=0 || scrub_rc=$?
+[[ "$out" == *"NO-ID"*"F91.3.md"* ]] && pass "scrub names a parseable file that has no id" \
+  || fail "scrub did not report the id-less F91.3; output: '$out'"
+[[ "$scrub_rc" -eq 3 ]] && pass "scrub exits 3 for an id-less file" \
+  || fail "expected exit 3 for an id-less file, got $scrub_rc"
 
 # A healthy ledger must stay quiet and exit 0, or the pump warns every tick.
-rm "$SCRUB_TASKS/F91.2.md"
-out=$(scrubcli scrub 2>/dev/null) && scrub_rc=0 || scrub_rc=$?
+rm "$SCRUB_TASKS/F91.3.md"
+out=$(scrubcli scrub 2>&1) && scrub_rc=0 || scrub_rc=$?
 [[ "$scrub_rc" -eq 0 ]] && pass "scrub exits 0 on a healthy ledger" \
   || fail "scrub exited $scrub_rc on a healthy ledger"
-[[ "$out" != *"UNPARSEABLE"* ]] && pass "scrub is quiet on a healthy ledger" \
-  || fail "scrub reported UNPARSEABLE on a healthy ledger: '$out'"
+[[ "$out" != *"UNPARSEABLE"* && "$out" != *"NO-ID"* ]] && pass "scrub is quiet on a healthy ledger" \
+  || fail "scrub reported an integrity problem on a healthy ledger: '$out'"
+
+# scrub must still do its real job — the integrity guard reads id and status in
+# one pass, so a bug there would silently stop all stale-claim relabeling.
+cat >| "$SCRUB_TASKS/F91.4.md" <<'EXHAUSTED'
+---
+id: F91.4
+phase: F91
+title: Exhausted claim
+status: in_progress
+claimed_by: agent-x
+turn_budget_remaining: 0
+consecutive_failed_iterations: 0
+---
+
+# F91.4 — exhausted claim
+EXHAUSTED
+out=$(scrubcli scrub 2>/dev/null) || true
+[[ "$out" == *"F91.4"*"needs-review"* ]] && pass "scrub still relabels an exhausted claim" \
+  || fail "scrub did not relabel F91.4 after the integrity refactor; output: '$out'"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo

@@ -788,7 +788,19 @@ reclaim_done_targets() {
 # ── One tick: scrub, plan, reclaim, gate, top up the pool to cap ───────────────
 do_tick() {
   git -C "$OPS_DIR" pull --ff-only >/dev/null 2>&1 || warn "ops pull --ff-only failed (continuing)"
-  "$ARACHNE_TASK" scrub >/dev/null 2>&1 || warn "scrub failed (continuing)"
+  # Capture rather than discard: a scrub that finds invisible task files (exit
+  # 3) has the one detail worth acting on — the paths. Dropping them left the
+  # operator a generic "scrub failed" every tick for days with nothing to go on,
+  # and conflated a corrupt ledger with scrub itself crashing.
+  local scrub_out scrub_line scrub_rc=0
+  scrub_out=$("$ARACHNE_TASK" scrub 2>&1) || scrub_rc=$?
+  if (( scrub_rc == 3 )); then
+    while IFS= read -r scrub_line; do
+      [[ -n "$scrub_line" ]] && warn "ledger integrity: $scrub_line"
+    done < <(grep -E 'UNPARSEABLE|NO-ID' <<<"$scrub_out" || true)
+  elif (( scrub_rc != 0 )); then
+    warn "scrub failed (continuing)"
+  fi
   reclaim_orphaned_claims   # D3: free tasks parked by dead containers before planning
 
   # Strip any `.worktrees/` ignore line the `gh worktree` extension auto-appended
