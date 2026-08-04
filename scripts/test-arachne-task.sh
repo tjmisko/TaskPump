@@ -980,6 +980,59 @@ else
   pass "create --blockers rejects self-blocking like blockers --add"
 fi
 
+# ── scrub reports unparseable frontmatter ────────────────────────────────────
+# The failure this guards against is silence: fm_get swallows yq's error, so an
+# unparseable task reads as having no id and no status, matches no filter, and
+# never reaches the frontier. F45.15 was authored that way (an unquoted `goal:`
+# containing a colon) and was invisible for nine weeks with nothing reporting it.
+echo
+echo "--- scrub: unparseable frontmatter ---"
+
+SCRUB_TASKS="$TMPDIR_TEST/scrubyaml/task-loop/tasks"
+mkdir -p "$SCRUB_TASKS"
+git -C "$TMPDIR_TEST/scrubyaml" init -q
+git -C "$TMPDIR_TEST/scrubyaml" -c user.name=test -c user.email=t@e commit --allow-empty -q -m init
+
+make_task "$SCRUB_TASKS" F91.1 F91 open "Healthy task"
+
+# Reproduce F45.15's exact shape: an unquoted scalar containing ": ".
+cat >| "$SCRUB_TASKS/F91.2.md" <<'BROKEN'
+---
+id: F91.2
+phase: F91
+title: Broken task
+status: open
+goal: Verify the thing: a flow that reaches a block cannot do the other thing.
+---
+
+# F91.2 — Broken task
+BROKEN
+
+scrubcli() { ARACHNE_TASKS_DIR="$SCRUB_TASKS" ARACHNE_TASK_NOCOMMIT=1 "$CLI" "$@"; }
+
+# Precondition: the broken file really is invisible to the frontier, so this
+# test would still be meaningful if the reporting were removed.
+got=$(scrubcli ready --count-eligible)
+[[ "$got" == "1" ]] && pass "unparseable task is absent from the frontier (1 of 2 eligible)" \
+  || fail "expected 1 eligible with one broken file, got '$got'"
+
+out=$(scrubcli scrub 2>/dev/null) && scrub_rc=0 || scrub_rc=$?
+if [[ "$out" == *"UNPARSEABLE"*"F91.2.md"* ]]; then
+  pass "scrub names the unparseable file"
+else
+  fail "scrub did not report F91.2; output: '$out'"
+fi
+[[ "$scrub_rc" -ne 0 ]] && pass "scrub exits non-zero when a file is unparseable" \
+  || fail "scrub exited 0 despite an unparseable file"
+
+# A healthy ledger must stay quiet and exit 0, or the pump warns every tick.
+rm "$SCRUB_TASKS/F91.2.md"
+out=$(scrubcli scrub 2>/dev/null) && scrub_rc=0 || scrub_rc=$?
+[[ "$scrub_rc" -eq 0 ]] && pass "scrub exits 0 on a healthy ledger" \
+  || fail "scrub exited $scrub_rc on a healthy ledger"
+[[ "$out" != *"UNPARSEABLE"* ]] && pass "scrub is quiet on a healthy ledger" \
+  || fail "scrub reported UNPARSEABLE on a healthy ledger: '$out'"
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo
 echo "=============================================="

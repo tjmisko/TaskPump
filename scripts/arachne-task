@@ -77,6 +77,19 @@ fm_set() {
   yq -i --front-matter=process "$expr" "$file"
 }
 
+# True if <file>'s frontmatter parses as YAML.
+#
+# Worth checking explicitly because every other read path fails *silently*:
+# `fm_get` swallows yq's error and returns "", so an unparseable file reads as
+# a task with no id and no status. It then matches no status filter, never
+# enters the `next`/`ready` frontier, and produces no diagnostic anywhere —
+# the work is in the ledger, committed, and unreachable. F45.15 sat that way
+# for nine weeks after being authored with an unquoted `goal:` containing a
+# colon.
+fm_parses() {
+  yq --front-matter=extract '.' "$1" >/dev/null 2>&1
+}
+
 # Path to a task file by id. Returns empty if not found.
 task_file() {
   local id=$1 file
@@ -1015,10 +1028,22 @@ iso_to_epoch() {
 }
 
 cmd_scrub() {
-  local scrubbed=0
+  local scrubbed=0 unparseable=0
   local file id budget failures
   while IFS= read -r file; do
     [[ -z "$file" ]] && continue
+
+    # Integrity check first: a file whose frontmatter yq cannot parse is
+    # invisible to every other verb, so scrub is the only place that will ever
+    # notice it. It cannot be repaired here — `fm_set` also goes through yq, so
+    # the CLI cannot write to a file it cannot read — hence report, don't relabel.
+    if ! fm_parses "$file"; then
+      echo "scrub: UNPARSEABLE $file (invisible to next/ready — repair the frontmatter by hand)"
+      printf 'arachne-task: unparseable frontmatter in %s; the task is silently absent from the frontier\n' "$file" >&2
+      unparseable=$((unparseable + 1))
+      continue
+    fi
+
     id=$(fm_get "$file" '.id')
     local status; status=$(fm_get "$file" '.status')
     [[ "$status" != "in_progress" ]] && continue
@@ -1077,6 +1102,14 @@ cmd_scrub() {
   if (( scrubbed > 0 )); then
     git_commit_state "scrub: $scrubbed task(s) relabeled"
   fi
+  # Non-zero so a supervisor notices. The pump runs scrub as
+  # `scrub >/dev/null 2>&1 || warn "scrub failed (continuing)"`, so this
+  # surfaces as a warning in the pump log without interrupting the run.
+  if (( unparseable > 0 )); then
+    printf 'arachne-task: %d task file(s) have unparseable frontmatter\n' "$unparseable" >&2
+    return 1
+  fi
+  return 0
 }
 
 # ── goal: read / set / list-missing the one-line outcome goal ──────────────────
@@ -1427,7 +1460,11 @@ Commands:
                                        (usually via a follow-up task). --caller must
                                        name the non-test call site as evidence.
   deferred [--json]                  List tasks with deferred wiring (collect follow-ups).
-  scrub                              Supervisor: relabel stale claims.
+  scrub                              Supervisor: relabel stale claims. Also
+                                       reports task files whose frontmatter is
+                                       unparseable — those are invisible to
+                                       next/ready with no other diagnostic —
+                                       and exits non-zero if any are found.
   resolve [--tasks-dir|--code-repo|--all]
                                      Print which workspace's ledger this
                                        invocation resolves to. Use it when a
