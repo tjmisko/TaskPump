@@ -118,20 +118,59 @@ echo "--- Test 9: colour ---"
 "$CLI" --phases F90 2>/dev/null | grep -q $'\033\[' \
     && pass "colour mode emits ANSI" || fail "colour mode emitted none"
 
-# The status palette: green is the progress axis. done is dark faded green, a
-# task with a live agent is bright green, an unstarted one is grey.
+# The status palette: green is the progress axis. done is a dimmed faded green,
+# a task with a live agent is a calmer mid green, an unstarted one is grey.
 col=$("$CLI" --phases F90 --live-branches feat/f90 2>/dev/null)
-grep -q $'\033\[0;38;5;65m'   <<<"$col" && pass "done wears dark faded green"   || fail "no faded green for done"
-grep -q $'\033\[0;1;38;5;46m' <<<"$col" && pass "a live task wears bright green" || fail "no bright green for the live task"
+grep -q $'\033\[0;2;38;5;65m' <<<"$col" && pass "done wears dark faded green" || fail "no faded green for done"
+grep -q $'\033\[0;38;5;71m'   <<<"$col" && pass "a live task wears mid green" || fail "no mid green for the live task"
 grep -q $'\033\[0;2;38;5;244m' <<<"$col" && pass "an open task waiting on a blocker wears dim grey" \
     || fail "no dim grey for the waiting task"
 # F91.1 is open with no blockers, so it is the ready (brighter grey) case.
 "$CLI" --phases F90..F91 2>/dev/null | grep -q $'\033\[0;38;5;250m' \
     && pass "a ready task wears grey" || fail "no grey for the ready task"
 # Without a live container the same in_progress task is parked, not running.
-"$CLI" --phases F90 2>/dev/null | grep -q $'\033\[0;1;38;5;46m' \
-    && fail "bright green used for a task with no live agent" \
-    || pass "a claimed-but-dead task is not bright green"
+"$CLI" --phases F90 2>/dev/null | grep -q $'\033\[0;38;5;71m' \
+    && fail "the running colour used for a task with no live agent" \
+    || pass "a claimed-but-dead task is not painted running"
+
+# Edge tiers: a component whose endpoints are all done wears the done green, so
+# a finished subtree reads as one settled unit; anything touching unfinished
+# work stays on the bright rail. Both must remain legible.
+grep -q $'\033\[0;38;5;249m' <<<"$col" && pass "live-frontier edges use the bright rail" \
+    || fail "no bright rail colour"
+# F90 has no fully-done edge component — every band there touches F90.3/F90.4 —
+# so the green-edge case needs its own chain: F98.1 → F98.2, both done.
+mktask F98.1 F98 done ""
+mktask F98.2 F98 done ""  F98.1
+# A colour run reaches to the next escape, so the whole run is what carries the
+# ink; the sequence itself opens on blanks. Node boxes cannot match here: done
+# NODES carry the dimmed 0;2;38;5;65, a different sequence.
+greenrail=$("$CLI" --phases F98 2>/dev/null \
+            | grep -o $'\033\[0;38;5;65m[^\033]*' | grep -c '[─│┬┴├┤┼┌┐└┘]' || true)
+[[ "${greenrail:-0}" -ge 1 ]] \
+    && pass "a done→done edge is drawn in the done green ($greenrail runs)" \
+    || fail "no green edge ink for a fully-done component"
+# ...and the same edge is not green once its child is unfinished.
+mktask F98.2 F98 open ""  F98.1
+notgreen=$("$CLI" --phases F98 2>/dev/null \
+           | grep -o $'\033\[0;38;5;65m[^\033]*' | grep -c '[─│┬┴├┤┼┌┐└┘]' || true)
+[[ "${notgreen:-0}" -eq 0 ]] \
+    && pass "an edge into unfinished work stays on the bright rail" \
+    || fail "green edge ink survived the child becoming open ($notgreen runs)"
+# Dimming is per EDGE, not per rail component: one parent with a done child and
+# an open child shares a band, and the settled link must still be green. At
+# component granularity the open child dragged the whole band bright — which is
+# what kept F79.1 → F79.2 grey while both were done.
+mktask F98.2 F98 done ""  F98.1
+mktask F98.3 F98 open ""  F98.1
+mixed=$("$CLI" --phases F98 2>/dev/null)
+[[ "$(grep -o $'\033\[0;38;5;65m[^\033]*' <<<"$mixed" | grep -c '[─│┬┴├┤┼┌┐└┘]' || true)" -ge 1 ]] \
+    && pass "a done link stays green in a band shared with an unfinished one" \
+    || fail "per-edge dimming lost: the shared band is entirely bright"
+[[ "$(grep -o $'\033\[0;38;5;249m[^\033]*' <<<"$mixed" | grep -c '[─│┬┴├┤┼┌┐└┘]' || true)" -ge 1 ]] \
+    && pass "...and the unfinished link in that same band stays bright" \
+    || fail "the open child's link is not on the bright rail"
+rm -f "$TD"/F98.*.md
 
 # Attribute leak: SGR dim/bold are sticky, so every sequence must re-open with
 # 0. A single non-absolute one after a dim `done` box greys out the whole rest

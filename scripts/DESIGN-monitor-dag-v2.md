@@ -148,9 +148,24 @@ With every node shown and full ids, the graph gets *wider*, not smaller — so
 clutter has to come from somewhere other than hiding nodes:
 
 - **Straightness** (O2) is the main lever: laced rails become vertical stems.
-- **Edge emphasis follows status.** Edges between two done nodes render dim;
-  edges touching the live frontier render at normal weight. The completed
-  history recedes without disappearing.
+- **Edge emphasis follows status.** An edge whose *both* endpoints are done
+  wears the done nodes' green (`0;38;5;65`), so a finished parent joined to
+  finished children reads as one settled green subtree instead of a green box,
+  a grey line, another green box. Everything touching unfinished work renders on
+  the bright rail (`0;38;5;249`).
+
+  **Per edge, not per rail component.** A band is one component, but it
+  routinely carries a finished link alongside a dummy trunk heading for
+  something still open; at component granularity that one unfinished target
+  dragged the settled links back to the bright tier — which is what kept
+  `F79.1 → F79.2` grey while both were done. Cells shared by several edges
+  resolve to bright automatically, since `addm()` marks a cell normal when *any*
+  edge through it is undimmed.
+
+  Both tiers must stay legible. The first implementation used a dimmed 238,
+  which on a dark background is indistinguishable from no edge at all — and on a
+  nearly-finished phase that is most of the graph. The distinction says "behind
+  you" vs "ahead of you", never "not drawn".
 - **Fewer crossings** (O1, now actually measured).
 
 ## Node rendering
@@ -165,14 +180,14 @@ nothing, and the status bar now shows the selection's full id at all times.
 Multi-phase ranges still use full ids, where the phase actually disambiguates.
 
 Green is the progress axis, so a glance at the graph reads as *how far along is
-this*: landed work recedes, the one task an agent is on right now is the
-brightest thing on screen, and anything not yet started is neutral.
+this*: landed work recedes, the one task an agent is on right now stands out,
+and anything not yet started is neutral.
 
 | State | Glyph | Colour | SGR |
 |---|---|---|---|
-| done | `✓` | dark faded green | `0;38;5;65` |
-| running (live container) | `▶` | **bright green, bold** | `0;1;38;5;46` |
-| in_progress, no container | `⧗` | amber | `0;38;5;179` |
+| done | `✓` | dark faded green | `0;2;38;5;65` |
+| running (live, elected) | `▶` | mid green | `0;38;5;71` |
+| in_progress, not running | `⧗` | amber | `0;38;5;179` |
 | open, eligible | `○` | grey | `0;38;5;250` |
 | open, waiting on a blocker | `◌` | dim grey | `0;2;38;5;244` |
 | blocked | `⊘` | muted red | `0;38;5;131` |

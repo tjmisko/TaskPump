@@ -519,7 +519,7 @@ function route(l,   c, i, j, m, K, e, cid, k, h, r, first) {
     delete ep; delete ec; delete erow; delete uf; delete ecomp
     delete cLo; delete cHi; delete cPn; delete cCn; delete seenP; delete seenC
     delete rowUsed; delete rowLo; delete rowHi; delete cOrder
-    delete cStraight; delete cDim; delete prowOf
+    delete cStraight; delete prowOf
     NE = 0; RN = 0; NCOMP = 0
     for (c = 0; c < cnt[l]; c++) {
         i = row[l, c]
@@ -536,7 +536,7 @@ function route(l,   c, i, j, m, K, e, cid, k, h, r, first) {
         cid = find(ep[e]); ecomp[e] = cid
         if (!(cid in cLo)) {
             cLo[cid] = 999999; cHi[cid] = -999999
-            cPn[cid] = 0; cCn[cid] = 0; cDim[cid] = 1; cOrder[NCOMP++] = cid
+            cPn[cid] = 0; cCn[cid] = 0; cOrder[NCOMP++] = cid
         }
         if (cx[ep[e]] < cLo[cid]) cLo[cid] = cx[ep[e]]
         if (cx[ep[e]] > cHi[cid]) cHi[cid] = cx[ep[e]]
@@ -544,7 +544,6 @@ function route(l,   c, i, j, m, K, e, cid, k, h, r, first) {
         if (cx[ec[e]] > cHi[cid]) cHi[cid] = cx[ec[e]]
         if (!((cid SUBSEP ep[e]) in seenP)) { seenP[cid, ep[e]] = 1; cPn[cid]++ }
         if (!((cid SUBSEP ec[e]) in seenC)) { seenC[cid, ec[e]] = 1; cCn[cid]++ }
-        if (!doneish(ep[e]) || !doneish(ec[e])) cDim[cid] = 0
     }
     # Route by whichever side is narrower: one rail row per parent, or one per
     # child. Either way a row carries exactly one node on the routed side, so
@@ -614,7 +613,14 @@ function draw(   l, c, i, e, nc, cid, dim, xp, xc, lo, hi, x, r) {
         route(l)
         nc = (RN < 1) ? 1 : RN
         for (e = 0; e < NE; e++) {
-            cid = ecomp[e]; dim = cDim[cid]
+            # PER EDGE, not per component. A rail band is one component, but it
+            # routinely carries a finished parent's link to its finished child
+            # alongside a dummy trunk heading for something still open — and at
+            # component granularity that one unfinished target dragged the whole
+            # band, including the settled links, back to the bright tier. Cells
+            # shared by several edges resolve to bright automatically: addm()
+            # marks rnorm when ANY edge through the cell is undimmed.
+            cid = ecomp[e]; dim = (doneish(ep[e]) && doneish(ec[e]))
             xp = cx[ep[e]]; xc = cx[ec[e]]
             if (cid in cStraight) { vseg(Y, Y + nc - 1, xp, dim); continue }
             r = Y + erow[e]
@@ -689,16 +695,19 @@ function eligible(i,   m, B, j, p) {
 # done, that one dim attribute leaked across the rest of the row and washed the
 # whole graph out to grey -- the colours were being emitted the entire time.
 #
-# Green is the progress axis: dark faded green for landed work, bright green for
-# the task an agent is on right now, grey for anything not yet started. Colour
-# still only reinforces the glyph (see glyph() above), never replaces it.
+# Green is the progress axis: a dimmed, faded green for landed work and a
+# calmer mid green for the task an agent is on right now, with grey for anything
+# not yet started. The running colour is deliberately NOT a vivid one -- at full
+# saturation it dominated a graph where it is the single most important cell,
+# and loud is not the same as legible. Colour still only reinforces the glyph
+# (see glyph() above), never replaces it.
 #
 # Keep in sync with the ST_* palette in scripts/arachne-monitor.
 function hue(i,   s) {
     if (!color) return ""
     s = st[i]
-    if (s == "done")        return "\033[0;38;5;65m"                                    # ✓ dark faded green
-    if (s == "in_progress") return islive(i) ? "\033[0;1;38;5;46m" : "\033[0;38;5;179m" # ▶ bright green / ⧗ amber
+    if (s == "done")        return "\033[0;2;38;5;65m"                                # ✓ dark faded green
+    if (s == "in_progress") return islive(i) ? "\033[0;38;5;71m" : "\033[0;38;5;179m" # ▶ green / ⧗ amber
     if (s == "blocked")     return "\033[0;38;5;131m"                                   # ⊘ muted red
     if (s == "needs-review" || s == "stuck") return "\033[0;1;38;5;203m"                 # ! bright red
     if (s == "open")        return eligible(i) ? "\033[0;38;5;250m" : "\033[0;2;38;5;244m" # ○ grey / ◌ dim grey
@@ -713,11 +722,23 @@ function put(y, x, ch) {
 }
 
 function flush(   y, x, xhi, line, c, o, cur, want, RAIL, DIM, RST) {
-    # Leading 0; for the same reason as hue(): these alternate with node colours
-    # cell by cell, so a non-absolute sequence inherits whichever attribute the
-    # previous box happened to leave on.
-    RAIL = color ? "\033[0;38;5;245m" : ""
-    DIM  = color ? "\033[0;2;38;5;238m" : ""
+    # Two edge tiers. DIM carries an edge whose BOTH endpoints are done, and
+    # wears the done nodes' green: a finished parent joined to finished children
+    # then reads as one settled green subtree rather than a green box, a grey
+    # line, another green box. RAIL carries anything still touching unfinished
+    # work, including a cell any such edge passes through.
+    #
+    # Both must stay LEGIBLE. The done tier was a dimmed 238, which on a dark
+    # background is indistinguishable from no edge at all -- and on a nearly
+    # finished phase that is most of the graph, so the structure the tab exists
+    # to show simply vanished. It uses the UNDIMMED 65 for that reason: a hairline
+    # needs more luminance than a filled label to read at the same weight. The
+    # tiers say "behind you" vs "ahead of you"; neither says "not drawn".
+    #
+    # Dummy trunks inherit their target's status (see dummies()), so a multi-layer
+    # edge into unfinished work correctly stays on the bright tier.
+    RAIL = color ? "\033[0;38;5;249m" : ""
+    DIM  = color ? "\033[0;38;5;65m" : ""
     RST  = color ? "\033[0m" : ""
     # Clip to the caller's viewport. A whole-corpus graph is ~9000 columns wide;
     # building those lines in full costs seconds of string reallocation for

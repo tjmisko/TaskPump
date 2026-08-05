@@ -136,8 +136,8 @@ task_status() {  # $1 = task id -> status string or "-"
 # Every sequence re-opens with 0; because SGR dim/bold are sticky and otherwise
 # bleed into everything painted after them. Keep in sync with hue() in
 # scripts/arachne-dag-layout.awk, which paints the same states on the canvas.
-ST_DONE=$'\033[0;38;5;65m'        # ✓ done      — dark faded green
-ST_LIVE=$'\033[0;1;38;5;46m'      # ▶ running   — bright green, an agent is on it
+ST_DONE=$'\033[0;2;38;5;65m'      # ✓ done      — dark faded green
+ST_LIVE=$'\033[0;38;5;71m'        # ▶ running   — mid green, an agent is on it
 ST_PARK=$'\033[0;38;5;179m'       # ⧗ parked    — claimed, no live container
 ST_BLOCK=$'\033[0;38;5;131m'      # ⊘ blocked   — muted red
 ST_ALERT=$'\033[0;1;38;5;203m'    # ! review    — needs-review / stuck
