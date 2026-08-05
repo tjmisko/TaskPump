@@ -896,8 +896,7 @@ term_height() {
 hbar() { local w="$1" s; printf -v s '%*s' "$w" ''; printf '%s' "${s// /─}"; }
 
 header() {  # $1 = optional suffix tag
-    local w; w="$(term_width)"
-    printf '%sArachne parallel agents%s %s— %s%s%s\n' \
+    printf '%sArachne Task Pump%s %s— %s%s%s\n' \
         "$C_STRONG" "$ST_RST" "$C_MUTED" "$(date '+%Y-%m-%d %H:%M:%S')" "${1:-}" "$ST_RST"
     rule
 }
@@ -988,21 +987,24 @@ render_sessions() {  # $1 = width
 }
 
 # ── Tabs ─────────────────────────────────────────────────────────────────────
-# The active tab is marked by brackets AND weight, never by colour alone, so it
-# survives --no-color terminals and colour-blind readers.
+# The active tab is marked by BOLD WEIGHT and colour together, never by colour
+# alone: C_STRONG carries a `1` that C_RULE does not, so the mark still reads on
+# --no-color and for a colour-blind reader (R2). That weight is the non-colour
+# signal, which is why the tab bar no longer needs the `┤ ├` brackets.
+#
+# Each label sits in a fixed-width cell in BOTH states, so switching tabs never
+# shifts a column: a label's start column is a property of the tab, not of which
+# one happens to be selected. Changing one cell's padding means changing both.
 tab_bar() {
-    local s g
+    local cs cg
     # Inactive is C_RULE undimmed rather than dim+245: the same apparent weight
-    # without a `2` that would leak into the hint after it (R1).
-    if (( TAB == 0 )); then
-        s="$C_STRONG┤ SESSIONS ├$ST_RST"; g="$C_RULE   GRAPH   $ST_RST"
-    else
-        s="$C_RULE  SESSIONS  $ST_RST"; g="$C_STRONG┤ GRAPH ├$ST_RST"
-    fi
-    local hint
-    if (( TAB == 0 )); then hint='Tab / ← → switch · ↑↓ select · Enter open · q quit'
-    else hint='Tab switch · ↑↓←→ move · o open · . running · q quit'; fi
-    printf '%s%s   %s%s%s\n' "$s" "$g" "$C_MUTED" "$hint" "$ST_RST"
+    # without a `2` that would leak into the affordance after it (R1).
+    cs="$C_RULE"; cg="$C_RULE"
+    if (( TAB == 0 )); then cs="$C_STRONG"; else cg="$C_STRONG"; fi
+    # One affordance, not a keymap — the `?` / `:help` overlay owns the per-tab
+    # key list, so the bar points at it instead of enumerating it.
+    printf '%s  SESSIONS  %s%s  GRAPH  %s   %s:help%s\n' \
+        "$cs" "$ST_RST" "$cg" "$ST_RST" "$C_MUTED" "$ST_RST"
 }
 
 # graph_live_branches -- worktree branches with a live agent container, as the

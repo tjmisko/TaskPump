@@ -86,7 +86,10 @@ glyph; a chrome grey never does.**
 ### SELECTION — never a colour
 
 Weight and glyph only: `▸` + bold on SESSIONS, the heavy border `┏━┓` on GRAPH,
-`┤ ├` on the tab bar. A selected node has to keep showing its own status colour,
+bold weight on the tab bar's active label (its `┤ ├` brackets were dropped once
+the weight was carrying the mark on its own; the label cells stay a fixed width
+in both states so switching tabs shifts nothing). A selected node has to keep
+showing its own status colour,
 so a "selected" hue would either overwrite that or introduce a fifth family.
 
 **Cyan is deleted.** It was the session dot, the pump status word, and the ready
@@ -169,7 +172,8 @@ the log tails — the largest block of text in the UI — were unreadable.
    the gauges are the one surface where a non-state hue is correct.
 5. **Glyph redundancy.** Do not drop a glyph because the colour now says the same
    thing; R2 is why the palette can be tuned at all.
-6. **Bracket-and-weight selection markers** (`┤ ├`, `▸`, `┏━┓`).
+6. **The non-colour half of every selection marker** (`▸`, `┏━┓`, and the bold
+   weight on the active tab). Dropping one leaves colour carrying state alone.
 7. **The awk's `color ? … : ""` guard.** It is what makes the renderer testable
    and pipe-safe; every new token must respect it the same way.
 

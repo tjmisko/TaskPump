@@ -277,11 +277,17 @@ rows=$(printf '%s' "$frame" | grep -c .)
 # ── Test 16: tab bar + --tab selection ────────────────────────────────────────
 echo "--- Test 16: tabs ---"
 make_usage_stub 30 40
-sess_out=$("$CLI" 2>/dev/null | strip_ansi)
-grep -q '┤ SESSIONS ├' <<<"$sess_out" && pass "SESSIONS tab is active by default" || fail "no active SESSIONS tab:\n$sess_out"
+# The active tab is marked by WEIGHT now, not by `┤ ├`, so it can only be
+# asserted before strip_ansi. tab_row picks the one line carrying both labels.
+tab_row() { grep 'SESSIONS.*GRAPH'; }
+C_STRONG_SGR=$'\033[0;1;38;5;252m'   # the `1` is the active-tab mark
+sess_raw=$("$CLI" 2>/dev/null); sess_out=$(strip_ansi <<<"$sess_raw")
+sess_tab=$(tab_row <<<"$sess_raw")
+grep -qF "$C_STRONG_SGR  SESSIONS" <<<"$sess_tab" && pass "SESSIONS tab is active by default" || fail "no active SESSIONS tab:\n$(cat -v <<<"$sess_tab")"
 grep -q 'GRAPH' <<<"$sess_out" && pass "GRAPH tab is listed" || fail "GRAPH tab missing"
-graph_out=$("$CLI" --tab graph 2>/dev/null | strip_ansi)
-grep -q '┤ GRAPH ├' <<<"$graph_out" && pass "--tab graph activates the GRAPH tab" || fail "--tab graph not active:\n$graph_out"
+graph_raw=$("$CLI" --tab graph 2>/dev/null); graph_out=$(strip_ansi <<<"$graph_raw")
+graph_tab=$(tab_row <<<"$graph_raw")
+grep -qF "$C_STRONG_SGR  GRAPH" <<<"$graph_tab" && pass "--tab graph activates the GRAPH tab" || fail "--tab graph not active:\n$(cat -v <<<"$graph_tab")"
 grep -q '✓ done' <<<"$graph_out" && pass "GRAPH tab shows the status legend" || fail "no legend on the graph tab"
 # No pump state is configured in this harness, so the graph must say so rather
 # than rendering the entire ledger.
@@ -646,6 +652,52 @@ offenders=$(grep -nE $'\033\\[[0-9;]*(3[0-7]|9[0-7]|7)m' "$CLI" | grep -v '^\s*#
 leaky=$(grep -oE $'\033\\[[0-9;]+m' "$CLI" | grep -vE $'\033\\[0([;m])' || true)
 [[ -z "$leaky" ]] && pass "every colour sequence re-opens with 0" \
     || fail "non-absolute sequences: $(tr -d '\033' <<<"$leaky" | sort -u | tr '\n' ' ')"
+
+# ── Test 24: the tab bar marks the active tab by weight, not by brackets ─────
+# The `┤ ├` indicators are gone. Bold weight is now the whole non-colour half of
+# the mark (R2) — it is all a --no-color or colour-blind reader has — so it must
+# land on exactly the active label. And because a bracket was also doing the
+# cell's padding, dropping it can silently move a label: the columns are pinned
+# here so switching tabs never reflows the row under the reader's eye.
+echo "--- Test 24: tab bar marking ---"
+strong_sgr=$'\033[0;1;38;5;252m'   # C_STRONG — active
+rule_sgr=$'\033[0;38;5;242m'       # C_RULE   — inactive, no bold
+sess_bar=$("$CLI" 2>/dev/null | grep 'SESSIONS.*GRAPH')
+graph_bar=$("$CLI" --tab graph 2>/dev/null | grep 'SESSIONS.*GRAPH')
+
+bold_hits=$(grep -oF "$strong_sgr" <<<"$sess_bar" | wc -l)
+[[ "$bold_hits" -eq 1 ]] && grep -qF "$strong_sgr  SESSIONS" <<<"$sess_bar" \
+    && grep -qF "$rule_sgr  GRAPH" <<<"$sess_bar" \
+    && pass "SESSIONS active: bold on its label, none on GRAPH" \
+    || fail "SESSIONS tab weight wrong (${bold_hits} bold runs):\n$(cat -v <<<"$sess_bar")"
+bold_hits=$(grep -oF "$strong_sgr" <<<"$graph_bar" | wc -l)
+[[ "$bold_hits" -eq 1 ]] && grep -qF "$strong_sgr  GRAPH" <<<"$graph_bar" \
+    && grep -qF "$rule_sgr  SESSIONS" <<<"$graph_bar" \
+    && pass "GRAPH active: bold on its label, none on SESSIONS" \
+    || fail "GRAPH tab weight wrong (${bold_hits} bold runs):\n$(cat -v <<<"$graph_bar")"
+
+if grep -qF '┤' <<<"$sess_bar$graph_bar" || grep -qF '├' <<<"$sess_bar$graph_bar"; then
+    fail "bracket indicator still on the tab row:\n$sess_bar\n$graph_bar"
+else
+    pass "no bracket glyph on the tab row"
+fi
+
+# Columns must not depend on which tab is selected.
+col_of() { awk -v n="$2" 'NR==1 { print index($0, n) }' <<<"$1"; }
+s_strip=$(strip_ansi <<<"$sess_bar"); g_strip=$(strip_ansi <<<"$graph_bar")
+sc_a=$(col_of "$s_strip" 'SESSIONS'); sc_b=$(col_of "$g_strip" 'SESSIONS')
+gc_a=$(col_of "$s_strip" 'GRAPH');    gc_b=$(col_of "$g_strip" 'GRAPH')
+[[ "$sc_a" -gt 0 && "$gc_a" -gt 0 && "$sc_a" == "$sc_b" && "$gc_a" == "$gc_b" ]] \
+    && pass "tab labels hold their columns across a switch (SESSIONS@$sc_a GRAPH@$gc_a)" \
+    || fail "tab labels shift on switch: SESSIONS $sc_a→$sc_b, GRAPH $gc_a→$gc_b"
+
+# The enumerated key hint is gone; one muted affordance points at the overlay.
+grep -q ':help' <<<"$s_strip" && grep -q ':help' <<<"$g_strip" \
+    && pass "tab row carries the :help affordance on both tabs" \
+    || fail "no :help affordance:\n$s_strip\n$g_strip"
+grep -qE 'q quit|Enter open|switch' <<<"$s_strip$g_strip" \
+    && fail "tab row still enumerates keys:\n$s_strip\n$g_strip" \
+    || pass "tab row enumerates no keys"
 
 echo
 echo "=============================================="
