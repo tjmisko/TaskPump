@@ -296,6 +296,77 @@ grep -q 'second event line' <<<"$feed_out" && pass "second feed line rendered (T
 # docker stub back to "no containers" for anything that follows.
 printf '#!/usr/bin/env bash\nexit 0\n' >| "$BIN/docker"; chmod +x "$BIN/docker"
 
+# ── Test 18: GRAPH tab cursor ────────────────────────────────────────────────
+# --moves replays cursor keys in one-shot mode, which is what makes navigation
+# assertable without a pty — the same trick --tab plays for the graph itself.
+echo "--- Test 18: graph cursor ---"
+GTD="$TMP/gtasks"; mkdir -p "$GTD"
+gtask() {  # <id> <status> <claimed_by> [blocker ...]
+    local id="$1" st="$2" by="$3"; shift 3
+    {
+        echo '---'; echo "id: \"$id\""; echo 'phase: "F96"'; echo "status: $st"
+        echo "claimed_by: $by"; echo "turn_budget_remaining: 7"
+        echo "goal: \"drive the $id outcome home\""
+        if (( $# )); then echo 'blockers:'; for b in "$@"; do echo "  - \"$b\""; done
+        else echo 'blockers: []'; fi
+        echo '---'; echo body
+    } >| "$GTD/$id.md"
+}
+#   .1 ─┬─ .2 ─── .4 ─── .6      (.6 also blocked by .1: a 3-layer span)
+#       └─ .3 ─── .5
+gtask F96.1 done        ""
+gtask F96.2 done        ""        F96.1
+gtask F96.3 done        ""        F96.1
+gtask F96.4 in_progress feat/f96  F96.2
+gtask F96.5 open        ""        F96.3
+gtask F96.6 open        ""        F96.4 F96.1
+GPS="$TMP/graph-pump.state"
+printf '%s' '{"phases":"F96","started_at":"2026-08-05T09:00:00Z","status":"running"}' >| "$GPS"
+gmon() { ARACHNE_PUMP_STATE_FILE="$GPS" ARACHNE_TASKS_DIR="$GTD" ARACHNE_MONITOR_COLS=100 \
+             "$CLI" --tab graph "$@" 2>/dev/null | strip_ansi; }
+gsel() { gmon "$@" | awk '/^F96\./ { print $1; exit }'; }
+
+sel=$(gsel)
+[[ "$sel" == "F96.4" ]] && pass "cursor defaults to the in_progress task ($sel)" \
+    || fail "default cursor should be the live task, got '$sel'"
+gmon | grep -q 'drive the F96.4 outcome home' \
+    && pass "status bar shows the selected task's goal" || fail "goal missing from the status bar"
+gmon | grep -qE 'F96\.4 .*7 turns.*feat/f96.*blockers F96\.2✓' \
+    && pass "status bar shows turns, branch and blocker statuses" \
+    || fail "status bar detail missing:\n$(gmon | sed -n '5p')"
+gmon | grep -q '┃ \.4 ' && pass "the selection is drawn with a heavy border" || fail "no heavy border in the graph"
+
+# ↑ prefers a blocker over the merely-nearest node; ↓ prefers a dependent.
+sel=$(gsel --cursor F96.4 --moves k)
+[[ "$sel" == "F96.2" ]] && pass "↑ walks to a blocker ($sel)" || fail "↑ should reach F96.2, got '$sel'"
+sel=$(gsel --cursor F96.2 --moves j)
+[[ "$sel" == "F96.4" ]] && pass "↓ walks to a dependent ($sel)" || fail "↓ should reach F96.4, got '$sel'"
+
+# Horizontal movement stays inside the layer.
+sel=$(gsel --cursor F96.2 --moves l)
+[[ "$sel" == "F96.3" ]] && pass "→ moves within the layer ($sel)" || fail "→ should reach F96.3, got '$sel'"
+sel=$(gsel --cursor F96.2 --moves hhhh)
+[[ "$sel" == "F96.2" ]] && pass "← clamps at the start of the layer" || fail "← ran off the layer to '$sel'"
+sel=$(gsel --cursor F96.2 --moves llll)
+[[ "$sel" == "F96.3" ]] && pass "→ clamps at the end of the layer" || fail "→ ran off the layer to '$sel'"
+
+# g / G jump to the ends of the DAG.
+sel=$(gsel --cursor F96.5 --moves g)
+[[ "$sel" == "F96.1" ]] && pass "g jumps to the first layer ($sel)" || fail "g should reach F96.1, got '$sel'"
+sel=$(gsel --cursor F96.1 --moves G)
+[[ "$sel" == "F96.6" ]] && pass "G jumps to the last layer ($sel)" || fail "G should reach F96.6, got '$sel'"
+
+# An unknown cursor falls back rather than rendering a selectionless graph.
+sel=$(gsel --cursor F96.999)
+[[ "$sel" == "F96.4" ]] && pass "an unknown cursor id falls back to the default" || fail "stale cursor kept: '$sel'"
+
+# The viewport follows the selection: in a terminal narrower than the graph, the
+# selected node must be on screen.
+narrow() { ARACHNE_PUMP_STATE_FILE="$GPS" ARACHNE_TASKS_DIR="$GTD" ARACHNE_MONITOR_COLS=40 \
+               "$CLI" --tab graph --cursor "$1" 2>/dev/null | strip_ansi; }
+narrow F96.5 | grep -q '┃ \.5 ' && pass "viewport pans to keep the selection visible" \
+    || fail "selection off-screen in a narrow terminal:\n$(narrow F96.5)"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"

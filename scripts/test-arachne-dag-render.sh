@@ -132,6 +132,104 @@ echo "--- Test 11: args ---"
 [[ "$rc" -ne 0 ]] && pass "unknown arg exits non-zero" || fail "unknown arg accepted"
 "$CLI" --help >/dev/null 2>&1 && pass "--help exits 0" || fail "--help failed"
 
+# ── Test 12: I2 — a multi-layer edge is actually drawn ──────────────────────
+# The exact bug v1 shipped: the router only joined layer L to L+1, so an edge
+# spanning further was silently dropped and the graph under-reported the DAG.
+# F92.5 is a root whose ONLY relationship is the 3-layer edge into F92.4, so if
+# that edge is missing it has no bottom port at all — the 2026-08-05 screenshot.
+echo "--- Test 12: multi-layer edges (I2) ---"
+mktask F92.1 F92 done ""
+mktask F92.2 F92 done ""        F92.1
+mktask F92.3 F92 done ""        F92.2
+mktask F92.5 F92 done ""
+mktask F92.4 F92 open ""        F92.3 F92.5
+IDX="$TMP/idx.tsv"
+span=$("$CLI" --phases F92 --no-color --index-file "$IDX" 2>/dev/null | strip)
+# The source box's bottom border must carry an outgoing port.
+srcport=$(awk '/│ \.5 /{getline; print; exit}' <<<"$span")
+grep -q '┬' <<<"$srcport" && pass "the far source .5 has a bottom port" \
+    || fail "multi-layer edge dropped at the source (bottom border: '$srcport')"
+tgtport=$(awk '/│ \.4 /{print prev; exit} {prev=$0}' <<<"$span")
+grep -q '┴' <<<"$tgtport" && pass "the far target .4 has a top port" \
+    || fail "multi-layer edge dropped at the target (top border: '$tgtport')"
+# ...and the trunk between them is one unbroken column (O2 for inner segments):
+# every row from under .5's box to above .4's box has ink in .5's port column.
+cx5=$(awk -F'\t' '$1=="F92.5"{print $4}' "$IDX")
+y5=$(awk -F'\t' '$1=="F92.5"{print $5}' "$IDX")
+y4=$(awk -F'\t' '$1=="F92.4"{print $5}' "$IDX")
+trunk=$(awk -v col="$cx5" -v lo="$((y5 + 3))" -v hi="$((y4 - 1))" '
+    NR - 1 >= lo && NR - 1 <= hi && substr($0, col + 1, 1) == " " { bad++ }
+    END { print bad + 0 }' <<<"$span")
+[[ -n "$cx5" && "$trunk" == "0" ]] && pass "the dummy trunk is a straight unbroken column" \
+    || fail "trunk column $cx5 broken in $trunk row(s) of $lo..$hi:\n$span"
+rm -f "$TD"/F92.*.md
+
+# ── Test 13: O2 — a single child sits directly under its parent ─────────────
+echo "--- Test 13: straightness (O2) ---"
+mktask F93.1 F93 done ""
+mktask F93.2 F93 open "" F93.1
+"$CLI" --phases F93 --no-color --index-file "$IDX" >/dev/null 2>&1
+cx1=$(awk -F'\t' '$1=="F93.1"{print $4}' "$IDX")
+cx2=$(awk -F'\t' '$1=="F93.2"{print $4}' "$IDX")
+[[ -n "$cx1" && "$cx1" == "$cx2" ]] \
+    && pass "an only child is x-aligned with its parent ($cx1)" \
+    || fail "single-child edge not vertical: parent=$cx1 child=$cx2"
+rm -f "$TD"/F93.*.md
+
+# ── Test 14: O3 — unrelated neighbours get a wider gutter than siblings ─────
+echo "--- Test 14: subtree separation (O3) ---"
+mktask F94.1 F94 done ""
+mktask F94.2 F94 done ""
+mktask F94.3 F94 done "" F94.1
+mktask F94.4 F94 done "" F94.1
+mktask F94.5 F94 done "" F94.2
+"$CLI" --phases F94 --no-color --index-file "$IDX" >/dev/null 2>&1
+g34=$(awk -F'\t' '$1=="F94.3"{a=$4} $1=="F94.4"{b=$4} END{d=b-a; print (d<0?-d:d)}' "$IDX")
+g45=$(awk -F'\t' '$1=="F94.4"{a=$4} $1=="F94.5"{b=$4} END{d=b-a; print (d<0?-d:d)}' "$IDX")
+[[ -n "$g34" && -n "$g45" && "$g45" -gt "$g34" ]] \
+    && pass "unrelated neighbours sit further apart than siblings ($g45 > $g34)" \
+    || fail "no subtree gutter: sibling gap=$g34 unrelated gap=$g45"
+rm -f "$TD"/F94.*.md
+
+# ── Test 15: O1 — ordering removes an avoidable crossing ────────────────────
+# Read in file order the layer-1 nodes start crossed (.3 hangs off .2, .4 off
+# .1). A working crossing-reduction pass swaps them, leaving no ┼ at all.
+echo "--- Test 15: crossing reduction (O1) ---"
+mktask F95.1 F95 done ""
+mktask F95.2 F95 done ""
+mktask F95.3 F95 done "" F95.2
+mktask F95.4 F95 done "" F95.1
+cross=$("$CLI" --phases F95 --no-color 2>/dev/null | strip | grep -c '┼' || true)
+[[ "$cross" == "0" ]] && pass "an avoidable crossing is ordered away" \
+    || fail "expected 0 crossings, drew $cross"
+rm -f "$TD"/F95.*.md
+
+# ── Test 16: determinism ────────────────────────────────────────────────────
+echo "--- Test 16: determinism (I6) ---"
+d1=$("$CLI" --phases F90 --no-color 2>/dev/null | md5sum)
+d2=$("$CLI" --phases F90 --no-color 2>/dev/null | md5sum)
+[[ "$d1" == "$d2" ]] && pass "two runs are byte-identical" || fail "render is not deterministic"
+
+# ── Test 17: cursor + index table ───────────────────────────────────────────
+echo "--- Test 17: cursor and index ---"
+cur=$("$CLI" --phases F90 --no-color --cursor F90.3 --index-file "$IDX" 2>/dev/null | strip)
+grep -q '┃ \.3 ' <<<"$cur" && pass "--cursor draws a heavy border" || fail "no heavy border:\n$cur"
+grep -q '│ \.1 ' <<<"$cur" && pass "unselected nodes keep a light border" || fail "light border lost"
+n_idx=$(wc -l < "$IDX")
+[[ "$n_idx" == "4" ]] && pass "index has one row per in-scope task (4)" || fail "index rows: $n_idx"
+awk -F'\t' '$1=="F90.4" && $2==2 && $10=="F90.2:done|F90.3:in_progress"' "$IDX" | grep -q . \
+    && pass "index carries layer and blocker statuses" \
+    || fail "index row wrong: $(grep F90.4 "$IDX")"
+awk -F'\t' '$1=="F90.3" && $7=="feat/f90"' "$IDX" | grep -q . \
+    && pass "index carries the claimed branch" || fail "claimed_by missing from index"
+
+# ── Test 18: viewport clipping ──────────────────────────────────────────────
+echo "--- Test 18: --cols clips the viewport ---"
+wide=$("$CLI" --phases F90 --no-color 2>/dev/null | strip | awk '{ if (length($0) > m) m = length($0) } END { print m }')
+clip=$("$CLI" --phases F90 --no-color --cols 12 2>/dev/null | strip | awk '{ if (length($0) > m) m = length($0) } END { print m }')
+[[ "$clip" -le 12 && "$wide" -gt "$clip" ]] \
+    && pass "--cols clips long lines ($wide → $clip)" || fail "--cols did not clip: $wide vs $clip"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"

@@ -38,9 +38,19 @@
 #   ./scripts/arachne-monitor --watch --log /tmp/mon.log   # log each redraw's timing
 #   ./scripts/arachne-monitor --no-disk   # hide the disk gauge
 #   ./scripts/arachne-monitor --demo      # synthetic sessions; no docker needed
+#   ./scripts/arachne-monitor --tab graph --cursor F79.5 --moves jj   # scripted focus
 #
-# Watch-mode keys:  j/k ↑/↓ scroll · g/G top/bottom · PgUp/PgDn (Ctrl-u/d) page
-#                   n add a note · e / Ctrl-G edit notes in nvim · q quit
+# Watch-mode keys, SESSIONS tab:
+#                   j/k ↑/↓ scroll · g/G top/bottom · PgUp/PgDn (Ctrl-u/d) page
+#                   ← → switch tab
+# Watch-mode keys, GRAPH tab (arrows move the CURSOR; the viewport follows it):
+#                   h/l ← → previous/next node in the layer
+#                   k/j ↑ ↓ nearest node one layer up/down, preferring a
+#                            connected one (a blocker, or a dependent)
+#                   g/G first/last layer · . recentre on the running task
+#                   PgUp/PgDn page the viewport without moving the cursor
+# Both tabs:        Tab / Shift-Tab switch tab · n add a note
+#                   e / Ctrl-G edit notes in nvim · q quit
 set -euo pipefail
 
 # REPO_ROOT is the checkout whose .worktrees/ hold the agent workspaces — i.e.
@@ -61,7 +71,8 @@ WATCH=0; INTERVAL="${ARACHNE_MONITOR_INTERVAL:-1}"; DEMO=0
 MONITOR_LOG="${ARACHNE_MONITOR_LOG:-}"        # redraw-instrumentation log (off if empty)
 SHOW_DISK="${ARACHNE_MONITOR_DISK:-1}"        # disk gauge on by default; --no-disk / =0 off
 # Tabs: 0 = SESSIONS (gauges + live sessions), 1 = GRAPH (layered task DAG).
-TAB=0; PAN=0
+# On the GRAPH tab a cursor selects one task node; the viewport follows it.
+TAB=0; PAN=0; CURSOR=""; MOVES=""; GRAPH_TOPH=7
 # Resolved next to this script, NOT under REPO_ROOT: the two differ whenever
 # ARACHNE_MONITOR_REPO_ROOT points a worktree copy at the primary checkout.
 DAG_BIN="${ARACHNE_DAG_BIN:-$(CDPATH= cd -- "$(dirname "$0")" && pwd)/arachne-dag-render}"
@@ -73,6 +84,10 @@ while [[ $# -gt 0 ]]; do
         --tab)          case "${2:-}" in graph|dag) TAB=1 ;; sessions) TAB=0 ;;
                             *) echo "ERROR: --tab wants sessions|graph" >&2; exit 1 ;;
                         esac; shift ;;
+        --cursor)       CURSOR="${2:-}"; shift ;;
+        --cursor=*)     CURSOR="${1#--cursor=}" ;;
+        --moves)        MOVES="${2:-}"; shift ;;
+        --moves=*)      MOVES="${1#--moves=}" ;;
         --tab=*)        case "${1#--tab=}" in graph|dag) TAB=1 ;; sessions) TAB=0 ;;
                             *) echo "ERROR: --tab wants sessions|graph" >&2; exit 1 ;;
                         esac ;;
@@ -718,7 +733,9 @@ tab_bar() {
     else
         s=$'\033[2;38;5;245m  SESSIONS  \033[0m'; g=$'\033[1m┤ GRAPH ├\033[0m'
     fi
-    printf '%s%s   \033[38;5;245mTab / ← → switch\033[0m\n' "$s" "$g"
+    local hint
+    if (( TAB == 0 )); then hint='Tab / ← → switch'; else hint='Tab switch · ↑↓←→ move · . running · q quit'; fi
+    printf '%s%s   \033[38;5;245m%s\033[0m\n' "$s" "$g" "$hint"
 }
 
 # graph_live_branches -- worktree branches with a live agent container, as the
@@ -742,23 +759,213 @@ graph_live_branches() {
     printf '%s' "${out%,}"
 }
 
+# ── Graph cursor ─────────────────────────────────────────────────────────────
+# The renderer emits a TSV node table alongside the picture; that table is the
+# only thing the monitor navigates by, so cursor movement never has to re-derive
+# the layout. Columns: id lay pos cx y status branch turns resumes blockers goal.
+declare -A GLAY GPOS GORD GCX GY GST GBY GTB GRA GBL GGOAL GKIDS
+GLAYERS=()
+graph_index_file() { printf '%s' "$CACHE_BASE-dag.$CACHE_KEY.tsv"; }
+# The monitor owns the pump-state path, so it resolves the range and passes it
+# explicitly — the renderer must not have to re-find .arachne-pump.state.
+graph_phases() {
+    [[ -f "$PUMP_STATE" ]] || return 0
+    jq -r '.phases // ""' "$PUMP_STATE" 2>/dev/null || true
+}
+# An empty subscript is an error on a bash associative array, so every lookup
+# has to be gated on the cursor being set at all — not just on it being known.
+graph_cur_ok() { [[ -n "$CURSOR" ]] && [[ -n "${GLAY[$CURSOR]:-}" ]]; }
+
+graph_load_index() {
+    local f; f="$(graph_index_file)"
+    GLAY=(); GPOS=(); GORD=(); GCX=(); GY=(); GST=(); GBY=(); GTB=(); GRA=(); GBL=(); GGOAL=(); GKIDS=()
+    GLAYERS=()
+    # The table lives in $TMPDIR and outlives the run that wrote it. With no
+    # pump there is no graph, so a leftover table must not resurrect a cursor
+    # for tasks the tab is telling the user it cannot show.
+    [[ -n "$(graph_phases)" ]] || { CURSOR=""; rm -f "$f" 2>/dev/null || true; return 0; }
+    [[ -s "$f" ]] || return 0
+    local id lay pos cx y st by tb ra bl goal b
+    while IFS=$'\t' read -r id lay pos cx y st by tb ra bl goal; do
+        [[ -z "$id" ]] && continue
+        GLAY[$id]=$lay; GPOS[$id]=$pos; GCX[$id]=$cx; GY[$id]=$y
+        GST[$id]=$st;   GBY[$id]=$by;   GTB[$id]=$tb; GRA[$id]=$ra
+        GBL[$id]=$bl;   GGOAL[$id]=$goal
+    done < "$f"
+    # Reverse edges, and per-layer id lists ordered by position, both built once
+    # per redraw so a keystroke is a lookup rather than a scan.
+    local -A byslot=()
+    for id in "${!GLAY[@]}"; do
+        byslot["${GLAY[$id]}.$(printf '%04d' "${GPOS[$id]}")"]=$id
+        [[ "${GBL[$id]}" == "-" ]] && continue
+        for b in ${GBL[$id]//|/ }; do
+            b="${b%%:*}"
+            [[ -n "${GLAY[$b]:-}" ]] && GKIDS[$b]="${GKIDS[$b]:-} $id"
+        done
+    done
+    local k lay
+    while IFS= read -r k; do
+        lay="${k%%.*}"
+        GLAYERS[$lay]="${GLAYERS[$lay]:-} ${byslot[$k]}"
+    done < <(printf '%s\n' "${!byslot[@]}" | sort -t. -k1,1n -k2,2n)
+    # GPOS is the renderer's slot, which counts the dummy trunk columns the
+    # index deliberately omits. Horizontal movement needs a dense ordinal over
+    # the real nodes only, or h/l skip and stall on the gaps.
+    local ord
+    for lay in "${!GLAYERS[@]}"; do
+        ord=0
+        for k in ${GLAYERS[$lay]}; do GORD[$k]=$ord; ord=$(( ord + 1 )); done
+    done
+}
+
+# graph_default_cursor -- what the cursor lands on with no prior selection: the
+# live agent's task if there is one, else the shallowest ready task, else the root.
+graph_default_cursor() {
+    local id best="" bestkey="" key
+    for id in "${!GLAY[@]}"; do
+        [[ "${GST[$id]}" == "in_progress" ]] || continue
+        printf '%s' "$id"; return 0
+    done
+    for id in "${!GLAY[@]}"; do
+        [[ "${GST[$id]}" == "open" ]] || continue
+        key="$(printf '%03d%s' "${GLAY[$id]}" "$id")"
+        [[ -z "$bestkey" || "$key" < "$bestkey" ]] && { bestkey="$key"; best="$id"; }
+    done
+    [[ -n "$best" ]] && { printf '%s' "$best"; return 0; }
+    printf '%s' "${GLAYERS[0]:-}" | awk '{print $1}'
+}
+
+# graph_nearest -- the node in $1's layer list closest to column $2, preferring
+# any id in the (space-separated) $3 set. That preference is what makes ↑ / ↓
+# walk the dependency chain instead of drifting sideways to a stranger.
+graph_nearest() {  # $1 layer-ids  $2 target-cx  $3 preferred-ids
+    local ids="$1" want="$2" pref=" ${3:-} " id d best="" bestd=-1 pbest="" pbestd=-1
+    for id in $ids; do
+        d=$(( GCX[$id] - want )); (( d < 0 )) && d=$(( -d ))
+        if (( bestd < 0 || d < bestd )); then bestd=$d; best="$id"; fi
+        if [[ "$pref" == *" $id "* ]] && (( pbestd < 0 || d < pbestd )); then pbestd=$d; pbest="$id"; fi
+    done
+    printf '%s' "${pbest:-$best}"
+}
+
+graph_move() {  # $1 = h|l|k|j|g|G
+    graph_cur_ok || { CURSOR="$(graph_default_cursor)"; return 0; }
+    local lay="${GLAY[$CURSOR]}" pos="${GORD[$CURSOR]}" id want
+    case "$1" in
+        h|l)
+            local -a arr=(${GLAYERS[$lay]})
+            local t
+            [[ "$1" == l ]] && t=$(( pos + 1 )) || t=$(( pos - 1 ))
+            (( t >= 0 && t < ${#arr[@]} )) && CURSOR="${arr[t]}"
+            ;;
+        k)
+            (( lay > 0 )) || return 0
+            want="${GCX[$CURSOR]}"
+            local blk="" b
+            [[ "${GBL[$CURSOR]}" != "-" ]] && for b in ${GBL[$CURSOR]//|/ }; do blk+=" ${b%%:*}"; done
+            id="$(graph_nearest "${GLAYERS[$(( lay - 1 ))]:-}" "$want" "$blk")"
+            [[ -n "$id" ]] && CURSOR="$id"
+            ;;
+        j)
+            want="${GCX[$CURSOR]}"
+            id="$(graph_nearest "${GLAYERS[$(( lay + 1 ))]:-}" "$want" "${GKIDS[$CURSOR]:-}")"
+            [[ -n "$id" ]] && CURSOR="$id"
+            ;;
+        g) CURSOR="$(graph_nearest "${GLAYERS[0]:-}" "${GCX[$CURSOR]}" "")" ;;
+        G) local last=$(( ${#GLAYERS[@]} - 1 ))
+           CURSOR="$(graph_nearest "${GLAYERS[$last]:-}" "${GCX[$CURSOR]}" "")" ;;
+    esac
+    return 0
+}
+
+# graph_apply_moves -- replay a --moves string against the cursor. This is what
+# makes navigation testable headlessly, the same way --tab made the DAG itself
+# testable: no pty, no key injection, just an assertion on the status bar.
+graph_apply_moves() {
+    [[ -n "$MOVES" ]] || return 0
+    local i c
+    for (( i=0; i<${#MOVES}; i++ )); do
+        c="${MOVES:i:1}"
+        case "$c" in
+            h|l|k|j|g|G) graph_move "$c" ;;
+            .)           CURSOR="$(graph_default_cursor)" ;;
+            *)           : ;;
+        esac
+    done
+}
+
+# graph_follow -- pan and scroll so the selection stays on screen. This is what
+# makes a graph wider than the terminal usable, and why panning (rather than
+# collapsing nodes) remains a viable overflow policy.
+graph_follow() {
+    graph_cur_ok || return 0
+    local cols rows body cx y margin=12
+    cols="$(term_width)"; rows="$(term_height)"
+    body=$(( rows - 1 - GRAPH_TOPH )); (( body < 3 )) && body=3
+    cx="${GCX[$CURSOR]}"; y="${GY[$CURSOR]}"
+    (( cx - margin < PAN )) && PAN=$(( cx - margin ))
+    (( cx + margin >= PAN + cols )) && PAN=$(( cx + margin - cols + 1 ))
+    (( PAN < 0 )) && PAN=0
+    # A node box is 3 rows; keep the whole box plus a row of its edges in view.
+    (( y - 1 < SCROLL )) && SCROLL=$(( y - 1 ))
+    (( y + 4 >= SCROLL + body )) && SCROLL=$(( y + 4 - body ))
+    (( SCROLL < 0 )) && SCROLL=0
+    return 0
+}
+
 # render_graph -- the SCROLLABLE region for the GRAPH tab. Rendered directly
 # rather than through a cache: one gawk pass over the whole task corpus is
-# ~40ms, comfortably inside the paint budget, and it keeps panning instant.
+# ~50ms, comfortably inside the paint budget, and it keeps panning instant.
 render_graph() {
     [[ -x "$DAG_BIN" ]] || { printf '(arachne-dag-render not found)\n'; return 0; }
-    # The monitor owns the pump-state path, so it resolves the range and passes
-    # it explicitly — the renderer must not have to re-find .arachne-pump.state.
-    local phases=""
-    [[ -f "$PUMP_STATE" ]] && phases="$(jq -r '.phases // ""' "$PUMP_STATE" 2>/dev/null || echo '')"
+    local phases; phases="$(graph_phases)"
     if [[ -z "$phases" ]]; then
         printf '%s(no pump running — nothing scoped to graph)%s\n' "$BAR_EMPTY" "$BAR_RST"
         printf '%s start a pump, or: scripts/arachne-dag-render --phases F79%s\n' "$BAR_EMPTY" "$BAR_RST"
         return 0
     fi
-    "$DAG_BIN" --phases "$phases" --pan "$PAN" \
+    "$DAG_BIN" --phases "$phases" --pan "$PAN" --cols "$(term_width)" \
+               --cursor "$CURSOR" --index-file "$(graph_index_file)" \
                --live-branches "$(graph_live_branches)" 2>/dev/null \
         || printf '(dag render failed)\n'
+}
+
+GRAPH_LEGEND=$'\033[2;38;5;245m✓ done  ▶ running  ⧗ parked  ○ ready  ◌ waiting  ⊘ blocked  ! review\033[0m'
+
+# graph_detail_lines -- the two-line top status bar describing the selection.
+# Falls back to the legend when nothing is selected, so the region never jumps.
+graph_detail_lines() {
+    if ! graph_cur_ok; then
+        printf '%s\n' "$GRAPH_LEGEND"
+        printf '%s%s%s\n' "$BAR_EMPTY" "  ↑↓←→ move · . running · g/G ends · PgUp/PgDn page" "$BAR_RST"
+        return 0
+    fi
+    local st="${GST[$CURSOR]}" word glyph parts="" b bid bst bg
+    case "$st" in
+        done)         glyph='✓'; word='done' ;;
+        in_progress)  glyph='▶'; word='in progress' ;;
+        blocked)      glyph='⊘'; word='blocked' ;;
+        needs-review) glyph='!'; word='needs review' ;;
+        stuck)        glyph='!'; word='stuck' ;;
+        open)         if [[ "${GBL[$CURSOR]}" == *':'* && "${GBL[$CURSOR]}" == *[!:]* ]] \
+                          && [[ "${GBL[$CURSOR]}" =~ :(open|in_progress|blocked|needs-review|stuck) ]]
+                      then glyph='◌'; word='waiting'; else glyph='○'; word='ready'; fi ;;
+        *)            glyph='○'; word="$st" ;;
+    esac
+    [[ "${GTB[$CURSOR]}" != "null" ]] && parts+=" · ${GTB[$CURSOR]} turns"
+    [[ "${GRA[$CURSOR]}" != "null" && "${GRA[$CURSOR]}" != "0" ]] && parts+=" · resume ${GRA[$CURSOR]}"
+    [[ "${GBY[$CURSOR]}" != "null" ]] && parts+=" · ${GBY[$CURSOR]}"
+    if [[ "${GBL[$CURSOR]}" != "-" ]]; then
+        parts+=" · blockers"
+        for b in ${GBL[$CURSOR]//|/ }; do
+            bid="${b%%:*}"; bst="${b##*:}"
+            case "$bst" in done) bg='✓' ;; in_progress) bg='▶' ;; blocked) bg='⊘' ;;
+                           needs-review|stuck) bg='!' ;; *) bg='○' ;; esac
+            parts+=" $bid$bg"
+        done
+    fi
+    printf '\033[1m%s\033[0m  %s %s%s\n' "$CURSOR" "$glyph" "$word" "$parts"
+    printf '%s  %s%s\n' "$BAR_EMPTY" "${GGOAL[$CURSOR]:-}" "$BAR_RST"
 }
 
 render_graph_top() {
@@ -767,12 +974,20 @@ render_graph_top() {
     local uj='{}'
     [[ -x "$USAGE_BIN" ]] && uj="$("$USAGE_BIN" --json 2>/dev/null || echo '{}')"
     [[ -f "$PUMP_STATE" ]] && pump_summary_line "$uj"
-    printf '\033[2;38;5;245m✓ done  ▶ running  ⧗ parked  ○ ready  ◌ waiting  ⊘ blocked  ! review\033[0m\n'
+    graph_detail_lines
     rule
 }
 
 render_all() {  # one-shot / pipe: top then body, no viewport clipping
     if (( TAB == 1 )); then
+        # One-shot has no prior frame, so prime the index with a throwaway render
+        # before describing the selection. Costs one extra gawk pass, off the
+        # interactive path entirely.
+        [[ -n "$(graph_phases)" ]] && { render_graph >/dev/null 2>&1 || true; }
+        graph_load_index
+        graph_cur_ok || CURSOR="$(graph_default_cursor)"
+        graph_apply_moves
+        graph_follow
         render_graph_top
         render_graph
         return 0
@@ -952,7 +1167,14 @@ if [[ "$WATCH" -eq 1 ]]; then
         __redraw=$((__redraw + 1))
         __t0="$(_now_us)"
         if (( TAB == 1 )); then
+            # Index, then follow, then paint: the cursor's coordinates come from
+            # the PREVIOUS frame's table, which is what lets one keystroke move
+            # the selection and the viewport in the same redraw.
+            graph_load_index
+            graph_cur_ok || CURSOR="$(graph_default_cursor)"
+            graph_follow
             __top="$(render_graph_top 2>/dev/null || true)"
+            mapfile -t __T <<< "$__top"; GRAPH_TOPH=${#__T[@]}
             mapfile -t __SESS < <(render_graph 2>/dev/null || true)
         else
             __top="$(render_top 2>/dev/null || true)"
@@ -966,24 +1188,45 @@ if [[ "$WATCH" -eq 1 ]]; then
         if [[ -t 0 ]]; then
             __key="$(read_key)"
             __page=$(( $(term_height) / 2 )); (( __page < 1 )) && __page=1
-            case "$__key" in
-                q|Q)                 break ;;
-                # Tab switching resets the viewport: the two tabs have unrelated
-                # coordinate spaces, so carrying scroll/pan across is meaningless.
-                $'\t'|STAB|LEFT|RIGHT) TAB=$(( 1 - TAB )); SCROLL=0; PAN=0 ;;
-                h|H)                 (( TAB == 1 )) && { PAN=$(( PAN - 8 )); (( PAN < 0 )) && PAN=0; } ;;
-                l|L)                 (( TAB == 1 )) && PAN=$(( PAN + 8 )) ;;
-                .)                   SCROLL=0; PAN=0 ;;
-                n|N)                 notes_input_mode ;;
-                e|E|$'\x07')         edit_in_nvim "$(notes_file)" ;;
-                j|J|DOWN)            SCROLL=$(( SCROLL + 1 )) ;;
-                k|K|UP)              SCROLL=$(( SCROLL - 1 )) ;;
-                $'\x04'|PGDN|' ')    SCROLL=$(( SCROLL + __page )) ;;
-                $'\x15'|PGUP|b)      SCROLL=$(( SCROLL - __page )) ;;
-                g|HOME)              SCROLL=0 ;;
-                G|END)               SCROLL=999999 ;;
-                *)                   : ;;
-            esac
+            # On the GRAPH tab the arrows and hjkl drive the CURSOR, not the
+            # viewport — graph_follow pans and scrolls to keep it visible. Tab /
+            # Shift-Tab are the only tab switch there; PgUp/PgDn still page the
+            # viewport on its own, for reading without losing the selection.
+            if (( TAB == 1 )); then
+                case "$__key" in
+                    q|Q)                 break ;;
+                    $'\t'|STAB)          TAB=0; SCROLL=0; PAN=0 ;;
+                    h|H|LEFT)            graph_move h ;;
+                    l|L|RIGHT)           graph_move l ;;
+                    k|K|UP)              graph_move k ;;
+                    j|J|DOWN)            graph_move j ;;
+                    g|HOME)              graph_move g ;;
+                    G|END)               graph_move G ;;
+                    .)                   CURSOR="$(graph_default_cursor)" ;;
+                    $'\x04'|PGDN|' ')    SCROLL=$(( SCROLL + __page )) ;;
+                    $'\x15'|PGUP|b)      SCROLL=$(( SCROLL - __page )) ;;
+                    n|N)                 notes_input_mode ;;
+                    e|E|$'\x07')         edit_in_nvim "$(notes_file)" ;;
+                    *)                   : ;;
+                esac
+            else
+                case "$__key" in
+                    q|Q)                 break ;;
+                    # Tab switching resets the viewport: the two tabs have unrelated
+                    # coordinate spaces, so carrying scroll/pan across is meaningless.
+                    $'\t'|STAB|LEFT|RIGHT) TAB=1; SCROLL=0; PAN=0 ;;
+                    .)                   SCROLL=0; PAN=0 ;;
+                    n|N)                 notes_input_mode ;;
+                    e|E|$'\x07')         edit_in_nvim "$(notes_file)" ;;
+                    j|J|DOWN)            SCROLL=$(( SCROLL + 1 )) ;;
+                    k|K|UP)              SCROLL=$(( SCROLL - 1 )) ;;
+                    $'\x04'|PGDN|' ')    SCROLL=$(( SCROLL + __page )) ;;
+                    $'\x15'|PGUP|b)      SCROLL=$(( SCROLL - __page )) ;;
+                    g|HOME)              SCROLL=0 ;;
+                    G|END)               SCROLL=999999 ;;
+                    *)                   : ;;
+                esac
+            fi
             (( SCROLL < 0 )) && SCROLL=0
         else
             sleep "$INTERVAL"

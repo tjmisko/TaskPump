@@ -311,7 +311,13 @@ function sharesParent(a, b,   m, k, A, C, i, j) {
             if (A[i] != "" && A[i] == C[j]) return 1
     return 0
 }
-function setx(i, v) { x0[i] = v; cx[i] = v + int((wd[i] - 1) / 2) }
+# Brandes-Kopf runs in PORT-COLUMN space, not left-edge space. Aligning left
+# edges lines up a 9-column box with a 1-column dummy at their left corners, so
+# a trunk entering a box jogged sideways by half a box width. Separation is
+# therefore expressed centre-to-centre.
+function lft(i) { return int((wd[i] - 1) / 2) }
+function rgt(i) { return wd[i] - 1 - int((wd[i] - 1) / 2) }
+function setcx(i, v) { cx[i] = v; x0[i] = v - lft(i) }
 
 # Separation between horizontally adjacent nodes: siblings sit tight, unrelated
 # neighbours get a visible gutter. This is O3, expressed as one number.
@@ -323,9 +329,16 @@ function gapTable(   l, c) {
 # Logical position/lookup: hdir 0 walks a layer left-to-right, hdir 1 mirrors it.
 function lpos(v, hd) { return hd ? cnt[lay[v]] - 1 - pos[v] : pos[v] }
 function nodeAt(l, k, hd) { return hd ? row[l, cnt[l] - 1 - k] : row[l, k] }
-function sepLog(l, p, hd,   u) {
-    if (hd) { u = row[l, cnt[l] - p]; return wd[u] + gapAt[l, cnt[l] - p] }
-    u = row[l, p - 1]; return wd[u] + gapAt[l, p]
+# Separation between the logical predecessor at p-1 and the node at p. Under
+# hd 1 the layer is mirrored, so the predecessor is the physically RIGHT
+# neighbour and the two half-widths swap roles.
+function sepLog(l, p, hd,   u, w) {
+    if (hd) {
+        u = row[l, cnt[l] - p]; w = row[l, cnt[l] - 1 - p]
+        return lft(u) + 1 + gapAt[l, cnt[l] - p] + rgt(w)
+    }
+    u = row[l, p - 1]; w = row[l, p]
+    return rgt(u) + 1 + gapAt[l, p] + lft(w)
 }
 
 # Type-1 conflict: a segment with a dummy endpoint on both ends (an "inner"
@@ -420,8 +433,8 @@ function horizCompact(hd, run,   v, s) {
     # Mirrored runs measure from the right; flip them back into real columns.
     if (hd) {
         s = -1000000
-        for (v = 0; v < NT; v++) if (xb[v] + wd[v] > s) s = xb[v] + wd[v]
-        for (v = 0; v < NT; v++) xb[v] = s - xb[v] - wd[v]
+        for (v = 0; v < NT; v++) if (xb[v] > s) s = xb[v]
+        for (v = 0; v < NT; v++) xb[v] = s - xb[v]
     }
     for (v = 0; v < NT; v++) xr[run, v] = xb[v]
 }
@@ -433,8 +446,8 @@ function balance(   run, v, lo, hi, wmin, wrun, off, t, q, tmp, V, k) {
     for (run = 0; run < 4; run++) {
         lo = 1000000; hi = -1000000
         for (v = 0; v < NT; v++) {
-            if (xr[run, v] < lo) lo = xr[run, v]
-            if (xr[run, v] + wd[v] > hi) hi = xr[run, v] + wd[v]
+            if (xr[run, v] - lft(v) < lo) lo = xr[run, v] - lft(v)
+            if (xr[run, v] + rgt(v) > hi) hi = xr[run, v] + rgt(v)
         }
         rlo[run] = lo; rhi[run] = hi
         wrun = hi - lo
@@ -450,7 +463,7 @@ function balance(   run, v, lo, hi, wmin, wrun, off, t, q, tmp, V, k) {
         for (t = 1; t < 4; t++) { tmp = V[t]; q = t - 1
             while (q >= 0 && V[q] > tmp) { V[q + 1] = V[q]; q-- }
             V[q + 1] = tmp }
-        setx(v, int((V[1] + V[2]) / 2 + 0.5))
+        setcx(v, int((V[1] + V[2]) / 2 + 0.5))
     }
 }
 # Averaging four feasible layouts can shave a gap below the minimum, so the
@@ -459,15 +472,15 @@ function fixFeasible(   l, c, i, j, need) {
     for (l = 0; l <= maxl; l++)
         for (c = 1; c < cnt[l]; c++) {
             i = row[l, c - 1]; j = row[l, c]
-            need = x0[i] + wd[i] + gapAt[l, c]
-            if (x0[j] < need) setx(j, need)
+            need = cx[i] + rgt(i) + 1 + gapAt[l, c] + lft(j)
+            if (cx[j] < need) setcx(j, need)
         }
 }
 function normX(   i, lo) {
     lo = 1000000
     for (i = 0; i < NT; i++) if (x0[i] < lo) lo = x0[i]
     if (lo == 0) return
-    for (i = 0; i < NT; i++) setx(i, x0[i] - lo)
+    for (i = 0; i < NT; i++) setcx(i, cx[i] - lo)
 }
 function xassign(   run) {
     gapTable()
