@@ -61,11 +61,15 @@ export MANIFEST="$TMP/empty-manifest.tsv"; : >| "$MANIFEST"
 # Disk gauge runs du/git/df on the real tree — disable it for the generic tests;
 # the dedicated disk test (Test 8) re-enables it against stubs + a seeded cache.
 export ARACHNE_MONITOR_DISK=0
-# The session cache is keyed by REPO ROOT, not by this harness, so without an
-# override the generic tests read whatever a real monitor run left in $TMPDIR —
-# and then a stubbed "no containers" docker asserts against the host's actual
-# agents. That made Test 4 pass or fail depending on whether a pump happened to
-# be up. Give the harness its own cache and warm it once.
+# EVERY cache the monitor keeps — sessions, pump queue, disk, and the GRAPH tab's
+# node index — lives at "$TMPDIR/arachne-monitor-*.<cksum of repo root>.tsv". The
+# key is the repo root, not this harness, so without isolation the fixtures read
+# whatever a real monitor run left behind: a stubbed "no containers" docker would
+# assert against the host's actual agents, and an F96 cursor fixture would
+# navigate a cached F79 graph. Both produced failures that depended on whether a
+# pump happened to be running. Redirecting TMPDIR into the per-run temp dir
+# isolates all four at once.
+export TMPDIR="$TMP"
 export ARACHNE_MONITOR_SESS_CACHE="$TMP/generic-sess.tsv"
 "$CLI" >/dev/null 2>&1
 for _ in 1 2 3 4 5 6 7 8 9 10; do [[ -s "$ARACHNE_MONITOR_SESS_CACHE" ]] && break; sleep 0.3; done
@@ -86,9 +90,11 @@ filled=$(grep -o '█' <<<"$five_line" | wc -l | tr -d ' ')
 [[ "$filled" == "19" ]] && pass "95% bar has 19/20 filled cells" || fail "95% expected 19 filled got $filled"
 empties=$(grep -o '░' <<<"$five_line" | wc -l | tr -d ' ')
 [[ "$empties" == "1" ]] && pass "95% bar has 1/20 empty cell" || fail "95% expected 1 empty got $empties"
-printf '%s' "$five_line" | grep -q $'\033\[1;31m' && pass "95% (critical) bar uses red fill" || fail "95% bar not red"
+printf '%s' "$five_line" | grep -q $'\033\[0;1;38;5;203m' \
+  && pass "95% (critical) bar uses the alert coral" || fail "95% bar not coral"
 seven_line=$(grep '7d' <<<"$out2" | head -1)
-printf '%s' "$seven_line" | grep -q $'\033\[38;5;173m' && pass "62% (normal) bar uses terracotta fill" || fail "62% bar not terracotta"
+printf '%s' "$seven_line" | grep -q $'\033\[0;38;5;173m' \
+  && pass "62% (normal) bar uses terracotta fill" || fail "62% bar not terracotta"
 
 # ── Test 3: usage_bars path (no pump) reflects the stubbed percentages ─────────
 echo "--- Test 3: live usage_bars path ---"
@@ -168,10 +174,15 @@ grep -qE 'docker img 15\.4G · cache 9\.6G' <<<"$outp" && pass "docker breakdown
 grep -q 'largest:' <<<"$outp" && fail "largest: line should be gone" || pass "largest: line removed"
 
 # Free-space colour bands (panic<5G red, pause<10G amber, else terracotta).
-fb() { DF_AVAIL_KB=$1 run_disk | grep -E '^[[:space:]]*Disk '; }
-printf '%s' "$(fb 52428800)" | grep -q $'\033\[38;5;173m' && pass "50G free → terracotta bar" || fail "50G not terracotta"
-printf '%s' "$(fb 8388608)"  | grep -q $'\033\[33m'      && pass "8G free → amber (pause band)"  || fail "8G not amber"
-printf '%s' "$(fb 3145728)"  | grep -q $'\033\[1;31m'    && pass "3G free → red (panic band)"    || fail "3G not red"
+# Matches "Disk" alone, not "Disk ": these assertions read the RAW output (they
+# are about escapes), and the label is now wrapped in its own colour, so the
+# line is `<indent>ESC[…mDiskESC[0m …` with no space adjacent to the word.
+fb() { DF_AVAIL_KB=$1 run_disk | grep 'Disk'; }
+# The escalation bands reuse STATE's amber and coral verbatim, so amber means
+# "attention" and coral means "act now" for a disk exactly as for a task.
+printf '%s' "$(fb 52428800)" | grep -q $'\033\[0;38;5;173m'   && pass "50G free → terracotta bar" || fail "50G not terracotta"
+printf '%s' "$(fb 8388608)"  | grep -q $'\033\[0;38;5;179m'   && pass "8G free → amber (pause band)"  || fail "8G not amber"
+printf '%s' "$(fb 3145728)"  | grep -q $'\033\[0;1;38;5;203m' && pass "3G free → coral (panic band)"  || fail "3G not coral"
 
 # --no-disk suppresses the gauge entirely.
 nd=$(ARACHNE_MONITOR_DISK=1 ARACHNE_MONITOR_DISK_CACHE="$DCACHE" ARACHNE_MONITOR_MAIN_ROOT="$FAKE_MAIN" "$CLI" --no-disk 2>/dev/null)
@@ -619,6 +630,22 @@ arm_has 'HOME)' 'SESS_SEL=0' \
     && pass "SESSIONS keeps Home as the first session" || fail "SESSIONS Home arm changed"
 arm_has 'END)' 'SESS_SEL=999999' \
     && pass "SESSIONS keeps End as the last session" || fail "SESSIONS End arm changed"
+
+# ── Test 23: the colour system admits no basic-ANSI ──────────────────────────
+# Rule R3. Basic-ANSI numbers (30-37, 90-97) and reverse video resolve through
+# the terminal's theme, so they cannot be reasoned about or checked for
+# contrast: under Catppuccin Mocha `32m` is #a6e3a1, a bright pastel that could
+# not sit beside the graph's #5FAF5F — which is exactly the clash this system
+# was written to delete. This guard is what stops one creeping back in.
+echo "--- Test 23: no basic-ANSI colour ---"
+offenders=$(grep -nE $'\033\\[[0-9;]*(3[0-7]|9[0-7]|7)m' "$CLI" | grep -v '^\s*#' || true)
+[[ -z "$offenders" ]] && pass "arachne-monitor emits no basic-ANSI colour or reverse video" \
+    || fail "basic-ANSI colour reintroduced:\n$offenders"
+# Every sequence must also re-open with 0 (R1): SGR dim/bold are sticky, and a
+# leaked attribute has silently washed out both the DAG and every gauge fill.
+leaky=$(grep -oE $'\033\\[[0-9;]+m' "$CLI" | grep -vE $'\033\\[0([;m])' || true)
+[[ -z "$leaky" ]] && pass "every colour sequence re-opens with 0" \
+    || fail "non-absolute sequences: $(tr -d '\033' <<<"$leaky" | sort -u | tr '\n' ' ')"
 
 echo
 echo "=============================================="

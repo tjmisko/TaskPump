@@ -146,23 +146,50 @@ task_status() {  # $1 = task id -> status string or "-"
     yq --front-matter=extract '.status' "$f" 2>/dev/null || echo "?"
 }
 
-# ── Status palette ───────────────────────────────────────────────────────────
-# One colour vocabulary for task state everywhere it is shown: the session rows,
-# the GRAPH legend, the graph's own node boxes. Green is the progress axis —
-# dark faded green for landed work, bright green for whatever an agent is on
-# right now, grey for anything not yet started.
+# ── Colour system ────────────────────────────────────────────────────────────
+# Four families, and no colour outside them. A new surface picks its family by
+# asking what the colour is ABOUT. Full spec + contrast table:
+# scripts/DESIGN-monitor-colour.md.
 #
-# Every sequence re-opens with 0; because SGR dim/bold are sticky and otherwise
-# bleed into everything painted after them. Keep in sync with hue() in
-# scripts/arachne-dag-layout.awk, which paints the same states on the canvas.
-ST_DONE=$'\033[0;2;38;5;65m'      # ✓ done      — dark faded green
-ST_LIVE=$'\033[0;38;5;71m'        # ▶ running   — mid green, an agent is on it
-ST_PARK=$'\033[0;38;5;179m'       # ⧗ parked    — claimed, no live container
-ST_BLOCK=$'\033[0;38;5;131m'      # ⊘ blocked   — muted red
-ST_ALERT=$'\033[0;1;38;5;203m'    # ! review    — needs-review / stuck
-ST_READY=$'\033[0;38;5;250m'      # ○ ready     — grey
-ST_WAIT=$'\033[0;2;38;5;244m'     # ◌ waiting   — dim grey (blocked upstream, exited)
+# Three rules hold the whole thing together:
+#
+#   R1  Every sequence re-opens with 0;. SGR attributes are STICKY — a bare
+#       "\033[38;5;173m" sets only the foreground, so a 1 or 2 set earlier stays
+#       on. This has produced two live bugs already: one dimmed `done` box
+#       washing the whole DAG grey, and BAR_CAP's dim leaking into every gauge
+#       fill on screen (both were invisible until someone read the raw bytes).
+#   R2  State is never carried by colour alone — a glyph or word always carries
+#       it too. Invariant I5 in DESIGN-monitor-dag-v2.md. This is what makes the
+#       palette safe to retune and survivable on --no-color.
+#   R3  No basic-ANSI colour numbers (30-37, 90-97) and no reverse video. They
+#       resolve through the terminal's theme, so they cannot be reasoned about:
+#       under Catppuccin Mocha `32m` is #a6e3a1, a bright pastel that could not
+#       sit beside the graph's #5FAF5F, and that mismatch is exactly what this
+#       system was written to delete. Enforced by a test.
+#
+# STATE — where a task or agent is in its life. The only family allowed green,
+# amber or red. Green is the progress axis and has exactly TWO steps, settled
+# and live; there is deliberately no third green anywhere in the monitor.
+# Keep in sync with hue() in scripts/arachne-dag-layout.awk — one vocabulary in
+# two languages, and changing either alone is a bug.
+ST_DONE=$'\033[0;2;38;5;65m'      # ✓ done      — settled, behind you
+ST_LIVE=$'\033[0;38;5;71m'        # ▶ running   — an agent is on it right now
+ST_PARK=$'\033[0;38;5;179m'       # ⧗ parked    — attention, not yet a problem
+ST_BLOCK=$'\033[0;38;5;131m'      # ⊘ blocked   — cannot proceed
+ST_ALERT=$'\033[0;1;38;5;203m'    # ! review    — act now
+ST_READY=$'\033[0;38;5;250m'      # ○ ready     — eligible, not started
+ST_WAIT=$'\033[0;2;38;5;244m'     # ◌ waiting   — ineligible, not started
 ST_RST=$'\033[0m'
+
+# CHROME — structure and text carrying no state. Greys only, never a hue.
+# STATE's two neutral tiers are greys too; the overlap is intended, since grey
+# here means "no colour information". They are told apart by attachment — a
+# state grey always sits on a glyph, a chrome grey never does.
+C_STRONG=$'\033[0;1;38;5;252m'    # titles, selected row, input prompt
+C_TEXT=$'\033[0;38;5;252m'        # the datum you actually read
+C_MUTED=$'\033[0;38;5;245m'       # labels, units, hints, log tails — text floor
+C_RULE=$'\033[0;38;5;242m'        # rules, gauge troughs, inactive tab
+C_FAINT=$'\033[0;2;38;5;244m'     # empty states and placeholders only
 
 colorize() {  # colorize a status word
     case "$1" in
@@ -190,14 +217,23 @@ vis_len() {  # $1 = string -> char count of the ANSI-stripped text
 }
 
 # ── Bars ──────────────────────────────────────────────────────────────────────
-# A 20-cell █/░ bar (5% per cell) wrapped in faded-brown ▐ ▌ end-caps with a
-# Claude-terracotta fill, matching the ~/.claude/claude-status toolbar.
+# RESOURCE family: how much headroom is left. A gauge is not a task state, so it
+# keeps its own resting hue — Claude terracotta, matching ~/.claude/claude-status
+# — but its ESCALATION reuses STATE's amber and coral verbatim, so amber means
+# "attention" and coral means "act now" everywhere on the screen, whether the
+# subject is a task or a disk.
+#
+# All five re-opened with 0; on 2026-08-05 (R1). Before that BAR_CAP set dim and
+# nothing cleared it, so every gauge fill and trough in the UI was rendering at
+# half brightness — the terracotta measured ~2.9:1 against the background
+# instead of ~5.9:1. Nothing looked obviously broken, which is how it survived.
 BAR_CELLS=20
-BAR_CAP=$'\033[2;38;5;130m'    # faded brown end-caps  ▐ ▌
-BAR_FILL=$'\033[38;5;173m'     # Claude terracotta fill (#da7756-ish)
-BAR_EMPTY=$'\033[38;5;245m'    # grey empty cells / labels
-BAR_WARN=$'\033[33m'           # amber fill (warning band)
-BAR_CRIT=$'\033[1;31m'         # red fill once a gauge is at/over critical
+BAR_CAP=$'\033[0;38;5;242m'       # ▐ ▌ end-caps — chrome, not brand
+BAR_FILL=$'\033[0;38;5;173m'      # Claude terracotta fill (#D7875F)
+BAR_TROUGH=$'\033[0;38;5;242m'    # ░ unfilled cells — sit UNDER the fill
+BAR_EMPTY="$C_MUTED"              # gauge labels + the surrounding metadata
+BAR_WARN=$'\033[0;38;5;179m'      # warning band — STATE's ⧗ amber, deliberately
+BAR_CRIT=$'\033[0;1;38;5;203m'    # critical band — STATE's ! coral, deliberately
 BAR_RST=$'\033[0m'
 
 # Gauge rows (5h / 7d / Disk) share one indent + a left-justified label column so
@@ -210,22 +246,22 @@ printf -v GAUGE_SUBINDENT '%*s' "$(( ${#GAUGE_INDENT} + GAUGE_LABEL_W + 1 ))" ''
 # fill colour; without it the fill is terracotta, turning red at/over 95%.
 bar_glyphs() {
     local p="$1" fill="${2:-}"
-    [[ "$p" =~ ^[0-9]+$ ]] || { printf '%s(n/a)%s' "$BAR_EMPTY" "$BAR_RST"; return 0; }
+    [[ "$p" =~ ^[0-9]+$ ]] || { printf '%s(n/a)%s' "$C_FAINT" "$ST_RST"; return 0; }
     (( p > 100 )) && p=100
     local filled=$(( p * BAR_CELLS / 100 )); (( filled > BAR_CELLS )) && filled=$BAR_CELLS
     local empty=$(( BAR_CELLS - filled )) i bar="" gap=""
     for (( i=0; i<filled; i++ )); do bar+="█"; done
     for (( i=0; i<empty;  i++ )); do gap+="░"; done
     [[ -z "$fill" ]] && { fill="$BAR_FILL"; (( p >= 95 )) && fill="$BAR_CRIT"; }
-    printf '%s▐%s%s%s%s%s▌%s' "$BAR_CAP" "$fill" "$bar" "$BAR_EMPTY" "$gap" "$BAR_CAP" "$BAR_RST"
+    printf '%s▐%s%s%s%s%s▌%s' "$BAR_CAP" "$fill" "$bar" "$BAR_TROUGH" "$gap" "$BAR_CAP" "$BAR_RST"
 }
 
 # render_bar -- one usage bar line. Args: label percent reset_at [date_fmt].
 render_bar() {
     local label="$1" pct="$2" reset_at="${3:-}" date_fmt="${4:-+%H:%M}"
     if ! [[ "$pct" =~ ^[0-9]+$ ]]; then
-        printf '%s%-*s %s(window unavailable)%s\n' \
-            "$GAUGE_INDENT" "$GAUGE_LABEL_W" "$label" "$BAR_EMPTY" "$BAR_RST"
+        printf '%s%s%-*s%s %s(window unavailable)%s\n' \
+            "$GAUGE_INDENT" "$C_MUTED" "$GAUGE_LABEL_W" "$label" "$ST_RST" "$C_FAINT" "$ST_RST"
         return 0
     fi
     local p="$pct"; (( p > 100 )) && p=100
@@ -233,8 +269,11 @@ render_bar() {
     if [[ -n "$reset_at" && "$reset_at" != "null" && "$reset_at" != "-" ]]; then
         reset_str="$(date -d "$reset_at" "$date_fmt" 2>/dev/null || true)"
     fi
-    printf '%s%-*s %s %3d%%' "$GAUGE_INDENT" "$GAUGE_LABEL_W" "$label" "$(bar_glyphs "$p")" "$p"
-    [[ -n "$reset_str" ]] && printf '  %sresets %s%s' "$BAR_EMPTY" "$reset_str" "$BAR_RST"
+    # Label is chrome, the percentage is the datum — the same split the Disk row
+    # makes between free space and capacity.
+    printf '%s%s%-*s%s %s %s%3d%%%s' "$GAUGE_INDENT" "$C_MUTED" "$GAUGE_LABEL_W" "$label" "$ST_RST" \
+        "$(bar_glyphs "$p")" "$C_TEXT" "$p" "$ST_RST"
+    [[ -n "$reset_str" ]] && printf '  %sresets %s%s' "$C_MUTED" "$reset_str" "$ST_RST"
     printf '\n'
     return 0
 }
@@ -407,7 +446,7 @@ notes_panel_lines() {
             printf '%s\n' "$ln"
         done < <(tail -n "$NOTES_TAIL" "$f" 2>/dev/null)
     else
-        printf '%s(no notes yet — press n)%s\n' "$BAR_EMPTY" "$BAR_RST"
+        printf '%s(no notes yet — press n)%s\n' "$C_FAINT" "$ST_RST"
     fi
 }
 
@@ -452,26 +491,32 @@ pump_summary_line() {
     [[ -z "${open_ct:-}" || "$open_ct" == "null" ]] && open_ct="$cached_open"
     [[ -z "${open_ct:-}" ]] && open_ct="?"
 
+    # The pump's own state is a STATE, not a fourth vocabulary: running is the
+    # same fact as "an agent is on it", paused is attention-not-yet-a-problem,
+    # drained is settled. These were basic-ANSI green/yellow/cyan, which under
+    # Catppuccin resolve to a pastel set that could not sit beside the graph.
     local color
     case "$status" in
-        paused)  color='\033[33m' ;;   # yellow
-        drained) color='\033[32m' ;;   # green
-        *)       color='\033[36m' ;;   # cyan
+        paused)  color="$ST_PARK" ;;
+        drained) color="$ST_DONE" ;;
+        running) color="$ST_LIVE" ;;
+        *)       color="$C_MUTED" ;;   # an unknown state is not a state
     esac
-    local rcolor='\033[90m'
+    local rcolor="$C_FAINT"
     if [[ "$open_ct" =~ ^[0-9]+$ && "$open_ct" -eq 0 ]]; then
-        rcolor='\033[32m'
+        rcolor="$ST_DONE"
     elif [[ "$eligible" =~ ^[0-9]+$ && "$open_ct" =~ ^[0-9]+$ && "$eligible" -eq 0 && "$open_ct" -gt 0 ]]; then
-        rcolor='\033[31m'   # STALL: work queued, nothing launchable
+        rcolor="$ST_ALERT"  # STALL: work queued, nothing launchable
     elif [[ "$eligible" =~ ^[0-9]+$ && "$eligible" -gt 0 ]]; then
-        rcolor='\033[36m'
+        rcolor="$ST_READY"  # this IS the ready state — wear the ○ grey
     fi
 
     local line
-    line="$(printf 'pump[%s]: %b%s\033[0m' "$phases" "$color" "$status")"
+    line="$(printf '%spump[%s]:%s %s%s%s' "$C_MUTED" "$phases" "$ST_RST" "$color" "$status" "$ST_RST")"
     [[ "$status" == "paused" && -n "${reason:-}" ]] && line+=" — $reason"
-    line+="$(printf '  |  %b%s ready\033[0m · %s open' "$rcolor" "$eligible" "$open_ct")"
-    printf '%b\n' "$line"
+    line+="$(printf '%s  |  %s%s ready%s%s · %s open%s' \
+        "$C_MUTED" "$rcolor" "$eligible" "$ST_RST" "$C_MUTED" "$open_ct" "$ST_RST")"
+    printf '%s\n' "$line"
     return 0
 }
 
@@ -509,10 +554,14 @@ disk_bar_line() {
     local fillcol="$BAR_FILL"
     (( free_gb < DISK_PAUSE_GB )) && fillcol="$BAR_WARN"
     (( free_gb < DISK_PANIC_GB )) && fillcol="$BAR_CRIT"
-    printf '%s%-*s %s  %s%s free%s / %s  (%d%% used)\n' \
-        "$GAUGE_INDENT" "$GAUGE_LABEL_W" "Disk" "$(bar_glyphs "$used_pct" "$fillcol")" \
-        "$BAR_EMPTY" "$(human_bytes $(( avail_kb * 1024 )))" "$BAR_RST" \
-        "$(human_bytes $(( total_kb * 1024 )))" "$used_pct"
+    # Free space is the datum — the one number that decides whether a multi-day
+    # run survives — so it gets C_TEXT and the capacity beside it recedes. It
+    # was the other way round.
+    printf '%s%s%-*s%s %s  %s%s free%s %s/ %s  (%d%% used)%s\n' \
+        "$GAUGE_INDENT" "$C_MUTED" "$GAUGE_LABEL_W" "Disk" "$ST_RST" \
+        "$(bar_glyphs "$used_pct" "$fillcol")" \
+        "$C_TEXT" "$(human_bytes $(( avail_kb * 1024 )))" "$ST_RST" \
+        "$C_MUTED" "$(human_bytes $(( total_kb * 1024 )))" "$used_pct" "$ST_RST"
 }
 
 # disk_subinfo_line -- the cached footprint summary as a vertical list (worktrees
@@ -522,7 +571,7 @@ disk_subinfo_line() {
     [[ "$SHOW_DISK" -eq 1 ]] || return 0
     cache_refresh_if_stale "$DISK_CACHE" "$DISK_TTL" disk_compute
     if [[ ! -f "$DISK_CACHE" ]]; then
-        printf '%s%ssizing worktrees…%s\n' "$GAUGE_SUBINDENT" "$BAR_EMPTY" "$BAR_RST"
+        printf '%s%ssizing worktrees…%s\n' "$GAUGE_SUBINDENT" "$C_FAINT" "$ST_RST"
         return 0
     fi
     local main_b wt_total=0 wt_count=0 wb
@@ -553,7 +602,7 @@ disk_subinfo_line() {
     [[ -n "$dline" ]] && printf '%s%sdocker%s %s\n' \
         "$GAUGE_SUBINDENT" "$BAR_EMPTY" "$BAR_RST" "$dline"
     [[ -n "$age" ]] && printf '%s%s(updated %ss ago)%s\n' \
-        "$GAUGE_SUBINDENT" "$BAR_EMPTY" "$age" "$BAR_RST"
+        "$GAUGE_SUBINDENT" "$C_FAINT" "$age" "$ST_RST"
     return 0
 }
 
@@ -671,18 +720,25 @@ sessions_compute() {
 session_header() {  # name cstate tstat task up age stale [index]
     local name="$1" cstate="$2" tstat="$3" task="$4" up="$5" age="$6" stale="$7"
     local idx="${8:--1}" dot age_c mark="  " nm="$name"
-    case "$cstate" in running) dot=$'\033[36m●\033[0m' ;; *) dot=$'\033[90m●\033[0m' ;; esac
-    if [[ "$stale" == "1" ]]; then age_c=$'\033[31m'"$age"$'\033[0m'; else age_c="$age"; fi
+    # The dot restates the container state the bracketed word already gives, so
+    # it must wear the SAME hue. It was cyan sitting immediately left of a green
+    # `[running]` — two colours for one fact, and the loudest instance of the
+    # second vocabulary this system deleted.
+    case "$cstate" in running) dot="$ST_LIVE●$ST_RST" ;; *) dot="$C_FAINT●$ST_RST" ;; esac
+    # A stale log on a running container is act-now: the same coral the graph
+    # draws for ! rather than a theme-dependent basic red.
+    if [[ "$stale" == "1" ]]; then age_c="$ST_ALERT$age$ST_RST"; else age_c="$C_MUTED$age$ST_RST"; fi
     # The selection is marked by a glyph AND weight, never colour alone — same
     # rule the GRAPH tab's heavy border follows.
     if [[ "$idx" == "$SESS_SEL" ]] && (( TAB == 0 )); then
-        mark=$'\033[1m▸ \033[0m'; nm=$'\033[1m'"$name"$'\033[0m'
+        mark="$C_STRONG▸ $ST_RST"; nm="$C_STRONG$name$ST_RST"
         printf -v nm '%s%*s' "$nm" "$(( 10 - ${#name} > 0 ? 10 - ${#name} : 0 ))" ''
     else
-        printf -v nm '%-10s' "$name"
+        printf -v nm "$C_TEXT%-10s$ST_RST" "$name"
     fi
-    printf '%s%b %s [%s] %s  up %s  log %s\n' \
-        "$mark" "$dot" "$nm" "$(colorize "$cstate")" "${task}:$(colorize "$tstat")" "$up" "$age_c"
+    printf '%s%b %s [%s] %s  %sup %s  log %s\n' \
+        "$mark" "$dot" "$nm" "$(colorize "$cstate")" "${task}:$(colorize "$tstat")" \
+        "$C_MUTED" "$up" "$age_c"
 }
 
 # ── Session cursor ───────────────────────────────────────────────────────────
@@ -779,14 +835,14 @@ sessions_detail_lines() {
     IFS=$'\t' read -r name cstate tstat task up age stale branch turns goal \
         < <(sessions_selected) || true
     if [[ -z "${name:-}" ]]; then
-        printf '%s%s%s\n' "$BAR_EMPTY" "  no sessions — nothing to select" "$BAR_RST"
-        printf '%s%s%s\n' "$BAR_EMPTY" "  ↑↓ select · Enter open · Tab graph" "$BAR_RST"
+        printf '%s%s%s\n' "$C_FAINT" "  no sessions — nothing to select" "$ST_RST"
+        printf '%s%s%s\n' "$C_MUTED" "  ↑↓ select · Enter open · Tab graph" "$ST_RST"
         return 0
     fi
     [[ -n "${branch:-}" ]] && parts+=" · $branch"
     [[ -n "${turns:-}" && "$turns" != "null" ]] && parts+=" · $turns turns"
     [[ -n "${up:-}" ]] && parts+=" · up $up"
-    printf '\033[1m%s\033[0m  %s%s\n' "${task:--}" "$(colorize "${tstat:--}")" "$parts"
+    printf '%s%s%s  %s%s\n' "$C_STRONG" "${task:--}" "$ST_RST" "$(colorize "${tstat:--}")" "$parts"
     printf '%s  %s%s\n' "$BAR_EMPTY" "${goal:-}" "$BAR_RST"
     return 0
 }
@@ -796,20 +852,25 @@ sessions_lines() {  # $1 = width
     local width="${1:-100}"
     cache_refresh_if_stale "$SESS_CACHE" "$SESS_TTL" sessions_compute
     if [[ ! -f "$SESS_CACHE" ]]; then
-        printf '%s(loading sessions…)%s\n' "$BAR_EMPTY" "$BAR_RST"
+        printf '%s(loading sessions…)%s\n' "$C_FAINT" "$ST_RST"
         return 0
     fi
     local flagged="" rec a b c d e f g h i j n=0
     while IFS=$'\t' read -r rec a b c d e f g h i j; do
         case "$rec" in
             S) session_header "$a" "$b" "$c" "$d" "$e" "$f" "$g" "$n"; n=$(( n + 1 )) ;;
-            L) printf '    \033[90m%s\033[0m\n' "${a:0:$((width - 4))}" ;;
-            N) printf '%s(no arachne-agent containers running or recently exited)%s\n' "$BAR_EMPTY" "$BAR_RST" ;;
-            F) flagged+="  $a ($b): $(colorize "$c")"$'\n' ;;
+            # The log tails are the largest block of text in the UI and were the
+            # least legible thing in it: basic bright-black is ~2.5:1 nominal and
+            # under 2:1 through a translucent terminal over a photo.
+            L) printf '    %s%s%s\n' "$C_MUTED" "${a:0:$((width - 4))}" "$ST_RST" ;;
+            N) printf '%s(no arachne-agent containers running or recently exited)%s\n' "$C_FAINT" "$ST_RST" ;;
+            F) flagged+="  $C_MUTED$a ($b)$ST_RST: $(colorize "$c")"$'\n' ;;
         esac
     done < "$SESS_CACHE"
     if [[ -n "$flagged" ]]; then
-        printf '%sNeeds attention:%s\n' "$BAR_WARN" "$BAR_RST"
+        # This heading exists to raise an alarm, and it collects blocked / stuck /
+        # needs-review rows — amber over coral rows understated them.
+        printf '%sNeeds attention:%s\n' "$ST_ALERT" "$ST_RST"
         printf '%s' "$flagged"
     fi
     return 0
@@ -836,12 +897,15 @@ hbar() { local w="$1" s; printf -v s '%*s' "$w" ''; printf '%s' "${s// /─}"; }
 
 header() {  # $1 = optional suffix tag
     local w; w="$(term_width)"
-    echo "Arachne parallel agents — $(date '+%Y-%m-%d %H:%M:%S')${1:-}"
-    printf '%s%s%s\n' "$BAR_EMPTY" "$(hbar "$w")" "$BAR_RST"
+    printf '%sArachne parallel agents%s %s— %s%s%s\n' \
+        "$C_STRONG" "$ST_RST" "$C_MUTED" "$(date '+%Y-%m-%d %H:%M:%S')" "${1:-}" "$ST_RST"
+    rule
 }
 
-# rule -- a dim full-width horizontal rule.
-rule() { local w; w="$(term_width)"; printf '%s%s%s\n' "$BAR_EMPTY" "$(hbar "$w")" "$BAR_RST"; }
+# rule -- a full-width horizontal rule. C_RULE, a tier below the labels: two
+# full-width lines at label brightness were the loudest chrome on the screen,
+# and a rule is a line, not text.
+rule() { local w; w="$(term_width)"; printf '%s%s%s\n' "$C_RULE" "$(hbar "$w")" "$ST_RST"; }
 
 # compose_columns -- merge a LEFT line array and a RIGHT line array side by side,
 # right-aligning the right block to the screen edge. Falls back to stacking
@@ -928,15 +992,17 @@ render_sessions() {  # $1 = width
 # survives --no-color terminals and colour-blind readers.
 tab_bar() {
     local s g
+    # Inactive is C_RULE undimmed rather than dim+245: the same apparent weight
+    # without a `2` that would leak into the hint after it (R1).
     if (( TAB == 0 )); then
-        s=$'\033[1m┤ SESSIONS ├\033[0m'; g=$'\033[2;38;5;245m   GRAPH   \033[0m'
+        s="$C_STRONG┤ SESSIONS ├$ST_RST"; g="$C_RULE   GRAPH   $ST_RST"
     else
-        s=$'\033[2;38;5;245m  SESSIONS  \033[0m'; g=$'\033[1m┤ GRAPH ├\033[0m'
+        s="$C_RULE  SESSIONS  $ST_RST"; g="$C_STRONG┤ GRAPH ├$ST_RST"
     fi
     local hint
     if (( TAB == 0 )); then hint='Tab / ← → switch · ↑↓ select · Enter open · q quit'
     else hint='Tab switch · ↑↓←→ move · o open · . running · q quit'; fi
-    printf '%s%s   \033[38;5;245m%s\033[0m\n' "$s" "$g" "$hint"
+    printf '%s%s   %s%s%s\n' "$s" "$g" "$C_MUTED" "$hint" "$ST_RST"
 }
 
 # graph_live_branches -- worktree branches with a live agent container, as the
@@ -1149,8 +1215,8 @@ render_graph() {
     [[ -x "$DAG_BIN" ]] || { printf '(arachne-dag-render not found)\n'; return 0; }
     local phases; phases="$(graph_phases)"
     if [[ -z "$phases" ]]; then
-        printf '%s(no pump running — nothing scoped to graph)%s\n' "$BAR_EMPTY" "$BAR_RST"
-        printf '%s start a pump, or: scripts/arachne-dag-render --phases F79%s\n' "$BAR_EMPTY" "$BAR_RST"
+        printf '%s(no pump running — nothing scoped to graph)%s\n' "$C_FAINT" "$ST_RST"
+        printf '%s start a pump, or: scripts/arachne-dag-render --phases F79%s\n' "$C_FAINT" "$ST_RST"
         return 0
     fi
     # Hand the renderer the monitor's own TASKS_DIR rather than letting it
@@ -1206,7 +1272,7 @@ graph_detail_lines() {
             parts+=" $bid$bg"
         done
     fi
-    printf '\033[1m%s\033[0m  %s%s %s%s%s\n' "$CURSOR" "$hue" "$glyph" "$word" "$ST_RST" "$parts"
+    printf '%s%s%s  %s%s %s%s%s\n' "$C_STRONG" "$CURSOR" "$ST_RST" "$hue" "$glyph" "$word" "$ST_RST" "$parts"
     printf '%s  %s%s\n' "$BAR_EMPTY" "${GGOAL[$CURSOR]:-}" "$BAR_RST"
 }
 
@@ -1242,7 +1308,11 @@ render_all() {  # one-shot / pipe: top then body, no viewport clipping
 
 # ── Demo (synthetic preview; no docker, no caches) ───────────────────────────
 demo_left_lines() {
-    printf 'pump[F43..F63]: \033[36mrunning\033[0m  |  \033[36m8 ready\033[0m · 35 open\n'
+    # The demo previews the real UI, so it must use the real tokens — a demo
+    # that drifts from the system lies about the design it is previewing.
+    printf '%spump[F43..F63]:%s %srunning%s%s  |  %s8 ready%s%s · 35 open%s\n' \
+        "$C_MUTED" "$ST_RST" "$ST_LIVE" "$ST_RST" "$C_MUTED" \
+        "$ST_READY" "$ST_RST" "$C_MUTED" "$ST_RST"
     printf '\n'
     render_bar "5h" 62 "" ""
     render_bar "7d" 65 "" ""
@@ -1269,11 +1339,11 @@ demo_sessions() {  # $1 = width — several sessions so scrolling is exercised
     l2="tsc is clean. Now run the full vitest suite to confirm no regressions."
     for n in 56 45 57 55 54 53; do
         session_header "feat-f$n" running in_progress "F$n.x" "$(( n - 30 )) minutes" "$(( n % 30 ))s" 0
-        printf '    \033[90m%s\033[0m\n' "${l1:0:$cut}"
-        printf '    \033[90m%s\033[0m\n' "${l2:0:$cut}"
+        printf '    %s%s%s\n' "$C_MUTED" "${l1:0:$cut}" "$ST_RST"
+        printf '    %s%s%s\n' "$C_MUTED" "${l2:0:$cut}" "$ST_RST"
     done
-    printf '%sNeeds attention:%s\n' "$BAR_WARN" "$BAR_RST"
-    printf '  %s\n' "F00.0 (example): blocked"
+    printf '%sNeeds attention:%s\n' "$ST_ALERT" "$ST_RST"
+    printf '  %sF00.0 (example)%s: %s\n' "$C_MUTED" "$ST_RST" "$(colorize blocked)"
     return 0
 }
 
@@ -1327,9 +1397,12 @@ paint_view() {  # $1 top(text)  $2 sessions-array-name
         (( SCROLL > 0 )) && pos+=" ↑"
     fi
     # Keys are documented in --help; show only the scroll position (when there is
-    # something to scroll), otherwise reclaim the line.
+    # something to scroll), otherwise reclaim the line. Plain grey, not reverse
+    # video: a reversed slab is the single loudest object on the screen, spent on
+    # the least important fact in the frame — and its colours come from the
+    # terminal's defaults, which R3 rules out.
     if [[ -n "$pos" ]]; then
-        printf '\033[7m%s \033[0m\033[K' "$pos"
+        printf '%s%s%s\033[K' "$C_MUTED" "$pos" "$ST_RST"
     else
         printf '\033[K'
     fi
@@ -1416,7 +1489,7 @@ notes_input_mode() {
     printf '\033[?7h' 2>/dev/null || true     # allow the cursor to track long input
     tput cnorm 2>/dev/null || true
     while true; do
-        printf '\033[%d;1H\033[K\033[36mnote>\033[0m %s' "$rows" "$buf"
+        printf '\033[%d;1H\033[K%snote>%s %s' "$rows" "$C_STRONG" "$ST_RST" "$buf"
         if ! IFS= read -rsn1 ch; then break; fi
         if [[ -z "$ch" ]]; then append_note "$buf"; break; fi      # Enter (delimiter → empty)
         case "$ch" in
