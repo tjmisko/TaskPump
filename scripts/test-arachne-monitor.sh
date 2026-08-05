@@ -647,6 +647,90 @@ leaky=$(grep -oE $'\033\\[[0-9;]+m' "$CLI" | grep -vE $'\033\\[0([;m])' || true)
 [[ -z "$leaky" ]] && pass "every colour sequence re-opens with 0" \
     || fail "non-absolute sequences: $(tr -d '\033' <<<"$leaky" | sort -u | tr '\n' ' ')"
 
+# ── Test 24: the help panel (? overlay / :help) ──────────────────────────────
+# The overlay itself needs a pty, so --show-help is its seam: it prints exactly
+# what help_lines() paints, for the tab --tab picked. What is asserted is the
+# property the old always-on hint line could not have had — the two tabs
+# document DIFFERENT keymaps, each naming its own axis, while still agreeing on
+# the handful of keys that really are shared.
+echo "--- Test 24: help panel ---"
+"$CLI" --show-help --tab graph >/dev/null 2>&1 && pass "--show-help exits 0" || fail "--show-help exited non-zero"
+hsess=$(ARACHNE_MONITOR_COLS=100 "$CLI" --show-help --tab sessions 2>/dev/null | strip_ansi)
+hgraph=$(ARACHNE_MONITOR_COLS=100 "$CLI" --show-help --tab graph 2>/dev/null | strip_ansi)
+[[ -n "$hsess" && "$hsess" != "$hgraph" ]] && pass "the two tabs get different help panels" \
+    || fail "sessions and graph help are identical:\n$hsess"
+grep -q 'SESSIONS tab keys' <<<"$hsess"  && pass "the sessions panel is titled for its tab" || fail "no SESSIONS title:\n$hsess"
+grep -q 'GRAPH tab keys'    <<<"$hgraph" && pass "the graph panel is titled for its tab"    || fail "no GRAPH title:\n$hgraph"
+grep -q '┌' <<<"$hgraph" && grep -q '└' <<<"$hgraph" && pass "the panel is a bordered box" || fail "no box border:\n$hgraph"
+
+# Each panel names its OWN tab's keys — and only its own.
+grep -q 'o Enter' <<<"$hgraph" && pass "graph help documents o (open the selected task)" \
+    || fail "graph help missing the o key:\n$hgraph"
+grep -q '\$ End' <<<"$hgraph" && pass "graph help documents \$ (last node in the layer)" \
+    || fail "graph help missing the \$ key:\n$hgraph"
+grep -q 'o Enter' <<<"$hsess" && fail "sessions help lists the graph-only o key" \
+    || pass "sessions help omits the graph-only keys"
+grep -q '│ Enter ' <<<"$hsess" && pass "sessions help documents Enter (open the session's task)" \
+    || fail "sessions help missing Enter:\n$hsess"
+grep -q 'next session' <<<"$hsess" && pass "sessions help describes the session cursor" \
+    || fail "sessions help says nothing about the session cursor:\n$hsess"
+# ...and both name the keys that are genuinely shared, including B's tab switch.
+for tabname in sessions graph; do
+    h=$([[ "$tabname" == graph ]] && printf '%s' "$hgraph" || printf '%s' "$hsess")
+    grep -q 'gt gT' <<<"$h" && pass "$tabname help documents gt/gT" || fail "$tabname help missing gt/gT:\n$h"
+    grep -q 'q :q'  <<<"$h" && pass "$tabname help documents q"     || fail "$tabname help missing q:\n$h"
+done
+
+# Width is bounded by the terminal, and sized to the content when there is room.
+panel_w() { ARACHNE_MONITOR_COLS="$1" "$CLI" --show-help --tab "$2" 2>/dev/null | strip_ansi \
+    | awk '{ if (length($0) > m) m = length($0) } END { print m+0 }'; }
+w48=$(panel_w 48 graph)
+[[ "$w48" -gt 0 && "$w48" -le 48 ]] && pass "panel respects ARACHNE_MONITOR_COLS=48 (${w48} cols)" \
+    || fail "panel overflowed a 48-column terminal: ${w48}"
+w200=$(panel_w 200 graph)
+[[ "$w200" -gt 48 && "$w200" -lt 200 ]] && pass "a wide terminal sizes the panel to its content (${w200} cols)" \
+    || fail "panel not content-sized at 200 columns: ${w200}"
+
+# The hint lines the panel replaced are gone — and the blocks that held them
+# still emit TWO lines each. The watch loop measures the top region's height
+# from those blocks, so a changed line count silently shifts the viewport.
+gtop=$("$CLI" --tab graph 2>/dev/null | strip_ansi)
+stop=$("$CLI" 2>/dev/null | strip_ansi)
+# Matched on the tail of each removed string, not its head: the tab bar carries
+# a hint of its own (a different surface, removed separately) whose opening
+# clause reads the same.
+grep -q 'gg/G layers' <<<"$gtop" && fail "the graph detail hint line is still painted" \
+    || pass "graph detail hint line removed"
+grep -q 'Enter open · Tab graph' <<<"$stop" && fail "the sessions detail hint line is still painted" \
+    || pass "sessions detail hint line removed"
+after() {  # $1 = a literal on the anchor line, $2 = how many lines past it
+    awk -v pat="$1" -v off="$2" 'index($0,pat) && !f { f=NR } f && NR==f+off { print; exit }'
+}
+gap=$(after '✓ done' 1 <<<"$gtop")
+[[ -z "${gap// }" ]] && pass "the graph detail block's second line is now blank" \
+    || fail "expected a blank second line, got '$gap'"
+[[ "$(after '✓ done' 2 <<<"$gtop")" == ─* ]] && pass "the graph top region keeps its height (rule 2 lines on)" \
+    || fail "graph top height changed: '$(after '✓ done' 2 <<<"$gtop")'"
+gap=$(after 'no sessions' 1 <<<"$stop")
+[[ -z "${gap// }" ]] && pass "the sessions detail block's second line is now blank" \
+    || fail "expected a blank second line, got '$gap'"
+[[ "$(after 'no sessions' 2 <<<"$stop")" == ─* ]] && pass "the sessions top region keeps its height" \
+    || fail "sessions top height changed: '$(after 'no sessions' 2 <<<"$stop")'"
+
+# The live ? and : arms need a pty, so they are pinned at source level — and
+# pinned in BOTH keymaps, since help_lines reads $TAB and a tab that never
+# reaches it is a tab with no documentation at all.
+arm_count() {  # how many lines of the monitor hold BOTH literals
+    awk -v a="$1" -v b="$2" 'index($0,a) && index($0,b) { c++ } END { print c+0 }' "$CLI"
+}
+[[ "$(arm_count "'?')" 'help_overlay')" -ge 2 ]] \
+    && pass "both tab keymaps bind ? to the overlay" || fail "the ? arm is missing from a keymap"
+[[ "$(arm_count "':')" 'command_input_mode')" -ge 2 ]] \
+    && pass "both tab keymaps bind : to the command prompt" || fail "the : arm is missing from a keymap"
+arm_has "':')" 'quit) break' && pass ":q breaks the watch loop" || fail "the : arm no longer routes quit to a break"
+arm_has 'help|h' 'CMD_ACTION=help' && pass ":help / :h / :? open the panel" || fail ":help verb missing"
+arm_has 'q|quit' 'CMD_ACTION=quit' && pass ":q / :quit quit the monitor"    || fail ":quit verb missing"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"
