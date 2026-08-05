@@ -367,6 +367,40 @@ narrow() { ARACHNE_PUMP_STATE_FILE="$GPS" ARACHNE_TASKS_DIR="$GTD" ARACHNE_MONIT
 narrow F96.5 | grep -q '┃ \.5 ' && pass "viewport pans to keep the selection visible" \
     || fail "selection off-screen in a narrow terminal:\n$(narrow F96.5)"
 
+# ── Test 19: `o` opens the selected task's file ──────────────────────────────
+# Asserted through --moves for the same reason cursor movement is: no pty. The
+# spawn is deliberately detached from the monitor, so the stub's marker file is
+# polled rather than awaited.
+echo "--- Test 19: open the selected task's file ---"
+MARK="$TMP/opened.txt"
+cat >| "$BIN/fake-editor" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$MARK"
+EOF
+chmod +x "$BIN/fake-editor"
+gopen() {  # $1 = cursor, $2 = moves
+    : >| "$MARK"
+    ARACHNE_PUMP_STATE_FILE="$GPS" ARACHNE_TASKS_DIR="$GTD" ARACHNE_MONITOR_COLS=100 \
+        ARACHNE_MONITOR_OPEN_CMD="$BIN/fake-editor --open" \
+        "$CLI" --tab graph --cursor "$1" --moves "$2" >/dev/null 2>&1
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10; do [[ -s "$MARK" ]] && break; sleep 0.2; done
+    cat "$MARK" 2>/dev/null
+}
+opened=$(gopen F96.5 o)
+[[ "$opened" == "--open $GTD/F96.5.md" ]] \
+    && pass "o opens the selected task's file ($opened)" \
+    || fail "o should have opened $GTD/F96.5.md, got '$opened'"
+# Moving first, then opening, must follow the cursor rather than the start id.
+opened=$(gopen F96.2 jo)
+[[ "$opened" == "--open $GTD/F96.4.md" ]] \
+    && pass "o follows the cursor after a move ($opened)" \
+    || fail "o should have opened F96.4 after ↓, got '$opened'"
+# A task with no file on disk must not spawn anything.
+opened=$(gopen F96.4 '')
+[[ -z "$opened" ]] && pass "no open command runs without the o key" \
+    || fail "spawned an editor unprompted: '$opened'"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"

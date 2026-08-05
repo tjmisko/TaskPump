@@ -48,9 +48,17 @@
 #                   k/j ↑ ↓ nearest node one layer up/down, preferring a
 #                            connected one (a blocker, or a dependent)
 #                   g/G first/last layer · . recentre on the running task
+#                   o / Enter open the selected task's file in a new editor
+#                            window (wezterm + $EDITOR; falls back to taking
+#                            over this terminal when there is no display)
 #                   PgUp/PgDn page the viewport without moving the cursor
 # Both tabs:        Tab / Shift-Tab switch tab · n add a note
 #                   e / Ctrl-G edit notes in nvim · q quit
+#
+# Env: ARACHNE_MONITOR_OPEN_CMD  replace the `o` spawn entirely (path appended)
+#      ARACHNE_MONITOR_TERM      GUI terminal to spawn (default wezterm)
+#      ARACHNE_MONITOR_TASK_CLASS  window class for it (default arachne-task),
+#                                  so a Hyprland windowrule can float/place it
 set -euo pipefail
 
 # REPO_ROOT is the checkout whose .worktrees/ hold the agent workspaces — i.e.
@@ -58,7 +66,10 @@ set -euo pipefail
 # on the primary's sessions instead of looking for a nested .worktrees/.
 REPO_ROOT="${ARACHNE_MONITOR_REPO_ROOT:-$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)}"
 MANIFEST="${MANIFEST:-$REPO_ROOT/ops/task-loop/parallel-manifest.tsv}"
-TASKS_DIR="$REPO_ROOT/ops/task-loop/tasks"
+# Honours ARACHNE_TASKS_DIR for the same reason arachne-dag-render does: the two
+# must read the SAME ledger, or the GRAPH tab draws one set of tasks while `o`
+# opens files from another.
+TASKS_DIR="${ARACHNE_TASKS_DIR:-$REPO_ROOT/ops/task-loop/tasks}"
 
 print_help() {
     # Print the leading comment block (minus the shebang), stripping "# ".
@@ -116,18 +127,6 @@ task_status() {  # $1 = task id -> status string or "-"
     yq --front-matter=extract '.status' "$f" 2>/dev/null || echo "?"
 }
 
-colorize() {  # colorize a status word
-    case "$1" in
-        running|in_progress) printf '%s%s%s' "$ST_LIVE"  "$1" "$ST_RST" ;;
-        done)                printf '%s%s%s' "$ST_DONE"  "$1" "$ST_RST" ;;
-        blocked)             printf '%s%s%s' "$ST_BLOCK" "$1" "$ST_RST" ;;
-        needs-review|stuck)  printf '%s%s%s' "$ST_ALERT" "$1" "$ST_RST" ;;
-        open)                printf '%s%s%s' "$ST_READY" "$1" "$ST_RST" ;;
-        exited)              printf '%s%s%s' "$ST_WAIT"  "$1" "$ST_RST" ;;
-        *)                   printf '%s' "$1" ;;
-    esac
-}
-
 # ── Status palette ───────────────────────────────────────────────────────────
 # One colour vocabulary for task state everywhere it is shown: the session rows,
 # the GRAPH legend, the graph's own node boxes. Green is the progress axis —
@@ -145,6 +144,18 @@ ST_ALERT=$'\033[0;1;38;5;203m'    # ! review    — needs-review / stuck
 ST_READY=$'\033[0;38;5;250m'      # ○ ready     — grey
 ST_WAIT=$'\033[0;2;38;5;244m'     # ◌ waiting   — dim grey (blocked upstream, exited)
 ST_RST=$'\033[0m'
+
+colorize() {  # colorize a status word
+    case "$1" in
+        running|in_progress) printf '%s%s%s' "$ST_LIVE"  "$1" "$ST_RST" ;;
+        done)                printf '%s%s%s' "$ST_DONE"  "$1" "$ST_RST" ;;
+        blocked)             printf '%s%s%s' "$ST_BLOCK" "$1" "$ST_RST" ;;
+        needs-review|stuck)  printf '%s%s%s' "$ST_ALERT" "$1" "$ST_RST" ;;
+        open)                printf '%s%s%s' "$ST_READY" "$1" "$ST_RST" ;;
+        exited)              printf '%s%s%s' "$ST_WAIT"  "$1" "$ST_RST" ;;
+        *)                   printf '%s' "$1" ;;
+    esac
+}
 
 # vis_len -- visible (printable) length of a string, ignoring CSI colour escapes.
 # Pure bash (no subprocess) so it is cheap to call per row while composing.
@@ -753,7 +764,8 @@ tab_bar() {
         s=$'\033[2;38;5;245m  SESSIONS  \033[0m'; g=$'\033[1m┤ GRAPH ├\033[0m'
     fi
     local hint
-    if (( TAB == 0 )); then hint='Tab / ← → switch'; else hint='Tab switch · ↑↓←→ move · . running · q quit'; fi
+    if (( TAB == 0 )); then hint='Tab / ← → switch'
+    else hint='Tab switch · ↑↓←→ move · o open · . running · q quit'; fi
     printf '%s%s   \033[38;5;245m%s\033[0m\n' "$s" "$g" "$hint"
 }
 
@@ -908,6 +920,7 @@ graph_apply_moves() {
         case "$c" in
             h|l|k|j|g|G) graph_move "$c" ;;
             .)           CURSOR="$(graph_default_cursor)" ;;
+            o)           open_task_file "$CURSOR" ;;
             *)           : ;;
         esac
     done
@@ -943,6 +956,11 @@ render_graph() {
         printf '%s start a pump, or: scripts/arachne-dag-render --phases F79%s\n' "$BAR_EMPTY" "$BAR_RST"
         return 0
     fi
+    # Hand the renderer the monitor's own TASKS_DIR rather than letting it
+    # re-derive one: with ARACHNE_MONITOR_REPO_ROOT pointing a worktree copy at
+    # the primary checkout the two resolve differently, and the graph would then
+    # draw one ledger's tasks while `o` opened files from another.
+    ARACHNE_TASKS_DIR="$TASKS_DIR" \
     "$DAG_BIN" --phases "$phases" --pan "$PAN" --cols "$(term_width)" \
                --cursor "$CURSOR" --index-file "$(graph_index_file)" \
                --live-branches "$(graph_live_branches)" 2>/dev/null \
@@ -959,7 +977,7 @@ ${ST_READY}○ ready${ST_RST}  ${ST_WAIT}◌ waiting${ST_RST}  ${ST_BLOCK}⊘ bl
 graph_detail_lines() {
     if ! graph_cur_ok; then
         printf '%s\n' "$GRAPH_LEGEND"
-        printf '%s%s%s\n' "$BAR_EMPTY" "  ↑↓←→ move · . running · g/G ends · PgUp/PgDn page" "$BAR_RST"
+        printf '%s%s%s\n' "$BAR_EMPTY" "  ↑↓←→ move · o open · . running · g/G ends · PgUp/PgDn page" "$BAR_RST"
         return 0
     fi
     local st="${GST[$CURSOR]}" word glyph hue parts="" b bid bst bg
@@ -1131,6 +1149,53 @@ edit_in_nvim() {  # file
     printf '\033[2J' 2>/dev/null || true
 }
 
+# ── Open the selected task's file ────────────────────────────────────────────
+# The GRAPH cursor names a task, so `o` / Enter opens that task's markdown —
+# goal, spec, acceptance, blockers — without leaving the dashboard.
+#
+# On a graphical session that means a NEW terminal window, fully detached from
+# the monitor: the dashboard keeps painting at its 1s cadence, and the editor
+# outlives it if you quit. With no display (a plain tty, ssh) there is no window
+# to open, so it falls back to handing THIS terminal to the editor, which the
+# notes popout already knows how to do and undo.
+TASK_TERM="${ARACHNE_MONITOR_TERM:-wezterm}"          # GUI terminal to spawn
+TASK_WIN_CLASS="${ARACHNE_MONITOR_TASK_CLASS:-arachne-task}"   # for Hyprland windowrules
+# ARACHNE_MONITOR_OPEN_CMD replaces the whole spawn; the file path is appended.
+
+task_file() { printf '%s/%s.md' "$TASKS_DIR" "$1"; }
+
+# spawn_detached -- run "$@" out of the monitor's session and controlling
+# terminal, so it neither draws on the dashboard nor dies with it.
+spawn_detached() {
+    if command -v setsid >/dev/null 2>&1; then
+        setsid -f "$@" </dev/null >/dev/null 2>&1 || return 1
+        return 0
+    fi
+    { "$@" </dev/null >/dev/null 2>&1 & disown 2>/dev/null; } || return 1
+    return 0
+}
+
+open_task_file() {  # $1 = task id
+    local id="${1:-}" f
+    [[ -n "$id" ]] || return 0
+    f="$(task_file "$id")"
+    [[ -f "$f" ]] || return 0
+    if [[ -n "${ARACHNE_MONITOR_OPEN_CMD:-}" ]]; then
+        local -a cmd; read -r -a cmd <<< "$ARACHNE_MONITOR_OPEN_CMD"
+        (( ${#cmd[@]} )) && { spawn_detached "${cmd[@]}" "$f"; return 0; }
+    fi
+    if [[ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]] && command -v "$TASK_TERM" >/dev/null 2>&1; then
+        # --always-new-process so the window gets its own class: wezterm sets the
+        # Wayland app_id per GUI process, and without it the window joins an
+        # existing instance under the default class, where a windowrule can't
+        # reach it.
+        spawn_detached "$TASK_TERM" start --always-new-process --class "$TASK_WIN_CLASS" \
+                       --cwd "$REPO_ROOT" -- "$EDITOR_BIN" "$f" && return 0
+    fi
+    edit_in_nvim "$f"
+    return 0
+}
+
 notes_input_mode() {
     local buf="" ch rows seq
     rows="$(term_height)"
@@ -1158,6 +1223,9 @@ notes_input_mode() {
 read_key() {
     local c rest tail
     IFS= read -rsn1 -t "$INTERVAL" c || { printf ''; return 0; }
+    # Enter is read's own delimiter, so it arrives as an EMPTY successful read —
+    # indistinguishable from a timeout unless it is named here.
+    [[ -z "$c" ]] && { printf 'ENTER'; return 0; }
     if [[ "$c" == $'\x1b' ]]; then
         IFS= read -rsn2 -t 0.01 rest || rest=""
         case "$rest" in
@@ -1226,6 +1294,7 @@ if [[ "$WATCH" -eq 1 ]]; then
                     g|HOME)              graph_move g ;;
                     G|END)               graph_move G ;;
                     .)                   CURSOR="$(graph_default_cursor)" ;;
+                    o|O|ENTER)           open_task_file "$CURSOR" ;;
                     $'\x04'|PGDN|' ')    SCROLL=$(( SCROLL + __page )) ;;
                     $'\x15'|PGUP|b)      SCROLL=$(( SCROLL - __page )) ;;
                     n|N)                 notes_input_mode ;;

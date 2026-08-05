@@ -201,18 +201,35 @@ tab-switch meaning — there is nothing there to navigate, and the muscle memory
 is worth more than the symmetry.
 
 Navigation is testable headlessly: `--cursor <id>` pins the selection and
-`--moves <hjklgG.>` replays keystrokes in one-shot mode, so the assertions run
+`--moves <hjklgG.o>` replays keystrokes in one-shot mode, so the assertions run
 without a pty — the same trick `--tab` plays for the graph itself.
 
 | Key | Action |
 |---|---|
 | `←` `→` / `h` `l` | previous / next node within the layer |
 | `↑` `↓` / `k` `j` | nearest node in the layer above / below, **preferring a connected one** (blocker or dependent) over nearest-by-x |
+| `o` / `Enter` | open the selected task's file in a new editor window |
 | `Tab` / `S-Tab` | switch tab |
 | `PgUp` / `PgDn` | page the viewport without moving the cursor |
 | `.` | recentre on the running node |
 | `g` / `G` | first / last layer |
 | `q` | quit |
+
+`o` exists because the status bar can only ever hold the *summary* — goal,
+budget, blockers. The moment a node raises a real question the answer is in its
+markdown, and re-deriving `ops/task-loop/tasks/<id>.md` by hand from a node
+labelled `.4` is exactly the friction the tab was built to remove.
+
+It spawns a **new terminal window** (wezterm, `--class arachne-task` so a
+Hyprland windowrule can float or place it), fully detached via `setsid` so the
+dashboard keeps painting at its 1s cadence and the editor outlives it. With no
+display — a plain tty, ssh — there is no window to open, so it falls back to
+handing over *this* terminal, which the notes popout already knows how to do
+and undo. `ARACHNE_MONITOR_OPEN_CMD` replaces the spawn wholesale.
+
+`Enter` needs naming explicitly in `read_key`: it is `read`'s own delimiter, so
+it arrives as an empty *successful* read, which is otherwise indistinguishable
+from the interval timeout.
 
 The cursor's default landing spot is the live agent's task, falling back to the
 shallowest ready task, then the root. `.` returns to it.
