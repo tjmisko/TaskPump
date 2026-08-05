@@ -527,6 +527,99 @@ grep -qE '▸ ● feat-f97b' <<<"$(smon --moves G)" && pass "G selects the last 
     || fail "G did not reach the last session"
 printf '#!/usr/bin/env bash\nexit 0\n' >| "$BIN/docker"; chmod +x "$BIN/docker"
 
+# ── Test 22: escape-sequence decoding ────────────────────────────────────────
+# read_key is a pure function of the bytes on stdin, so --decode-keys drives it
+# directly — no pty, the same trick --moves plays for cursor motion.
+#
+# WHY so many variants per key: one logical key has SEVERAL encodings and the
+# terminal picks between them at runtime. Home arrives as CSI H with cursor keys
+# in normal mode, SS3 H in application mode (this host's terminfo declares
+# khome=\EOH, kend=\EOF, kcuu1=\EOA — the SS3 forms), CSI 1~ / CSI 7~ from the
+# linux-console and rxvt lineages, and any of those gains a parameter once a
+# modifier is held (terminfo kHOM=\E[1;2H, kEND=\E[1;2F). The decoder used to
+# read a FIXED two bytes after ESC, which matched only the 3-byte CSI forms: it
+# dropped \EOH entirely, and dropped \E[1~ *and* stranded its trailing "~" to be
+# read as a phantom keypress on the next iteration.
+echo "--- Test 22: key decoding ---"
+dk_is() {  # $1 = bytes (printf %b escapes), $2 = expected tokens one per line, $3 = label
+    local want n got
+    want=$(printf '%b' "$2")            # \n in the expectation is a real newline
+    n=$(grep -c '' <<<"$want")          # read exactly as many keys as expected
+    got=$(printf '%b' "$1" | "$CLI" --decode-keys "$n" 2>/dev/null)
+    [[ "$got" == "$want" ]] && pass "$3" \
+        || fail "$3 — expected [${want//$'\n'/,}] got [${got//$'\n'/,}]"
+}
+
+# Home and End, in every form a terminal may emit. \EOH / \EOF are the ones the
+# reported bug was about: terminfo says that is what this host sends.
+dk_is '\033[H'  HOME 'CSI H decodes to HOME'
+dk_is '\033OH'  HOME 'SS3 H (application cursor mode) decodes to HOME'
+dk_is '\033[1~' HOME 'CSI 1~ decodes to HOME'
+dk_is '\033[7~' HOME 'CSI 7~ decodes to HOME'
+dk_is '\033[F'  END  'CSI F decodes to END'
+dk_is '\033OF'  END  'SS3 F (application cursor mode) decodes to END'
+dk_is '\033[4~' END  'CSI 4~ decodes to END'
+dk_is '\033[8~' END  'CSI 8~ decodes to END'
+
+# Arrows in both modes — the same DECCKM split, and the reason the fix is a
+# decoder rewrite rather than two extra Home/End cases.
+dk_is '\033[A' UP    'CSI A decodes to UP'
+dk_is '\033[B' DOWN  'CSI B decodes to DOWN'
+dk_is '\033[C' RIGHT 'CSI C decodes to RIGHT'
+dk_is '\033[D' LEFT  'CSI D decodes to LEFT'
+dk_is '\033OA' UP    'SS3 A decodes to UP'
+dk_is '\033OB' DOWN  'SS3 B decodes to DOWN'
+dk_is '\033OC' RIGHT 'SS3 C decodes to RIGHT'
+dk_is '\033OD' LEFT  'SS3 D decodes to LEFT'
+
+dk_is '\033[Z'  STAB 'CSI Z decodes to Shift-Tab'
+dk_is '\033[5~' PGUP 'CSI 5~ decodes to PGUP'
+dk_is '\033[6~' PGDN 'CSI 6~ decodes to PGDN'
+
+# A modifier adds parameters; the key is still named by the final byte (or, for
+# the tilde family, by the FIRST parameter). These are the exact byte strings
+# this host's terminfo lists for Shift-Home / Shift-End.
+dk_is '\033[1;2H' HOME 'Shift-Home (CSI 1;2H) still decodes to HOME'
+dk_is '\033[1;2F' END  'Shift-End (CSI 1;2F) still decodes to END'
+dk_is '\033[1;5H' HOME 'Ctrl-Home (CSI 1;5H) still decodes to HOME'
+dk_is '\033[5;2~' PGUP 'Shift-PgUp (CSI 5;2~) still decodes to PGUP'
+
+# NO STRAY BYTE: a sequence must be consumed to its final byte. If the trailing
+# "~" survived, the next read would see it as a keypress instead of nothing.
+dk_is '\033[1~'   'HOME\nNONE' 'CSI 1~ leaves nothing behind'
+dk_is '\033[1~x'  'HOME\nx'    'a key typed after CSI 1~ is read next, intact'
+dk_is '\033OHq'   'HOME\nq'    'a key typed after SS3 H is read next, intact'
+dk_is '\033[5~\033[6~' 'PGUP\nPGDN' 'back-to-back sequences decode independently'
+
+# Non-escape keys are unchanged: Enter is an empty successful read (read's own
+# delimiter) and must stay distinguishable from the interval timeout.
+dk_is 'q'    q      'a plain key passes through'
+dk_is '\n'   ENTER  'Enter decodes to ENTER, not to a timeout'
+dk_is '\033' ESC    'a lone ESC decodes to ESC'
+dk_is ''     NONE   'no input decodes to nothing'
+
+"$CLI" --decode-keys nine >/dev/null 2>&1 && fail "--decode-keys accepted a non-count" \
+    || pass "--decode-keys rejects a non-numeric count"
+
+# The live key loop needs a pty, so the HOME/END arms of the two tab keymaps are
+# pinned at the source level. This is the join the bug report was about: decoding
+# HOME is only useful if GRAPH routes it HORIZONTALLY (first node in the layer,
+# like ^) while gg/G stay vertical, and SESSIONS — which has no horizontal axis —
+# keeps it as first/last session.
+arm_has() {  # true when one line of the monitor holds both literals (no regex)
+    awk -v a="$1" -v b="$2" 'index($0,a) && index($0,b) { ok=1 } END { exit !ok }' "$CLI"
+}
+arm_has 'HOME)' "graph_move '^'" \
+    && pass "GRAPH routes Home horizontally (first node in the layer)" \
+    || fail "GRAPH Home arm no longer calls graph_move '^'"
+arm_has 'END)' "graph_move '\$'" \
+    && pass "GRAPH routes End horizontally (last node in the layer)" \
+    || fail "GRAPH End arm no longer calls graph_move '\$'"
+arm_has 'HOME)' 'SESS_SEL=0' \
+    && pass "SESSIONS keeps Home as the first session" || fail "SESSIONS Home arm changed"
+arm_has 'END)' 'SESS_SEL=999999' \
+    && pass "SESSIONS keeps End as the last session" || fail "SESSIONS End arm changed"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"

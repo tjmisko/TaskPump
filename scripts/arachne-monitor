@@ -39,6 +39,10 @@
 #   ./scripts/arachne-monitor --no-disk   # hide the disk gauge
 #   ./scripts/arachne-monitor --demo      # synthetic sessions; no docker needed
 #   ./scripts/arachne-monitor --tab graph --cursor F79.5 --moves jj   # scripted focus
+#   ./scripts/arachne-monitor --decode-keys 5   # print the token each keypress
+#                                               # decodes to (q stops early);
+#                                               # run this when a key does
+#                                               # nothing in a new terminal
 #
 # Both tabs navigate a SELECTION with vim motions; the viewport follows it.
 #
@@ -91,6 +95,7 @@ SHOW_DISK="${ARACHNE_MONITOR_DISK:-1}"        # disk gauge on by default; --no-d
 # Tabs: 0 = SESSIONS (gauges + live sessions), 1 = GRAPH (layered task DAG).
 # On the GRAPH tab a cursor selects one task node; the viewport follows it.
 TAB=0; PAN=0; CURSOR=""; MOVES=""; GRAPH_TOPH=7
+DECODE_KEYS=""                                # --decode-keys N: key-decoder probe
 # Resolved next to this script, NOT under REPO_ROOT: the two differ whenever
 # ARACHNE_MONITOR_REPO_ROOT points a worktree copy at the primary checkout.
 DAG_BIN="${ARACHNE_DAG_BIN:-$(CDPATH= cd -- "$(dirname "$0")" && pwd)/arachne-dag-render}"
@@ -111,12 +116,19 @@ while [[ $# -gt 0 ]]; do
                         esac ;;
         --log)          MONITOR_LOG="${2:-}"; shift ;;
         --log=*)        MONITOR_LOG="${1#--log=}" ;;
+        --decode-keys)  DECODE_KEYS="${2:-}"; shift ;;
+        --decode-keys=*) DECODE_KEYS="${1#--decode-keys=}" ;;
         [0-9]*)         INTERVAL="$1" ;;
         -h|--help)      print_help; exit 0 ;;
         *)              echo "ERROR: unknown arg '$1'" >&2; exit 1 ;;
     esac
     shift
 done
+# Validated here rather than at use: the count drives an arithmetic for-loop, so
+# garbage would surface as a bash arithmetic error instead of a usage message.
+if [[ -n "$DECODE_KEYS" && ! "$DECODE_KEYS" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: --decode-keys wants a count" >&2; exit 1
+fi
 
 # branch-slug -> "name<TAB>epic_task" lookup from the manifest.
 declare -A SLUG_NAME SLUG_TASK SLUG_BRANCH
@@ -1420,30 +1432,98 @@ notes_input_mode() {
     printf '\033[?7l' 2>/dev/null || true
 }
 
-# read_key -- read one key within the refresh interval, normalising arrow/page
-# keys to tokens (UP/DOWN/PGUP/PGDN/HOME/END). Empty on timeout. Honors set -e.
+# Continuation bytes of one escape sequence arrive in the same burst as its
+# introducer, so this only has to outlast scheduling jitter — not a human. It is
+# also the delay before a bare ESC is reported, which nothing is bound to.
+ESC_BYTE_TIMEOUT=0.05
+
+# read_key -- read one key within the refresh interval, normalising escape
+# sequences to tokens (UP/DOWN/LEFT/RIGHT/HOME/END/PGUP/PGDN/STAB/ESC). Empty on
+# timeout. Honors set -e.
+#
+# Escapes are decoded by INTRODUCER + incremental read rather than by slurping a
+# fixed two bytes, because one logical key has several encodings of DIFFERENT
+# LENGTHS and a terminal picks between them at runtime:
+#
+#   Home →  \E[H   (CSI, cursor keys in normal mode)
+#           \EOH   (SS3, cursor keys in APPLICATION mode — DECCKM set)
+#           \E[1~ / \E[7~   (tilde family: linux console / rxvt lineage)
+#           \E[1;5H etc.    (any of the above, plus a modifier parameter)
+#
+# This host's terminfo declares khome=\EOH / kend=\EOF / kcuu1=\EOA — the SS3
+# forms — and nothing here sends smkx/rmkx, so whether the terminal is in
+# application mode when the monitor starts depends on what ran before it. The
+# old fixed 2-byte read matched ONLY the 3-byte CSI forms: \EOH yielded "OH",
+# matched nothing, and the keypress vanished. Worse, \E[1~ yielded "[1", also
+# unmatched, and left its trailing "~" in the input stream to be read as a
+# phantom keypress on the next iteration.
+#
+# Reading a CSI up to and including its FINAL byte consumes exactly one
+# sequence whatever its length, so nothing is ever stranded.
 read_key() {
-    local c rest tail
+    local c intro seq="" ch final params
     IFS= read -rsn1 -t "$INTERVAL" c || { printf ''; return 0; }
     # Enter is read's own delimiter, so it arrives as an EMPTY successful read —
     # indistinguishable from a timeout unless it is named here.
     [[ -z "$c" ]] && { printf 'ENTER'; return 0; }
-    if [[ "$c" == $'\x1b' ]]; then
-        IFS= read -rsn2 -t 0.01 rest || rest=""
-        case "$rest" in
-            '[A') printf 'UP' ;;   '[B') printf 'DOWN' ;;
-            '[C') printf 'RIGHT' ;; '[D') printf 'LEFT' ;;
-            '[H') printf 'HOME' ;; '[F') printf 'END' ;;
-            '[Z') printf 'STAB' ;;                     # Shift-Tab
-            '[5') IFS= read -rsn1 -t 0.01 tail || true; printf 'PGUP' ;;
-            '[6') IFS= read -rsn1 -t 0.01 tail || true; printf 'PGDN' ;;
-            '')   printf 'ESC' ;;
-            *)    printf '' ;;
+    [[ "$c" == $'\x1b' ]] || { printf '%s' "$c"; return 0; }
+
+    IFS= read -rsn1 -t "$ESC_BYTE_TIMEOUT" intro || intro=""
+    case "$intro" in
+        # CSI: parameter bytes (0x30-0x3F) run until the final byte (0x40-0x7E),
+        # which is kept as the last character of $seq.
+        '[') while IFS= read -rsn1 -t "$ESC_BYTE_TIMEOUT" ch; do
+                 [[ -n "$ch" ]] || break
+                 seq+="$ch"
+                 [[ '0123456789;:<=>?' == *"$ch"* ]] || break
+             done ;;
+        # SS3: exactly one byte follows the introducer.
+        'O') IFS= read -rsn1 -t "$ESC_BYTE_TIMEOUT" seq || seq="" ;;
+        '')  printf 'ESC'; return 0 ;;
+        # ESC + printable is Alt-<key>. Consumed (never re-read as a bare key),
+        # but nothing is bound to it.
+        *)   printf ''; return 0 ;;
+    esac
+    [[ -n "$seq" ]] || { printf ''; return 0; }
+
+    final="${seq: -1}"; params="${seq%?}"
+    # The tilde family names the key in its FIRST parameter; every other form
+    # names it in the final byte and uses parameters only for modifiers. So
+    # \E[1~, \E[7~ and \E[1;5H all have to land on HOME.
+    if [[ "$final" == '~' ]]; then
+        case "${params%%;*}" in
+            1|7) printf 'HOME' ;;
+            4|8) printf 'END' ;;
+            5)   printf 'PGUP' ;;
+            6)   printf 'PGDN' ;;
+            *)   printf '' ;;
         esac
         return 0
     fi
-    printf '%s' "$c"
+    case "$final" in
+        A) printf 'UP' ;;    B) printf 'DOWN' ;;
+        C) printf 'RIGHT' ;; D) printf 'LEFT' ;;
+        H) printf 'HOME' ;;  F) printf 'END' ;;
+        Z) printf 'STAB' ;;                        # Shift-Tab
+        *) printf '' ;;
+    esac
+    return 0
 }
+
+# --decode-keys N -- read N keys and print the token read_key made of each, one
+# per line, 'NONE' when nothing arrived within the interval. Two jobs: it is the
+# decoder's test seam (the decoder is a pure function of the bytes on stdin, so
+# the suite can feed it \EOH and assert HOME with no pty), and it is the
+# diagnostic to reach for when a key "does nothing" in some new terminal — run
+# it and press the key. Stops early on q so it can be used interactively.
+if [[ -n "$DECODE_KEYS" ]]; then
+    for (( __dk = 0; __dk < DECODE_KEYS; __dk++ )); do
+        __tok="$(read_key)"
+        printf '%s\n' "${__tok:-NONE}"
+        if [[ "$__tok" == q ]]; then break; fi
+    done
+    exit 0
+fi
 
 if [[ "$WATCH" -eq 1 ]]; then
     restore() {
