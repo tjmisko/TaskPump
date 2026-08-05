@@ -118,6 +118,29 @@ echo "--- Test 9: colour ---"
 "$CLI" --phases F90 2>/dev/null | grep -q $'\033\[' \
     && pass "colour mode emits ANSI" || fail "colour mode emitted none"
 
+# The status palette: green is the progress axis. done is dark faded green, a
+# task with a live agent is bright green, an unstarted one is grey.
+col=$("$CLI" --phases F90 --live-branches feat/f90 2>/dev/null)
+grep -q $'\033\[0;38;5;65m'   <<<"$col" && pass "done wears dark faded green"   || fail "no faded green for done"
+grep -q $'\033\[0;1;38;5;46m' <<<"$col" && pass "a live task wears bright green" || fail "no bright green for the live task"
+grep -q $'\033\[0;2;38;5;244m' <<<"$col" && pass "an open task waiting on a blocker wears dim grey" \
+    || fail "no dim grey for the waiting task"
+# F91.1 is open with no blockers, so it is the ready (brighter grey) case.
+"$CLI" --phases F90..F91 2>/dev/null | grep -q $'\033\[0;38;5;250m' \
+    && pass "a ready task wears grey" || fail "no grey for the ready task"
+# Without a live container the same in_progress task is parked, not running.
+"$CLI" --phases F90 2>/dev/null | grep -q $'\033\[0;1;38;5;46m' \
+    && fail "bright green used for a task with no live agent" \
+    || pass "a claimed-but-dead task is not bright green"
+
+# Attribute leak: SGR dim/bold are sticky, so every sequence must re-open with
+# 0. A single non-absolute one after a dim `done` box greys out the whole rest
+# of the row -- which is what made the graph look uniformly grey.
+leaky=$("$CLI" --phases F90 --live-branches feat/f90 2>/dev/null \
+        | grep -oE $'\033\\[[0-9;]*m' | grep -vE $'\033\\[0(;|m)' || true)
+[[ -z "$leaky" ]] && pass "every colour sequence is absolute (re-opens with 0)" \
+    || fail "non-absolute sequences leak attributes: $(tr -d '\033' <<<"$leaky" | sort -u | tr '\n' ' ')"
+
 # ── Test 10: panning + empty range ──────────────────────────────────────────
 echo "--- Test 10: pan and empty range ---"
 p0=$("$CLI" --phases F90 --no-color 2>/dev/null | strip | sed -n '1p')

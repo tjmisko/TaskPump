@@ -681,14 +681,27 @@ function eligible(i,   m, B, j, p) {
     }
     return 1
 }
+# State -> colour. Two rules hold this together.
+#
+# Every sequence RE-OPENS WITH 0. SGR attributes are sticky: a bare
+# "\033[38;5;245m" changes only the foreground, so a `2` (dim) or `1` (bold) set
+# for one box stays on for every cell painted after it. With most of a phase
+# done, that one dim attribute leaked across the rest of the row and washed the
+# whole graph out to grey -- the colours were being emitted the entire time.
+#
+# Green is the progress axis: dark faded green for landed work, bright green for
+# the task an agent is on right now, grey for anything not yet started. Colour
+# still only reinforces the glyph (see glyph() above), never replaces it.
+#
+# Keep in sync with the ST_* palette in scripts/arachne-monitor.
 function hue(i,   s) {
     if (!color) return ""
     s = st[i]
-    if (s == "done")        return "\033[2;38;5;245m"
-    if (s == "in_progress") return islive(i) ? "\033[1;38;5;173m" : "\033[33m"
-    if (s == "blocked")     return "\033[33m"
-    if (s == "needs-review" || s == "stuck") return "\033[1;31m"
-    if (s == "open")        return eligible(i) ? "\033[0m" : "\033[2;38;5;245m"
+    if (s == "done")        return "\033[0;38;5;65m"                                    # ✓ dark faded green
+    if (s == "in_progress") return islive(i) ? "\033[0;1;38;5;46m" : "\033[0;38;5;179m" # ▶ bright green / ⧗ amber
+    if (s == "blocked")     return "\033[0;38;5;131m"                                   # ⊘ muted red
+    if (s == "needs-review" || s == "stuck") return "\033[0;1;38;5;203m"                 # ! bright red
+    if (s == "open")        return eligible(i) ? "\033[0;38;5;250m" : "\033[0;2;38;5;244m" # ○ grey / ◌ dim grey
     return "\033[0m"
 }
 
@@ -700,8 +713,11 @@ function put(y, x, ch) {
 }
 
 function flush(   y, x, xhi, line, c, o, cur, want, RAIL, DIM, RST) {
-    RAIL = color ? "\033[38;5;245m" : ""
-    DIM  = color ? "\033[2;38;5;238m" : ""
+    # Leading 0; for the same reason as hue(): these alternate with node colours
+    # cell by cell, so a non-absolute sequence inherits whichever attribute the
+    # previous box happened to leave on.
+    RAIL = color ? "\033[0;38;5;245m" : ""
+    DIM  = color ? "\033[0;2;38;5;238m" : ""
     RST  = color ? "\033[0m" : ""
     # Clip to the caller's viewport. A whole-corpus graph is ~9000 columns wide;
     # building those lines in full costs seconds of string reallocation for

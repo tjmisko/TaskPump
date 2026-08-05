@@ -164,15 +164,31 @@ was that clutter must not come from hiding nodes; a shortened *label* hides
 nothing, and the status bar now shows the selection's full id at all times.
 Multi-phase ranges still use full ids, where the phase actually disambiguates.
 
-| State | Glyph | Colour |
-|---|---|---|
-| done | `✓` | dark green |
-| running (live container) | `▶` | **bright green, bold** |
-| in_progress, no container | `⧗` | amber |
-| open, eligible | `○` | bright neutral |
-| open, waiting on a blocker | `◌` | dim grey |
-| blocked | `⊘` | orange |
-| needs-review / stuck | `!` | red |
+Green is the progress axis, so a glance at the graph reads as *how far along is
+this*: landed work recedes, the one task an agent is on right now is the
+brightest thing on screen, and anything not yet started is neutral.
+
+| State | Glyph | Colour | SGR |
+|---|---|---|---|
+| done | `✓` | dark faded green | `0;38;5;65` |
+| running (live container) | `▶` | **bright green, bold** | `0;1;38;5;46` |
+| in_progress, no container | `⧗` | amber | `0;38;5;179` |
+| open, eligible | `○` | grey | `0;38;5;250` |
+| open, waiting on a blocker | `◌` | dim grey | `0;2;38;5;244` |
+| blocked | `⊘` | muted red | `0;38;5;131` |
+| needs-review / stuck | `!` | bright red | `0;1;38;5;203` |
+
+**Every sequence re-opens with `0;`, and that is load-bearing.** SGR attributes
+are sticky: a bare `\033[38;5;245m` sets only the foreground, so the `2` (dim)
+belonging to one `done` box stays on for every cell painted after it. The first
+implementation emitted this whole palette correctly and still looked uniformly
+grey, because on a mostly-done phase the first dim box washed out the rest of
+the frame. The same applies to the rail/gutter colours in `flush()`, which
+alternate with node colours cell by cell.
+
+The palette is duplicated between `hue()` in `arachne-dag-layout.awk` (the
+canvas) and the `ST_*` constants in `arachne-monitor` (the legend, the status
+bar, the session rows) — two languages, one vocabulary; they must move together.
 
 The cursor-selected node is drawn with a **heavy border** (`┏━┓`), so selection
 is not colour-dependent (I5).
