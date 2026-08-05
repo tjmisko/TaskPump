@@ -6,10 +6,14 @@
 #
 # Layout (top is FIXED, sessions SCROLL):
 #   ┌ title + rule
+#   │ tabs
+#   │ (blank — the tab row is chrome, the numbers below it are the report)
 #   │ pump summary (range · status · ready/open)            Notes (right column)
-#   │ usage bars (5h/7d) · Disk bar — padded above/below    ─ stacks under if narrow
-#   │ disk subinfo as a vertical list (worktrees / main / docker / updated)
-#   ├ rule
+#   │ usage bars (5h/7d) · Disk bar — padded above/below    ─ wrapped, not
+#   │ disk subinfo list (worktrees / main / docker / updated)  truncated, and
+#   │ (blank — closes the two-column block)                    flowing on past
+#   │ selection detail (what is selected, and its goal)         the disk list
+#   ├ rule                                                  ─ stacks under if narrow
 #   │ ● session …   (scrollable viewport; 2 feed lines each)
 #   └ status bar (scroll position only; keys are in --help)
 #
@@ -434,8 +438,51 @@ append_note() {
     printf -- '- %s  %s\n' "$(date '+%H:%M')" "$text" >> "$f" 2>/dev/null || true
 }
 
+# wrap_note_line -- word-wrap ONE note entry to NOTES_COLW. Notes used to be
+# truncated with an "…", which ate the end of every note worth writing down;
+# they now wrap. Continuation lines are indented past the "- HH:MM" stamp, so
+# the timestamp keeps a column of its own and the eye can still see where one
+# entry ends and the next begins.
+wrap_note_line() {  # $1 = one raw note entry -> one or more display lines
+    local ln="$1" w="$NOTES_COLW" prefix indent rest cur word room take
+    (( w < 16 )) && w=16
+    (( ${#ln} <= w )) && { printf '%s\n' "$ln"; return 0; }
+    if [[ "$ln" =~ ^(-[[:space:]]+[0-9]{1,2}:[0-9]{2}[[:space:]]+) ]]; then
+        prefix="${BASH_REMATCH[1]}"; rest="${ln:${#prefix}}"
+        printf -v indent '%*s' "${#prefix}" ''
+    else
+        # Not a stamped entry (someone hand-edited the file) — hang it by two.
+        prefix=""; rest="$ln"; indent="  "
+    fi
+    room=$(( w - ${#indent} )); (( room < 8 )) && room=8
+    # read -ra splits on IFS WITHOUT globbing; `for word in $rest` would expand a
+    # note containing * against the cwd.
+    local -a words=(); read -ra words <<<"$rest"
+    (( ${#words[@]} )) || { printf '%s\n' "$ln"; return 0; }
+    cur="$prefix"
+    for word in "${words[@]}"; do
+        # A token longer than the column (a URL, a path) has no break point, so
+        # hard-split it rather than blowing the column width out.
+        while (( ${#word} > room )); do
+            if [[ "$cur" != "$prefix" && "$cur" != "$indent" ]]; then
+                printf '%s\n' "$cur"; cur="$indent"
+            fi
+            take=$(( w - ${#cur} )); (( take < 1 )) && take=1
+            printf '%s%s\n' "$cur" "${word:0:take}"
+            word="${word:take}"; cur="$indent"
+        done
+        if   [[ "$cur" == "$prefix" || "$cur" == "$indent" ]]; then cur+="$word"
+        elif (( ${#cur} + 1 + ${#word} <= w )); then cur+=" $word"
+        else printf '%s\n' "$cur"; cur="$indent$word"; fi
+    done
+    [[ -n "${cur//[[:space:]]/}" ]] && printf '%s\n' "$cur"
+    return 0
+}
+
 # notes_panel_lines -- the RIGHT column: a header naming the run scope + the most
-# recent NOTES_TAIL note lines (each truncated to NOTES_COLW), or an empty hint.
+# recent NOTES_TAIL note ENTRIES (each wrapped to NOTES_COLW, so one long note
+# costs several display lines but still only one of the tail's slots), or an
+# empty hint.
 notes_panel_lines() {
     local f label; f="$(notes_file)"; label="$(notes_label)"
     printf 'Notes [%s]  %s(n · C-g)%s\n' "$label" "$BAR_EMPTY" "$BAR_RST"
@@ -443,8 +490,7 @@ notes_panel_lines() {
         local ln
         while IFS= read -r ln; do
             [[ -n "${ln//[[:space:]]/}" ]] || continue
-            (( ${#ln} > NOTES_COLW )) && ln="${ln:0:$((NOTES_COLW - 1))}…"
-            printf '%s\n' "$ln"
+            wrap_note_line "$ln"
         done < <(tail -n "$NOTES_TAIL" "$f" 2>/dev/null)
     else
         printf '%s(no notes yet — press n)%s\n' "$C_FAINT" "$ST_RST"
@@ -941,7 +987,12 @@ compose_columns() {
 }
 
 # top_left_lines -- the left column: pump summary (if a pump is running) + usage
-# bars + the live Disk bar. $1 = usage json blob.
+# bars + the live Disk bar + the cached disk-footprint list. $1 = usage json blob.
+#
+# The footprint list is IN the array rather than printed after compose_columns,
+# which is what used to dead-end the notes column above it: notes now flow on
+# past the disk lines instead of stopping short of them. Rhythm is unchanged —
+# pump line, blank, gauges, blank, footprint list.
 top_left_lines() {
     local uj="${1:-{}}"
     [[ -f "$PUMP_STATE" ]] && pump_summary_line "$uj"
@@ -949,32 +1000,40 @@ top_left_lines() {
     usage_bars "$uj"
     disk_bar_line
     printf '\n'              # padding below the gauge bars
+    disk_subinfo_line
 }
 
-# render_top -- the FIXED top region: title, two-column gauges/notes, disk
-# subinfo, and a closing rule. Cheap: reads caches + one usage fetch.
+# render_top -- the FIXED top region: title, tabs, a breath, the two-column
+# gauges+disk / notes block, another breath, the selection detail, and a closing
+# rule. Cheap: reads caches + one usage fetch.
+#
+# The two blank lines are printed OUTSIDE compose_columns on purpose. Inside the
+# left array, the one under the tabs would push the gauges down while the notes
+# column stayed put; outside, both columns start level on the pump line.
 render_top() {
     local W; W="$(term_width)"
     if (( DEMO )); then
         header "   [DEMO — synthetic data]"
         tab_bar
+        printf '\n'
         local -a L R
         mapfile -t L < <(demo_left_lines)
         mapfile -t R < <(demo_notes_lines)
         compose_columns "$W" L R
-        demo_disk_subinfo
+        printf '\n'
         rule
         return 0
     fi
     header
     tab_bar
+    printf '\n'
     local uj='{}'
     [[ -x "$USAGE_BIN" ]] && uj="$("$USAGE_BIN" --json 2>/dev/null || echo '{}')"
     local -a L R
     mapfile -t L < <(top_left_lines "$uj")
     mapfile -t R < <(notes_panel_lines)
     compose_columns "$W" L R
-    disk_subinfo_line
+    printf '\n'
     sessions_detail_lines
     rule
     return 0
@@ -1282,6 +1341,7 @@ graph_detail_lines() {
 render_graph_top() {
     header
     tab_bar
+    printf '\n'              # same breath under the tabs as the SESSIONS tab
     local uj='{}'
     [[ -x "$USAGE_BIN" ]] && uj="$("$USAGE_BIN" --json 2>/dev/null || echo '{}')"
     [[ -f "$PUMP_STATE" ]] && pump_summary_line "$uj"
@@ -1322,13 +1382,27 @@ demo_left_lines() {
     printf '%s%-*s %s  %s60.5G free%s / 226.4G  (73%% used)\n' \
         "$GAUGE_INDENT" "$GAUGE_LABEL_W" "Disk" "$(bar_glyphs 73 "$BAR_FILL")" "$BAR_EMPTY" "$BAR_RST"
     printf '\n'
+    demo_disk_subinfo        # in the LEFT array, exactly as in top_left_lines
 }
+# The demo notes deliberately outrun the left column and include two entries too
+# long for NOTES_COLW: wrapping and flowing on past the disk list are the two
+# behaviours this region has, so a preview that fits neatly in four short notes
+# would be previewing a layout that does not exist.
 demo_notes_lines() {
     printf 'Notes [F43..F63]  %s(n · C-g)%s\n' "$BAR_EMPTY" "$BAR_RST"
-    printf -- '- 15:10  watch f55 disk — cargo clean\n'
-    printf -- '- 15:12  F00.0 example blocked on creds\n'
-    printf -- '- 15:18  PR #150/#151 merged to main\n'
-    printf -- '- 15:34  Issue: authentication and stale oauth tokens\n'
+    local n
+    for n in \
+        '- 15:10  watch f55 disk — cargo clean' \
+        '- 15:12  F00.0 example blocked on creds' \
+        '- 15:18  PR #150/#151 merged to main' \
+        '- 15:34  the host oauth token expired mid-run, so every container stalled and the pump idled green' \
+        '- 15:41  f57 needs a rebase on main' \
+        '- 15:52  disk guard fired at the 95 pct mark and reclaimed 31G of target dirs across six worktrees' \
+        '- 16:03  ask about the eligible-vs-open split on the pump line' \
+        '- 16:07  cargo clean the primary before the next drain'
+    do
+        wrap_note_line "$n"
+    done
 }
 demo_disk_subinfo() {
     printf '%s%sworktrees%s 87.8G in 8\n' "$GAUGE_SUBINDENT" "$BAR_EMPTY" "$BAR_RST"
