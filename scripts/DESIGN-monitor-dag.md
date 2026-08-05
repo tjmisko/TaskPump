@@ -13,11 +13,14 @@ Two tabs, switched with `Tab` / `Shift-Tab` and `←` / `→`:
 | 2 | `GRAPH`    | layered boxed DAG of the pump's phase range. |
 
 The tab bar is one row, rendered above the existing content, and is the only
-chrome the SESSIONS tab gains. Inactive tab dim, active tab bold + underline,
-never colour-alone (the active tab is also bracketed):
+chrome the SESSIONS tab gains. Inactive tab dim, active tab bold, never
+colour-alone — bold weight is the non-colour half of the mark. (It was once
+bracketed too; the brackets were dropped in 2026-08, and because a bracket was
+also padding the cell, both labels now sit in fixed-width cells so the row does
+not reflow when the selection changes.)
 
 ```
- ┤ SESSIONS ├   GRAPH        F79 · 04:12 · ✓14 ▶1 ○5
+  SESSIONS    GRAPH     :help
 ```
 
 `--tab sessions|graph` selects the initial tab and, in one-shot (non-`--watch`)

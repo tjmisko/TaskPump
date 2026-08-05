@@ -269,7 +269,8 @@ Selecting a node fills a **top status bar** (under the pump summary, above the
 rule) with its detail — the legend renders there when nothing is selected:
 
 ```
- SESSIONS ┤ GRAPH ├    Tab switch · ↑↓←→ move · q quit
+  SESSIONS    GRAPH     :help
+
 pump[F79]: running  |  2 ready · 4 open
 F79.5   ○ ready · 3 turns · blockers F79.3 ✓ F79.4 ✓ · feat/f79
   missing_const_for_fn (515) + redundant_clone (81) — need human judgement

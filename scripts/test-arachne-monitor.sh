@@ -277,11 +277,17 @@ rows=$(printf '%s' "$frame" | grep -c .)
 # ── Test 16: tab bar + --tab selection ────────────────────────────────────────
 echo "--- Test 16: tabs ---"
 make_usage_stub 30 40
-sess_out=$("$CLI" 2>/dev/null | strip_ansi)
-grep -q '┤ SESSIONS ├' <<<"$sess_out" && pass "SESSIONS tab is active by default" || fail "no active SESSIONS tab:\n$sess_out"
+# The active tab is marked by WEIGHT now, not by `┤ ├`, so it can only be
+# asserted before strip_ansi. tab_row picks the one line carrying both labels.
+tab_row() { grep 'SESSIONS.*GRAPH'; }
+C_STRONG_SGR=$'\033[0;1;38;5;252m'   # the `1` is the active-tab mark
+sess_raw=$("$CLI" 2>/dev/null); sess_out=$(strip_ansi <<<"$sess_raw")
+sess_tab=$(tab_row <<<"$sess_raw")
+grep -qF "$C_STRONG_SGR  SESSIONS" <<<"$sess_tab" && pass "SESSIONS tab is active by default" || fail "no active SESSIONS tab:\n$(cat -v <<<"$sess_tab")"
 grep -q 'GRAPH' <<<"$sess_out" && pass "GRAPH tab is listed" || fail "GRAPH tab missing"
-graph_out=$("$CLI" --tab graph 2>/dev/null | strip_ansi)
-grep -q '┤ GRAPH ├' <<<"$graph_out" && pass "--tab graph activates the GRAPH tab" || fail "--tab graph not active:\n$graph_out"
+graph_raw=$("$CLI" --tab graph 2>/dev/null); graph_out=$(strip_ansi <<<"$graph_raw")
+graph_tab=$(tab_row <<<"$graph_raw")
+grep -qF "$C_STRONG_SGR  GRAPH" <<<"$graph_tab" && pass "--tab graph activates the GRAPH tab" || fail "--tab graph not active:\n$(cat -v <<<"$graph_tab")"
 grep -q '✓ done' <<<"$graph_out" && pass "GRAPH tab shows the status legend" || fail "no legend on the graph tab"
 # No pump state is configured in this harness, so the graph must say so rather
 # than rendering the entire ledger.
@@ -646,6 +652,316 @@ offenders=$(grep -nE $'\033\\[[0-9;]*(3[0-7]|9[0-7]|7)m' "$CLI" | grep -v '^\s*#
 leaky=$(grep -oE $'\033\\[[0-9;]+m' "$CLI" | grep -vE $'\033\\[0([;m])' || true)
 [[ -z "$leaky" ]] && pass "every colour sequence re-opens with 0" \
     || fail "non-absolute sequences: $(tr -d '\033' <<<"$leaky" | sort -u | tr '\n' ' ')"
+
+# ── Test 24: the tab bar marks the active tab by weight, not by brackets ─────
+# The `┤ ├` indicators are gone. Bold weight is now the whole non-colour half of
+# the mark (R2) — it is all a --no-color or colour-blind reader has — so it must
+# land on exactly the active label. And because a bracket was also doing the
+# cell's padding, dropping it can silently move a label: the columns are pinned
+# here so switching tabs never reflows the row under the reader's eye.
+echo "--- Test 24: tab bar marking ---"
+strong_sgr=$'\033[0;1;38;5;252m'   # C_STRONG — active
+rule_sgr=$'\033[0;38;5;242m'       # C_RULE   — inactive, no bold
+sess_bar=$("$CLI" 2>/dev/null | grep 'SESSIONS.*GRAPH')
+graph_bar=$("$CLI" --tab graph 2>/dev/null | grep 'SESSIONS.*GRAPH')
+
+bold_hits=$(grep -oF "$strong_sgr" <<<"$sess_bar" | wc -l)
+[[ "$bold_hits" -eq 1 ]] && grep -qF "$strong_sgr  SESSIONS" <<<"$sess_bar" \
+    && grep -qF "$rule_sgr  GRAPH" <<<"$sess_bar" \
+    && pass "SESSIONS active: bold on its label, none on GRAPH" \
+    || fail "SESSIONS tab weight wrong (${bold_hits} bold runs):\n$(cat -v <<<"$sess_bar")"
+bold_hits=$(grep -oF "$strong_sgr" <<<"$graph_bar" | wc -l)
+[[ "$bold_hits" -eq 1 ]] && grep -qF "$strong_sgr  GRAPH" <<<"$graph_bar" \
+    && grep -qF "$rule_sgr  SESSIONS" <<<"$graph_bar" \
+    && pass "GRAPH active: bold on its label, none on SESSIONS" \
+    || fail "GRAPH tab weight wrong (${bold_hits} bold runs):\n$(cat -v <<<"$graph_bar")"
+
+if grep -qF '┤' <<<"$sess_bar$graph_bar" || grep -qF '├' <<<"$sess_bar$graph_bar"; then
+    fail "bracket indicator still on the tab row:\n$sess_bar\n$graph_bar"
+else
+    pass "no bracket glyph on the tab row"
+fi
+
+# Columns must not depend on which tab is selected.
+col_of() { awk -v n="$2" 'NR==1 { print index($0, n) }' <<<"$1"; }
+s_strip=$(strip_ansi <<<"$sess_bar"); g_strip=$(strip_ansi <<<"$graph_bar")
+sc_a=$(col_of "$s_strip" 'SESSIONS'); sc_b=$(col_of "$g_strip" 'SESSIONS')
+gc_a=$(col_of "$s_strip" 'GRAPH');    gc_b=$(col_of "$g_strip" 'GRAPH')
+[[ "$sc_a" -gt 0 && "$gc_a" -gt 0 && "$sc_a" == "$sc_b" && "$gc_a" == "$gc_b" ]] \
+    && pass "tab labels hold their columns across a switch (SESSIONS@$sc_a GRAPH@$gc_a)" \
+    || fail "tab labels shift on switch: SESSIONS $sc_a→$sc_b, GRAPH $gc_a→$gc_b"
+
+# The enumerated key hint is gone; one muted affordance points at the overlay.
+grep -q ':help' <<<"$s_strip" && grep -q ':help' <<<"$g_strip" \
+    && pass "tab row carries the :help affordance on both tabs" \
+    || fail "no :help affordance:\n$s_strip\n$g_strip"
+grep -qE 'q quit|Enter open|switch' <<<"$s_strip$g_strip" \
+    && fail "tab row still enumerates keys:\n$s_strip\n$g_strip" \
+    || pass "tab row enumerates no keys"
+
+# ── Test 25: gt/gT switch tab; the arrows never do ───────────────────────────
+# Pinned at source level with Test 22's arm_has, for the same reason: the live
+# key loop needs a pty. The `--moves` seam cannot stand in here — render_all
+# branches on TAB and *then* calls the tab's replayer, so a replayed tab switch
+# could not change which renderer ran without restructuring the one-shot path.
+echo "--- Test 25: gt/gT tab switching ---"
+
+# The bug this closes: ← / → switched tab on SESSIONS while driving the node
+# cursor on GRAPH, so the same key both navigated and teleported you off the
+# page depending on where you were. Every case arm naming an arrow must now be
+# a graph_move — there is no other legitimate consumer.
+arrow_arms=$(grep -nE '^[[:space:]]*[^#]*\b(LEFT|RIGHT)\)' "$CLI" || true)
+stray_arrows=$(printf '%s\n' "$arrow_arms" | grep -v 'graph_move' | grep -v '^$' || true)
+[[ -n "$arrow_arms" ]] && [[ -z "$stray_arrows" ]] \
+    && pass "← / → drive only the GRAPH node cursor — no arm switches tab" \
+    || fail "an arrow key arm no longer routes to graph_move:\n$stray_arrows"
+
+# ...and specifically that the SESSIONS switch arm dropped them, rather than the
+# arrows merely having moved to some other tab-switching arm.
+arm_has 'LEFT' 'tab_switch' && fail "an arrow arm still switches tab" \
+    || pass "SESSIONS tab-switch arm no longer names LEFT"
+arm_has 'RIGHT' 'tab_switch' && fail "an arrow arm still switches tab" \
+    || pass "SESSIONS tab-switch arm no longer names RIGHT"
+arm_has 'RIGHT)' 'TAB=1' && fail "the old SESSIONS ←/→ tab-switch arm is still present" \
+    || pass "the old '\$'\\t'|STAB|LEFT|RIGHT) TAB=1' arm is gone"
+
+# `g` is the prefix; t and T must resolve inside it, beside gg. If they leaked to
+# the per-tab keymaps instead, `gt` would move the cursor and then switch tab.
+arm_has 't)' 'tab_switch next' \
+    && pass "the g-prefix block resolves t → next tab" \
+    || fail "gt does not resolve to a next-tab switch in the g-prefix block"
+arm_has 'T)' 'tab_switch prev' \
+    && pass "the g-prefix block resolves T → previous tab" \
+    || fail "gT does not resolve to a previous-tab switch in the g-prefix block"
+
+# One switch function, four entry points, both tabs: the SCROLL/PAN reset is the
+# whole reason it exists, so an arm that sets TAB by hand is the regression.
+[[ "$(grep -cE '^[[:space:]]*[^#]*tab_switch (next|prev)' "$CLI")" -ge 6 ]] \
+    && pass "Tab/Shift-Tab/gt/gT on both tabs all route through tab_switch" \
+    || fail "fewer than six tab_switch call sites — an arm bypasses it"
+raw_tab_sets=$(grep -nE '^[[:space:]]*[^#]*(\$.\\t.|STAB)\).*TAB=' "$CLI" || true)
+[[ -z "$raw_tab_sets" ]] \
+    && pass "no tab-switch arm assigns TAB directly (the viewport reset can't be skipped)" \
+    || fail "a tab-switch arm sets TAB by hand:\n$raw_tab_sets"
+
+# The reset itself, and the directionality that lets a third tab be added
+# without rewriting the arms.
+# The function's BEHAVIOUR, not its source text. The monitor cannot be sourced
+# (it renders on load), so lift the definition out and run it standalone: the
+# viewport reset is the whole point of centralising the switch, and a grep for
+# `SCROLL=0` would still pass if the assignment moved behind a condition.
+tab_switch_says() {  # $1 = start TAB, $2 = direction → "TAB SCROLL PAN"
+    bash -c '
+        eval "$(sed -n "/^TAB_COUNT=/,/^}/p" "$0")"
+        TAB="$1"; SCROLL=42; PAN=17
+        tab_switch "$2"
+        printf "%s %s %s" "$TAB" "$SCROLL" "$PAN"
+    ' "$CLI" "$1" "$2"
+}
+[[ "$(tab_switch_says 0 next)" == "1 0 0" ]] \
+    && pass "tab_switch next from SESSIONS lands on GRAPH with the viewport zeroed" \
+    || fail "tab_switch 0 next → $(tab_switch_says 0 next), want '1 0 0'"
+[[ "$(tab_switch_says 1 next)" == "0 0 0" ]] \
+    && pass "tab_switch next wraps GRAPH → SESSIONS" \
+    || fail "tab_switch 1 next → $(tab_switch_says 1 next), want '0 0 0'"
+[[ "$(tab_switch_says 0 prev)" == "1 0 0" ]] \
+    && pass "tab_switch prev from SESSIONS wraps back to GRAPH" \
+    || fail "tab_switch 0 prev → $(tab_switch_says 0 prev), want '1 0 0'"
+[[ "$(tab_switch_says 1 prev)" == "0 0 0" ]] \
+    && pass "tab_switch prev from GRAPH lands on SESSIONS" \
+    || fail "tab_switch 1 prev → $(tab_switch_says 1 prev), want '0 0 0'"
+# Never out of range, whatever it is handed — an out-of-range TAB would render
+# the SESSIONS tab while the tab bar claimed otherwise.
+[[ "$(tab_switch_says 0 '')" == "1 0 0" ]] \
+    && pass "tab_switch defaults to next when handed no direction" \
+    || fail "tab_switch with no direction → $(tab_switch_says 0 '')"
+grep -q 'TAB_COUNT' <(sed -n '/^tab_switch()/,/^}/p' "$CLI") \
+    && pass "tab_switch is directional over TAB_COUNT, not a two-tab toggle" \
+    || fail "tab_switch hardcodes a two-tab toggle"
+
+# The documented keymap is the one the code implements. That documentation is
+# the ? panel and nothing else — the leading comment block deliberately stopped
+# restating it when the overlay landed, so a second copy cannot go stale. These
+# assertions therefore read the panel, not `--help`.
+b25_sess=$(ARACHNE_MONITOR_COLS=100 "$CLI" --show-help --tab sessions 2>/dev/null | strip_ansi)
+b25_graph=$(ARACHNE_MONITOR_COLS=100 "$CLI" --show-help --tab graph 2>/dev/null | strip_ansi)
+grep -qE '^│ gt gT ' <<<"$b25_sess" && grep -qE '^│ gt gT ' <<<"$b25_graph" \
+    && pass "the help panel binds gt / gT on both tabs" \
+    || fail "the help panel does not document gt / gT:\n$b25_sess"
+# The arrows are the GRAPH tab's node cursor, so SESSIONS must say so rather
+# than leaving a reader to try them and watch the tab change under them.
+grep -E '^│ ← →' <<<"$b25_sess" | grep -q 'nothing here' \
+    && pass "SESSIONS help states the arrows do nothing there" \
+    || fail "SESSIONS help still binds ← → to something:\n$(grep '←' <<<"$b25_sess")"
+
+# ── Test 26: top-region vertical rhythm ──────────────────────────────────────
+# Three facts about the fixed top, all of them spacing: one blank line under the
+# tab row on BOTH tabs; notes that WRAP (they used to be cut with an "…") and
+# flow on past the disk sub-info instead of dead-ending above it; and one blank
+# line closing the whole composed block. The pump row is located by content, not
+# by row number — the tab bar above it is being rewritten independently.
+echo "--- Test 26: top-region vertical rhythm ---"
+make_usage_stub 40 50
+# A pump state so the `pump[…]` line renders at all; its counts come from a
+# pre-seeded cache with a huge TTL so no background frontier scan is kicked off.
+PS24="$TMP/pump24.state"
+printf '%s' '{"phases":"F24","started_at":"2026-08-05T09:00:00Z","status":"running","open_tasks":3,"ceiling":95}' >| "$PS24"
+PC24="$TMP/pump24-cache.tsv"; printf 'ELIG\t1\nOPEN\t3\n' >| "$PC24"
+run24() {  # $1 = cols  $2 = notes file  $3 = notes tail (default 6)
+  ARACHNE_MONITOR_DISK=1 ARACHNE_MONITOR_DISK_CACHE="$DCACHE" ARACHNE_MONITOR_DISK_TTL=99999 \
+  ARACHNE_MONITOR_MAIN_ROOT="$FAKE_MAIN" DF_AVAIL_KB=52428800 \
+  ARACHNE_PUMP_STATE_FILE="$PS24" ARACHNE_MONITOR_PUMP_CACHE="$PC24" ARACHNE_MONITOR_PUMP_TTL=99999 \
+  ARACHNE_TASKS_DIR="$TMP/no-such-tasks" \
+  ARACHNE_MONITOR_COLS="$1" ARACHNE_MONITOR_NOTES_FILE="$2" ARACHNE_MONITOR_NOTES_TAIL="${3:-6}" \
+  "$CLI" 2>/dev/null | strip_ansi; }
+row_at() { sed -n "${2}p" <<<"$1" 2>/dev/null; }   # $1 = text, $2 = 1-based row
+
+# (a) A long note wraps instead of gaining an "…", and its tail is the NEXT row.
+# Narrow, so the notes column stacks at column 0 and the indent is assertable.
+NF24="$TMP/notes24.md"
+printf -- '- 14:02  the host oauth token expired mid-run and every agent container stalled waiting on SENTINELTAIL\n' >| "$NF24"
+w24=$(run24 60 "$NF24")
+grep -q 'SENTINELTAIL' <<<"$w24" && pass "a long note keeps its tail" || fail "note tail cut off:\n$w24"
+grep -qE 'oauth token.*…' <<<"$w24" && fail "the long note is still truncated with an …:\n$w24" \
+    || pass "the long note is wrapped, not truncated"
+head_row=$(awk '/^- 14:02/{print NR; exit}' <<<"$w24")
+tail_row=$(awk '/SENTINELTAIL/{print NR; exit}' <<<"$w24")
+[[ -n "$head_row" && "$tail_row" == "$((head_row + 1))" ]] \
+    && pass "the wrapped tail lands on the line after the stamp (rows $head_row/$tail_row)" \
+    || fail "wrap did not spill onto the next line: head=$head_row tail=$tail_row:\n$w24"
+# Continuation is indented past the "- HH:MM  " stamp, so the timestamp keeps a
+# column of its own and one entry stays visually distinct from the next.
+grep -qE '^ {9}[^ ].*SENTINELTAIL' <<<"$w24" \
+    && pass "the continuation line is indented under the note text" \
+    || fail "continuation not indented past the stamp:\n$w24"
+
+# (b)+(d) Wide terminal: notes continue BELOW the disk sub-info rows, and one
+# blank line closes the composed block.
+MF24="$TMP/notes24-many.md"
+printf -- '- 09:%02d  note-%02d body\n' 1 1 2 2 3 3 4 4 5 5 6 6 7 7 8 8 9 9 10 10 11 11 12 12 >| "$MF24"
+m24=$(run24 200 "$MF24" 12)
+wt_row=$(awk '/worktrees 11/{print NR; exit}' <<<"$m24")
+dk_row=$(awk '/docker img /{print NR; exit}' <<<"$m24")
+last_note=$(awk '/note-[0-9]+ body/{r=NR} END{print r+0}' <<<"$m24")
+[[ -n "$wt_row" && -n "$dk_row" && "$last_note" -gt "$dk_row" && "$last_note" -gt "$wt_row" ]] \
+    && pass "notes flow on past the disk sub-info (last note row $last_note > docker row $dk_row)" \
+    || fail "notes dead-end above the disk column: worktrees=$wt_row docker=$dk_row last-note=$last_note:\n$m24"
+below=$(row_at "$m24" "$((last_note + 1))")
+[[ "$last_note" -gt 0 && -z "${below//[[:space:]]/}" ]] \
+    && pass "a blank line closes the composed top block" \
+    || fail "no blank line under the composed block: [$below]"
+
+# (c) Exactly one blank row between the tab row and the pump row — the pump row
+# is found by content so no assertion here depends on the tab bar's text.
+p_row=$(awk '/pump\[/{print NR; exit}' <<<"$m24")
+above1=$(row_at "$m24" "$((p_row - 1))"); above2=$(row_at "$m24" "$((p_row - 2))")
+[[ -n "$p_row" && -z "${above1//[[:space:]]/}" && -n "${above2//[[:space:]]/}" ]] \
+    && pass "exactly one blank line separates the tab row from the pump line" \
+    || fail "tab→pump spacing wrong (pump row $p_row): above=[$above1] above-above=[$above2]"
+# The GRAPH tab breathes the same way — the two tops must not drift apart.
+g24=$(ARACHNE_PUMP_STATE_FILE="$GPS" ARACHNE_TASKS_DIR="$GTD" ARACHNE_MONITOR_PUMP_CACHE="$PC24" \
+      ARACHNE_MONITOR_PUMP_TTL=99999 ARACHNE_MONITOR_COLS=120 "$CLI" --tab graph 2>/dev/null | strip_ansi)
+gp_row=$(awk '/pump\[/{print NR; exit}' <<<"$g24")
+gab1=$(row_at "$g24" "$((gp_row - 1))"); gab2=$(row_at "$g24" "$((gp_row - 2))")
+[[ -n "$gp_row" && -z "${gab1//[[:space:]]/}" && -n "${gab2//[[:space:]]/}" ]] \
+    && pass "the GRAPH tab gets the same blank line under the tabs" \
+    || fail "GRAPH tab→pump spacing wrong (pump row $gp_row): above=[$gab1] above-above=[$gab2]"
+
+# (e) NOTES_TAIL still counts ENTRIES — a wrapped note must not eat two slots.
+TF24="$TMP/notes24-tail.md"
+{ printf -- '- 08:00  oldest-entry\n'
+  printf -- '- 08:01  second entry deliberately long enough to need two display lines all by itself\n'
+  printf -- '- 08:02  third entry also deliberately long enough to need two display lines all by itself\n'; } >| "$TF24"
+t24=$(run24 60 "$TF24" 2)
+grep -q 'oldest-entry' <<<"$t24" && fail "NOTES_TAIL counted display lines, not entries:\n$t24" \
+    || pass "NOTES_TAIL=2 drops the third-oldest entry"
+grep -q 'second entry' <<<"$t24" && grep -q 'third entry' <<<"$t24" \
+    && pass "NOTES_TAIL=2 shows two ENTRIES even when each wraps to two lines" \
+    || fail "a wrapped entry cost more than one tail slot:\n$t24"
+
+# ── Test 27: the help panel (? overlay / :help) ──────────────────────────────
+# The overlay itself needs a pty, so --show-help is its seam: it prints exactly
+# what help_lines() paints, for the tab --tab picked. What is asserted is the
+# property the old always-on hint line could not have had — the two tabs
+# document DIFFERENT keymaps, each naming its own axis, while still agreeing on
+# the handful of keys that really are shared.
+echo "--- Test 27: help panel ---"
+"$CLI" --show-help --tab graph >/dev/null 2>&1 && pass "--show-help exits 0" || fail "--show-help exited non-zero"
+hsess=$(ARACHNE_MONITOR_COLS=100 "$CLI" --show-help --tab sessions 2>/dev/null | strip_ansi)
+hgraph=$(ARACHNE_MONITOR_COLS=100 "$CLI" --show-help --tab graph 2>/dev/null | strip_ansi)
+[[ -n "$hsess" && "$hsess" != "$hgraph" ]] && pass "the two tabs get different help panels" \
+    || fail "sessions and graph help are identical:\n$hsess"
+grep -q 'SESSIONS tab keys' <<<"$hsess"  && pass "the sessions panel is titled for its tab" || fail "no SESSIONS title:\n$hsess"
+grep -q 'GRAPH tab keys'    <<<"$hgraph" && pass "the graph panel is titled for its tab"    || fail "no GRAPH title:\n$hgraph"
+grep -q '┌' <<<"$hgraph" && grep -q '└' <<<"$hgraph" && pass "the panel is a bordered box" || fail "no box border:\n$hgraph"
+
+# Each panel names its OWN tab's keys — and only its own.
+grep -q 'o Enter' <<<"$hgraph" && pass "graph help documents o (open the selected task)" \
+    || fail "graph help missing the o key:\n$hgraph"
+grep -q '\$ End' <<<"$hgraph" && pass "graph help documents \$ (last node in the layer)" \
+    || fail "graph help missing the \$ key:\n$hgraph"
+grep -q 'o Enter' <<<"$hsess" && fail "sessions help lists the graph-only o key" \
+    || pass "sessions help omits the graph-only keys"
+grep -q '│ Enter ' <<<"$hsess" && pass "sessions help documents Enter (open the session's task)" \
+    || fail "sessions help missing Enter:\n$hsess"
+grep -q 'next session' <<<"$hsess" && pass "sessions help describes the session cursor" \
+    || fail "sessions help says nothing about the session cursor:\n$hsess"
+# ...and both name the keys that are genuinely shared, including B's tab switch.
+for tabname in sessions graph; do
+    h=$([[ "$tabname" == graph ]] && printf '%s' "$hgraph" || printf '%s' "$hsess")
+    grep -q 'gt gT' <<<"$h" && pass "$tabname help documents gt/gT" || fail "$tabname help missing gt/gT:\n$h"
+    grep -q 'q :q'  <<<"$h" && pass "$tabname help documents q"     || fail "$tabname help missing q:\n$h"
+done
+
+# Width is bounded by the terminal, and sized to the content when there is room.
+panel_w() { ARACHNE_MONITOR_COLS="$1" "$CLI" --show-help --tab "$2" 2>/dev/null | strip_ansi \
+    | awk '{ if (length($0) > m) m = length($0) } END { print m+0 }'; }
+w48=$(panel_w 48 graph)
+[[ "$w48" -gt 0 && "$w48" -le 48 ]] && pass "panel respects ARACHNE_MONITOR_COLS=48 (${w48} cols)" \
+    || fail "panel overflowed a 48-column terminal: ${w48}"
+w200=$(panel_w 200 graph)
+[[ "$w200" -gt 48 && "$w200" -lt 200 ]] && pass "a wide terminal sizes the panel to its content (${w200} cols)" \
+    || fail "panel not content-sized at 200 columns: ${w200}"
+
+# The hint lines the panel replaced are gone — and the blocks that held them
+# still emit TWO lines each. The watch loop measures the top region's height
+# from those blocks, so a changed line count silently shifts the viewport.
+gtop=$("$CLI" --tab graph 2>/dev/null | strip_ansi)
+stop=$("$CLI" 2>/dev/null | strip_ansi)
+# Matched on the tail of each removed string, not its head: the tab bar carries
+# a hint of its own (a different surface, removed separately) whose opening
+# clause reads the same.
+grep -q 'gg/G layers' <<<"$gtop" && fail "the graph detail hint line is still painted" \
+    || pass "graph detail hint line removed"
+grep -q 'Enter open · Tab graph' <<<"$stop" && fail "the sessions detail hint line is still painted" \
+    || pass "sessions detail hint line removed"
+after() {  # $1 = a literal on the anchor line, $2 = how many lines past it
+    awk -v pat="$1" -v off="$2" 'index($0,pat) && !f { f=NR } f && NR==f+off { print; exit }'
+}
+gap=$(after '✓ done' 1 <<<"$gtop")
+[[ -z "${gap// }" ]] && pass "the graph detail block's second line is now blank" \
+    || fail "expected a blank second line, got '$gap'"
+[[ "$(after '✓ done' 2 <<<"$gtop")" == ─* ]] && pass "the graph top region keeps its height (rule 2 lines on)" \
+    || fail "graph top height changed: '$(after '✓ done' 2 <<<"$gtop")'"
+gap=$(after 'no sessions' 1 <<<"$stop")
+[[ -z "${gap// }" ]] && pass "the sessions detail block's second line is now blank" \
+    || fail "expected a blank second line, got '$gap'"
+[[ "$(after 'no sessions' 2 <<<"$stop")" == ─* ]] && pass "the sessions top region keeps its height" \
+    || fail "sessions top height changed: '$(after 'no sessions' 2 <<<"$stop")'"
+
+# The live ? and : arms need a pty, so they are pinned at source level — and
+# pinned in BOTH keymaps, since help_lines reads $TAB and a tab that never
+# reaches it is a tab with no documentation at all.
+arm_count() {  # how many lines of the monitor hold BOTH literals
+    awk -v a="$1" -v b="$2" 'index($0,a) && index($0,b) { c++ } END { print c+0 }' "$CLI"
+}
+[[ "$(arm_count "'?')" 'help_overlay')" -ge 2 ]] \
+    && pass "both tab keymaps bind ? to the overlay" || fail "the ? arm is missing from a keymap"
+[[ "$(arm_count "':')" 'command_input_mode')" -ge 2 ]] \
+    && pass "both tab keymaps bind : to the command prompt" || fail "the : arm is missing from a keymap"
+arm_has "':')" 'quit) break' && pass ":q breaks the watch loop" || fail "the : arm no longer routes quit to a break"
+arm_has 'help|h' 'CMD_ACTION=help' && pass ":help / :h / :? open the panel" || fail ":help verb missing"
+arm_has 'q|quit' 'CMD_ACTION=quit' && pass ":q / :quit quit the monitor"    || fail ":quit verb missing"
 
 echo
 echo "=============================================="
