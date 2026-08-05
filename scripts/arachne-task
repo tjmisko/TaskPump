@@ -864,13 +864,21 @@ cmd_release() {
   echo "released $id"
 }
 
-# Reopen a task back to status=open, from either `blocked` or `done`.
+# Reopen a task back to status=open, from `blocked`, `done`, `needs-review`, or
+# `stuck`.
 #  - from blocked: a blocker was a transient/environment issue (e.g. an upstream
 #    branch that has since merged) rather than a genuine remaining feature gap.
 #  - from done: the task was falsely-done / partial — marked complete on green
 #    unit tests but its production wiring was never landed (see `defer`). The
 #    completion + wiring-deferred markers are dropped so it re-enters the queue
 #    as fresh work; the prior completion commits are preserved in the body note.
+#  - from needs-review / stuck: a human (or the pump's resume path) has looked at
+#    a scrub-parked task and decided it is workable again. Without this, those two
+#    statuses are dead ends: `release` requires in_progress, `claim` requires open
+#    or a same-branch in_progress, and nothing else writes `open` — so a task
+#    scrubbed to needs-review could only be revived by hand-editing frontmatter,
+#    which the ledger's whole design forbids. The failure streak is cleared too,
+#    so a task reopened from `stuck` does not trip its tripwire on the next turn.
 # Distinct from release (which relinquishes a live in_progress claim).
 cmd_reopen() {
   local id="" reason=""
@@ -887,9 +895,10 @@ cmd_reopen() {
   local file; file=$(task_file_required "$id")
 
   local status; status=$(fm_get "$file" '.status')
-  if [[ "$status" != "blocked" && "$status" != "done" ]]; then
-    die "cannot reopen $id: status=$status (must be blocked or done)"
-  fi
+  case "$status" in
+    blocked|done|needs-review|stuck) : ;;
+    *) die "cannot reopen $id: status=$status (must be blocked, done, needs-review or stuck)";;
+  esac
 
   local now; now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   # A done task reopened as falsely-done/partial: shed its completion markers so
@@ -905,6 +914,12 @@ cmd_reopen() {
       .wiring_deferred_note = null
     "
   fi
+  # A scrub-parked task re-enters the queue with its tripwire counter cleared:
+  # `stuck` means consecutive_failed_iterations hit 3, and reopening without
+  # resetting would re-trip on the very next unproductive heartbeat.
+  if [[ "$status" == "needs-review" || "$status" == "stuck" ]]; then
+    fm_set "$file" ".consecutive_failed_iterations = 0"
+  fi
   fm_set "$file" "
     .status = \"open\" |
     .blocked_at = null |
@@ -912,13 +927,80 @@ cmd_reopen() {
     .claimed_by = null |
     .claimed_at = null |
     .turn_budget_remaining = null |
-    .last_heartbeat_head_sha = null
+    .last_heartbeat_head_sha = null |
+    .scrub_reason = null
   "
   local note="$reason"
   [[ "$status" == "done" && -n "$prior_commits" ]] && note="$reason (prior completion commits: $prior_commits)"
   printf '\n## Reopened (%s, from %s)\n\n%s\n' "$now" "$status" "$note" >> "$file"
   git_commit_state "reopen $id: $reason"
   echo "reopened $id (was $status)"
+}
+
+# Record that the pump is about to auto-resume a stalled task, and rule on
+# whether it still may. Returns the verdict on stdout and in the exit code so the
+# caller never has to read frontmatter itself — there is no generic read verb,
+# and the ledger's one-writer rule means the counter's increment, its
+# progress-reset, and the limit test have to be a single locked
+# read-modify-write here rather than a race between the pump's read and write.
+#
+# Progress is "did the branch move since the last resume", measured by comparing
+# --head against the stored sha. That deliberately does NOT depend on the
+# container cooperating: a dead agent never fires `heartbeat --end`, so
+# consecutive_failed_iterations stays 0 and cannot serve as the attempt budget.
+# `claim` also zeroes that counter on every (re)claim, so the pump's own resume
+# cycle would reset the very tripwire meant to stop it.
+#
+#   progress (head moved, or first ever resume) -> counter resets to 1
+#   no progress                                 -> counter increments
+#   would exceed --max                          -> clamp, verdict `escalate`, rc 10
+#
+# Clamping (rather than letting the counter run past --max) keeps repeated
+# escalate calls idempotent: once exhausted the function writes nothing, so a
+# pump ticking every 30s does not churn a ledger commit per tick.
+cmd_resume_attempt() {
+  local id="" head="" max="3"
+  while (( $# )); do
+    case $1 in
+      --head) head=$2; shift 2;;
+      --head=*) head=${1#--head=}; shift;;
+      --max) max=$2; shift 2;;
+      --max=*) max=${1#--max=}; shift;;
+      -*) die "unknown flag: $1";;
+      *) [[ -z "$id" ]] && id=$1 || die "too many positional args"; shift;;
+    esac
+  done
+  [[ -z "$id" ]] && die "usage: arachne-task resume-attempt <id> --head <sha> [--max N]"
+  [[ -z "$head" ]] && die "--head is required (the branch head sha at this resume)"
+  # Validated rather than escaped: the sha is interpolated into a yq expression,
+  # and a hex-only shape is a cheaper guarantee than getting the quoting right.
+  [[ "$head" =~ ^[0-9a-fA-F]{7,40}$ ]] || die "--head must be a git sha (7-40 hex chars), got: $head"
+  [[ "$max" =~ ^[0-9]+$ ]] || die "--max must be a non-negative integer, got: $max"
+  (( max >= 1 )) || die "--max must be at least 1"
+  local file; file=$(task_file_required "$id")
+
+  local cur; cur=$(fm_get "$file" '.resume_attempts')
+  [[ "$cur" =~ ^[0-9]+$ ]] || cur=0
+  local prev; prev=$(fm_get "$file" '.resume_head_sha')
+
+  local next verdict rc
+  if [[ -z "$prev" || "$prev" != "$head" ]]; then
+    next=1                      # branch moved (or never resumed): real progress
+  else
+    next=$((cur + 1))
+  fi
+  if (( next > max )); then
+    next=$max; verdict="escalate"; rc=10
+  else
+    verdict="resume"; rc=0
+  fi
+
+  if [[ "$next" != "$cur" || "$prev" != "$head" ]]; then
+    fm_set "$file" ".resume_attempts = $next | .resume_head_sha = \"$head\""
+    git_commit_state "resume-attempt $id: $verdict $next/$max (head=${head:0:12})"
+  fi
+  echo "$verdict $next/$max"
+  return "$rc"
 }
 
 # Mark a task's production wiring as deliberately deferred: the foundation
@@ -1407,6 +1489,8 @@ cmd_create() {
     printf 'last_heartbeat_ts: null\n'
     printf 'blocked_at: null\n'
     printf 'blocked_reason: null\n'
+    printf 'resume_attempts: 0\n'
+    printf 'resume_head_sha: null\n'
     printf -- '---\n\n'
     printf '# %s — %s\n\n' "$id" "$title"
     printf '## Spec\n\n_TODO_\n\n## Scope\n\n_TODO_\n\n## Acceptance\n\n_TODO_\n'
@@ -1479,8 +1563,18 @@ Commands:
   block <id> --reason "..."          Mark blocked with reason.
   needs-review <id> --reason "..."   Flag for human review (pump quarantine setter).
   release <id> --reason "..."        Relinquish a claim back to status=open.
-  reopen <id> --reason "..."         Reopen a blocked OR done task to status=open
-                                       (done → sheds completion markers: falsely-done).
+  reopen <id> --reason "..."         Reopen a blocked, done, needs-review or stuck
+                                       task to status=open (done → sheds completion
+                                       markers: falsely-done; needs-review/stuck →
+                                       clears the failure streak + scrub_reason).
+  resume-attempt <id> --head <sha> [--max N]
+                                     Pump-only: record an auto-resume of a stalled
+                                       task and rule on whether it may proceed.
+                                       Counter resets when <sha> differs from the
+                                       last resume (the branch moved = progress),
+                                       else increments. Prints "resume n/max"
+                                       (rc 0) or "escalate n/max" (rc 10) once the
+                                       budget is spent. Default --max 3.
   defer <id> --reason "..."          Mark production wiring deferred (status unchanged).
   undefer <id> --caller "file:line"  Clear the deferred flag: the wiring HAS landed
                                        (usually via a follow-up task). --caller must
@@ -1520,7 +1614,7 @@ main() {
   # Mutating subcommands serialize on the cross-agent state lock for their
   # whole read-modify-write + commit. Read-only commands (next/list) skip it.
   case $cmd in
-    claim|heartbeat|complete|block|needs-review|release|reopen|defer|scrub) acquire_state_lock;;
+    claim|heartbeat|complete|block|needs-review|release|reopen|defer|undefer|resume-attempt|scrub) acquire_state_lock;;
   esac
   case $cmd in
     next) cmd_next "$@";;
@@ -1540,6 +1634,7 @@ main() {
     defer) cmd_defer "$@";;
     undefer) cmd_undefer "$@";;
     deferred) cmd_deferred "$@";;
+    resume-attempt) cmd_resume_attempt "$@";;
     scrub) cmd_scrub "$@";;
     resolve) cmd_resolve "$@";;
     -h|--help|help) usage;;
