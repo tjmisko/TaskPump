@@ -34,7 +34,19 @@
 #   arachne-pump --phases F64 --list             # one planning pass, then exit
 #   arachne-pump --phases F64 --once             # one REAL tick (scrub+gate+launch), exit
 #
+# Stalled-claim auto-resume (on by default):
+#   A phase whose only blocker is its OWN orphaned claim — dead container, work
+#   already committed, so the reclaim path refuses to reopen it — is relaunched
+#   to CONTINUE that task, with a resume note pointing the agent at it. Bounded
+#   by --resume-max no-progress attempts (a new commit resets the count); when
+#   spent, the task is marked needs-review and the pump notifies. When nothing
+#   is live, launchable, or resumable, the pump exits 3 instead of idling.
+#   --resume-max N          attempts before escalating to a human (default 3)
+#   --no-resume-stalled     disable; revert to parking orphans for review
+#
 # Env overrides (mostly for testing / advanced use):
+#   ARACHNE_PUMP_RESUME_MAX        default for --resume-max (3)
+#   ARACHNE_PUMP_STALL_EXIT_TICKS  consecutive deadlocked ticks before exit (3)
 #   ARACHNE_TASK    path to arachne-task   (default: alongside this script)
 #   ARACHNE_USAGE   path to arachne-usage  (default: alongside this script)
 #   ARACHNE_DISK_WATCHDOG  path to arachne-disk-watchdog (default: alongside this script)
@@ -105,9 +117,21 @@ TRUNK_LOCK_FILE="${ARACHNE_PUMP_TRUNK_LOCK_FILE:-$REPO_ROOT/.auto-trunk.lock}"
 QUARANTINE_FILE="${ARACHNE_PUMP_QUARANTINE_FILE:-$REPO_ROOT/.auto-trunk-quarantine}"
 MAX_TURNS="${MAX_TURNS:-600}"
 AGENT_MODEL="${AGENT_MODEL:-opus}"
+# ── Stalled-claim auto-resume (2026-08-05) ───────────────────────────────────
+# A phase starved solely by its own orphaned-but-committed claim is relaunched
+# to *continue* that task, bounded by RESUME_MAX no-progress attempts. Default
+# ON: the behaviour it replaces is a permanent, silent idle loop.
+RESUME_STALLED=1
+RESUME_MAX="${ARACHNE_PUMP_RESUME_MAX:-3}"
+# Consecutive fully-deadlocked ticks before the pump gives up and pages a human.
+# >1 so a container dying mid-tick cannot trip it.
+STALL_EXIT_TICKS="${ARACHNE_PUMP_STALL_EXIT_TICKS:-3}"
+STALL_TICKS=0
+RESUME_TASK_ID=""
+LAST_PARKED_FP=""
 CAP_FILE="${ARACHNE_POOL_CAP_FILE:-$REPO_ROOT/.arachne-pool-cap}"
 RESET_FILE="${ARACHNE_USAGE_RESET_FILE:-$REPO_ROOT/.arachne-usage-reset}"
-MODE="run"        # run | dry | list | once | render | help
+MODE="run"        # run | dry | list | once | render | resume-note | help
 DETACH=0
 STATE_FILE="${ARACHNE_PUMP_STATE_FILE:-$REPO_ROOT/.arachne-pump.state}"
 PUMP_LOG="${ARACHNE_PUMP_LOG:-$REPO_ROOT/.arachne-pump.log}"
@@ -146,6 +170,11 @@ while [[ $# -gt 0 ]]; do
     --integration-trunk) INTEGRATION=1; shift;;
     --integration-base) INTEGRATION_BASE="$2"; shift 2;;
     --integration-base=*) INTEGRATION_BASE="${1#--integration-base=}"; shift;;
+    --resume-max)
+      [[ "${2:-}" =~ ^[1-9][0-9]*$ ]] || die "--resume-max needs a positive integer"
+      RESUME_MAX="$2"; shift 2;;
+    --resume-max=*) RESUME_MAX="${1#--resume-max=}"; shift;;
+    --no-resume-stalled) RESUME_STALLED=0; shift;;
     --no-health-gate) HEALTH_GATE=0; shift;;
     --no-usage-gate)  USAGE_GATE=0; shift;;
     --no-disk-gate)   DISK_GATE=0; shift;;
@@ -154,6 +183,8 @@ while [[ $# -gt 0 ]]; do
     --once)    MODE="once"; shift;;
     --render-brief) MODE="render"; PHASES="$2"; shift 2;;   # print rendered brief, exit
     --render-brief=*) MODE="render"; PHASES="${1#--render-brief=}"; shift;;
+    --render-resume-note) MODE="resume-note"; PHASES="$2"; shift 2;;   # print resume preamble, exit
+    --render-resume-note=*) MODE="resume-note"; PHASES="${1#--render-resume-note=}"; shift;;
     --detach)  DETACH=1; shift;;          # F64.5 wires the actual detach mechanism
     -h|--help) MODE="help"; shift;;
     --*) die "unknown flag $1 (try --help)";;
@@ -263,7 +294,7 @@ phase_lead_task() {
 reclaim_orphaned_claims() {
   local -A live=()
   local s; while IFS= read -r s; do [[ -n "$s" ]] && live["$s"]=1; done < <(apl_live_agent_slugs)
-  local reclaimed=0 parked=0 id status branch _rest
+  local reclaimed=0 parked=0 id status branch _rest parked_ids=""
   while read -r id status branch _rest; do
     [[ "$id" == "ID" || "$status" != "in_progress" ]] && continue
     [[ -z "$branch" || "$branch" == "-" ]] && continue
@@ -276,7 +307,7 @@ reclaim_orphaned_claims() {
     # Orphaned claim. Preserve committed work; only auto-reopen clean orphans.
     local ahead; ahead="$(git -C "$REPO_ROOT" rev-list --count "$BASE_REF..$branch" 2>/dev/null || echo 0)"
     if [[ "$ahead" -gt 0 ]]; then
-      warn "orphaned claim with committed work: $id ($branch, $ahead commit(s), container dead) — parked for review, not auto-reopened"
+      parked_ids+="$id:$ahead "
       parked=$((parked + 1))
       continue
     fi
@@ -288,7 +319,69 @@ reclaim_orphaned_claims() {
     fi
   done < <("$ARACHNE_TASK" list --status in_progress 2>/dev/null)
   [[ "$reclaimed" -gt 0 ]] && log "liveness reclaim: $reclaimed task(s) released to open"
-  [[ "$parked" -gt 0 ]] && warn "liveness reclaim: $parked orphaned claim(s) with committed work need review"
+  # Report parked orphans only when the SET changes. This used to warn twice per
+  # tick unconditionally: one 2026-08-05 F79 stall produced 563 identical pairs
+  # over 7h, which buries every other line in the journal and trains the operator
+  # to ignore the log. The resume path below now clears most of these anyway;
+  # what survives (resume disabled or budget spent) is genuinely worth one line.
+  if [[ "$parked_ids" != "$LAST_PARKED_FP" ]]; then
+    if [[ "$parked" -gt 0 ]]; then
+      warn "liveness reclaim: $parked orphaned claim(s) with committed work parked for review: ${parked_ids% }"
+      [[ "$RESUME_STALLED" -eq 1 ]] \
+        || warn "  (auto-resume disabled via --no-resume-stalled; these will not be picked up)"
+    fi
+    LAST_PARKED_FP="$parked_ids"
+  fi
+  return 0
+}
+
+# ── Stalled-claim detection (2026-08-05) ───────────────────────────────────────
+# The gap reclaim_orphaned_claims deliberately leaves open. It refuses to reopen
+# an orphan with committed work — right instinct, since blindly reopening would
+# make a fresh agent redo landed work — but it then has no exit: `ready` only
+# surfaces `status: open`, so the claim is invisible to the frontier, everything
+# blocked behind it is ineligible, `compute_plan` files the phase under WAITING,
+# and `is_drained` never fires because open_count > 0. The pump idles forever.
+#
+# So instead of reopening (fresh start, loses context) we *resume*: keep the
+# claim and relaunch a container on the same branch and worktree, with a note
+# telling the agent to continue that specific task. The prior work is right there
+# in git; nothing is redone.
+#
+# Ownership rules are inherited from reclaim_orphaned_claims: only branches this
+# pump's naming scheme owns, never a human's. `in_progress` carries its claimant
+# in claimed_by; `scrub` NULLs claimed_by when it parks a task, so needs-review /
+# stuck ownership is inferred from the phase branch — the same inference the
+# reclaim path already makes. Both are included because a stalled claim reaches
+# needs-review on its own: with last_heartbeat_ts null, scrub falls back to
+# claimed_at and trips the 24h staleness tripwire.
+declare -A STALL_TASK STALL_STATUS ESCALATED
+detect_stalled_orphans() {
+  STALL_TASK=(); STALL_STATUS=()
+  [[ "$RESUME_STALLED" -eq 1 ]] || return 0
+  local -A live=()
+  local s; while IFS= read -r s; do [[ -n "$s" ]] && live["$s"]=1; done < <(apl_live_agent_slugs)
+  local id status branch _rest phase pbranch ahead
+  while read -r id status branch _rest; do
+    [[ "$id" == "ID" ]] && continue
+    case "$status" in in_progress|needs-review|stuck) : ;; *) continue;; esac
+    phase="${id%%.*}"
+    pbranch="$(phase_branch "$phase")"
+    # Already handed to a human this run. Without this the phase would re-enter
+    # PLAN_RESUME every tick, re-run resume-attempt (which returns `escalate`
+    # forever once the budget is spent), and re-notify every 30s. Dropping it
+    # here is also what lets the deadlock detector below accumulate and exit.
+    [[ -n "${ESCALATED[$phase]:-}" ]] && continue
+    # First (lowest) match per phase wins; one container drains one phase.
+    [[ -n "${STALL_TASK[$phase]:-}" ]] && continue
+    [[ "$status" == "in_progress" && "$branch" != "$pbranch" ]] && continue
+    [[ -n "${live["$(branch_slug "$pbranch")"]:-}" ]] && continue
+    git -C "$REPO_ROOT" rev-parse --verify "refs/heads/$pbranch" >/dev/null 2>&1 || continue
+    ahead="$(git -C "$REPO_ROOT" rev-list --count "$BASE_REF..$pbranch" 2>/dev/null || echo 0)"
+    [[ "$ahead" -gt 0 ]] || continue
+    STALL_TASK["$phase"]="$id"
+    STALL_STATUS["$phase"]="$status"
+  done < <("$ARACHNE_TASK" list 2>/dev/null)
   return 0
 }
 
@@ -449,18 +542,159 @@ render_brief() {
 }
 
 # ── Launch one phase's worktree + container ────────────────────────────────────
+# Write the resume preamble the container prepends ahead of the kickoff brief.
+# `entrypoint-parallel.sh` already resolves ARACHNE_RESUME_NOTE and cats it
+# between the goal preamble and the brief — that plumbing was built for
+# run-parallel.sh's interrupted-session path and the pump simply never used it,
+# so nothing in the container needs to change.
+#
+# The one thing run-parallel.sh's version cannot say is what a *dead* agent
+# already landed: it only reports uncommitted state. A resumed task's whole
+# context is its commits, so those lead here.
+render_resume_note_stream() {
+  local wt="$1" branch="$2" id="$3"
+  local phase="${id%%.*}"
+  {
+    cat <<'EOF'
+# RESUME CONTEXT — read this before the kickoff brief below
+EOF
+    printf '\nYou are **resuming `%s`** on this worktree (`%s`). A previous agent\n' "$id" "$branch"
+    printf 'session claimed this task, committed real work, and then died without\n'
+    printf 'finishing it. Your job is to carry it to a conclusion.\n\n'
+    cat <<'EOF'
+## Do NOT start by running `arachne-task next`
+EOF
+    printf '\n`%s` is already claimed to this branch, so it is **invisible** to\n' "$id"
+    printf '`next` and `ready` — both surface only `status: open` tasks. Calling\n'
+    printf '`arachne-task next --phase %s` returns `null`, and reading that as\n' "$phase"
+    printf '"frontier drained" is precisely the stall that stranded this task.\n'
+    printf 'Read the task file directly instead:\n\n'
+    printf '```\ncat ops/task-loop/tasks/%s.md\n```\n\n' "$id"
+    printf '## Work already committed on this branch\n\n```\n'
+    git -C "$wt" log --oneline "$BASE_REF..$branch" 2>/dev/null | head -40 || true
+    printf '```\n\n## Uncommitted state (`git status --short`, then `git diff --stat`)\n\n```\n'
+    git -C "$wt" status --short 2>/dev/null | head -40 || true
+    printf '```\n\n```\n'
+    git -C "$wt" diff --stat 2>/dev/null | tail -20 || true
+    printf '```\n\n'
+    cat <<'EOF'
+## How to finish
+
+Re-read the task's Spec / Scope / Acceptance, work out what the commits above
+already satisfy, and do the rest. Then pick exactly one of these three endings.
+**All three release the tasks blocked behind this one; leaving it claimed and
+unfinished does not** — that is what stalled the pump.
+
+1. **Finish it.** `scripts/arachne-task complete <id> --commits <shas>`, once
+   `cargo fmt --all` and `cargo clippy --workspace -- -D warnings` are clean and
+   the affected crates' tests pass.
+2. **Split it.** If part of the work is genuinely done and the remainder needs
+   judgement, a decision, or scope you cannot settle alone: `complete` the
+   finished portion — stating precisely what you did and did NOT do in the
+   completion notes — and file the remainder as a new task with
+   `scripts/arachne-task create <phase>.<n> --title "..." --goal "..."`, setting
+   its `blockers` if it depends on anything. If only the production wiring is
+   outstanding, `complete --defer-wiring "..."` instead.
+3. **Block it.** If it truly cannot proceed:
+   `scripts/arachne-task block <id> --reason "..."`.
+
+Do not hand-edit task frontmatter; the CLI is its only writer. Commit early and
+often — another interruption must not lose your work.
+
+---
+
+EOF
+  }
+}
+
+# write_resume_note <wt> <branch> <id> — render to the worktree and echo the path
+# (the launcher passes the path to the container via ARACHNE_RESUME_NOTE).
+write_resume_note() {
+  local wt="$1" branch="$2" id="$3"
+  local out="$wt/.arachne-resume.md"
+  render_resume_note_stream "$wt" "$branch" "$id" >| "$out"
+  printf '%s' "$out"
+}
+
+# Give up on a stalled task and hand it to a human. Uses `needs-review` (the
+# sanctioned quarantine status, same as quarantine_phase) rather than `block`,
+# which means "external dependency". `reopen` now accepts needs-review, so this
+# is a door the operator can walk back through.
+escalate_stalled() {
+  local phase="$1" id="$2" verdict="$3"
+  ESCALATED["$phase"]=1
+  "$ARACHNE_TASK" needs-review "$id" \
+    --reason "Pump auto-resume exhausted: $RESUME_MAX resume attempts made no new commits on $(phase_branch "$phase"). Needs a human to finish, split, or block it." \
+    >/dev/null 2>&1 \
+    || warn "escalate $id: needs-review failed"
+  pump_notify "$phase STALLED on $id — $verdict, no progress across $RESUME_MAX auto-resumes. Marked needs-review; finish, split, or block it by hand."
+}
+
+# Relaunch a starved phase to continue its orphaned task.
+resume_phase() {
+  local phase="$1"
+  local id="${STALL_TASK[$phase]:-}"
+  [[ -n "$id" ]] || return 1
+  local branch; branch="$(phase_branch "$phase")"
+  local head; head="$(git -C "$REPO_ROOT" rev-parse "$branch" 2>/dev/null || true)"
+  [[ -n "$head" ]] || { warn "resume $phase: cannot resolve head of $branch"; return 1; }
+
+  # Bookkeep the attempt HERE rather than inside launch_phase: a phase that is
+  # detected but not launched — pool cap reached, feed gate shut — must not burn
+  # an attempt it never got to use.
+  local verdict rc=0
+  verdict="$("$ARACHNE_TASK" resume-attempt "$id" --head "$head" --max "$RESUME_MAX" 2>/dev/null)" || rc=$?
+  if (( rc == 10 )); then
+    escalate_stalled "$phase" "$id" "$verdict"
+    return 1
+  fi
+  (( rc == 0 )) || { warn "resume $phase: resume-attempt $id failed (rc=$rc)"; return 1; }
+
+  # A scrub-parked task has to come back to `open` before the container's
+  # safety-net claim can take it (claim accepts open, or in_progress on the same
+  # branch — never needs-review/stuck).
+  local status="${STALL_STATUS[$phase]:-}"
+  if [[ "$status" == "needs-review" || "$status" == "stuck" ]]; then
+    "$ARACHNE_TASK" reopen "$id" \
+      --reason "Pump auto-resume ($verdict): committed work on $branch, container dead; relaunching to continue." \
+      >/dev/null 2>&1 || { warn "resume $phase: reopen $id failed"; return 1; }
+  fi
+
+  log "resuming $phase task $id ($verdict, was $status, head $(printf '%s' "$head" | cut -c1-12))"
+  RESUME_TASK_ID="$id"
+  local lrc=0
+  launch_phase "$phase" || lrc=$?
+  RESUME_TASK_ID=""
+  return "$lrc"
+}
+
 launch_phase() {
   local phase="$1"
   # Test/maintenance hook: tick through the gate + plan + state logic without
   # materialising worktrees or containers.
   if [[ "${ARACHNE_PUMP_NO_LAUNCH:-0}" -eq 1 ]]; then
-    log "would launch $phase -> $(phase_branch "$phase") (NO_LAUNCH)"
+    if [[ -n "$RESUME_TASK_ID" ]]; then
+      log "would launch $phase -> $(phase_branch "$phase") (NO_LAUNCH, resume $RESUME_TASK_ID)"
+    else
+      log "would launch $phase -> $(phase_branch "$phase") (NO_LAUNCH)"
+    fi
     return 0
   fi
   local branch; branch="$(phase_branch "$phase")"
   local wt="$WORKTREES_DIR/$branch"
   local cname; cname="$(phase_container "$phase")"
-  local lead; lead="$(phase_lead_task "$phase")"
+  # A resumed phase names its own task. phase_lead_task reads the *eligible*
+  # frontier, which by definition excludes the claimed task that stalled us, so
+  # it would hand back an empty id — and the entrypoint skips its safety-net
+  # claim + heartbeat entirely when ARACHNE_TASK_ID is empty. That empty-lead
+  # path is exactly how a naive relaunch reproduces the original stall, and it
+  # also leaves last_heartbeat_ts unset so scrub re-parks the task within 24h.
+  local lead
+  if [[ -n "$RESUME_TASK_ID" ]]; then
+    lead="$RESUME_TASK_ID"
+  else
+    lead="$(phase_lead_task "$phase")"
+  fi
 
   # Materialise the worktree (idempotent). Create the branch from BASE_REF if new.
   if [[ ! -d "$wt" ]]; then
@@ -492,6 +726,15 @@ launch_phase() {
   fi
 
   local brief; brief="$(render_brief "$phase")"
+  # Resume preamble, prepended by the entrypoint ahead of the brief. A normal
+  # launch actively clears a stale note so a later fresh drain of this worktree
+  # cannot inherit a previous resume's instructions.
+  local resume_note=""
+  if [[ -n "$RESUME_TASK_ID" ]]; then
+    resume_note="$(write_resume_note "$wt" "$branch" "$RESUME_TASK_ID")"
+  else
+    rm -f "$wt/.arachne-resume.md" 2>/dev/null || true
+  fi
 
   "$DOCKER" rm -f "$cname" >/dev/null 2>&1 || true
   local cid
@@ -504,6 +747,7 @@ launch_phase() {
     -e WORKSPACE_PATH="$wt" \
     -e REPO_ROOT="$REPO_ROOT" \
     -e ARACHNE_BRIEF="$brief" \
+    -e ARACHNE_RESUME_NOTE="$resume_note" \
     -e ARACHNE_TASK_ID="$lead" \
     -e ARACHNE_PHASE="$phase" \
     -e MAX_TURNS="$MAX_TURNS" \
@@ -516,7 +760,7 @@ launch_phase() {
     -v "$REPO_ROOT/ops":"$REPO_ROOT/ops" \
     -w "$wt" \
     arachne /entrypoint-parallel.sh)
-  log "launched $phase -> $cname ($(printf '%s' "$cid" | cut -c1-12))  lead=$lead  log: $wt/.arachne-agent.log"
+  log "launched $phase -> $cname ($(printf '%s' "$cid" | cut -c1-12))  lead=$lead${RESUME_TASK_ID:+ (RESUME)}  log: $wt/.arachne-agent.log"
   return 0
 }
 
@@ -705,10 +949,11 @@ graduate_trunk() {
 
 # ── Planning pass: classify every phase in range ───────────────────────────────
 # Sets arrays LAUNCH/RUNNING/WAITING/DONEP. Returns the plan via globals.
-declare -a PLAN_LAUNCH PLAN_RUNNING PLAN_WAITING PLAN_DONE
+declare -a PLAN_LAUNCH PLAN_RUNNING PLAN_WAITING PLAN_DONE PLAN_RESUME
 declare -A PLAN_WAIT_REASON
 compute_plan() {
-  PLAN_LAUNCH=(); PLAN_RUNNING=(); PLAN_WAITING=(); PLAN_DONE=(); PLAN_WAIT_REASON=()
+  PLAN_LAUNCH=(); PLAN_RUNNING=(); PLAN_WAITING=(); PLAN_DONE=(); PLAN_RESUME=(); PLAN_WAIT_REASON=()
+  detect_stalled_orphans
   local -A in_frontier=()
   local p
   while IFS= read -r p; do [[ -n "$p" ]] && in_frontier["$p"]=1; done < <(frontier_phases)
@@ -727,6 +972,14 @@ compute_plan() {
       else
         PLAN_LAUNCH+=("$p")
       fi
+    elif [[ -n "${STALL_TASK[$p]:-}" ]] && ! phase_live "$p"; then
+      # Not in the frontier, no live container, but an orphaned claim with
+      # committed work sits on this phase's branch — that claim IS the reason
+      # nothing here is eligible. Tested ahead of `oc` deliberately: when the
+      # orphan is the phase's only remaining work oc == 0, and the phase would
+      # otherwise land in PLAN_DONE and let is_drained declare the range
+      # finished over committed, unfinished work.
+      PLAN_RESUME+=("$p")
     elif [[ "$oc" -gt 0 ]]; then
       # Has open tasks but none eligible — gated on incomplete cross-phase deps,
       # unless a live container is already draining it.
@@ -750,9 +1003,11 @@ print_plan() {
   local p
   for p in "${PLAN_LAUNCH[@]:-}";  do [[ -n "$p" ]] && printf '  LAUNCH   %-6s -> %s\n' "$p" "$(phase_branch "$p")"; done
   for p in "${PLAN_RUNNING[@]:-}"; do [[ -n "$p" ]] && printf '  RUNNING  %-6s -> %s (live container)\n' "$p" "$(phase_branch "$p")"; done
+  for p in "${PLAN_RESUME[@]:-}";  do [[ -n "$p" ]] && printf '  RESUME   %-6s -> %s (stalled on %s, %s; container dead, work committed)\n' \
+      "$p" "$(phase_branch "$p")" "${STALL_TASK[$p]}" "${STALL_STATUS[$p]}"; done
   for p in "${PLAN_WAITING[@]:-}"; do [[ -n "$p" ]] && printf '  WAITING  %-6s (%s)\n' "$p" "${PLAN_WAIT_REASON[$p]:-cross-phase blockers pending}"; done
   for p in "${PLAN_DONE[@]:-}";    do [[ -n "$p" ]] && printf '  DONE     %-6s (no open tasks)\n' "$p"; done
-  echo "frontier: ${#PLAN_LAUNCH[@]} launchable, ${#PLAN_RUNNING[@]} running, ${#PLAN_WAITING[@]} waiting | open tasks in range: $(open_count)"
+  echo "frontier: ${#PLAN_LAUNCH[@]} launchable, ${#PLAN_RUNNING[@]} running, ${#PLAN_RESUME[@]} resumable, ${#PLAN_WAITING[@]} waiting | open tasks in range: $(open_count)"
 }
 
 # ── Reclaim build artifacts of completed phases (A4 / F65.3) ───────────────────
@@ -855,9 +1110,44 @@ do_tick() {
       have=$((have + 1)); launched=$((launched + 1)); sleep "$STAGGER"
     fi
   done
+  # Starved phases go last: genuinely-eligible work is always preferred over
+  # resuming a partially-done task. Same cap, same stagger, and — because this
+  # sits below the feed gate's early return — the same usage/token/WiFi/disk
+  # pause, so a resume never fires while the pump is throttled.
+  for p in "${PLAN_RESUME[@]:-}"; do
+    [[ -z "$p" ]] && continue
+    (( have >= cap )) && break
+    if resume_phase "$p"; then
+      have=$((have + 1)); launched=$((launched + 1)); sleep "$STAGGER"
+    fi
+  done
   [[ "$launched" -gt 0 ]] && log "tick: launched $launched (live=$have/$cap)"
+
+  # Deadlock detector. Nothing running, nothing launchable, nothing resumable ⇒
+  # no later tick can change state by itself, so idling is pointless — this is
+  # the 7-hour/563-tick silence the F79 stall produced. Counted over consecutive
+  # ticks so a container dying mid-tick cannot trip it; gate-paused ticks return
+  # before this point and never count.
+  if (( have == 0 )) && [[ -z "${PLAN_LAUNCH[*]:-}" && -z "${PLAN_RESUME[*]:-}" ]]; then
+    STALL_TICKS=$((STALL_TICKS + 1))
+  else
+    STALL_TICKS=0
+  fi
   write_state running ""
   return 0
+}
+
+# No live agents, nothing launchable, nothing resumable, and open work left:
+# hand the range to a human instead of spinning. Exits non-zero so the systemd
+# unit reports `failed` rather than sitting green while making no progress.
+stall_exit() {
+  local attention
+  attention=$("$ARACHNE_TASK" list 2>/dev/null \
+    | awk '$2=="blocked"||$2=="stuck"||$2=="needs-review"{n++} END{print n+0}')
+  write_state stalled "no live agents, nothing launchable, nothing resumable"
+  git -C "$OPS_DIR" push >/dev/null 2>&1 || warn "ops push on stall exit failed"
+  pump_notify "$PHASES STALLED after $STALL_TICKS idle ticks — $(open_count) open task(s) remain but none can launch, and no orphaned claim is resumable. $attention task(s) need human review (blocked/stuck/needs-review)."
+  exit 3
 }
 
 # ── Drain check ────────────────────────────────────────────────────────────────
@@ -938,6 +1228,15 @@ case "$MODE" in
     render_brief_stream "$PHASES"
     exit 0
     ;;
+  resume-note)
+    # Print the resume preamble a stalled phase WOULD get, to stdout (debug /
+    # test). Same split as render_brief: the stream form is the testable one.
+    detect_stalled_orphans
+    id="${STALL_TASK[$PHASES]:-}"
+    [[ -n "$id" ]] || die "no stalled orphan detected for phase $PHASES (nothing to resume)"
+    render_resume_note_stream "$WORKTREES_DIR/$(phase_branch "$PHASES")" "$(phase_branch "$PHASES")" "$id"
+    exit 0
+    ;;
   dry)
     echo "[dry-run] no image build, no launches, no ops mutation"
     print_plan
@@ -1013,6 +1312,9 @@ while true; do
   if is_drained; then
     log "range $PHASES drained: no open tasks and no live agents remain."
     break
+  fi
+  if (( STALL_TICKS >= STALL_EXIT_TICKS )); then
+    stall_exit
   fi
   sleep "$TICK"
 done
