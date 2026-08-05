@@ -1,0 +1,65 @@
+#!/bin/bash
+# arachne-dag-render -- render the task DAG for a phase range as a layered ASCII
+# graph, for the arachne-monitor GRAPH tab.
+#
+# Nodes are boxes, one row of boxes per dependency layer, edges routed through
+# horizontal rail bands between layers. Reads task frontmatter directly (the
+# whole graph in one gawk pass) rather than shelling out to yq per task, so it
+# is cheap enough to sit behind the monitor's normal cache TTL.
+#
+# Layout passes:
+#   layer()     longest-path layering over `blockers:`
+#   order()     barycentre sweeps (down over parents, up over children) to cut
+#               edge crossings
+#   place()     column assignment; each node gets a port column at its centre
+#   channels()  greedy interval routing -- parents whose edge spans do not
+#               overlap horizontally share one rail row, so a wide fan-out band
+#               stays a few rows tall instead of one row per parent
+#
+# Usage:
+#   ./scripts/arachne-dag-render                     # phases from .arachne-pump.state
+#   ./scripts/arachne-dag-render --phases F79
+#   ./scripts/arachne-dag-render --phases F55..F63
+#   ./scripts/arachne-dag-render --running F79.4     # mark these as live (▶)
+#   ./scripts/arachne-dag-render --no-color --plain  # for tests
+set -euo pipefail
+
+REPO_ROOT="${ARACHNE_DAG_REPO_ROOT:-$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)}"
+TASKS_DIR="${ARACHNE_TASKS_DIR:-$REPO_ROOT/ops/task-loop/tasks}"
+PUMP_STATE="${ARACHNE_PUMP_STATE_FILE:-$REPO_ROOT/.arachne-pump.state}"
+
+PHASES=""; RUNNING=""; COLOR=1; COMPACT=-1; PANX=0
+
+print_help() { awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$0"; }
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --phases)    PHASES="${2:-}"; shift ;;
+        --phases=*)  PHASES="${1#--phases=}" ;;
+        --running)   RUNNING="${2:-}"; shift ;;
+        --running=*) RUNNING="${1#--running=}" ;;
+        --pan)       PANX="${2:-0}"; shift ;;
+        --pan=*)     PANX="${1#--pan=}" ;;
+        --no-color)  COLOR=0 ;;
+        --compact)   COMPACT=1 ;;
+        --full-ids)  COMPACT=0 ;;
+        -h|--help)   print_help; exit 0 ;;
+        *)           echo "ERROR: unknown arg '$1'" >&2; exit 1 ;;
+    esac
+    shift
+done
+
+# Phase range: explicit flag > the live pump's range > every phase present.
+if [[ -z "$PHASES" && -f "$PUMP_STATE" ]]; then
+    PHASES="$(jq -r '.phases // ""' "$PUMP_STATE" 2>/dev/null || echo '')"
+fi
+
+[[ -d "$TASKS_DIR" ]] || { echo "(no tasks dir: $TASKS_DIR)"; exit 0; }
+
+shopt -s nullglob
+files=("$TASKS_DIR"/*.md)
+(( ${#files[@]} )) || { echo "(no tasks found)"; exit 0; }
+
+gawk -v phases="$PHASES" -v running="$RUNNING" -v color="$COLOR" \
+     -v compact="$COMPACT" -v panx="$PANX" -f "$REPO_ROOT/scripts/arachne-dag-layout.awk" \
+     "${files[@]}"
