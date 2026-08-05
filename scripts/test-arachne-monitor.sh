@@ -334,7 +334,7 @@ gmon | grep -q 'drive the F96.4 outcome home' \
 gmon | grep -qE 'F96\.4 .*7 turns.*feat/f96.*blockers F96\.2✓' \
     && pass "status bar shows turns, branch and blocker statuses" \
     || fail "status bar detail missing:\n$(gmon | sed -n '5p')"
-gmon | grep -q '┃ \.4 ' && pass "the selection is drawn with a heavy border" || fail "no heavy border in the graph"
+gmon | grep -q '┃ F96.4 ' && pass "the selection is drawn with a heavy border" || fail "no heavy border in the graph"
 
 # ↑ prefers a blocker over the merely-nearest node; ↓ prefers a dependent.
 sel=$(gsel --cursor F96.4 --moves k)
@@ -364,7 +364,7 @@ sel=$(gsel --cursor F96.999)
 # selected node must be on screen.
 narrow() { ARACHNE_PUMP_STATE_FILE="$GPS" ARACHNE_TASKS_DIR="$GTD" ARACHNE_MONITOR_COLS=40 \
                "$CLI" --tab graph --cursor "$1" 2>/dev/null | strip_ansi; }
-narrow F96.5 | grep -q '┃ \.5 ' && pass "viewport pans to keep the selection visible" \
+narrow F96.5 | grep -q '┃ F96.5 ' && pass "viewport pans to keep the selection visible" \
     || fail "selection off-screen in a narrow terminal:\n$(narrow F96.5)"
 
 # ── Test 19: `o` opens the selected task's file ──────────────────────────────

@@ -133,7 +133,7 @@ function layer(   pass, i, j, m, B, p, L, cand, changed) {
 
 # ── labels + node widths ─────────────────────────────────────────────────────
 function labels(   i, lbl) {
-    if (compact < 0) compact = (lo_ph >= 0 && lo_ph == hi_ph) ? 1 : 0
+    if (compact < 0) compact = 0
     BOXW = 0
     for (i = 0; i < n; i++) {
         lbl = (compact && index(id[i], ".")) ? substr(id[i], index(id[i], ".")) : id[i]
@@ -160,6 +160,12 @@ function dummies(   i, j, m, B, p, l, d, minl, prev) {
         m = split(bl[i], B, ",")
         minl = -1
         for (j = 1; j <= m; j++) {
+# Full ids by default, in every range. Dropping the phase prefix inside a
+# single-phase range saved ~4 columns per box, but a node reading `.17` is not
+# something you can say out loud, paste into `arachne-task`, or match against
+# the pump's log without mentally re-attaching the phase every time. The four
+# columns are the cheaper thing to spend. `--compact` still asks for the short
+# form when the width actually matters.
             if (B[j] == "" || !((B[j]) in ix)) continue
             p = ix[B[j]]
             if (lay[i] - lay[p] <= 1) { link(p, i); continue }

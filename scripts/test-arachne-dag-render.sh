@@ -57,45 +57,45 @@ strip() { sed -r 's/\x1b\[[0-9;]*m//g'; }
 # ── Test 1: every node is rendered (node-drop regression) ────────────────────
 echo "--- Test 1: all nodes present ---"
 out=$("$CLI" --phases F90 --no-color 2>/dev/null | strip)
-for id in .1 .2 .3 .4; do
+for id in F90.1 F90.2 F90.3 F90.4; do
     grep -qE "│ $id +[^│]*│" <<<"$out" && pass "node $id rendered" || fail "node $id missing:\n$out"
 done
 
 # ── Test 2: the ROOT layer is rendered (lay[] subscript regression) ──────────
 echo "--- Test 2: root layer present and on top ---"
-l1=$(grep -n "│ .1 " <<<"$out" | head -1 | cut -d: -f1)
-l2=$(grep -n "│ .2 " <<<"$out" | head -1 | cut -d: -f1)
-l4=$(grep -n "│ .4 " <<<"$out" | head -1 | cut -d: -f1)
+l1=$(grep -n "│ F90.1 " <<<"$out" | head -1 | cut -d: -f1)
+l2=$(grep -n "│ F90.2 " <<<"$out" | head -1 | cut -d: -f1)
+l4=$(grep -n "│ F90.4 " <<<"$out" | head -1 | cut -d: -f1)
 [[ -n "$l1" && -n "$l2" && "$l1" -lt "$l2" ]] \
-    && pass "root .1 renders above its child .2 ($l1 < $l2)" \
-    || fail "root layer missing or misordered: .1=$l1 .2=$l2"
+    && pass "root F90.1 renders above its child F90.2 ($l1 < $l2)" \
+    || fail "root layer missing or misordered: F90.1=$l1 F90.2=$l2"
 [[ -n "$l4" && "$l2" -lt "$l4" ]] \
-    && pass "join node .4 renders below its parents ($l2 < $l4)" \
-    || fail "join node misordered: .2=$l2 .4=$l4"
+    && pass "join node F90.4 renders below its parents ($l2 < $l4)" \
+    || fail "join node misordered: F90.2=$l2 F90.4=$l4"
 
 # ── Test 3: sibling layer keeps BOTH nodes (cnt[] subscript regression) ──────
 echo "--- Test 3: sibling layer complete ---"
-sib=$(grep -cE "│ \.2 .*│ \.3 |│ \.3 .*│ \.2 " <<<"$out")
-[[ "$sib" -ge 1 ]] && pass ".2 and .3 share one layer row" || fail "siblings not on one row:\n$out"
+sib=$(grep -cE "│ F90\.2 .*│ F90\.3 |│ F90\.3 .*│ F90\.2 " <<<"$out")
+[[ "$sib" -ge 1 ]] && pass "F90.2 and F90.3 share one layer row" || fail "siblings not on one row:\n$out"
 
 # ── Test 4: status glyphs ────────────────────────────────────────────────────
 echo "--- Test 4: status glyphs ---"
-grep -qE "│ \.1 +✓ │" <<<"$out" && pass "done renders ✓" || fail "done glyph wrong"
-grep -qE "│ \.3 +⧗ │" <<<"$out" && pass "in_progress with no live agent renders ⧗" || fail "parked glyph wrong"
-grep -qE "│ \.4 +◌ │" <<<"$out" && pass "open behind an unfinished blocker renders ◌" || fail "waiting glyph wrong"
+grep -qE "│ F90\.1 +✓ │" <<<"$out" && pass "done renders ✓" || fail "done glyph wrong"
+grep -qE "│ F90\.3 +⧗ │" <<<"$out" && pass "in_progress with no live agent renders ⧗" || fail "parked glyph wrong"
+grep -qE "│ F90\.4 +◌ │" <<<"$out" && pass "open behind an unfinished blocker renders ◌" || fail "waiting glyph wrong"
 
 # ── Test 5: liveness by task id and by claimed branch ───────────────────────
 echo "--- Test 5: liveness ---"
 byid=$("$CLI" --phases F90 --no-color --running F90.3 2>/dev/null | strip)
-grep -qE "│ \.3 +▶ │" <<<"$byid" && pass "--running marks the task ▶" || fail "--running did not mark ▶"
+grep -qE "│ F90\.3 +▶ │" <<<"$byid" && pass "--running marks the task ▶" || fail "--running did not mark ▶"
 bybr=$("$CLI" --phases F90 --no-color --live-branches feat/f90 2>/dev/null | strip)
-grep -qE "│ \.3 +▶ │" <<<"$bybr" && pass "--live-branches matches claimed_by → ▶" || fail "--live-branches did not mark ▶"
+grep -qE "│ F90\.3 +▶ │" <<<"$bybr" && pass "--live-branches matches claimed_by → ▶" || fail "--live-branches did not mark ▶"
 
 # ── Test 6: eligible vs waiting ─────────────────────────────────────────────
 echo "--- Test 6: eligible open task renders ○ ---"
 mktask F90.5 F90 open "" F90.2          # only blocker is done → eligible
 elig=$("$CLI" --phases F90 --no-color 2>/dev/null | strip)
-grep -qE "│ \.5 +○ │" <<<"$elig" && pass "open with all blockers done renders ○" || fail "eligible glyph wrong:\n$elig"
+grep -qE "│ F90\.5 +○ │" <<<"$elig" && pass "open with all blockers done renders ○" || fail "eligible glyph wrong:\n$elig"
 rm -f "$TD/F90.5.md"
 
 # ── Test 7: phase-range scoping ─────────────────────────────────────────────
@@ -104,6 +104,13 @@ grep -q 'F91' <<<"$out" && fail "out-of-range phase leaked into the graph" || pa
 rng=$("$CLI" --phases F90..F91 --no-color 2>/dev/null | strip)
 grep -q 'F91.1' <<<"$rng" && pass "F90..F91 range includes F91" || fail "range scope missed F91:\n$rng"
 grep -q 'F90.1' <<<"$rng" && pass "a multi-phase range uses full ids" || fail "multi-phase range should not compact ids"
+# A single-phase range keeps the phase too: `.17` is not something you can paste
+# into arachne-task or match against the pump's log.
+grep -qE "│ F90\.1 " <<<"$out" && pass "a single-phase range also uses full ids" \
+    || fail "single-phase range dropped the phase prefix"
+short=$("$CLI" --phases F90 --no-color --compact 2>/dev/null | strip)
+grep -qE "│ \.1 " <<<"$short" && pass "--compact still shortens the label" \
+    || fail "--compact no longer drops the phase prefix:\n$short"
 
 # ── Test 8: box drawing + edges ─────────────────────────────────────────────
 echo "--- Test 8: structure glyphs ---"
@@ -208,11 +215,11 @@ mktask F92.4 F92 open ""        F92.3 F92.5
 IDX="$TMP/idx.tsv"
 span=$("$CLI" --phases F92 --no-color --index-file "$IDX" 2>/dev/null | strip)
 # The source box's bottom border must carry an outgoing port.
-srcport=$(awk '/│ \.5 /{getline; print; exit}' <<<"$span")
-grep -q '┬' <<<"$srcport" && pass "the far source .5 has a bottom port" \
+srcport=$(awk '/│ F92\.5 /{getline; print; exit}' <<<"$span")
+grep -q '┬' <<<"$srcport" && pass "the far source F92.5 has a bottom port" \
     || fail "multi-layer edge dropped at the source (bottom border: '$srcport')"
-tgtport=$(awk '/│ \.4 /{print prev; exit} {prev=$0}' <<<"$span")
-grep -q '┴' <<<"$tgtport" && pass "the far target .4 has a top port" \
+tgtport=$(awk '/│ F92\.4 /{print prev; exit} {prev=$0}' <<<"$span")
+grep -q '┴' <<<"$tgtport" && pass "the far target F92.4 has a top port" \
     || fail "multi-layer edge dropped at the target (top border: '$tgtport')"
 # ...and the trunk between them is one unbroken column (O2 for inner segments):
 # every row from under .5's box to above .4's box has ink in .5's port column.
@@ -275,8 +282,8 @@ d2=$("$CLI" --phases F90 --no-color 2>/dev/null | md5sum)
 # ── Test 17: cursor + index table ───────────────────────────────────────────
 echo "--- Test 17: cursor and index ---"
 cur=$("$CLI" --phases F90 --no-color --cursor F90.3 --index-file "$IDX" 2>/dev/null | strip)
-grep -q '┃ \.3 ' <<<"$cur" && pass "--cursor draws a heavy border" || fail "no heavy border:\n$cur"
-grep -q '│ \.1 ' <<<"$cur" && pass "unselected nodes keep a light border" || fail "light border lost"
+grep -q '┃ F90.3 ' <<<"$cur" && pass "--cursor draws a heavy border" || fail "no heavy border:\n$cur"
+grep -q '│ F90.1 ' <<<"$cur" && pass "unselected nodes keep a light border" || fail "light border lost"
 n_idx=$(wc -l < "$IDX")
 [[ "$n_idx" == "4" ]] && pass "index has one row per in-scope task (4)" || fail "index rows: $n_idx"
 awk -F'\t' '$1=="F90.4" && $2==2 && $10=="F90.2:done|F90.3:in_progress"' "$IDX" | grep -q . \

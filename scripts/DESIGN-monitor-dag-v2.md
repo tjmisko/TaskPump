@@ -172,12 +172,15 @@ clutter has to come from somewhere other than hiding nodes:
 
 Boxes stay narrow: id + status glyph.
 
-**Retained from v1, against this section's original wording:** inside a
-single-phase range the `F79.` prefix is still dropped (`│ .24 ◌ │`), which is
-worth ~4 columns per box — 48 on F79's widest layer. The argument for full ids
-was that clutter must not come from hiding nodes; a shortened *label* hides
-nothing, and the status bar now shows the selection's full id at all times.
-Multi-phase ranges still use full ids, where the phase actually disambiguates.
+**Full ids, in every range** (reversed 2026-08-05; this section previously
+retained v1's compact labels). Dropping the `F79.` prefix inside a single-phase
+range was worth ~4 columns per box — 48 on F79's widest layer — and the argument
+was that a shortened *label* hides nothing while the status bar carries the full
+id. In use that traded the wrong thing: `.17` is not something you can say out
+loud, paste into `arachne-task`, or match against the pump's log without
+mentally re-attaching the phase every time, and you do that far more often than
+you run out of width. `--compact` still asks for the short form when width
+genuinely binds.
 
 Green is the progress axis, so a glance at the graph reads as *how far along is
 this*: landed work recedes, the one task an agent is on right now stands out,
