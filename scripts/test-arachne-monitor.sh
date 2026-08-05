@@ -647,6 +647,91 @@ leaky=$(grep -oE $'\033\\[[0-9;]+m' "$CLI" | grep -vE $'\033\\[0([;m])' || true)
 [[ -z "$leaky" ]] && pass "every colour sequence re-opens with 0" \
     || fail "non-absolute sequences: $(tr -d '\033' <<<"$leaky" | sort -u | tr '\n' ' ')"
 
+# ── Test 24: top-region vertical rhythm ──────────────────────────────────────
+# Three facts about the fixed top, all of them spacing: one blank line under the
+# tab row on BOTH tabs; notes that WRAP (they used to be cut with an "…") and
+# flow on past the disk sub-info instead of dead-ending above it; and one blank
+# line closing the whole composed block. The pump row is located by content, not
+# by row number — the tab bar above it is being rewritten independently.
+echo "--- Test 24: top-region vertical rhythm ---"
+make_usage_stub 40 50
+# A pump state so the `pump[…]` line renders at all; its counts come from a
+# pre-seeded cache with a huge TTL so no background frontier scan is kicked off.
+PS24="$TMP/pump24.state"
+printf '%s' '{"phases":"F24","started_at":"2026-08-05T09:00:00Z","status":"running","open_tasks":3,"ceiling":95}' >| "$PS24"
+PC24="$TMP/pump24-cache.tsv"; printf 'ELIG\t1\nOPEN\t3\n' >| "$PC24"
+run24() {  # $1 = cols  $2 = notes file  $3 = notes tail (default 6)
+  ARACHNE_MONITOR_DISK=1 ARACHNE_MONITOR_DISK_CACHE="$DCACHE" ARACHNE_MONITOR_DISK_TTL=99999 \
+  ARACHNE_MONITOR_MAIN_ROOT="$FAKE_MAIN" DF_AVAIL_KB=52428800 \
+  ARACHNE_PUMP_STATE_FILE="$PS24" ARACHNE_MONITOR_PUMP_CACHE="$PC24" ARACHNE_MONITOR_PUMP_TTL=99999 \
+  ARACHNE_TASKS_DIR="$TMP/no-such-tasks" \
+  ARACHNE_MONITOR_COLS="$1" ARACHNE_MONITOR_NOTES_FILE="$2" ARACHNE_MONITOR_NOTES_TAIL="${3:-6}" \
+  "$CLI" 2>/dev/null | strip_ansi; }
+row_at() { sed -n "${2}p" <<<"$1" 2>/dev/null; }   # $1 = text, $2 = 1-based row
+
+# (a) A long note wraps instead of gaining an "…", and its tail is the NEXT row.
+# Narrow, so the notes column stacks at column 0 and the indent is assertable.
+NF24="$TMP/notes24.md"
+printf -- '- 14:02  the host oauth token expired mid-run and every agent container stalled waiting on SENTINELTAIL\n' >| "$NF24"
+w24=$(run24 60 "$NF24")
+grep -q 'SENTINELTAIL' <<<"$w24" && pass "a long note keeps its tail" || fail "note tail cut off:\n$w24"
+grep -qE 'oauth token.*…' <<<"$w24" && fail "the long note is still truncated with an …:\n$w24" \
+    || pass "the long note is wrapped, not truncated"
+head_row=$(awk '/^- 14:02/{print NR; exit}' <<<"$w24")
+tail_row=$(awk '/SENTINELTAIL/{print NR; exit}' <<<"$w24")
+[[ -n "$head_row" && "$tail_row" == "$((head_row + 1))" ]] \
+    && pass "the wrapped tail lands on the line after the stamp (rows $head_row/$tail_row)" \
+    || fail "wrap did not spill onto the next line: head=$head_row tail=$tail_row:\n$w24"
+# Continuation is indented past the "- HH:MM  " stamp, so the timestamp keeps a
+# column of its own and one entry stays visually distinct from the next.
+grep -qE '^ {9}[^ ].*SENTINELTAIL' <<<"$w24" \
+    && pass "the continuation line is indented under the note text" \
+    || fail "continuation not indented past the stamp:\n$w24"
+
+# (b)+(d) Wide terminal: notes continue BELOW the disk sub-info rows, and one
+# blank line closes the composed block.
+MF24="$TMP/notes24-many.md"
+printf -- '- 09:%02d  note-%02d body\n' 1 1 2 2 3 3 4 4 5 5 6 6 7 7 8 8 9 9 10 10 11 11 12 12 >| "$MF24"
+m24=$(run24 200 "$MF24" 12)
+wt_row=$(awk '/worktrees 11/{print NR; exit}' <<<"$m24")
+dk_row=$(awk '/docker img /{print NR; exit}' <<<"$m24")
+last_note=$(awk '/note-[0-9]+ body/{r=NR} END{print r+0}' <<<"$m24")
+[[ -n "$wt_row" && -n "$dk_row" && "$last_note" -gt "$dk_row" && "$last_note" -gt "$wt_row" ]] \
+    && pass "notes flow on past the disk sub-info (last note row $last_note > docker row $dk_row)" \
+    || fail "notes dead-end above the disk column: worktrees=$wt_row docker=$dk_row last-note=$last_note:\n$m24"
+below=$(row_at "$m24" "$((last_note + 1))")
+[[ "$last_note" -gt 0 && -z "${below//[[:space:]]/}" ]] \
+    && pass "a blank line closes the composed top block" \
+    || fail "no blank line under the composed block: [$below]"
+
+# (c) Exactly one blank row between the tab row and the pump row — the pump row
+# is found by content so no assertion here depends on the tab bar's text.
+p_row=$(awk '/pump\[/{print NR; exit}' <<<"$m24")
+above1=$(row_at "$m24" "$((p_row - 1))"); above2=$(row_at "$m24" "$((p_row - 2))")
+[[ -n "$p_row" && -z "${above1//[[:space:]]/}" && -n "${above2//[[:space:]]/}" ]] \
+    && pass "exactly one blank line separates the tab row from the pump line" \
+    || fail "tab→pump spacing wrong (pump row $p_row): above=[$above1] above-above=[$above2]"
+# The GRAPH tab breathes the same way — the two tops must not drift apart.
+g24=$(ARACHNE_PUMP_STATE_FILE="$GPS" ARACHNE_TASKS_DIR="$GTD" ARACHNE_MONITOR_PUMP_CACHE="$PC24" \
+      ARACHNE_MONITOR_PUMP_TTL=99999 ARACHNE_MONITOR_COLS=120 "$CLI" --tab graph 2>/dev/null | strip_ansi)
+gp_row=$(awk '/pump\[/{print NR; exit}' <<<"$g24")
+gab1=$(row_at "$g24" "$((gp_row - 1))"); gab2=$(row_at "$g24" "$((gp_row - 2))")
+[[ -n "$gp_row" && -z "${gab1//[[:space:]]/}" && -n "${gab2//[[:space:]]/}" ]] \
+    && pass "the GRAPH tab gets the same blank line under the tabs" \
+    || fail "GRAPH tab→pump spacing wrong (pump row $gp_row): above=[$gab1] above-above=[$gab2]"
+
+# (e) NOTES_TAIL still counts ENTRIES — a wrapped note must not eat two slots.
+TF24="$TMP/notes24-tail.md"
+{ printf -- '- 08:00  oldest-entry\n'
+  printf -- '- 08:01  second entry deliberately long enough to need two display lines all by itself\n'
+  printf -- '- 08:02  third entry also deliberately long enough to need two display lines all by itself\n'; } >| "$TF24"
+t24=$(run24 60 "$TF24" 2)
+grep -q 'oldest-entry' <<<"$t24" && fail "NOTES_TAIL counted display lines, not entries:\n$t24" \
+    || pass "NOTES_TAIL=2 drops the third-oldest entry"
+grep -q 'second entry' <<<"$t24" && grep -q 'third entry' <<<"$t24" \
+    && pass "NOTES_TAIL=2 shows two ENTRIES even when each wraps to two lines" \
+    || fail "a wrapped entry cost more than one tail slot:\n$t24"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"
