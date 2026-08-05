@@ -647,6 +647,93 @@ leaky=$(grep -oE $'\033\\[[0-9;]+m' "$CLI" | grep -vE $'\033\\[0([;m])' || true)
 [[ -z "$leaky" ]] && pass "every colour sequence re-opens with 0" \
     || fail "non-absolute sequences: $(tr -d '\033' <<<"$leaky" | sort -u | tr '\n' ' ')"
 
+# ── Test 24: gt/gT switch tab; the arrows never do ───────────────────────────
+# Pinned at source level with Test 22's arm_has, for the same reason: the live
+# key loop needs a pty. The `--moves` seam cannot stand in here — render_all
+# branches on TAB and *then* calls the tab's replayer, so a replayed tab switch
+# could not change which renderer ran without restructuring the one-shot path.
+echo "--- Test 24: gt/gT tab switching ---"
+
+# The bug this closes: ← / → switched tab on SESSIONS while driving the node
+# cursor on GRAPH, so the same key both navigated and teleported you off the
+# page depending on where you were. Every case arm naming an arrow must now be
+# a graph_move — there is no other legitimate consumer.
+arrow_arms=$(grep -nE '^[[:space:]]*[^#]*\b(LEFT|RIGHT)\)' "$CLI" || true)
+stray_arrows=$(printf '%s\n' "$arrow_arms" | grep -v 'graph_move' | grep -v '^$' || true)
+[[ -n "$arrow_arms" ]] && [[ -z "$stray_arrows" ]] \
+    && pass "← / → drive only the GRAPH node cursor — no arm switches tab" \
+    || fail "an arrow key arm no longer routes to graph_move:\n$stray_arrows"
+
+# ...and specifically that the SESSIONS switch arm dropped them, rather than the
+# arrows merely having moved to some other tab-switching arm.
+arm_has 'LEFT' 'tab_switch' && fail "an arrow arm still switches tab" \
+    || pass "SESSIONS tab-switch arm no longer names LEFT"
+arm_has 'RIGHT' 'tab_switch' && fail "an arrow arm still switches tab" \
+    || pass "SESSIONS tab-switch arm no longer names RIGHT"
+arm_has 'RIGHT)' 'TAB=1' && fail "the old SESSIONS ←/→ tab-switch arm is still present" \
+    || pass "the old '\$'\\t'|STAB|LEFT|RIGHT) TAB=1' arm is gone"
+
+# `g` is the prefix; t and T must resolve inside it, beside gg. If they leaked to
+# the per-tab keymaps instead, `gt` would move the cursor and then switch tab.
+arm_has 't)' 'tab_switch next' \
+    && pass "the g-prefix block resolves t → next tab" \
+    || fail "gt does not resolve to a next-tab switch in the g-prefix block"
+arm_has 'T)' 'tab_switch prev' \
+    && pass "the g-prefix block resolves T → previous tab" \
+    || fail "gT does not resolve to a previous-tab switch in the g-prefix block"
+
+# One switch function, four entry points, both tabs: the SCROLL/PAN reset is the
+# whole reason it exists, so an arm that sets TAB by hand is the regression.
+[[ "$(grep -cE '^[[:space:]]*[^#]*tab_switch (next|prev)' "$CLI")" -ge 6 ]] \
+    && pass "Tab/Shift-Tab/gt/gT on both tabs all route through tab_switch" \
+    || fail "fewer than six tab_switch call sites — an arm bypasses it"
+raw_tab_sets=$(grep -nE '^[[:space:]]*[^#]*(\$.\\t.|STAB)\).*TAB=' "$CLI" || true)
+[[ -z "$raw_tab_sets" ]] \
+    && pass "no tab-switch arm assigns TAB directly (the viewport reset can't be skipped)" \
+    || fail "a tab-switch arm sets TAB by hand:\n$raw_tab_sets"
+
+# The reset itself, and the directionality that lets a third tab be added
+# without rewriting the arms.
+# The function's BEHAVIOUR, not its source text. The monitor cannot be sourced
+# (it renders on load), so lift the definition out and run it standalone: the
+# viewport reset is the whole point of centralising the switch, and a grep for
+# `SCROLL=0` would still pass if the assignment moved behind a condition.
+tab_switch_says() {  # $1 = start TAB, $2 = direction → "TAB SCROLL PAN"
+    bash -c '
+        eval "$(sed -n "/^TAB_COUNT=/,/^}/p" "$0")"
+        TAB="$1"; SCROLL=42; PAN=17
+        tab_switch "$2"
+        printf "%s %s %s" "$TAB" "$SCROLL" "$PAN"
+    ' "$CLI" "$1" "$2"
+}
+[[ "$(tab_switch_says 0 next)" == "1 0 0" ]] \
+    && pass "tab_switch next from SESSIONS lands on GRAPH with the viewport zeroed" \
+    || fail "tab_switch 0 next → $(tab_switch_says 0 next), want '1 0 0'"
+[[ "$(tab_switch_says 1 next)" == "0 0 0" ]] \
+    && pass "tab_switch next wraps GRAPH → SESSIONS" \
+    || fail "tab_switch 1 next → $(tab_switch_says 1 next), want '0 0 0'"
+[[ "$(tab_switch_says 0 prev)" == "1 0 0" ]] \
+    && pass "tab_switch prev from SESSIONS wraps back to GRAPH" \
+    || fail "tab_switch 0 prev → $(tab_switch_says 0 prev), want '1 0 0'"
+[[ "$(tab_switch_says 1 prev)" == "0 0 0" ]] \
+    && pass "tab_switch prev from GRAPH lands on SESSIONS" \
+    || fail "tab_switch 1 prev → $(tab_switch_says 1 prev), want '0 0 0'"
+# Never out of range, whatever it is handed — an out-of-range TAB would render
+# the SESSIONS tab while the tab bar claimed otherwise.
+[[ "$(tab_switch_says 0 '')" == "1 0 0" ]] \
+    && pass "tab_switch defaults to next when handed no direction" \
+    || fail "tab_switch with no direction → $(tab_switch_says 0 '')"
+grep -q 'TAB_COUNT' <(sed -n '/^tab_switch()/,/^}/p' "$CLI") \
+    && pass "tab_switch is directional over TAB_COUNT, not a two-tab toggle" \
+    || fail "tab_switch hardcodes a two-tab toggle"
+
+# The documented keymap is the one the code implements.
+"$CLI" --help 2>/dev/null | grep -q 'gt / gT' \
+    && pass "--help documents gt / gT" || fail "--help does not mention gt / gT"
+"$CLI" --help 2>/dev/null | sed -n '/SESSIONS tab/,/GRAPH tab/p' | grep -q '← → switch tab' \
+    && fail "--help still lists ← → as the SESSIONS tab switch" \
+    || pass "--help no longer lists ← → as a SESSIONS tab switch"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"
