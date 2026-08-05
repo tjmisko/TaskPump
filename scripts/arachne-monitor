@@ -492,7 +492,12 @@ log_events() {  # $1 = log file
             | gsub("\\s+";" ") | sub("^ ";"")' 2>/dev/null \
         | grep -v '^$' | tail -"$TAIL_LINES" || true)"
     [[ -z "$out" ]] && out="$(tail -"$TAIL_LINES" "$logf" 2>/dev/null || true)"
-    printf '%s' "$out"
+    # Terminate the last line. Callers consume this with `while IFS= read -r`,
+    # and read returns non-zero on an unterminated final line — so with a bare
+    # `printf '%s'` the loop body never runs for it and the most recent event is
+    # silently dropped. That is why TAIL_LINES=2 only ever rendered one line.
+    [[ -n "$out" ]] && printf '%s\n' "$out"
+    return 0
 }
 
 # sessions_compute -- BACKGROUND worker: docker ps + per-container metadata + log
