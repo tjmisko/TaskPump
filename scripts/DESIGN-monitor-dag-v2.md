@@ -226,12 +226,21 @@ without a pty — the same trick `--tab` plays for the graph itself.
 |---|---|
 | `←` `→` / `h` `l` | previous / next node within the layer |
 | `↑` `↓` / `k` `j` | nearest node in the layer above / below, **preferring a connected one** (blocker or dependent) over nearest-by-x |
+| `gg` / `G` | first / last layer |
+| `^` `_` `0` `Home` / `$` `End` | first / last node **in the layer** |
 | `o` / `Enter` | open the selected task's file in a new editor window |
 | `Tab` / `S-Tab` | switch tab |
 | `PgUp` / `PgDn` | page the viewport without moving the cursor |
 | `.` | recentre on the running node |
-| `g` / `G` | first / last layer |
 | `q` | quit |
+
+The motions are vim's, mapped onto the graph's two axes: `gg`/`G` run **down**
+the layers, which are the DAG's depth, and `^`/`$` run **across** one layer,
+which is the graph's equivalent of a line. `Home`/`End` follow `^`/`$` rather
+than `gg`/`G` for that reason — in a graph that is wider than it is deep, the
+horizontal ends are what you actually reach for. `g` is a genuine prefix: a key
+typed after it cancels the pending motion and still acts, so a half-typed `gg`
+never eats a command.
 
 `o` exists because the status bar can only ever hold the *summary* — goal,
 budget, blockers. The moment a node raises a real question the answer is in its
@@ -270,6 +279,30 @@ F79.5   ○ ready · 3 turns · blockers F79.3 ✓ F79.4 ✓ · feat/f79
 Detail fields: id, status, turn budget, resume attempts, claimed branch,
 blockers with their statuses, and the task's `goal` (falling back to `title`).
 
+## Which task is *running*
+
+`--running` names a task outright. `--live-branches` names a branch with a live
+container — one step short of an answer, because under phase grain one container
+drains a whole phase serially and a branch routinely holds several `in_progress`
+tasks: the one being worked, plus claims an earlier session left behind.
+
+Treating "branch is live" as "task is live" lit all of them ▶, and the GRAPH tab
+then disagreed with SESSIONS about how much was actually moving — two nodes
+running against one container (observed 2026-08-05 on `feat/f79`, where F79.5's
+16:56 claim was still open while the agent worked F79.20).
+
+So a live branch **elects exactly one** task: the `in_progress` claim with the
+newest `last_heartbeat_ts`, falling back to `claimed_at` for a claim that never
+heartbeated. Both are ISO-8601 UTC, so a string compare is a time compare. Every
+other claim on that branch renders `⧗` — which is honest: it is a stale claim, and
+usually one about to hit its turn budget.
+
+The election lives in `resolve_live()` next to the frontmatter parser, and the
+`--claims` mode exposes the same computation as `branch → task` rows for the
+SESSIONS tab. That sharing is the point: the two tabs read one election, so they
+cannot drift into disagreeing. The node table carries the verdict as its own
+`live` column rather than letting the monitor re-derive it from `status`.
+
 ## Viewport clipping
 
 A whole-corpus graph is ~9000 columns wide. Building those lines in full costs
@@ -292,3 +325,32 @@ Beyond the existing 25 renderer cases:
 - **Determinism:** two runs byte-identical.
 - Cursor: movement stays in bounds; `↑`/`↓` prefer a connected node; viewport
   follows the selection.
+- Motions: `gg` reaches the first layer, a lone `g` moves nothing, and a key
+  after `g` cancels the prefix and still acts; `^`/`$` reach the ends of a layer.
+- Liveness: a branch with two `in_progress` claims paints exactly one `▶`, the
+  newest heartbeat wins, the loser is `⧗`, and `--claims` names the same task.
+- Palette: every emitted sequence is absolute (re-opens with `0`), both edge
+  tiers are legible, and a fully-done component's edges are green.
+
+## The SESSIONS cursor
+
+Symmetric with the above by design: `↑`/`↓` move a **selection** between agent
+sessions rather than scrolling a wall of text past a fixed eye, `gg`/`G` and
+`Home`/`End` reach the ends, `PgUp`/`PgDn` still page the viewport without
+disturbing the selection, and `Enter` opens the selected session's current task.
+The fixed top region grows a two-line detail bar for the selection — task, status,
+branch, turn budget, uptime, goal — mirroring the GRAPH status bar.
+
+Two details worth stating:
+
+- The cursor is an **index** into the S records, not a remembered session name.
+  Sessions come and go between sweeps; an index clamps cleanly where a stale
+  name would silently select nothing.
+- The row's task comes from the ledger's live claim, **not** the manifest. The
+  manifest's epic anchor is a launch-time constant that goes stale the moment the
+  agent moves on, and a pump run has no manifest at all — which is why that
+  column used to read `—` for every session under the pump.
+
+`--moves` replays session motions too, so the cursor is assertable without a pty.
+Only navigation: `Enter` has no printable character, and inventing a replay alias
+would mean testing a keymap the user never touches.

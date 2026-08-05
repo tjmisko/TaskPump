@@ -38,7 +38,32 @@ BEGIN {
     HBL = "\342\224\227"; HBR = "\342\224\233"                         # ┗ ┛
     HTU = "\342\224\267"; HTD = "\342\224\257"                         # ┷ ┯
 }
-function islive(i) { return (id[i] in LIVE) || (by[i] != "" && (by[i] in LIVEB)) }
+# islive -- is an agent working THIS task right now?
+#
+# --running names a task outright. --live-branches only names a branch with a
+# live container, which is one step short of an answer: under phase grain one
+# container drains a whole phase serially, so a branch routinely carries several
+# in_progress tasks -- the one being worked plus claims an earlier session left
+# behind. Treating "branch is live" as "task is live" lit them all up, and the
+# GRAPH tab then disagreed with SESSIONS about how much was moving.
+#
+# So a live branch elects exactly ONE task: the most recently heartbeated
+# in_progress claim on it (resolve_live). Stale claims fall back to ⧗ parked,
+# which is what they are.
+function islive(i) { return (id[i] in LIVE) || (by[i] != "" && liveOf[by[i]] == i + 1) }
+
+# resolve_live -- per live branch, elect the in_progress claim with the newest
+# heartbeat. Falls back to claimed_at when a claim has never heartbeated (a
+# session that died before its first end), and both are ISO-8601 UTC, so a
+# string compare is a time compare.
+function resolve_live(   i, b, k) {
+    for (i = 0; i < n; i++) {
+        b = by[i]
+        if (b == "" || st[i] != "in_progress" || !(b in LIVEB)) continue
+        k = (hb[i] != "" && hb[i] != "null") ? hb[i] : ca[i]
+        if (!(b in liveKey) || k > liveKey[b]) { liveKey[b] = k; liveOf[b] = i + 1 }
+    }
+}
 function num(s) { gsub(/[^0-9]/, "", s); return s + 0 }
 function unq(s) {
     gsub(/^[ \t]*/, "", s); gsub(/[ \t]*$/, "", s); gsub(/^"|"$/, "", s)
@@ -49,7 +74,7 @@ function unq(s) {
 # ── frontmatter extraction ───────────────────────────────────────────────────
 FNR == 1 {
     fm = 0; inb = 0; cid = ""; cst = ""; cbl = ""; cph = ""; cby = ""
-    cgo = ""; cti = ""; ctb = ""; cra = ""
+    cgo = ""; cti = ""; ctb = ""; cra = ""; chb = ""; cca = ""
 }
 /^---[ \t]*$/ { fm++; if (fm == 2) { store() } next }
 fm != 1 { next }
@@ -75,6 +100,8 @@ fm != 1 { next }
     else if ($0 ~ /^title:/)      { cti = unq(substr($0, 7)) }
     else if ($0 ~ /^turn_budget_remaining:/) { ctb = unq(substr($0, 23)) }
     else if ($0 ~ /^resume_attempts:/)       { cra = unq(substr($0, 17)) }
+    else if ($0 ~ /^last_heartbeat_ts:/)     { chb = unq(substr($0, 19)) }
+    else if ($0 ~ /^claimed_at:/)            { cca = unq(substr($0, 12)) }
 }
 function store(   p) {
     if (cid == "") return
@@ -82,6 +109,7 @@ function store(   p) {
     sub(/\..*$/, "", p)
     aId[N] = cid; aSt[N] = cst; aBl[N] = cbl; aPh[N] = num(p); aBy[N] = cby
     aGo[N] = cgo; aTi[N] = cti; aTb[N] = ctb; aRa[N] = cra
+    aHb[N] = chb; aCa[N] = cca
     aIx[cid] = N
     N++
 }
@@ -106,7 +134,7 @@ function select(   k, j, m, B, p) {
         id[n] = aId[k]; st[n] = aSt[k]; bl[n] = aBl[k]
         ph[n] = aPh[k]; by[n] = aBy[k]; isStub[n] = (k in stub) ? 1 : 0
         goal[n] = (aGo[k] != "" && aGo[k] != "null") ? aGo[k] : aTi[k]
-        tbud[n] = aTb[k]; ratt[n] = aRa[k]
+        tbud[n] = aTb[k]; ratt[n] = aRa[k]; hb[n] = aHb[k]; ca[n] = aCa[k]
         ix[aId[k]] = n; n++
     }
 }
@@ -132,6 +160,12 @@ function layer(   pass, i, j, m, B, p, L, cand, changed) {
 }
 
 # ── labels + node widths ─────────────────────────────────────────────────────
+# Full ids by default, in every range. Dropping the phase prefix inside a
+# single-phase range saved ~4 columns per box, but a node reading `.17` is not
+# something you can say out loud, paste into `arachne-task`, or match against
+# the pump's log without mentally re-attaching the phase every time. The four
+# columns are the cheaper thing to spend. `--compact` still asks for the short
+# form when the width actually matters.
 function labels(   i, lbl) {
     if (compact < 0) compact = 0
     BOXW = 0
@@ -160,12 +194,6 @@ function dummies(   i, j, m, B, p, l, d, minl, prev) {
         m = split(bl[i], B, ",")
         minl = -1
         for (j = 1; j <= m; j++) {
-# Full ids by default, in every range. Dropping the phase prefix inside a
-# single-phase range saved ~4 columns per box, but a node reading `.17` is not
-# something you can say out loud, paste into `arachne-task`, or match against
-# the pump's log without mentally re-attaching the phase every time. The four
-# columns are the cheaper thing to spend. `--compact` still asks for the short
-# form when the width actually matters.
             if (B[j] == "" || !((B[j]) in ix)) continue
             p = ix[B[j]]
             if (lay[i] - lay[p] <= 1) { link(p, i); continue }
@@ -781,19 +809,42 @@ function emit_index(   i, j, m, B, s, p, bs) {
             s = ((B[j]) in aIx) ? aSt[aIx[B[j]]] : "?"
             bs = bs (bs ? "|" : "") B[j] ":" s
         }
-        printf "%s\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n",
+        # `live` is islive()'s verdict, not st[]: the monitor's status bar must
+        # agree with the canvas about which single claim is actually running.
+        printf "%s\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n",
                id[i], lay[i], pos[i], cx[i], ny[i], st[i],
                (by[i] == "" ? "null" : by[i]),
                (tbud[i] == "" ? "null" : tbud[i]),
                (ratt[i] == "" ? "null" : ratt[i]),
-               (bs == "" ? "-" : bs), goal[i] > indexfile
+               (bs == "" ? "-" : bs), islive(i), goal[i] > indexfile
     }
     close(indexfile)
 }
 
+# emit_claims -- the `--claims` mode: one row per branch holding an in_progress
+# claim, naming the single task an agent is actually on. Same election as
+# resolve_live(), deliberately sharing this file's frontmatter parser, so the
+# monitor's SESSIONS tab and the GRAPH canvas cannot disagree about which claim
+# is live. Liveness itself stays the caller's business -- it knows the branches
+# with containers; this only answers "which task, on this branch".
+#   branch \t task \t turn_budget \t goal
+function emit_claims(   i, b, k) {
+    for (i = 0; i < n; i++) {
+        if (st[i] != "in_progress" || by[i] == "" || by[i] == "null") continue
+        k = (hb[i] != "" && hb[i] != "null") ? hb[i] : ca[i]
+        if (!(by[i] in cKey) || k > cKey[by[i]]) { cKey[by[i]] = k; cIx[by[i]] = i + 1 }
+    }
+    for (b in cIx) {
+        i = cIx[b] - 1
+        printf "%s\t%s\t%s\t%s\n", b, id[i], (tbud[i] == "" ? "null" : tbud[i]), goal[i]
+    }
+}
+
 END {
     select()
+    if (mode == "claims") { emit_claims(); exit 0 }
     if (n == 0) { print "(no tasks in range" (phases ? " " phases : "") ")"; exit 0 }
+    resolve_live()
     layer(); labels(); dummies(); seed(); order(); xassign(); draw(); flush()
     emit_index()
 }

@@ -29,6 +29,11 @@
 #   ./scripts/arachne-dag-render --index-file /tmp/i # TSV node table for the monitor
 #   ./scripts/arachne-dag-render --cols 200          # clip output to a viewport
 #   ./scripts/arachne-dag-render --no-color          # for tests
+#   ./scripts/arachne-dag-render --claims            # no picture: one row per
+#       branch holding an in_progress claim, naming the single task an agent is
+#       actually on (branch/task/turns/goal, tab separated). Shares this file's
+#       parser and election with the canvas, so the monitor's two tabs cannot
+#       disagree about which claim is live.
 set -euo pipefail
 
 REPO_ROOT="${ARACHNE_DAG_REPO_ROOT:-$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)}"
@@ -36,7 +41,7 @@ TASKS_DIR="${ARACHNE_TASKS_DIR:-$REPO_ROOT/ops/task-loop/tasks}"
 PUMP_STATE="${ARACHNE_PUMP_STATE_FILE:-$REPO_ROOT/.arachne-pump.state}"
 
 PHASES=""; RUNNING=""; LIVEBRANCHES=""; COLOR=1; COMPACT=-1; PANX=0
-CURSOR=""; INDEXFILE=""; COLS=0
+CURSOR=""; INDEXFILE=""; COLS=0; MODE=""
 
 print_help() { awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$0"; }
 
@@ -56,6 +61,7 @@ while [[ $# -gt 0 ]]; do
         --cursor=*)  CURSOR="${1#--cursor=}" ;;
         --index-file)   INDEXFILE="${2:-}"; shift ;;
         --index-file=*) INDEXFILE="${1#--index-file=}" ;;
+        --claims)    MODE=claims ;;
         --no-color)  COLOR=0 ;;
         --compact)   COMPACT=1 ;;
         --full-ids)  COMPACT=0 ;;
@@ -78,5 +84,5 @@ files=("$TASKS_DIR"/*.md)
 
 gawk -v phases="$PHASES" -v running="$RUNNING" -v livebranches="$LIVEBRANCHES" \
      -v color="$COLOR" -v compact="$COMPACT" -v panx="$PANX" \
-     -v cursor="$CURSOR" -v indexfile="$INDEXFILE" -v cols="$COLS" \
+     -v cursor="$CURSOR" -v indexfile="$INDEXFILE" -v cols="$COLS" -v mode="$MODE" \
      -f "$(dirname "$0")/arachne-dag-layout.awk" "${files[@]}"

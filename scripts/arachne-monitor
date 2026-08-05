@@ -40,14 +40,21 @@
 #   ./scripts/arachne-monitor --demo      # synthetic sessions; no docker needed
 #   ./scripts/arachne-monitor --tab graph --cursor F79.5 --moves jj   # scripted focus
 #
-# Watch-mode keys, SESSIONS tab:
-#                   j/k ↑/↓ scroll · g/G top/bottom · PgUp/PgDn (Ctrl-u/d) page
-#                   ← → switch tab
-# Watch-mode keys, GRAPH tab (arrows move the CURSOR; the viewport follows it):
+# Both tabs navigate a SELECTION with vim motions; the viewport follows it.
+#
+# Watch-mode keys, SESSIONS tab (the cursor selects one agent session):
+#                   k/j ↑ ↓ previous/next session
+#                   gg/G · Home/End  first/last session
+#                   Enter    open that session's current task file
+#                   ← → switch tab · PgUp/PgDn (Ctrl-u/d) page the viewport
+# Watch-mode keys, GRAPH tab (the cursor selects one task node):
 #                   h/l ← → previous/next node in the layer
 #                   k/j ↑ ↓ nearest node one layer up/down, preferring a
 #                            connected one (a blocker, or a dependent)
-#                   g/G first/last layer · . recentre on the running task
+#                   gg/G     first/last layer   (vertical: the DAG's depth)
+#                   ^/_/0/Home · $/End  first/last node in the LAYER
+#                            (horizontal: a layer is the graph's "line")
+#                   .        recentre on the running task
 #                   o / Enter open the selected task's file in a new editor
 #                            window (wezterm + $EDITOR; falls back to taking
 #                            over this terminal when there is no display)
@@ -559,34 +566,68 @@ log_events() {  # $1 = log file
     return 0
 }
 
+# slug_branch -- container-name slug -> worktree branch. The slug is the branch
+# with '/' replaced by '-', which is NOT reversible ("feat-f79-x" could be
+# feat/f79-x or feat/f79/x), so match against the real worktree paths instead of
+# guessing where the separator was. The manifest wins when it has the row.
+slug_branch() {  # $1 = slug
+    local slug="$1" cand d
+    [[ -n "${SLUG_BRANCH[$slug]:-}" ]] && { printf '%s' "${SLUG_BRANCH[$slug]}"; return 0; }
+    while IFS= read -r cand; do
+        d="${cand#"$REPO_ROOT/.worktrees/"}"; d="${d%/}"
+        [[ "${d//\//-}" == "$slug" ]] && { printf '%s' "$d"; return 0; }
+    # Match on either marker: .git identifies a real worktree, and the agent log
+    # identifies a workspace whose checkout is not visible from here (and is the
+    # only marker the fixtures carry).
+    done < <(find "$REPO_ROOT/.worktrees" -mindepth 1 -maxdepth 4 \
+                  \( -name .git -o -name .arachne-agent.log \) -printf '%h\n' 2>/dev/null)
+    printf ''
+}
+
+# ledger_claims -- branch -> the ONE task an agent is actually on, as
+# "branch<TAB>task<TAB>turns<TAB>goal" rows. Delegated to the renderer's
+# --claims mode ON PURPOSE: it shares the frontmatter parser AND the
+# newest-heartbeat election with the canvas, so the two tabs cannot drift into
+# disagreeing about which claim is live. Called only from the background
+# sessions worker, never on the paint path.
+ledger_claims() {
+    [[ -x "$DAG_BIN" ]] || return 0
+    ARACHNE_TASKS_DIR="$TASKS_DIR" "$DAG_BIN" --claims 2>/dev/null || true
+}
+
 # sessions_compute -- BACKGROUND worker: docker ps + per-container metadata + log
 # tails, plus flagged epics. Emits records for sessions_lines to format cheaply:
-#   S <name> <cstate> <tstat> <task> <up> <age> <stale>
+#   S <name> <cstate> <tstat> <task> <up> <age> <stale> <branch> <turns> <goal>
 #   L <logline>                      (belongs to the most recent S)
 #   N 1                              (no containers)
 #   F <task> <name> <status>         (blocked/stuck/needs-review epic)
 sessions_compute() {
     local found=0 cname state status
     local flagged=""
+    # Which task each branch is on, resolved once for the whole sweep.
+    local -A CLAIM_TASK=() CLAIM_TURNS=() CLAIM_GOAL=()
+    local cb ct cn cg
+    while IFS=$'\t' read -r cb ct cn cg; do
+        [[ -z "$cb" ]] && continue
+        CLAIM_TASK[$cb]="$ct"; CLAIM_TURNS[$cb]="$cn"; CLAIM_GOAL[$cb]="$cg"
+    done < <(ledger_claims)
     while IFS='|' read -r cname state status; do
         [[ -z "$cname" || "$cname" != arachne-agent* ]] && continue
         found=1
         local slug="${cname#arachne-agent-}"
         local name="${SLUG_NAME[$slug]:-$slug}"
-        local task="${SLUG_TASK[$slug]:-—}"
+        local branch; branch="$(slug_branch "$slug")"
+        # The manifest's epic anchor is a launch-time constant and goes stale the
+        # moment the agent moves on; the ledger's live claim is the truth. A
+        # pump run has no manifest at all, which is why this column used to read
+        # "—" for every session.
+        local task="${CLAIM_TASK[$branch]:-${SLUG_TASK[$slug]:-—}}"
+        local turns="${CLAIM_TURNS[$branch]:-null}" goal="${CLAIM_GOAL[$branch]:-}"
         local tstat="-"; [[ "$task" != "—" ]] && tstat="$(task_status "$task")"
         local cstate="running"; [[ "$state" != "running" ]] && cstate="exited"
         local up; up="$(printf '%s' "$status" | sed -E 's/^(Up|Exited[^ ]*) //; s/ ago$//' | cut -c1-11)"
-        local logf="" branch="${SLUG_BRANCH[$slug]:-}"
-        if [[ -n "$branch" ]]; then
-            logf="$REPO_ROOT/.worktrees/$branch/.arachne-agent.log"
-        else
-            local cand d
-            while IFS= read -r cand; do
-                d="$(dirname "$cand")"; d="${d#"$REPO_ROOT/.worktrees/"}"
-                [[ "${d//\//-}" == "$slug" ]] && { logf="$cand"; break; }
-            done < <(find "$REPO_ROOT/.worktrees" -name .arachne-agent.log 2>/dev/null)
-        fi
+        local logf=""
+        [[ -n "$branch" ]] && logf="$REPO_ROOT/.worktrees/$branch/.arachne-agent.log"
         local age="-" stale=0
         if [[ -n "$logf" && -f "$logf" ]]; then
             local mtime; mtime="$(stat -c %Y "$logf" 2>/dev/null || echo 0)"
@@ -595,7 +636,8 @@ sessions_compute() {
                 [[ "$cstate" == running && "$secs" -gt 120 ]] && stale=1
             fi
         fi
-        printf 'S\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$cstate" "$tstat" "$task" "$up" "$age" "$stale"
+        printf 'S\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$name" "$cstate" "$tstat" "$task" "$up" "$age" "$stale" "$branch" "$turns" "$goal"
         local ln
         while IFS= read -r ln; do
             [[ -z "${ln// }" ]] && continue
@@ -614,12 +656,127 @@ sessions_compute() {
     return 0
 }
 
-session_header() {  # name cstate tstat task up age stale
-    local name="$1" cstate="$2" tstat="$3" task="$4" up="$5" age="$6" stale="$7" dot age_c
+session_header() {  # name cstate tstat task up age stale [index]
+    local name="$1" cstate="$2" tstat="$3" task="$4" up="$5" age="$6" stale="$7"
+    local idx="${8:--1}" dot age_c mark="  " nm="$name"
     case "$cstate" in running) dot=$'\033[36m●\033[0m' ;; *) dot=$'\033[90m●\033[0m' ;; esac
     if [[ "$stale" == "1" ]]; then age_c=$'\033[31m'"$age"$'\033[0m'; else age_c="$age"; fi
-    printf '%b %-10s [%s] %s  up %s  log %s\n' \
-        "$dot" "$name" "$(colorize "$cstate")" "${task}:$(colorize "$tstat")" "$up" "$age_c"
+    # The selection is marked by a glyph AND weight, never colour alone — same
+    # rule the GRAPH tab's heavy border follows.
+    if [[ "$idx" == "$SESS_SEL" ]] && (( TAB == 0 )); then
+        mark=$'\033[1m▸ \033[0m'; nm=$'\033[1m'"$name"$'\033[0m'
+        printf -v nm '%s%*s' "$nm" "$(( 10 - ${#name} > 0 ? 10 - ${#name} : 0 ))" ''
+    else
+        printf -v nm '%-10s' "$name"
+    fi
+    printf '%s%b %s [%s] %s  up %s  log %s\n' \
+        "$mark" "$dot" "$nm" "$(colorize "$cstate")" "${task}:$(colorize "$tstat")" "$up" "$age_c"
+}
+
+# ── Session cursor ───────────────────────────────────────────────────────────
+# The GRAPH tab navigates a node cursor; SESSIONS navigates a session cursor,
+# on the same principle — arrows move the SELECTION and the viewport follows,
+# rather than arrows scrolling a wall of text past a fixed eye.
+#
+# The cache is the only source of order, so the cursor is an INDEX into the S
+# records rather than a remembered name: sessions come and go between sweeps,
+# and an index clamps cleanly where a stale name would silently select nothing.
+SESS_SEL=0; SESS_N=0; SESS_SELLINE=-1; SESS_TOPH=8
+
+# sessions_index -- one row per session, "name<TAB>line", where `line` is the
+# 0-based output line its header occupies in sessions_lines' output. The cursor
+# needs both: the count to clamp against, and the line to scroll to.
+sessions_index() {
+    [[ -f "$SESS_CACHE" ]] || return 0
+    local rec rest ln=0
+    while IFS=$'\t' read -r rec rest; do
+        case "$rec" in
+            S)   printf '%s\t%d\n' "${rest%%$'\t'*}" "$ln"; ln=$(( ln + 1 )) ;;
+            L|N) ln=$(( ln + 1 )) ;;
+            *)   : ;;
+        esac
+    done < "$SESS_CACHE"
+}
+
+sessions_cursor_sync() {
+    local -a rows; mapfile -t rows < <(sessions_index)
+    SESS_N=${#rows[@]}
+    (( SESS_N == 0 )) && { SESS_SEL=0; SESS_SELLINE=-1; return 0; }
+    (( SESS_SEL >= SESS_N )) && SESS_SEL=$(( SESS_N - 1 ))
+    (( SESS_SEL < 0 )) && SESS_SEL=0
+    local r="${rows[SESS_SEL]}"
+    SESS_SELLINE="${r##*$'\t'}"
+    return 0
+}
+
+# sessions_selected -- the selected session's S record fields, tab separated.
+sessions_selected() {
+    [[ -f "$SESS_CACHE" ]] || return 0
+    local rec rest i=0
+    while IFS=$'\t' read -r rec rest; do
+        [[ "$rec" == S ]] || continue
+        (( i == SESS_SEL )) && { printf '%s' "$rest"; return 0; }
+        i=$(( i + 1 ))
+    done < "$SESS_CACHE"
+    return 0
+}
+
+# sessions_apply_moves -- replay a --moves string against the session cursor, the
+# same trick graph_apply_moves plays for the node cursor: assertions without a
+# pty. Navigation only — Enter (open) has no printable character to replay, and
+# inventing an alias would mean testing a keymap the user never touches; the
+# action itself is covered through the GRAPH tab's `o`.
+sessions_apply_moves() {
+    [[ -n "$MOVES" ]] || return 0
+    local i c pend=0
+    for (( i=0; i<${#MOVES}; i++ )); do
+        c="${MOVES:i:1}"
+        if (( pend )); then
+            pend=0
+            [[ "$c" == g ]] && { SESS_SEL=0; continue; }
+        fi
+        case "$c" in
+            g) pend=1 ;;
+            j) SESS_SEL=$(( SESS_SEL + 1 )) ;;
+            k) SESS_SEL=$(( SESS_SEL - 1 )) ;;
+            G) SESS_SEL=$(( SESS_N - 1 )) ;;
+            *) : ;;
+        esac
+    done
+    (( SESS_SEL < 0 )) && SESS_SEL=0
+    (( SESS_N > 0 && SESS_SEL >= SESS_N )) && SESS_SEL=$(( SESS_N - 1 ))
+    return 0
+}
+
+# sessions_follow -- keep the selected header, and its feed lines, on screen.
+sessions_follow() {
+    (( SESS_SELLINE < 0 )) && return 0
+    local rows body last
+    rows="$(term_height)"; body=$(( rows - 1 - SESS_TOPH )); (( body < 3 )) && body=3
+    (( SESS_SELLINE < SCROLL )) && SCROLL=$SESS_SELLINE
+    last=$(( SESS_SELLINE + TAIL_LINES ))
+    (( last >= SCROLL + body )) && SCROLL=$(( last - body + 1 ))
+    (( SCROLL < 0 )) && SCROLL=0
+    return 0
+}
+
+# sessions_detail_lines -- the two-line top status bar for the selected session,
+# mirroring graph_detail_lines: what is this agent on, and how much rope is left.
+sessions_detail_lines() {
+    local name cstate tstat task up age stale branch turns goal parts=""
+    IFS=$'\t' read -r name cstate tstat task up age stale branch turns goal \
+        < <(sessions_selected) || true
+    if [[ -z "${name:-}" ]]; then
+        printf '%s%s%s\n' "$BAR_EMPTY" "  no sessions — nothing to select" "$BAR_RST"
+        printf '%s%s%s\n' "$BAR_EMPTY" "  ↑↓ select · Enter open · Tab graph" "$BAR_RST"
+        return 0
+    fi
+    [[ -n "${branch:-}" ]] && parts+=" · $branch"
+    [[ -n "${turns:-}" && "$turns" != "null" ]] && parts+=" · $turns turns"
+    [[ -n "${up:-}" ]] && parts+=" · up $up"
+    printf '\033[1m%s\033[0m  %s%s\n' "${task:--}" "$(colorize "${tstat:--}")" "$parts"
+    printf '%s  %s%s\n' "$BAR_EMPTY" "${goal:-}" "$BAR_RST"
+    return 0
 }
 
 # sessions_lines -- the SCROLLABLE region, formatted cheaply from the cache.
@@ -630,10 +787,10 @@ sessions_lines() {  # $1 = width
         printf '%s(loading sessions…)%s\n' "$BAR_EMPTY" "$BAR_RST"
         return 0
     fi
-    local flagged="" rec a b c d e f g
-    while IFS=$'\t' read -r rec a b c d e f g; do
+    local flagged="" rec a b c d e f g h i j n=0
+    while IFS=$'\t' read -r rec a b c d e f g h i j; do
         case "$rec" in
-            S) session_header "$a" "$b" "$c" "$d" "$e" "$f" "$g" ;;
+            S) session_header "$a" "$b" "$c" "$d" "$e" "$f" "$g" "$n"; n=$(( n + 1 )) ;;
             L) printf '    \033[90m%s\033[0m\n' "${a:0:$((width - 4))}" ;;
             N) printf '%s(no arachne-agent containers running or recently exited)%s\n' "$BAR_EMPTY" "$BAR_RST" ;;
             F) flagged+="  $a ($b): $(colorize "$c")"$'\n' ;;
@@ -742,6 +899,7 @@ render_top() {
     mapfile -t R < <(notes_panel_lines)
     compose_columns "$W" L R
     disk_subinfo_line
+    sessions_detail_lines
     rule
     return 0
 }
@@ -764,7 +922,7 @@ tab_bar() {
         s=$'\033[2;38;5;245m  SESSIONS  \033[0m'; g=$'\033[1m┤ GRAPH ├\033[0m'
     fi
     local hint
-    if (( TAB == 0 )); then hint='Tab / ← → switch'
+    if (( TAB == 0 )); then hint='Tab / ← → switch · ↑↓ select · Enter open · q quit'
     else hint='Tab switch · ↑↓←→ move · o open · . running · q quit'; fi
     printf '%s%s   \033[38;5;245m%s\033[0m\n' "$s" "$g" "$hint"
 }
@@ -775,17 +933,11 @@ tab_bar() {
 # with '/' replaced by '-', which is not reversible, so match against the real
 # worktree paths rather than guessing.
 graph_live_branches() {
-    local out="" cname slug cand d
+    local out="" cname b
     while IFS= read -r cname; do
         [[ -z "$cname" ]] && continue
-        slug="${cname#arachne-agent-}"
-        if [[ -n "${SLUG_BRANCH[$slug]:-}" ]]; then
-            out+="${SLUG_BRANCH[$slug]},"; continue
-        fi
-        while IFS= read -r cand; do
-            d="${cand#"$REPO_ROOT/.worktrees/"}"; d="${d%/}"
-            [[ "${d//\//-}" == "$slug" ]] && { out+="$d,"; break; }
-        done < <(find "$REPO_ROOT/.worktrees" -mindepth 1 -maxdepth 3 -name .git -printf '%h\n' 2>/dev/null)
+        b="$(slug_branch "${cname#arachne-agent-}")"
+        [[ -n "$b" ]] && out+="$b,"
     done < <(docker ps --filter 'name=arachne-agent' --format '{{.Names}}' 2>/dev/null)
     printf '%s' "${out%,}"
 }
@@ -793,8 +945,12 @@ graph_live_branches() {
 # ── Graph cursor ─────────────────────────────────────────────────────────────
 # The renderer emits a TSV node table alongside the picture; that table is the
 # only thing the monitor navigates by, so cursor movement never has to re-derive
-# the layout. Columns: id lay pos cx y status branch turns resumes blockers goal.
-declare -A GLAY GPOS GORD GCX GY GST GBY GTB GRA GBL GGOAL GKIDS
+# the layout. Columns:
+#   id lay pos cx y status branch turns resumes blockers live goal
+# `live` is the renderer's own islive() verdict rather than a restatement of
+# `status`, because a branch with several in_progress claims elects exactly one
+# of them; the status bar has to name the same one the canvas drew.
+declare -A GLAY GPOS GORD GCX GY GST GBY GTB GRA GBL GLIVE GGOAL GKIDS
 GLAYERS=()
 graph_index_file() { printf '%s' "$CACHE_BASE-dag.$CACHE_KEY.tsv"; }
 # The monitor owns the pump-state path, so it resolves the range and passes it
@@ -809,19 +965,20 @@ graph_cur_ok() { [[ -n "$CURSOR" ]] && [[ -n "${GLAY[$CURSOR]:-}" ]]; }
 
 graph_load_index() {
     local f; f="$(graph_index_file)"
-    GLAY=(); GPOS=(); GORD=(); GCX=(); GY=(); GST=(); GBY=(); GTB=(); GRA=(); GBL=(); GGOAL=(); GKIDS=()
+    GLAY=(); GPOS=(); GORD=(); GCX=(); GY=(); GST=(); GBY=(); GTB=(); GRA=(); GBL=()
+    GLIVE=(); GGOAL=(); GKIDS=()
     GLAYERS=()
     # The table lives in $TMPDIR and outlives the run that wrote it. With no
     # pump there is no graph, so a leftover table must not resurrect a cursor
     # for tasks the tab is telling the user it cannot show.
     [[ -n "$(graph_phases)" ]] || { CURSOR=""; rm -f "$f" 2>/dev/null || true; return 0; }
     [[ -s "$f" ]] || return 0
-    local id lay pos cx y st by tb ra bl goal b
-    while IFS=$'\t' read -r id lay pos cx y st by tb ra bl goal; do
+    local id lay pos cx y st by tb ra bl live goal b
+    while IFS=$'\t' read -r id lay pos cx y st by tb ra bl live goal; do
         [[ -z "$id" ]] && continue
         GLAY[$id]=$lay; GPOS[$id]=$pos; GCX[$id]=$cx; GY[$id]=$y
         GST[$id]=$st;   GBY[$id]=$by;   GTB[$id]=$tb; GRA[$id]=$ra
-        GBL[$id]=$bl;   GGOAL[$id]=$goal
+        GBL[$id]=$bl;   GLIVE[$id]=$live; GGOAL[$id]=$goal
     done < "$f"
     # Reverse edges, and per-layer id lists ordered by position, both built once
     # per redraw so a keystroke is a lookup rather than a scan.
@@ -853,6 +1010,13 @@ graph_load_index() {
 # live agent's task if there is one, else the shallowest ready task, else the root.
 graph_default_cursor() {
     local id best="" bestkey="" key
+    # The task actually being worked, not merely the first claim on the branch:
+    # a phase that has left stale claims behind has several in_progress tasks
+    # and only one of them is live.
+    for id in "${!GLAY[@]}"; do
+        [[ "${GLIVE[$id]:-0}" == "1" ]] || continue
+        printf '%s' "$id"; return 0
+    done
     for id in "${!GLAY[@]}"; do
         [[ "${GST[$id]}" == "in_progress" ]] || continue
         printf '%s' "$id"; return 0
@@ -879,7 +1043,7 @@ graph_nearest() {  # $1 layer-ids  $2 target-cx  $3 preferred-ids
     printf '%s' "${pbest:-$best}"
 }
 
-graph_move() {  # $1 = h|l|k|j|g|G
+graph_move() {  # $1 = h|l|k|j|g|G|^|$
     graph_cur_ok || { CURSOR="$(graph_default_cursor)"; return 0; }
     local lay="${GLAY[$CURSOR]}" pos="${GORD[$CURSOR]}" id want
     case "$1" in
@@ -888,6 +1052,17 @@ graph_move() {  # $1 = h|l|k|j|g|G
             local t
             [[ "$1" == l ]] && t=$(( pos + 1 )) || t=$(( pos - 1 ))
             (( t >= 0 && t < ${#arr[@]} )) && CURSOR="${arr[t]}"
+            ;;
+        # vim's line-wise ends, read against the LAYER rather than a line: a
+        # layer is the graph's horizontal axis, so ^ / $ mean its first and last
+        # node. g/G stay vertical (first/last layer), matching the same split.
+        '^')
+            local -a arr=(${GLAYERS[$lay]})
+            (( ${#arr[@]} )) && CURSOR="${arr[0]}"
+            ;;
+        '$')
+            local -a arr=(${GLAYERS[$lay]})
+            (( ${#arr[@]} )) && CURSOR="${arr[-1]}"
             ;;
         k)
             (( lay > 0 )) || return 0
@@ -914,14 +1089,24 @@ graph_move() {  # $1 = h|l|k|j|g|G
 # testable: no pty, no key injection, just an assertion on the status bar.
 graph_apply_moves() {
     [[ -n "$MOVES" ]] || return 0
-    local i c
+    local i c pend=0
     for (( i=0; i<${#MOVES}; i++ )); do
         c="${MOVES:i:1}"
+        # `g` is a prefix, exactly as in the live key loop: gg is first-layer,
+        # a lone g is a no-op. Replaying them differently would make the
+        # headless assertions test a keymap the user never touches.
+        if (( pend )); then
+            pend=0
+            [[ "$c" == g ]] && { graph_move g; continue; }
+        fi
         case "$c" in
-            h|l|k|j|g|G) graph_move "$c" ;;
-            .)           CURSOR="$(graph_default_cursor)" ;;
-            o)           open_task_file "$CURSOR" ;;
-            *)           : ;;
+            g)             pend=1 ;;
+            h|l|k|j|G)     graph_move "$c" ;;
+            '^'|'_'|0)     graph_move '^' ;;
+            '$')           graph_move '$' ;;
+            .)             CURSOR="$(graph_default_cursor)" ;;
+            o)             open_task_file "$CURSOR" ;;
+            *)             : ;;
         esac
     done
 }
@@ -977,13 +1162,17 @@ ${ST_READY}○ ready${ST_RST}  ${ST_WAIT}◌ waiting${ST_RST}  ${ST_BLOCK}⊘ bl
 graph_detail_lines() {
     if ! graph_cur_ok; then
         printf '%s\n' "$GRAPH_LEGEND"
-        printf '%s%s%s\n' "$BAR_EMPTY" "  ↑↓←→ move · o open · . running · g/G ends · PgUp/PgDn page" "$BAR_RST"
+        printf '%s%s%s\n' "$BAR_EMPTY" "  ↑↓←→ move · o open · . running · gg/G layers · ^/\$ ends" "$BAR_RST"
         return 0
     fi
     local st="${GST[$CURSOR]}" word glyph hue parts="" b bid bst bg
     case "$st" in
         done)         glyph='✓'; word='done';         hue="$ST_DONE" ;;
-        in_progress)  glyph='▶'; word='in progress';  hue="$ST_LIVE" ;;
+        in_progress)  if [[ "${GLIVE[$CURSOR]:-0}" == "1" ]]
+                      then glyph='▶'; word='in progress'; hue="$ST_LIVE"
+                      # A claim with no agent behind it: either the container is
+                      # gone, or the branch is draining a different task now.
+                      else glyph='⧗'; word='claimed, idle'; hue="$ST_PARK"; fi ;;
         blocked)      glyph='⊘'; word='blocked';      hue="$ST_BLOCK" ;;
         needs-review) glyph='!'; word='needs review'; hue="$ST_ALERT" ;;
         stuck)        glyph='!'; word='stuck';        hue="$ST_ALERT" ;;
@@ -1033,6 +1222,8 @@ render_all() {  # one-shot / pipe: top then body, no viewport clipping
         render_graph
         return 0
     fi
+    sessions_cursor_sync
+    sessions_apply_moves
     render_top
     render_sessions "$(term_width)"
 }
@@ -1196,6 +1387,17 @@ open_task_file() {  # $1 = task id
     return 0
 }
 
+# open_session_task -- Enter on the SESSIONS tab: open the task the selected
+# session is actually on. Resolved from the ledger by sessions_compute, so it
+# tracks the agent as it moves through a phase rather than pointing at whatever
+# the manifest named at launch.
+open_session_task() {
+    local name cstate tstat task rest
+    IFS=$'\t' read -r name cstate tstat task rest < <(sessions_selected) || true
+    [[ -n "${task:-}" && "$task" != "—" && "$task" != "-" ]] || return 0
+    open_task_file "$task"
+}
+
 notes_input_mode() {
     local buf="" ch rows seq
     rows="$(term_height)"
@@ -1253,7 +1455,7 @@ if [[ "$WATCH" -eq 1 ]]; then
     tput smcup 2>/dev/null || true   # alternate screen
     tput civis 2>/dev/null || true   # hide cursor
     printf '\033[?7l' 2>/dev/null || true   # autowrap OFF → long lines clip, never wrap
-    SCROLL=0; __redraw=0
+    SCROLL=0; __redraw=0; __gpend=0
     while true; do
         __redraw=$((__redraw + 1))
         __t0="$(_now_us)"
@@ -1268,7 +1470,12 @@ if [[ "$WATCH" -eq 1 ]]; then
             mapfile -t __T <<< "$__top"; GRAPH_TOPH=${#__T[@]}
             mapfile -t __SESS < <(render_graph 2>/dev/null || true)
         else
+            # Same order, same reason: sync the cursor against the cache and
+            # follow it before painting, using the previous frame's top height.
+            sessions_cursor_sync
+            sessions_follow
             __top="$(render_top 2>/dev/null || true)"
+            mapfile -t __T <<< "$__top"; SESS_TOPH=${#__T[@]}
             mapfile -t __SESS < <(render_sessions "$(term_width)" 2>/dev/null || true)
         fi
         __compute_us=$(( $(_now_us) - __t0 ))
@@ -1283,6 +1490,19 @@ if [[ "$WATCH" -eq 1 ]]; then
             # viewport — graph_follow pans and scrolls to keep it visible. Tab /
             # Shift-Tab are the only tab switch there; PgUp/PgDn still page the
             # viewport on its own, for reading without losing the selection.
+            # `g` is a PREFIX (vim's gg), so it is resolved before the tab's own
+            # keymap sees the key. Any other key cancels a pending g rather than
+            # being swallowed by it — a half-typed motion must never eat a
+            # command.
+            if (( __gpend )); then
+                __gpend=0
+                if [[ "$__key" == g ]]; then
+                    if (( TAB == 1 )); then graph_move g; else SESS_SEL=0; SCROLL=0; fi
+                    __key=""
+                fi
+            elif [[ "$__key" == g ]]; then
+                __gpend=1; __key=""
+            fi
             if (( TAB == 1 )); then
                 case "$__key" in
                     q|Q)                 break ;;
@@ -1291,8 +1511,11 @@ if [[ "$WATCH" -eq 1 ]]; then
                     l|L|RIGHT)           graph_move l ;;
                     k|K|UP)              graph_move k ;;
                     j|J|DOWN)            graph_move j ;;
-                    g|HOME)              graph_move g ;;
-                    G|END)               graph_move G ;;
+                    G)                   graph_move G ;;
+                    # ^ / $ / Home / End work along the LAYER, the graph's
+                    # horizontal axis, the way vim's work along a line.
+                    '^'|_|0|HOME)        graph_move '^' ;;
+                    '$'|END)             graph_move '$' ;;
                     .)                   CURSOR="$(graph_default_cursor)" ;;
                     o|O|ENTER)           open_task_file "$CURSOR" ;;
                     $'\x04'|PGDN|' ')    SCROLL=$(( SCROLL + __page )) ;;
@@ -1307,17 +1530,20 @@ if [[ "$WATCH" -eq 1 ]]; then
                     # Tab switching resets the viewport: the two tabs have unrelated
                     # coordinate spaces, so carrying scroll/pan across is meaningless.
                     $'\t'|STAB|LEFT|RIGHT) TAB=1; SCROLL=0; PAN=0 ;;
-                    .)                   SCROLL=0; PAN=0 ;;
+                    .)                   SESS_SEL=0; SCROLL=0; PAN=0 ;;
                     n|N)                 notes_input_mode ;;
                     e|E|$'\x07')         edit_in_nvim "$(notes_file)" ;;
-                    j|J|DOWN)            SCROLL=$(( SCROLL + 1 )) ;;
-                    k|K|UP)              SCROLL=$(( SCROLL - 1 )) ;;
+                    # Arrows move the SELECTION; the viewport follows it.
+                    j|J|DOWN)            SESS_SEL=$(( SESS_SEL + 1 )) ;;
+                    k|K|UP)              SESS_SEL=$(( SESS_SEL - 1 )) ;;
+                    G|END)               SESS_SEL=999999 ;;
+                    HOME)                SESS_SEL=0 ;;
+                    ENTER)               open_session_task ;;
                     $'\x04'|PGDN|' ')    SCROLL=$(( SCROLL + __page )) ;;
                     $'\x15'|PGUP|b)      SCROLL=$(( SCROLL - __page )) ;;
-                    g|HOME)              SCROLL=0 ;;
-                    G|END)               SCROLL=999999 ;;
                     *)                   : ;;
                 esac
+                (( SESS_SEL < 0 )) && SESS_SEL=0
             fi
             (( SCROLL < 0 )) && SCROLL=0
         else

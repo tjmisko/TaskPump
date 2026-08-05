@@ -61,6 +61,14 @@ export MANIFEST="$TMP/empty-manifest.tsv"; : >| "$MANIFEST"
 # Disk gauge runs du/git/df on the real tree — disable it for the generic tests;
 # the dedicated disk test (Test 8) re-enables it against stubs + a seeded cache.
 export ARACHNE_MONITOR_DISK=0
+# The session cache is keyed by REPO ROOT, not by this harness, so without an
+# override the generic tests read whatever a real monitor run left in $TMPDIR —
+# and then a stubbed "no containers" docker asserts against the host's actual
+# agents. That made Test 4 pass or fail depending on whether a pump happened to
+# be up. Give the harness its own cache and warm it once.
+export ARACHNE_MONITOR_SESS_CACHE="$TMP/generic-sess.tsv"
+"$CLI" >/dev/null 2>&1
+for _ in 1 2 3 4 5 6 7 8 9 10; do [[ -s "$ARACHNE_MONITOR_SESS_CACHE" ]] && break; sleep 0.3; done
 
 # ── Test 1: --demo renders both window bars with the toolbar glyphs ────────────
 echo "--- Test 1: demo bars render ---"
@@ -350,9 +358,28 @@ sel=$(gsel --cursor F96.2 --moves hhhh)
 sel=$(gsel --cursor F96.2 --moves llll)
 [[ "$sel" == "F96.3" ]] && pass "→ clamps at the end of the layer" || fail "→ ran off the layer to '$sel'"
 
-# g / G jump to the ends of the DAG.
+# gg / G jump to the ends of the DAG, as in vim.
+sel=$(gsel --cursor F96.5 --moves gg)
+[[ "$sel" == "F96.1" ]] && pass "gg jumps to the first layer ($sel)" || fail "gg should reach F96.1, got '$sel'"
+# A lone g is a prefix, not a motion — it must not move anything on its own.
 sel=$(gsel --cursor F96.5 --moves g)
-[[ "$sel" == "F96.1" ]] && pass "g jumps to the first layer ($sel)" || fail "g should reach F96.1, got '$sel'"
+[[ "$sel" == "F96.5" ]] && pass "a lone g is an incomplete motion" || fail "bare g moved the cursor to '$sel'"
+# ...and a key after it cancels the prefix rather than being swallowed by it.
+sel=$(gsel --cursor F96.2 --moves gl)
+[[ "$sel" == "F96.3" ]] && pass "a key after g cancels the prefix and still acts" \
+    || fail "g swallowed the following key, got '$sel'"
+
+# ^ / $ work along the LAYER — the graph's horizontal axis.
+sel=$(gsel --cursor F96.3 --moves '^')
+[[ "$sel" == "F96.2" ]] && pass "^ jumps to the first node in the layer ($sel)" \
+    || fail "^ should reach F96.2, got '$sel'"
+sel=$(gsel --cursor F96.2 --moves '$')
+[[ "$sel" == "F96.3" ]] && pass "\$ jumps to the last node in the layer ($sel)" \
+    || fail "\$ should reach F96.3, got '$sel'"
+sel=$(gsel --cursor F96.3 --moves _)
+[[ "$sel" == "F96.2" ]] && pass "_ is an alias for ^" || fail "_ should reach F96.2, got '$sel'"
+sel=$(gsel --cursor F96.3 --moves 0)
+[[ "$sel" == "F96.2" ]] && pass "0 is an alias for ^" || fail "0 should reach F96.2, got '$sel'"
 sel=$(gsel --cursor F96.1 --moves G)
 [[ "$sel" == "F96.6" ]] && pass "G jumps to the last layer ($sel)" || fail "G should reach F96.6, got '$sel'"
 
@@ -400,6 +427,105 @@ opened=$(gopen F96.2 jo)
 opened=$(gopen F96.4 '')
 [[ -z "$opened" ]] && pass "no open command runs without the o key" \
     || fail "spawned an editor unprompted: '$opened'"
+
+# ── Test 20: one live branch elects ONE running task ─────────────────────────
+# Phase grain drains a phase serially, so a branch routinely holds a stale claim
+# alongside the one being worked. Painting both ▶ made the GRAPH tab disagree
+# with SESSIONS about how much was moving.
+echo "--- Test 20: one running task per live branch ---"
+claim() {  # <id> <status> <branch> <claimed_at> <heartbeat> [blocker ...]
+    local id="$1" st="$2" by="$3" ca="$4" hb="$5"; shift 5
+    {
+        echo '---'; echo "id: \"$id\""; echo 'phase: "F97"'; echo "status: $st"
+        echo "claimed_by: $by"; echo "claimed_at: \"$ca\""
+        echo "last_heartbeat_ts: $hb"; echo 'turn_budget_remaining: 4'
+        echo "goal: \"the $id outcome\""
+        if (( $# )); then echo 'blockers:'; for b in "$@"; do echo "  - \"$b\""; done
+        else echo 'blockers: []'; fi
+        echo '---'; echo body
+    } >| "$CTD/$id.md"
+}
+CTD="$TMP/ctasks"; mkdir -p "$CTD"
+claim F97.1 done        ""        ""                     null
+# Both claimed by feat/f97; .3 heartbeated more recently, so it is the live one.
+claim F97.2 in_progress feat/f97  "2026-08-05T10:00:00Z" '"2026-08-05T10:30:00Z"' F97.1
+claim F97.3 in_progress feat/f97  "2026-08-05T11:00:00Z" '"2026-08-05T11:30:00Z"' F97.1
+CPS="$TMP/claim-pump.state"
+printf '%s' '{"phases":"F97","started_at":"2026-08-05T09:00:00Z","status":"running"}' >| "$CPS"
+cgraph=$(ARACHNE_TASKS_DIR="$CTD" "$SCRIPT_DIR/arachne-dag-render" \
+             --phases F97 --no-color --live-branches feat/f97 2>/dev/null)
+runners=$(grep -o '▶' <<<"$cgraph" | wc -l)
+[[ "$runners" == "1" ]] && pass "exactly one node renders ▶ ($runners)" \
+    || fail "expected 1 running node, got $runners:\n$cgraph"
+grep -qE "│ F97\.3 +▶ │" <<<"$cgraph" && pass "the newest heartbeat wins the election" \
+    || fail "F97.3 should be the running one:\n$cgraph"
+grep -qE "│ F97\.2 +⧗ │" <<<"$cgraph" && pass "the stale claim falls back to ⧗ parked" \
+    || fail "F97.2 should be parked:\n$cgraph"
+# A claim that never heartbeated still competes, on claimed_at.
+claim F97.4 in_progress feat/f97b "2026-08-05T12:00:00Z" null F97.1
+nohb=$(ARACHNE_TASKS_DIR="$CTD" "$SCRIPT_DIR/arachne-dag-render" \
+           --phases F97 --no-color --live-branches feat/f97b 2>/dev/null)
+grep -qE "│ F97\.4 +▶ │" <<<"$nohb" && pass "a never-heartbeated claim falls back to claimed_at" \
+    || fail "F97.4 should be running:\n$nohb"
+# --claims is the same election, and is what the SESSIONS tab reads.
+cl=$(ARACHNE_TASKS_DIR="$CTD" "$SCRIPT_DIR/arachne-dag-render" --claims 2>/dev/null)
+[[ "$(awk -F'\t' '$1=="feat/f97"{print $2}' <<<"$cl")" == "F97.3" ]] \
+    && pass "--claims names the same task the canvas paints ▶" \
+    || fail "--claims disagrees with the canvas:\n$cl"
+
+# ── Test 21: SESSIONS cursor ─────────────────────────────────────────────────
+echo "--- Test 21: session cursor ---"
+SFR="$TMP/sessroot"; mkdir -p "$SFR/.worktrees/feat/f97" "$SFR/.worktrees/feat/f97b"
+printf '%s\n' '{"type":"assistant","message":{"content":[{"text":"alpha log"}]}}' \
+    >| "$SFR/.worktrees/feat/f97/.arachne-agent.log"
+printf '%s\n' '{"type":"assistant","message":{"content":[{"text":"beta log"}]}}' \
+    >| "$SFR/.worktrees/feat/f97b/.arachne-agent.log"
+cat >| "$BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+for a in "$@"; do
+  case "$a" in
+    '{{.Names}}|{{.State}}|{{.Status}}')
+      echo 'arachne-agent-feat-f97|running|Up 3 minutes'
+      echo 'arachne-agent-feat-f97b|running|Up 9 minutes'; exit 0 ;;
+    '{{.Names}}') echo 'arachne-agent-feat-f97'; echo 'arachne-agent-feat-f97b'; exit 0 ;;
+  esac
+done
+exit 0
+EOF
+chmod +x "$BIN/docker"
+SCACHE="$TMP/sess-cursor.tsv"
+smon() { ARACHNE_MONITOR_REPO_ROOT="$SFR" ARACHNE_TASKS_DIR="$CTD" \
+         ARACHNE_PUMP_STATE_FILE="$CPS" ARACHNE_MONITOR_SESS_CACHE="$SCACHE" \
+         ARACHNE_MONITOR_COLS=140 "$CLI" "$@" 2>/dev/null | strip_ansi; }
+smon >/dev/null; sleep 2; smon >/dev/null      # warm the background session cache
+sess=$(smon)
+# The row's task comes from the LEDGER's live claim, not the (empty) manifest.
+grep -qE 'feat-f97 .*F97\.3:in_progress' <<<"$sess" \
+    && pass "a session row names the task its branch is actually on" \
+    || fail "session row did not resolve the live claim:\n$sess"
+grep -q '▸ ' <<<"$sess" && pass "the selected session is marked" || fail "no selection marker:\n$sess"
+[[ "$(grep -c '▸ ' <<<"$sess")" == "1" ]] && pass "exactly one session is marked" \
+    || fail "more than one row marked:\n$sess"
+# The top bar describes the selection, mirroring the GRAPH status bar.
+grep -q 'the F97.3 outcome' <<<"$sess" && pass "the top bar shows the selected session's goal" \
+    || fail "no goal in the session detail bar:\n$sess"
+# ↓ moves the selection to the next session, and its detail follows.
+down=$(smon --moves j)
+grep -qE '▸ ● feat-f97b' <<<"$down" && pass "↓ selects the next session" \
+    || fail "↓ did not move the session cursor:\n$down"
+grep -q 'the F97.4 outcome' <<<"$down" && pass "the detail bar follows the selection" \
+    || fail "detail bar did not follow:\n$down"
+# ↑ past the top and ↓ past the bottom clamp rather than wrapping or vanishing.
+grep -qE '▸ ● feat-f97\b' <<<"$(smon --moves kkkk)" && pass "↑ clamps at the first session" \
+    || fail "↑ ran off the top"
+grep -qE '▸ ● feat-f97b' <<<"$(smon --moves jjjj)" && pass "↓ clamps at the last session" \
+    || fail "↓ ran off the bottom"
+# gg / G, as on the GRAPH tab.
+grep -qE '▸ ● feat-f97\b' <<<"$(smon --moves jgg)" && pass "gg selects the first session" \
+    || fail "gg did not reach the first session"
+grep -qE '▸ ● feat-f97b' <<<"$(smon --moves G)" && pass "G selects the last session" \
+    || fail "G did not reach the last session"
+printf '#!/usr/bin/env bash\nexit 0\n' >| "$BIN/docker"; chmod +x "$BIN/docker"
 
 echo
 echo "=============================================="
