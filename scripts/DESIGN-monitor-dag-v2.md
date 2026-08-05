@@ -155,7 +155,14 @@ clutter has to come from somewhere other than hiding nodes:
 
 ## Node rendering
 
-Boxes stay narrow: full id + status glyph, e.g. `│ F79.24 ◌ │`.
+Boxes stay narrow: id + status glyph.
+
+**Retained from v1, against this section's original wording:** inside a
+single-phase range the `F79.` prefix is still dropped (`│ .24 ◌ │`), which is
+worth ~4 columns per box — 48 on F79's widest layer. The argument for full ids
+was that clutter must not come from hiding nodes; a shortened *label* hides
+nothing, and the status bar now shows the selection's full id at all times.
+Multi-phase ranges still use full ids, where the phase actually disambiguates.
 
 | State | Glyph | Colour |
 |---|---|---|
