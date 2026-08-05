@@ -34,6 +34,12 @@
 #   arachne-pump --phases F64 --list             # one planning pass, then exit
 #   arachne-pump --phases F64 --once             # one REAL tick (scrub+gate+launch), exit
 #
+# Monitor handoff:
+#   With --detach, the supervisor goes to systemd and this terminal is then
+#   handed to `arachne-monitor --watch` — quitting the monitor (q) leaves the
+#   pump running. --no-monitor (or ARACHNE_PUMP_MONITOR=0) keeps your shell;
+#   a non-tty skips it automatically.
+#
 # Stalled-claim auto-resume (on by default):
 #   A phase whose only blocker is its OWN orphaned claim — dead container, work
 #   already committed, so the reclaim path refuses to reopen it — is relaunched
@@ -47,6 +53,8 @@
 # Env overrides (mostly for testing / advanced use):
 #   ARACHNE_PUMP_RESUME_MAX        default for --resume-max (3)
 #   ARACHNE_PUMP_STALL_EXIT_TICKS  consecutive deadlocked ticks before exit (3)
+#   ARACHNE_PUMP_MONITOR           0 = never open the monitor after --detach
+#   ARACHNE_MONITOR_BIN            path to arachne-monitor (default: alongside)
 #   ARACHNE_TASK    path to arachne-task   (default: alongside this script)
 #   ARACHNE_USAGE   path to arachne-usage  (default: alongside this script)
 #   ARACHNE_DISK_WATCHDOG  path to arachne-disk-watchdog (default: alongside this script)
@@ -81,6 +89,7 @@ TASKS_DIR="${ARACHNE_PUMP_TASKS_DIR:-$OPS_DIR/task-loop/tasks}"
 ARACHNE_TASK="${ARACHNE_TASK:-$SCRIPT_DIR/arachne-task}"
 ARACHNE_USAGE="${ARACHNE_USAGE:-$SCRIPT_DIR/arachne-usage}"
 ARACHNE_DISK_WATCHDOG="${ARACHNE_DISK_WATCHDOG:-$SCRIPT_DIR/arachne-disk-watchdog}"
+MONITOR_BIN="${ARACHNE_MONITOR_BIN:-$SCRIPT_DIR/arachne-monitor}"
 DOCKER="${DOCKER:-docker}"
 ARACHNE_PHASE_BRIEF_TEMPLATE="${ARACHNE_PHASE_BRIEF_TEMPLATE:-$OPS_DIR/task-loop/briefs/_phase-drain-template.md}"
 # Worktrees base — overridable so the reclaim sweep / launcher can be unit-tested
@@ -133,6 +142,11 @@ CAP_FILE="${ARACHNE_POOL_CAP_FILE:-$REPO_ROOT/.arachne-pool-cap}"
 RESET_FILE="${ARACHNE_USAGE_RESET_FILE:-$REPO_ROOT/.arachne-usage-reset}"
 MODE="run"        # run | dry | list | once | render | resume-note | help
 DETACH=0
+# After --detach hands the supervisor to systemd, the launching terminal is free
+# — and watching the monitor is what you almost always want next, so take it
+# over by default. ARACHNE_PUMP_MONITOR=0 or --no-monitor opts out; a non-tty
+# (cron, CI, a nested pump re-exec) opts out automatically.
+MONITOR="${ARACHNE_PUMP_MONITOR:-1}"
 STATE_FILE="${ARACHNE_PUMP_STATE_FILE:-$REPO_ROOT/.arachne-pump.state}"
 PUMP_LOG="${ARACHNE_PUMP_LOG:-$REPO_ROOT/.arachne-pump.log}"
 PUMP_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -186,6 +200,7 @@ while [[ $# -gt 0 ]]; do
     --render-resume-note) MODE="resume-note"; PHASES="$2"; shift 2;;   # print resume preamble, exit
     --render-resume-note=*) MODE="resume-note"; PHASES="${1#--render-resume-note=}"; shift;;
     --detach)  DETACH=1; shift;;          # F64.5 wires the actual detach mechanism
+    --no-monitor) MONITOR=0; shift;;      # don't hand the terminal to arachne-monitor
     -h|--help) MODE="help"; shift;;
     --*) die "unknown flag $1 (try --help)";;
     *) die "unexpected argument: $1";;
@@ -1215,7 +1230,23 @@ detach_and_exit() {
     log "detached via setsid+nohup (pid=$pid, log=$PUMP_LOG)."
     log "  stop: kill $pid   (or: pkill -f 'arachne-pump.*$PHASES')"
   fi
+  exec_monitor
   exit 0
+}
+
+# Hand the launching terminal to the monitor. Only ever called after the
+# supervisor is detached, so quitting the monitor (q) leaves the pump running —
+# it is a viewer, not the run. Skipped when not interactive so cron/CI and the
+# detached re-exec itself never block on a UI.
+exec_monitor() {
+  [[ "$MONITOR" -eq 1 ]] || return 0
+  [[ -t 0 && -t 1 ]] || { log "not a tty — skipping the monitor (run: $MONITOR_BIN --watch)"; return 0; }
+  [[ -x "$MONITOR_BIN" ]] || { log "no arachne-monitor at $MONITOR_BIN — skipping"; return 0; }
+  # The supervisor writes .arachne-pump.state on its first tick; give it a beat
+  # so the monitor's opening frame shows the run instead of "no pump".
+  sleep 2
+  log "opening the monitor (q to close it; the pump keeps running)"
+  exec "$MONITOR_BIN" --watch
 }
 
 # ── Modes ──────────────────────────────────────────────────────────────────────

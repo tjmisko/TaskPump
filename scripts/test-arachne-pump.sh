@@ -672,6 +672,59 @@ out=$(PATH="$BIN:$PATH" ARACHNE_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 \
 have "$out" 'STALLED after [0-9]+ idle ticks' && pass "stall exit pages with a reason" || fail "no stall page:\n$out"
 have "$out" 'none can launch' && pass "stall page explains why nothing ran" || fail "stall page lacks the cause:\n$out"
 
+# ── Test 20: --detach hands the terminal to the monitor ───────────────────────
+# The detach itself is stubbed: systemd-run records its argv to a marker instead
+# of creating a unit, so no supervisor is ever launched. The marker is asserted
+# FIRST — if the stub were bypassed this test would start a real pump.
+echo "--- Test 20: monitor handoff after --detach ---"
+MARK="$TMP/systemd-run.argv"
+cat >| "$BIN/systemd-run" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$MARK"
+exit 0
+EOF
+cat >| "$BIN/systemctl" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+MONMARK="$TMP/monitor.ran"
+cat >| "$BIN/fake-monitor" <<EOF
+#!/usr/bin/env bash
+printf 'monitor-started %s\n' "\$*" >> "$MONMARK"
+exit 0
+EOF
+chmod +x "$BIN/systemd-run" "$BIN/systemctl" "$BIN/fake-monitor"
+
+detach_run() {  # $@ = extra pump flags
+    PATH="$BIN:$PATH" ARACHNE_MONITOR_BIN="$BIN/fake-monitor" \
+    ARACHNE_PUMP_STATE_FILE="$TMP/detach.state" ARACHNE_PUMP_LOG="$TMP/detach.log" \
+    ARACHNE_TASKS_DIR="$TASKS" \
+    timeout 60 "$PUMP" --phases F98 --detach "$@" 2>&1
+}
+
+: >| "$MARK"
+out=$(detach_run) || true
+[[ -s "$MARK" ]] && pass "detach went through the systemd-run stub (no real unit)" \
+                 || fail "systemd-run stub was NOT used — aborting:\n$out"
+have "$out" 'detached as systemd --user unit' && pass "detach reports the unit" || fail "no detach line:\n$out"
+# This harness is not a tty, so the handoff must decline rather than block.
+have "$out" 'not a tty' && pass "non-tty declines the monitor instead of blocking" || fail "no tty guard:\n$out"
+[[ -s "$MONMARK" ]] && fail "monitor was started from a non-tty" || pass "monitor not started from a non-tty"
+
+: >| "$MARK"
+out=$(detach_run --no-monitor) || true
+[[ -s "$MARK" ]] && pass "--no-monitor still detaches" || fail "--no-monitor broke detach:\n$out"
+have "$out" 'not a tty' && fail "--no-monitor still probed for a tty:\n$out" \
+                        || pass "--no-monitor skips the handoff entirely"
+
+out=$(PATH="$BIN:$PATH" ARACHNE_PUMP_MONITOR=0 ARACHNE_MONITOR_BIN="$BIN/fake-monitor" \
+      ARACHNE_PUMP_STATE_FILE="$TMP/detach.state" ARACHNE_PUMP_LOG="$TMP/detach2.log" \
+      ARACHNE_TASKS_DIR="$TASKS" timeout 60 "$PUMP" --phases F98 --detach 2>&1) || true
+have "$out" 'not a tty' && fail "ARACHNE_PUMP_MONITOR=0 ignored:\n$out" \
+                        || pass "ARACHNE_PUMP_MONITOR=0 opts out"
+have "$(sed -n '2,60p' "$PUMP")" 'no-monitor' && pass "--no-monitor is documented in --help" \
+                                              || fail "--no-monitor missing from the help block"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"
