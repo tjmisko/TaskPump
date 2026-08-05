@@ -1080,6 +1080,88 @@ out=$(scrubcli scrub 2>/dev/null) || true
 [[ "$out" == *"F91.4"*"needs-review"* ]] && pass "scrub still relabels an exhausted claim" \
   || fail "scrub did not relabel F91.4 after the integrity refactor; output: '$out'"
 
+# ── Test 24: resume-attempt (pump stalled-claim budget) ──────────────────────
+# The pump's auto-resume budget lives here rather than in the pump because the
+# increment, the progress-reset and the limit test have to be one locked
+# read-modify-write, and because no read verb exists for arbitrary frontmatter.
+# It deliberately does NOT reuse consecutive_failed_iterations: that is driven by
+# `heartbeat --end`, which a dead agent never fires, and `claim` zeroes it on
+# every (re)claim — so the pump's own resume cycle would reset the tripwire meant
+# to bound it.
+echo
+echo "--- Test 24: resume-attempt ---"
+ra_field() { sed -n "s/^$2: *//p" "$TASKS/$1.md" | head -1; }
+make_task "$TASKS" F93.1 F93 in_progress "Stalled claim" "feat/f93"
+
+out=$("$CLI" resume-attempt F93.1 --head aaaaaaa1111 --max 3) && rc=0 || rc=$?
+[[ "$rc" -eq 0 && "$out" == "resume 1/3" ]] && pass "first resume: 'resume 1/3', rc 0" \
+  || fail "first resume gave rc=$rc out='$out'"
+[[ "$(ra_field F93.1 resume_attempts)" == "1" ]] && pass "resume_attempts written as 1" \
+  || fail "resume_attempts='$(ra_field F93.1 resume_attempts)'"
+
+out=$("$CLI" resume-attempt F93.1 --head aaaaaaa1111 --max 3) || true
+[[ "$out" == "resume 2/3" ]] && pass "same head ⇒ counter increments" || fail "got '$out'"
+
+out=$("$CLI" resume-attempt F93.1 --head bbbbbbb2222 --max 3) || true
+[[ "$out" == "resume 1/3" ]] && pass "moved head ⇒ counter resets to 1" || fail "got '$out'"
+[[ "$(ra_field F93.1 resume_head_sha)" == "bbbbbbb2222" ]] && pass "new head recorded" \
+  || fail "resume_head_sha='$(ra_field F93.1 resume_head_sha)'"
+
+"$CLI" resume-attempt F93.1 --head bbbbbbb2222 --max 3 >/dev/null || true
+"$CLI" resume-attempt F93.1 --head bbbbbbb2222 --max 3 >/dev/null || true
+out=$("$CLI" resume-attempt F93.1 --head bbbbbbb2222 --max 3) && rc=0 || rc=$?
+[[ "$rc" -eq 10 && "$out" == "escalate 3/3" ]] && pass "budget spent ⇒ 'escalate 3/3', rc 10" \
+  || fail "escalation gave rc=$rc out='$out'"
+
+# Idempotent once exhausted: the pump ticks every 30s, and a counter that kept
+# climbing would write (and commit) a ledger change on every one of them.
+before=$(md5sum "$TASKS/F93.1.md" | cut -d' ' -f1)
+out=$("$CLI" resume-attempt F93.1 --head bbbbbbb2222 --max 3) || true
+after=$(md5sum "$TASKS/F93.1.md" | cut -d' ' -f1)
+[[ "$out" == "escalate 3/3" && "$before" == "$after" ]] && pass "repeat escalate is a no-op write" \
+  || fail "escalate churned the file (out='$out')"
+
+# A legacy task file (none of the 680 in the ledger carry these fields yet) must
+# backfill rather than fail — there is no migration step.
+make_task "$TASKS" F93.2 F93 in_progress "Legacy shape" "feat/f93"
+out=$("$CLI" resume-attempt F93.2 --head ccccccc3333 --max 3) || true
+[[ "$out" == "resume 1/3" && "$(ra_field F93.2 resume_attempts)" == "1" ]] \
+  && pass "fields backfill onto a task that lacks them" || fail "backfill failed: '$out'"
+
+"$CLI" resume-attempt F93.2 --head "not-a-sha!!" --max 3 >/dev/null 2>&1 \
+  && fail "accepted a non-sha --head" || pass "rejects a --head that is not a git sha"
+
+# ── Test 25: reopen from needs-review / stuck ────────────────────────────────
+# Before this, both were dead ends: release requires in_progress, reopen took
+# only blocked|done, and claim takes only open or a same-branch in_progress. A
+# task scrubbed to needs-review could be revived ONLY by hand-editing
+# frontmatter — which the ledger's one-writer rule forbids.
+echo
+echo "--- Test 25: reopen from needs-review / stuck ---"
+make_task "$TASKS" F93.3 F93 in_progress "Parked by scrub" "feat/f93"
+"$CLI" needs-review F93.3 --reason "turn budget exhausted" >/dev/null
+"$CLI" reopen F93.3 --reason "human looked, it is workable" >/dev/null 2>&1 \
+  && pass "reopen accepts needs-review" || fail "reopen rejected a needs-review task"
+[[ "$(ra_field F93.3 status)" == "open" ]] && pass "needs-review → open" \
+  || fail "status='$(ra_field F93.3 status)'"
+[[ -z "$(ra_field F93.3 scrub_reason)" || "$(ra_field F93.3 scrub_reason)" == "null" ]] \
+  && pass "scrub_reason cleared on reopen" || fail "scrub_reason survived: '$(ra_field F93.3 scrub_reason)'"
+
+# `stuck` means the failure streak hit 3; reopening without clearing it would
+# re-trip on the next unproductive heartbeat.
+make_task "$TASKS" F93.4 F93 stuck "Tripped the failure tripwire"
+sed -i 's/^consecutive_failed_iterations: 0/consecutive_failed_iterations: 3/' "$TASKS/F93.4.md"
+"$CLI" reopen F93.4 --reason "root cause fixed" >/dev/null 2>&1 \
+  && pass "reopen accepts stuck" || fail "reopen rejected a stuck task"
+[[ "$(ra_field F93.4 consecutive_failed_iterations)" == "0" ]] \
+  && pass "failure streak cleared reopening from stuck" \
+  || fail "streak survived: '$(ra_field F93.4 consecutive_failed_iterations)'"
+
+# Still refuses the statuses it always refused.
+make_task "$TASKS" F93.5 F93 open "Already open"
+"$CLI" reopen F93.5 --reason "nope" >/dev/null 2>&1 \
+  && fail "reopen accepted an already-open task" || pass "reopen still refuses an open task"
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo
 echo "=============================================="

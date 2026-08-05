@@ -534,6 +534,144 @@ printf '#!/usr/bin/env bash\nexit 1\n' >| "$STUB_TASK"; chmod +x "$STUB_TASK"
 err=$(STUB_LIVE="" STUB_GATE_RC=0 ARACHNE_TASK="$STUB_TASK" tick18 2>&1 >/dev/null)
 have "$err" 'scrub failed \(continuing\)' && pass "a crashing scrub still warns 'scrub failed'" || fail "scrub crash not reported:\n$err"
 
+echo "--- Test 19: auto-resume of a stalled orphaned claim (2026-08-05 F79 stall) ---"
+# reclaim_orphaned_claims PARKS an orphan that has committed work rather than
+# reopening it (Test 17d) — the right call, but it left no exit. `ready` only
+# surfaces status:open, so the claim is invisible to the frontier, everything
+# blocked behind it is ineligible, compute_plan files the phase under WAITING,
+# and is_drained never fires because open_count > 0. The live F79 pump idled
+# 563 ticks over 7h with 5 open tasks and launched nothing.
+#
+# The fix resumes rather than reopens: keep the claim, relaunch the phase, and
+# hand the agent a note naming the task (a plain relaunch would call
+# `next --phase FN`, get null, and re-conclude "frontier drained").
+#
+# The git stub answers rev-parse (branch head, for progress detection),
+# rev-parse --verify (branch exists), rev-list --count (commits ahead) and
+# log --oneline (the resume note's commit list). Order matters: --verify must
+# be matched before the bare rev-parse arm.
+cat >| "$BIN/git" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  *rev-parse*--verify*) exit 0 ;;
+  *rev-parse*)          echo "${STUB_HEAD:-aaaaaaa1111}" ;;
+  *rev-list*--count*)   echo "${STUB_AHEAD:-0}" ;;
+  *log*--oneline*)      echo "cafe123 feat: partial work from the dead agent" ;;
+  *) : ;;
+esac
+exit 0
+EOF
+chmod +x "$BIN/git"
+STATE19="$TMP/pump19.state"
+rtick() {  # one --once tick over F97; extra flags forwarded
+  PATH="$BIN:$PATH" ARACHNE_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 \
+  ARACHNE_CLAIM_STALE_HOURS=99999 ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
+  ARACHNE_PUMP_STATE_FILE="$STATE19" ARACHNE_POOL_CAP_FILE="$TMP/cap" \
+  ARACHNE_PUMP_LOG="$TMP/pump19.log" ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+  "$PUMP" --no-health-gate --once --phases F97 "$@"
+}
+attempts_of() { sed -n 's/^resume_attempts: *//p' "$TASKS/$1.md" | head -1; }
+# The F79 shape: a done .0, the stalled claim .1, and a .2 blocked behind it.
+stall_fixture() { rm -f "$TASKS"/*.md; mk F97.0 done; mkclaim F97.1 feat/f97; mk F97.2 open F97.1; }
+
+# 19a: dead container + committed work + empty frontier ⇒ resumed, not parked.
+stall_fixture
+out=$(STUB_LIVE="" STUB_AHEAD=3 STUB_HEAD=aaaa111 rtick 2>&1)
+have "$out" 'resuming F97 task F97\.1' && pass "stalled phase resumed" || fail "no resume:\n$out"
+have "$out" 'NO_LAUNCH, resume F97\.1' && pass "container would launch with the orphan as its task id" || fail "resume task id not passed to launch:\n$out"
+[[ "$(attempts_of F97.1)" == "1" ]] && pass "first resume records attempt 1" || fail "attempts=$(attempts_of F97.1), want 1"
+[[ "$(status_of F97.1)" == "in_progress" ]] && pass "resume keeps the claim (does not reopen)" || fail "F97.1 status=$(status_of F97.1), want in_progress"
+
+# 19b: a LIVE container on the phase ⇒ never resumed (no double-launch).
+stall_fixture
+out=$(STUB_LIVE="arachne-agent-feat-f97" STUB_AHEAD=3 STUB_HEAD=aaaa111 rtick 2>&1)
+have "$out" 'resuming F97' && fail "resumed a phase with a live container:\n$out" || pass "live container ⇒ no resume"
+
+# 19c: no new commits between ticks ⇒ the counter climbs.
+stall_fixture
+for _ in 1 2 3; do STUB_LIVE="" STUB_AHEAD=3 STUB_HEAD=bbbb222 rtick >/dev/null 2>&1; done
+[[ "$(attempts_of F97.1)" == "3" ]] && pass "three no-progress resumes ⇒ attempts=3" || fail "attempts=$(attempts_of F97.1), want 3"
+
+# 19d: the branch moved ⇒ real progress ⇒ counter resets. A task that needs four
+# sessions but commits each time must never be escalated.
+STUB_LIVE="" STUB_AHEAD=4 STUB_HEAD=cccc333 rtick >/dev/null 2>&1
+[[ "$(attempts_of F97.1)" == "1" ]] && pass "new commits reset the attempt counter" || fail "attempts=$(attempts_of F97.1) after progress, want 1"
+
+# 19e: budget spent ⇒ escalate to needs-review + notify, and do NOT relaunch.
+stall_fixture
+for _ in 1 2 3; do STUB_LIVE="" STUB_AHEAD=3 STUB_HEAD=dddd444 rtick >/dev/null 2>&1; done
+out=$(STUB_LIVE="" STUB_AHEAD=3 STUB_HEAD=dddd444 rtick 2>&1)
+[[ "$(status_of F97.1)" == "needs-review" ]] && pass "exhausted budget ⇒ needs-review" || fail "F97.1 status=$(status_of F97.1), want needs-review"
+have "$out" 'STALLED on F97\.1' && pass "escalation notifies" || fail "no escalation notice:\n$out"
+have "$out" 'NO_LAUNCH, resume' && fail "relaunched after escalating:\n$out" || pass "no relaunch once escalated"
+
+# 19f: --resume-max is honoured (2 ⇒ escalate on the third).
+stall_fixture
+for _ in 1 2; do STUB_LIVE="" STUB_AHEAD=3 STUB_HEAD=eeee555 rtick --resume-max 2 >/dev/null 2>&1; done
+STUB_LIVE="" STUB_AHEAD=3 STUB_HEAD=eeee555 rtick --resume-max 2 >/dev/null 2>&1
+[[ "$(status_of F97.1)" == "needs-review" ]] && pass "--resume-max 2 escalates one attempt earlier" || fail "F97.1 status=$(status_of F97.1), want needs-review"
+
+# 19g: a claim on a branch this pump does not own is never resumed.
+rm -f "$TASKS"/*.md; mk F97.0 done; mkclaim F97.1 feat/somebody-else
+out=$(STUB_LIVE="" STUB_AHEAD=3 STUB_HEAD=aaaa111 rtick 2>&1)
+have "$out" 'resuming F97' && fail "resumed a foreign-branch claim:\n$out" || pass "foreign-branch claim not resumed"
+
+# 19h: the orphan is the phase's ONLY remaining work (open_count == 0). Before
+# the RESUME arm was tested ahead of `oc`, this phase was classified DONE and
+# is_drained declared the range finished over committed, unfinished work.
+rm -f "$TASKS"/*.md; mk F97.0 done; mkclaim F97.1 feat/f97
+out=$(PATH="$BIN:$PATH" ARACHNE_NOTIFY_CMD=true ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
+      ARACHNE_PUMP_STATE_FILE="$STATE19" ARACHNE_POOL_CAP_FILE="$TMP/cap" \
+      ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" STUB_LIVE="" STUB_AHEAD=3 STUB_HEAD=aaaa111 \
+      "$PUMP" --no-health-gate --dry-run --phases F97 2>&1)
+have "$out" 'RESUME +F97' && pass "orphan-only phase plans as RESUME" || fail "not RESUME:\n$out"
+have "$out" 'DONE +F97' && fail "orphan-only phase wrongly classified DONE:\n$out" || pass "orphan-only phase not classified DONE"
+
+# 19i: a shut feed gate must not resume — and must not burn an attempt on a
+# resume it never performed.
+stall_fixture
+out=$(STUB_LIVE="" STUB_AHEAD=3 STUB_HEAD=ffff666 STUB_GATE_RC=10 rtick 2>&1)
+have "$out" 'resuming F97' && fail "resumed while the feed gate was shut:\n$out" || pass "gate paused ⇒ no resume"
+[[ -z "$(attempts_of F97.1)" || "$(attempts_of F97.1)" == "0" ]] && pass "gate-paused tick burns no attempt" || fail "attempt burned while gated: $(attempts_of F97.1)"
+
+# 19j: --no-resume-stalled restores the old park-and-warn behaviour verbatim.
+stall_fixture
+out=$(STUB_LIVE="" STUB_AHEAD=3 STUB_HEAD=aaaa111 rtick --no-resume-stalled 2>&1)
+have "$out" 'resuming F97' && fail "resumed despite --no-resume-stalled:\n$out" || pass "--no-resume-stalled disables resume"
+have "$out" 'parked for review' && pass "parked-for-review warning still surfaces" || fail "no park warning:\n$out"
+[[ "$(status_of F97.1)" == "in_progress" ]] && pass "claim untouched with resume disabled" || fail "F97.1 status=$(status_of F97.1)"
+
+# 19k: the resume note tells the agent NOT to trust `next` — the single most
+# load-bearing sentence in it. A relaunched agent that calls `next --phase F97`
+# gets null (the task is claimed, so it is not `open`) and exits "drained",
+# which is the stall reproducing itself.
+stall_fixture
+note=$(PATH="$BIN:$PATH" ARACHNE_PUMP_OPS_DIR="$TMP/noops" ARACHNE_POOL_CAP_FILE="$TMP/cap" \
+       ARACHNE_PUMP_STATE_FILE="$STATE19" ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+       STUB_LIVE="" STUB_AHEAD=3 STUB_HEAD=aaaa111 \
+       "$PUMP" --no-health-gate --render-resume-note F97 2>/dev/null)
+have "$note" 'RESUME CONTEXT' && pass "resume note renders" || fail "no resume note:\n$note"
+have "$note" 'Do NOT start by running' && pass "note warns against the next-returns-null trap" || fail "note lacks the next warning:\n$note"
+have "$note" 'F97\.1' && pass "note names the stalled task" || fail "note does not name the task:\n$note"
+have "$note" 'partial work from the dead agent' && pass "note lists the already-committed work" || fail "note lacks the commit log:\n$note"
+have "$note" 'Split it' && pass "note authorises split-and-unblock" || fail "note lacks the split escape hatch:\n$note"
+
+# 19l: fully deadlocked (nothing live, launchable, or resumable) ⇒ the pump
+# exits 3 and pages, instead of idling green forever. Escalate first so the
+# phase leaves PLAN_RESUME, then let the run loop tick.
+stall_fixture
+for _ in 1 2 3; do STUB_LIVE="" STUB_AHEAD=3 STUB_HEAD=9999aaa rtick >/dev/null 2>&1; done
+rc=0
+out=$(PATH="$BIN:$PATH" ARACHNE_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 \
+      ARACHNE_CLAIM_STALE_HOURS=99999 ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
+      ARACHNE_PUMP_STATE_FILE="$STATE19" ARACHNE_POOL_CAP_FILE="$TMP/cap" \
+      ARACHNE_PUMP_LOG="$TMP/pump19.log" ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+      STUB_LIVE="" STUB_AHEAD=3 STUB_HEAD=9999aaa \
+      timeout 60 "$PUMP" --no-health-gate --phases F97 --tick 1 --resume-max 1 2>&1) || rc=$?
+[[ "$rc" -eq 3 ]] && pass "deadlocked pump exits 3 (systemd sees failed, not green)" || fail "exit=$rc, want 3:\n$out"
+have "$out" 'STALLED after [0-9]+ idle ticks' && pass "stall exit pages with a reason" || fail "no stall page:\n$out"
+have "$out" 'none can launch' && pass "stall page explains why nothing ran" || fail "stall page lacks the cause:\n$out"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"
