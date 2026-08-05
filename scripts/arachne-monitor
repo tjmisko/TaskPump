@@ -15,7 +15,7 @@
 #   │ selection detail (what is selected, and its goal)         the disk list
 #   ├ rule                                                  ─ stacks under if narrow
 #   │ ● session …   (scrollable viewport; 2 feed lines each)
-#   └ status bar (scroll position only; keys are in --help)
+#   └ status bar (scroll position only; keys are behind ? / :help)
 #
 # All expensive data (the eligible-task scan, the docker session table, disk
 # sizing) is refreshed in BACKGROUND workers on their own TTLs and read from
@@ -47,29 +47,23 @@
 #                                               # decodes to (q stops early);
 #                                               # run this when a key does
 #                                               # nothing in a new terminal
+#   ./scripts/arachne-monitor --show-help --tab graph  # print that tab's key
+#                                               # panel and exit (the headless
+#                                               # form of the ? overlay)
 #
 # Both tabs navigate a SELECTION with vim motions; the viewport follows it.
 #
-# Watch-mode keys, SESSIONS tab (the cursor selects one agent session):
-#                   k/j ↑ ↓ previous/next session
-#                   gg/G · Home/End  first/last session
-#                   Enter    open that session's current task file
-#                   PgUp/PgDn (Ctrl-u/d) page the viewport
-#                   (← → do nothing here — arrows are the GRAPH tab's)
-# Watch-mode keys, GRAPH tab (the cursor selects one task node):
-#                   h/l ← → previous/next node in the layer
-#                   k/j ↑ ↓ nearest node one layer up/down, preferring a
-#                            connected one (a blocker, or a dependent)
-#                   gg/G     first/last layer   (vertical: the DAG's depth)
-#                   ^/_/0/Home · $/End  first/last node in the LAYER
-#                            (horizontal: a layer is the graph's "line")
-#                   .        recentre on the running task
-#                   o / Enter open the selected task's file in a new editor
-#                            window (wezterm + $EDITOR; falls back to taking
-#                            over this terminal when there is no display)
-#                   PgUp/PgDn page the viewport without moving the cursor
-# Both tabs:        gt / gT · Tab / Shift-Tab  next/previous tab · n add a note
-#                   e / Ctrl-G edit notes in nvim · q quit
+# Watch-mode keys are documented inside the monitor, for the tab you are
+# actually on: press `?` — or type `:help` — and the panel pops over the frame;
+# any key closes it again. The `:` prompt also takes `q` / `quit`. There is
+# deliberately NO always-on hint line: the two tabs share only a handful of
+# keys, so one line could not describe either of them honestly, and it spent
+# permanent screen space on something you read twice and then never again.
+#
+# That panel is the ONLY keymap in the tree — this comment block deliberately
+# does not restate it, because a second copy is a copy that goes stale. To read
+# the keys without launching the dashboard, run `--show-help --tab <t>`, which
+# prints the very same panel.
 #
 # Env: ARACHNE_MONITOR_OPEN_CMD  replace the `o` spawn entirely (path appended)
 #      ARACHNE_MONITOR_TERM      GUI terminal to spawn (default wezterm)
@@ -99,8 +93,11 @@ MONITOR_LOG="${ARACHNE_MONITOR_LOG:-}"        # redraw-instrumentation log (off 
 SHOW_DISK="${ARACHNE_MONITOR_DISK:-1}"        # disk gauge on by default; --no-disk / =0 off
 # Tabs: 0 = SESSIONS (gauges + live sessions), 1 = GRAPH (layered task DAG).
 # On the GRAPH tab a cursor selects one task node; the viewport follows it.
-TAB=0; PAN=0; CURSOR=""; MOVES=""; GRAPH_TOPH=7
+# GRAPH_TOPH seeds the first frame only — the watch loop recomputes it from the
+# rendered top every redraw. 8 = title, rule, tabs, blank, pump, 2 detail, rule.
+TAB=0; PAN=0; CURSOR=""; MOVES=""; GRAPH_TOPH=8
 DECODE_KEYS=""                                # --decode-keys N: key-decoder probe
+SHOW_HELP=0                                   # --show-help: print the key panel, exit
 # Resolved next to this script, NOT under REPO_ROOT: the two differ whenever
 # ARACHNE_MONITOR_REPO_ROOT points a worktree copy at the primary checkout.
 DAG_BIN="${ARACHNE_DAG_BIN:-$(CDPATH= cd -- "$(dirname "$0")" && pwd)/arachne-dag-render}"
@@ -123,6 +120,7 @@ while [[ $# -gt 0 ]]; do
         --log=*)        MONITOR_LOG="${1#--log=}" ;;
         --decode-keys)  DECODE_KEYS="${2:-}"; shift ;;
         --decode-keys=*) DECODE_KEYS="${1#--decode-keys=}" ;;
+        --show-help)    SHOW_HELP=1 ;;
         [0-9]*)         INTERVAL="$1" ;;
         -h|--help)      print_help; exit 0 ;;
         *)              echo "ERROR: unknown arg '$1'" >&2; exit 1 ;;
@@ -883,7 +881,10 @@ sessions_detail_lines() {
         < <(sessions_selected) || true
     if [[ -z "${name:-}" ]]; then
         printf '%s%s%s\n' "$C_FAINT" "  no sessions — nothing to select" "$ST_RST"
-        printf '%s%s%s\n' "$C_MUTED" "  ↑↓ select · Enter open · Tab graph" "$ST_RST"
+        # The keys used to be listed here. They live in the ? overlay now, but
+        # the LINE stays: the watch loop measures the top region's height from
+        # this block, so dropping a line silently shifts the viewport under it.
+        printf '\n'
         return 0
     fi
     [[ -n "${branch:-}" ]] && parts+=" · $branch"
@@ -1302,7 +1303,10 @@ ${ST_READY}○ ready${ST_RST}  ${ST_WAIT}◌ waiting${ST_RST}  ${ST_BLOCK}⊘ bl
 graph_detail_lines() {
     if ! graph_cur_ok; then
         printf '%s\n' "$GRAPH_LEGEND"
-        printf '%s%s%s\n' "$BAR_EMPTY" "  ↑↓←→ move · o open · . running · gg/G layers · ^/\$ ends" "$BAR_RST"
+        # Was the key hint; the keys are in the ? overlay now. The blank line is
+        # load-bearing — GRAPH_TOPH is measured from this block, so two lines in
+        # and two lines out (see sessions_detail_lines for the same note).
+        printf '\n'
         return 0
     fi
     local st="${GST[$CURSOR]}" word glyph hue parts="" b bid bst bg
@@ -1582,6 +1586,195 @@ notes_input_mode() {
     printf '\033[?7l' 2>/dev/null || true
 }
 
+# ── Help panel ───────────────────────────────────────────────────────────────
+# The keymap is documented ONCE, here, and only for the tab you are on. The two
+# tabs agree on about six keys and disagree on the rest — a single always-on
+# hint line had to either lie or truncate, and it did both.
+#
+# The panel is a self-contained bordered box, which is what lets one function
+# serve two callers: the watch-mode overlay paints it over the frame, and
+# --show-help prints it. The overlay cannot be driven without a pty, so
+# everything worth asserting is reachable through --show-help.
+#
+# Colour comes from the chrome family only (this is structure and text carrying
+# no state): C_STRONG for the title, headings and keys, C_MUTED for the
+# descriptions, C_RULE for the border. No new token, and nothing here means
+# anything — R2 does not apply because the panel carries no state to encode.
+
+# help_rows -- the key table for tab $1 (0 = SESSIONS, 1 = GRAPH) as TSV
+# records, so measurement and painting stay separate:
+#   K <keys> <what>   one key row      H <heading>   section heading
+#   B                 a spacer
+#
+# A heading's text sits in the SECOND field, not the third: tab is IFS
+# whitespace, so "H<tab><tab>text" collapses to two fields on read and the text
+# lands in the key column anyway. Same trap pump_summary_line documents.
+help_rows() {
+    local tab="${1:-0}"
+    if (( tab == 1 )); then
+        printf 'H\tThis tab — GRAPH (the cursor selects one task node)\n'
+        printf 'K\th l ← →\tprevious / next node in the layer\n'
+        printf 'K\tk j ↑ ↓\tnearest node one layer up/down, preferring a connected one\n'
+        printf 'K\tgg G\tfirst / last layer\n'
+        printf 'K\t^ _ 0 Home\tfirst node in the layer\n'
+        printf 'K\t$ End\tlast node in the layer\n'
+        printf 'K\t.\trecentre on the running task\n'
+        printf "K\to Enter\topen the selected task's file in a new window\n"
+    else
+        printf 'H\tThis tab — SESSIONS (the cursor selects one agent session)\n'
+        printf 'K\tk j ↑ ↓\tprevious / next session\n'
+        printf 'K\tgg Home\tfirst session\n'
+        printf 'K\tG End\tlast session\n'
+        printf "K\tEnter\topen that session's current task file\n"
+        printf 'K\t.\tback to the first session\n'
+        printf 'K\t← →\tnothing here — gt / gT switch tab\n'
+    fi
+    printf 'B\n'
+    printf 'H\tBoth tabs\n'
+    printf 'K\tgt gT\tnext / previous tab\n'
+    printf 'K\tTab Shift-Tab\tswitch tab\n'
+    printf 'K\tn\tadd a note\n'
+    printf 'K\te Ctrl-G\tedit notes in $EDITOR\n'
+    printf 'K\t? :help\tthis help — any key closes it\n'
+    printf 'K\tq :q\tquit the monitor\n'
+    printf 'K\tPgUp PgDn\tpage the viewport (Ctrl-u / Ctrl-d, Space / b)\n'
+}
+
+# help_lines -- the panel for the current $TAB, one line per output line.
+#
+# Every width is measured with ${#s} and every pad is emitted as %*s over an
+# EMPTY string, never as %-*s over the text: the key column holds ← ↑ ↓ →, and
+# printf's field width counts bytes where bash's ${#s} counts characters, so
+# padding the text directly would misalign every row carrying an arrow.
+help_lines() {
+    local tab="${TAB:-0}" title W
+    W="$(term_width)"
+    if (( tab == 1 )); then title="GRAPH tab keys"; else title="SESSIONS tab keys"; fi
+
+    local -a KIND=() BODY=()
+    local kind k d keyw=0
+    while IFS=$'\t' read -r kind k d; do
+        if [[ "$kind" == K ]] && (( ${#k} > keyw )); then keyw=${#k}; fi
+        KIND+=("$kind"); BODY+=("$k"$'\t'"$d")
+    done < <(help_rows "$tab")
+
+    # Second pass: the key column's width is only known once every row is in.
+    local i n=${#KIND[@]} plain contentw=0 pad
+    local -a TEXT=()
+    for (( i=0; i<n; i++ )); do
+        k="${BODY[i]%%$'\t'*}"; d="${BODY[i]#*$'\t'}"
+        case "${KIND[i]}" in
+            K) pad=$(( keyw - ${#k} )); printf -v plain '%s%*s  %s' "$k" "$pad" '' "$d" ;;
+            H) plain="$k" ;;
+            *) plain="" ;;
+        esac
+        TEXT+=("$plain")
+        if (( ${#plain} > contentw )); then contentw=${#plain}; fi
+    done
+
+    # A box is "│ text │": four columns of chrome around the content.
+    local inner=$contentw maxin=$(( W - 4 ))
+    if (( maxin < 10 )); then maxin=10; fi
+    if (( inner < ${#title} + 1 )); then inner=$(( ${#title} + 1 )); fi
+    if (( inner > maxin )); then inner=$maxin; fi
+    local total=$(( inner + 4 )) t="$title" fill
+    if (( ${#t} > total - 5 )); then t="${t:0:$(( total - 5 ))}"; fi
+    fill=$(( total - 5 - ${#t} )); if (( fill < 0 )); then fill=0; fi
+    printf '%s┌─ %s%s%s %s┐%s\n' "$C_RULE" "$C_STRONG" "$t" "$C_RULE" "$(hbar "$fill")" "$ST_RST"
+    for (( i=0; i<n; i++ )); do
+        plain="${TEXT[i]}"
+        if (( ${#plain} > inner )); then plain="${plain:0:inner}"; fi
+        pad=$(( inner - ${#plain} ))
+        case "${KIND[i]}" in
+            # Split back at the key column so the keys read as keys. A panel
+            # squeezed narrower than that column loses the split, not the row.
+            K) printf '%s│ %s%s%s%s%*s %s│%s\n' "$C_RULE" \
+                   "$C_STRONG" "${plain:0:keyw}" "$C_MUTED" "${plain:keyw}" \
+                   "$pad" '' "$C_RULE" "$ST_RST" ;;
+            H) printf '%s│ %s%s%*s %s│%s\n' "$C_RULE" "$C_STRONG" "$plain" "$pad" '' "$C_RULE" "$ST_RST" ;;
+            *) printf '%s│ %*s %s│%s\n' "$C_RULE" "$inner" '' "$C_RULE" "$ST_RST" ;;
+        esac
+    done
+    printf '%s└%s┘%s\n' "$C_RULE" "$(hbar "$(( total - 2 ))")" "$ST_RST"
+    return 0
+}
+
+# help_overlay -- pop the panel over the current frame until a key is pressed.
+#
+# Painted AFTER paint_view with absolute \033[row;colH addressing, so it touches
+# nothing the frame owns: SCROLL, the cursor selection, the alternate screen and
+# the autowrap-off state all survive it, and the next redraw simply paints over
+# it (paint_view rewrites every row with \033[K, so no residue is possible).
+help_overlay() {
+    local -a HL; mapfile -t HL < <(help_lines)
+    local n=${#HL[@]}
+    (( n )) || return 0
+    local rows cols w col top i
+    rows="$(term_height)"; cols="$(term_width)"
+    w="$(vis_len "${HL[0]}")"
+    col=$(( (cols - w) / 2 + 1 )); if (( col < 1 )); then col=1; fi
+    top=$(( (rows - n) / 2 + 1 )); if (( top < 1 )); then top=1; fi
+    for (( i=0; i<n; i++ )); do
+        if (( top + i > rows )); then break; fi
+        printf '\033[%d;%dH%s' "$(( top + i ))" "$col" "${HL[i]}"
+    done
+    # Dismiss on any key, read through read_key so an ARROW closes the panel as
+    # one keypress instead of leaving its final bytes to be read as two more.
+    # read_key's wait is the refresh interval, which would blink the panel away
+    # after a second, so it is widened for exactly this read and put back.
+    local saved="$INTERVAL"; INTERVAL=3600
+    read_key >/dev/null 2>&1 || true
+    INTERVAL="$saved"
+    return 0
+}
+
+# ── The `:` command prompt ───────────────────────────────────────────────────
+# CMD_ACTION is how the prompt talks to the key loop: the loop owns quitting (a
+# `break` only breaks the loop it is written in), so the prompt names an action
+# and lets the caller take it.
+CMD_ACTION=""
+
+# command_dispatch -- the verbs. An unknown command is IGNORED on purpose: this
+# is a shortcut, not a shell, and wedging the watch loop on a typo would be a
+# far worse failure than doing nothing.
+command_dispatch() {
+    case "${1//[[:space:]]/}" in
+        help|h|'?') CMD_ACTION=help ;;
+        q|quit)     CMD_ACTION=quit ;;
+        *)          : ;;                 # includes the empty line: `:` + Enter cancels
+    esac
+    return 0
+}
+
+# command_input_mode -- the prompt on the bottom line. Deliberately the same
+# read loop, cursor handling and restore as notes_input_mode: `:` and `n` are
+# one interaction with two verbs, and forking their input handling is how one of
+# them ends up leaving the cursor visible or autowrap on.
+command_input_mode() {
+    CMD_ACTION=""
+    local buf="" ch rows seq
+    rows="$(term_height)"
+    printf '\033[?7h' 2>/dev/null || true     # let the cursor track long input
+    tput cnorm 2>/dev/null || true
+    while true; do
+        printf '\033[%d;1H\033[K%s:%s%s' "$rows" "$C_STRONG" "$ST_RST" "$buf"
+        if ! IFS= read -rsn1 ch; then break; fi
+        if [[ -z "$ch" ]]; then command_dispatch "$buf"; break; fi   # Enter
+        case "$ch" in
+            $'\r')            command_dispatch "$buf"; break ;;
+            $'\x7f'|$'\x08')  buf="${buf%?}" ;;
+            # A bare ESC cancels; an escape SEQUENCE is told apart by whether
+            # anything follows within the burst, exactly as in the note prompt.
+            $'\x1b')          seq=""; IFS= read -rsn2 -t 0.002 seq || true
+                              [[ -z "$seq" ]] && break ;;
+            *)                buf+="$ch" ;;
+        esac
+    done
+    tput civis 2>/dev/null || true
+    printf '\033[?7l' 2>/dev/null || true
+    return 0
+}
+
 # Continuation bytes of one escape sequence arrive in the same burst as its
 # introducer, so this only has to outlast scheduling jitter — not a human. It is
 # also the delay before a bare ESC is reported, which nothing is bound to.
@@ -1696,6 +1889,15 @@ tab_switch() {
     return 0
 }
 
+# --show-help -- print the panel the ? overlay paints, for the tab --tab picked,
+# and exit. The overlay needs a pty; this is the seam every assertion about the
+# panel's content and width goes through, the same way --decode-keys is the seam
+# for the key decoder and --moves for the cursor.
+if (( SHOW_HELP )); then
+    help_lines
+    exit 0
+fi
+
 if [[ "$WATCH" -eq 1 ]]; then
     restore() {
         printf '\033[?7h' 2>/dev/null || true   # autowrap back on
@@ -1780,6 +1982,11 @@ if [[ "$WATCH" -eq 1 ]]; then
                     $'\x15'|PGUP|b)      SCROLL=$(( SCROLL - __page )) ;;
                     n|N)                 notes_input_mode ;;
                     e|E|$'\x07')         edit_in_nvim "$(notes_file)" ;;
+                    # ? and : are the only documentation surface in watch mode.
+                    # Both patterns are QUOTED: unquoted, `?` is a glob matching
+                    # any single key and would swallow the whole keymap.
+                    '?')                 help_overlay ;;
+                    ':')                 command_input_mode; case "$CMD_ACTION" in help) help_overlay ;; quit) break ;; esac ;;
                     *)                   : ;;
                 esac
             else
@@ -1801,6 +2008,10 @@ if [[ "$WATCH" -eq 1 ]]; then
                     ENTER)               open_session_task ;;
                     $'\x04'|PGDN|' ')    SCROLL=$(( SCROLL + __page )) ;;
                     $'\x15'|PGUP|b)      SCROLL=$(( SCROLL - __page )) ;;
+                    # Same two arms as GRAPH, and the same quoting caveat — but
+                    # help_lines reads $TAB, so each tab documents itself.
+                    '?')                 help_overlay ;;
+                    ':')                 command_input_mode; case "$CMD_ACTION" in help) help_overlay ;; quit) break ;; esac ;;
                     *)                   : ;;
                 esac
                 (( SESS_SEL < 0 )) && SESS_SEL=0
