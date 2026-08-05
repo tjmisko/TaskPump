@@ -43,7 +43,10 @@
 #                   n add a note · e / Ctrl-G edit notes in nvim · q quit
 set -euo pipefail
 
-REPO_ROOT="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
+# REPO_ROOT is the checkout whose .worktrees/ hold the agent workspaces — i.e.
+# the PRIMARY checkout. The override lets a worktree copy of this script report
+# on the primary's sessions instead of looking for a nested .worktrees/.
+REPO_ROOT="${ARACHNE_MONITOR_REPO_ROOT:-$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)}"
 MANIFEST="${MANIFEST:-$REPO_ROOT/ops/task-loop/parallel-manifest.tsv}"
 TASKS_DIR="$REPO_ROOT/ops/task-loop/tasks"
 
@@ -57,11 +60,22 @@ print_help() {
 WATCH=0; INTERVAL="${ARACHNE_MONITOR_INTERVAL:-1}"; DEMO=0
 MONITOR_LOG="${ARACHNE_MONITOR_LOG:-}"        # redraw-instrumentation log (off if empty)
 SHOW_DISK="${ARACHNE_MONITOR_DISK:-1}"        # disk gauge on by default; --no-disk / =0 off
+# Tabs: 0 = SESSIONS (gauges + live sessions), 1 = GRAPH (layered task DAG).
+TAB=0; PAN=0
+# Resolved next to this script, NOT under REPO_ROOT: the two differ whenever
+# ARACHNE_MONITOR_REPO_ROOT points a worktree copy at the primary checkout.
+DAG_BIN="${ARACHNE_DAG_BIN:-$(CDPATH= cd -- "$(dirname "$0")" && pwd)/arachne-dag-render}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --watch)        WATCH=1 ;;
         --demo)         DEMO=1 ;;          # render synthetic sessions; no docker needed
         --no-disk)      SHOW_DISK=0 ;;
+        --tab)          case "${2:-}" in graph|dag) TAB=1 ;; sessions) TAB=0 ;;
+                            *) echo "ERROR: --tab wants sessions|graph" >&2; exit 1 ;;
+                        esac; shift ;;
+        --tab=*)        case "${1#--tab=}" in graph|dag) TAB=1 ;; sessions) TAB=0 ;;
+                            *) echo "ERROR: --tab wants sessions|graph" >&2; exit 1 ;;
+                        esac ;;
         --log)          MONITOR_LOG="${2:-}"; shift ;;
         --log=*)        MONITOR_LOG="${1#--log=}" ;;
         [0-9]*)         INTERVAL="$1" ;;
@@ -665,6 +679,7 @@ render_top() {
     local W; W="$(term_width)"
     if (( DEMO )); then
         header "   [DEMO — synthetic data]"
+        tab_bar
         local -a L R
         mapfile -t L < <(demo_left_lines)
         mapfile -t R < <(demo_notes_lines)
@@ -674,6 +689,7 @@ render_top() {
         return 0
     fi
     header
+    tab_bar
     local uj='{}'
     [[ -x "$USAGE_BIN" ]] && uj="$("$USAGE_BIN" --json 2>/dev/null || echo '{}')"
     local -a L R
@@ -692,7 +708,75 @@ render_sessions() {  # $1 = width
     sessions_lines "$width"
 }
 
-render_all() {  # one-shot / pipe: top then sessions, no viewport clipping
+# ── Tabs ─────────────────────────────────────────────────────────────────────
+# The active tab is marked by brackets AND weight, never by colour alone, so it
+# survives --no-color terminals and colour-blind readers.
+tab_bar() {
+    local s g
+    if (( TAB == 0 )); then
+        s=$'\033[1m┤ SESSIONS ├\033[0m'; g=$'\033[2;38;5;245m   GRAPH   \033[0m'
+    else
+        s=$'\033[2;38;5;245m  SESSIONS  \033[0m'; g=$'\033[1m┤ GRAPH ├\033[0m'
+    fi
+    printf '%s%s   \033[38;5;245mTab / ← → switch\033[0m\n' "$s" "$g"
+}
+
+# graph_live_branches -- worktree branches with a live agent container, as the
+# renderer's liveness signal (it matches them against each task's claimed_by).
+# Mirrors sessions_compute's slug -> worktree resolution: a slug is the branch
+# with '/' replaced by '-', which is not reversible, so match against the real
+# worktree paths rather than guessing.
+graph_live_branches() {
+    local out="" cname slug cand d
+    while IFS= read -r cname; do
+        [[ -z "$cname" ]] && continue
+        slug="${cname#arachne-agent-}"
+        if [[ -n "${SLUG_BRANCH[$slug]:-}" ]]; then
+            out+="${SLUG_BRANCH[$slug]},"; continue
+        fi
+        while IFS= read -r cand; do
+            d="${cand#"$REPO_ROOT/.worktrees/"}"; d="${d%/}"
+            [[ "${d//\//-}" == "$slug" ]] && { out+="$d,"; break; }
+        done < <(find "$REPO_ROOT/.worktrees" -mindepth 1 -maxdepth 3 -name .git -printf '%h\n' 2>/dev/null)
+    done < <(docker ps --filter 'name=arachne-agent' --format '{{.Names}}' 2>/dev/null)
+    printf '%s' "${out%,}"
+}
+
+# render_graph -- the SCROLLABLE region for the GRAPH tab. Rendered directly
+# rather than through a cache: one gawk pass over the whole task corpus is
+# ~40ms, comfortably inside the paint budget, and it keeps panning instant.
+render_graph() {
+    [[ -x "$DAG_BIN" ]] || { printf '(arachne-dag-render not found)\n'; return 0; }
+    # The monitor owns the pump-state path, so it resolves the range and passes
+    # it explicitly — the renderer must not have to re-find .arachne-pump.state.
+    local phases=""
+    [[ -f "$PUMP_STATE" ]] && phases="$(jq -r '.phases // ""' "$PUMP_STATE" 2>/dev/null || echo '')"
+    if [[ -z "$phases" ]]; then
+        printf '%s(no pump running — nothing scoped to graph)%s\n' "$BAR_EMPTY" "$BAR_RST"
+        printf '%s start a pump, or: scripts/arachne-dag-render --phases F79%s\n' "$BAR_EMPTY" "$BAR_RST"
+        return 0
+    fi
+    "$DAG_BIN" --phases "$phases" --pan "$PAN" \
+               --live-branches "$(graph_live_branches)" 2>/dev/null \
+        || printf '(dag render failed)\n'
+}
+
+render_graph_top() {
+    header
+    tab_bar
+    local uj='{}'
+    [[ -x "$USAGE_BIN" ]] && uj="$("$USAGE_BIN" --json 2>/dev/null || echo '{}')"
+    [[ -f "$PUMP_STATE" ]] && pump_summary_line "$uj"
+    printf '\033[2;38;5;245m✓ done  ▶ running  ⧗ parked  ○ ready  ◌ waiting  ⊘ blocked  ! review\033[0m\n'
+    rule
+}
+
+render_all() {  # one-shot / pipe: top then body, no viewport clipping
+    if (( TAB == 1 )); then
+        render_graph_top
+        render_graph
+        return 0
+    fi
     render_top
     render_sessions "$(term_width)"
 }
@@ -842,6 +926,7 @@ read_key() {
             '[A') printf 'UP' ;;   '[B') printf 'DOWN' ;;
             '[C') printf 'RIGHT' ;; '[D') printf 'LEFT' ;;
             '[H') printf 'HOME' ;; '[F') printf 'END' ;;
+            '[Z') printf 'STAB' ;;                     # Shift-Tab
             '[5') IFS= read -rsn1 -t 0.01 tail || true; printf 'PGUP' ;;
             '[6') IFS= read -rsn1 -t 0.01 tail || true; printf 'PGDN' ;;
             '')   printf 'ESC' ;;
@@ -866,8 +951,13 @@ if [[ "$WATCH" -eq 1 ]]; then
     while true; do
         __redraw=$((__redraw + 1))
         __t0="$(_now_us)"
-        __top="$(render_top 2>/dev/null || true)"
-        mapfile -t __SESS < <(render_sessions "$(term_width)" 2>/dev/null || true)
+        if (( TAB == 1 )); then
+            __top="$(render_graph_top 2>/dev/null || true)"
+            mapfile -t __SESS < <(render_graph 2>/dev/null || true)
+        else
+            __top="$(render_top 2>/dev/null || true)"
+            mapfile -t __SESS < <(render_sessions "$(term_width)" 2>/dev/null || true)
+        fi
         __compute_us=$(( $(_now_us) - __t0 ))
         __p0="$(_now_us)"
         paint_view "$__top" __SESS
@@ -878,6 +968,12 @@ if [[ "$WATCH" -eq 1 ]]; then
             __page=$(( $(term_height) / 2 )); (( __page < 1 )) && __page=1
             case "$__key" in
                 q|Q)                 break ;;
+                # Tab switching resets the viewport: the two tabs have unrelated
+                # coordinate spaces, so carrying scroll/pan across is meaningless.
+                $'\t'|STAB|LEFT|RIGHT) TAB=$(( 1 - TAB )); SCROLL=0; PAN=0 ;;
+                h|H)                 (( TAB == 1 )) && { PAN=$(( PAN - 8 )); (( PAN < 0 )) && PAN=0; } ;;
+                l|L)                 (( TAB == 1 )) && PAN=$(( PAN + 8 )) ;;
+                .)                   SCROLL=0; PAN=0 ;;
                 n|N)                 notes_input_mode ;;
                 e|E|$'\x07')         edit_in_nvim "$(notes_file)" ;;
                 j|J|DOWN)            SCROLL=$(( SCROLL + 1 )) ;;

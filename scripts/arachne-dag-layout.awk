@@ -17,7 +17,12 @@ BEGIN {
     } else if (phases != "") { lo_ph = num(phases); hi_ph = lo_ph }
     m = split(running, RR, ",")
     for (i = 1; i <= m; i++) if (RR[i] != "") LIVE[RR[i]] = 1
+    # The monitor knows liveness by container -> branch, not by task id, so a
+    # claimed_by match is the practical signal for "an agent is on this now".
+    m = split(livebranches, LB, ",")
+    for (i = 1; i <= m; i++) if (LB[i] != "") LIVEB[LB[i]] = 1
 }
+function islive(i) { return (id[i] in LIVE) || (by[i] != "" && (by[i] in LIVEB)) }
 function num(s) { gsub(/[^0-9]/, "", s); return s + 0 }
 function unq(s) { gsub(/^[ \t]*/, "", s); gsub(/[ \t]*$/, "", s); gsub(/^"|"$/, "", s); return s }
 
@@ -234,7 +239,7 @@ function box(i, y,   inner, w, x, above, top) {
 function glyph(i,   s) {
     s = st[i]
     if (s == "done")         return "\342\234\223"                       # ✓
-    if (s == "in_progress")  return (id[i] in LIVE) ? "\342\226\266" : "\342\247\227"  # ▶ / ⧗
+    if (s == "in_progress")  return islive(i) ? "\342\226\266" : "\342\247\227"  # ▶ / ⧗
     if (s == "blocked")      return "\342\212\230"                       # ⊘
     if (s == "needs-review" || s == "stuck") return "!"
     if (s == "open")         return eligible(i) ? "\342\227\213" : "\342\227\214"      # ○ / ◌
@@ -253,7 +258,7 @@ function hue(i,   s) {
     if (!color) return ""
     s = st[i]
     if (s == "done")        return "\033[2;38;5;245m"
-    if (s == "in_progress") return (id[i] in LIVE) ? "\033[1;38;5;173m" : "\033[33m"
+    if (s == "in_progress") return islive(i) ? "\033[1;38;5;173m" : "\033[33m"
     if (s == "blocked")     return "\033[33m"
     if (s == "needs-review" || s == "stuck") return "\033[1;31m"
     if (s == "open")        return eligible(i) ? "\033[0m" : "\033[2;38;5;245m"

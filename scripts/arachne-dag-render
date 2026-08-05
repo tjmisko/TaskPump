@@ -28,7 +28,7 @@ REPO_ROOT="${ARACHNE_DAG_REPO_ROOT:-$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 TASKS_DIR="${ARACHNE_TASKS_DIR:-$REPO_ROOT/ops/task-loop/tasks}"
 PUMP_STATE="${ARACHNE_PUMP_STATE_FILE:-$REPO_ROOT/.arachne-pump.state}"
 
-PHASES=""; RUNNING=""; COLOR=1; COMPACT=-1; PANX=0
+PHASES=""; RUNNING=""; LIVEBRANCHES=""; COLOR=1; COMPACT=-1; PANX=0
 
 print_help() { awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$0"; }
 
@@ -38,6 +38,8 @@ while [[ $# -gt 0 ]]; do
         --phases=*)  PHASES="${1#--phases=}" ;;
         --running)   RUNNING="${2:-}"; shift ;;
         --running=*) RUNNING="${1#--running=}" ;;
+        --live-branches)   LIVEBRANCHES="${2:-}"; shift ;;
+        --live-branches=*) LIVEBRANCHES="${1#--live-branches=}" ;;
         --pan)       PANX="${2:-0}"; shift ;;
         --pan=*)     PANX="${1#--pan=}" ;;
         --no-color)  COLOR=0 ;;
@@ -60,6 +62,6 @@ shopt -s nullglob
 files=("$TASKS_DIR"/*.md)
 (( ${#files[@]} )) || { echo "(no tasks found)"; exit 0; }
 
-gawk -v phases="$PHASES" -v running="$RUNNING" -v color="$COLOR" \
-     -v compact="$COMPACT" -v panx="$PANX" -f "$REPO_ROOT/scripts/arachne-dag-layout.awk" \
-     "${files[@]}"
+gawk -v phases="$PHASES" -v running="$RUNNING" -v livebranches="$LIVEBRANCHES" \
+     -v color="$COLOR" -v compact="$COMPACT" -v panx="$PANX" \
+     -f "$(dirname "$0")/arachne-dag-layout.awk" "${files[@]}"

@@ -255,6 +255,47 @@ frame=$(awk 'BEGIN{RS="\033\\[H"} {last=$0} END{printf "%s", last}' "$CAP" | sed
 rows=$(printf '%s' "$frame" | grep -c .)
 [[ -n "$rows" && "$rows" -le 12 ]] && pass "watch frame clipped to height (${rows} ≤ 12 rows)" || fail "frame not clipped: ${rows} rows"
 
+# ── Test 16: tab bar + --tab selection ────────────────────────────────────────
+echo "--- Test 16: tabs ---"
+make_usage_stub 30 40
+sess_out=$("$CLI" 2>/dev/null | strip_ansi)
+grep -q '┤ SESSIONS ├' <<<"$sess_out" && pass "SESSIONS tab is active by default" || fail "no active SESSIONS tab:\n$sess_out"
+grep -q 'GRAPH' <<<"$sess_out" && pass "GRAPH tab is listed" || fail "GRAPH tab missing"
+graph_out=$("$CLI" --tab graph 2>/dev/null | strip_ansi)
+grep -q '┤ GRAPH ├' <<<"$graph_out" && pass "--tab graph activates the GRAPH tab" || fail "--tab graph not active:\n$graph_out"
+grep -q '✓ done' <<<"$graph_out" && pass "GRAPH tab shows the status legend" || fail "no legend on the graph tab"
+# No pump state is configured in this harness, so the graph must say so rather
+# than rendering the entire ledger.
+grep -q 'no pump running' <<<"$graph_out" && pass "graph tab degrades cleanly with no pump" || fail "no-pump fallback missing:\n$graph_out"
+"$CLI" --tab bogus >/dev/null 2>&1 && fail "--tab accepted a bogus value" || pass "--tab rejects a bogus value"
+
+# ── Test 17: two feed lines per session (regression: dropped final line) ──────
+echo "--- Test 17: two transcript lines per session ---"
+FAKE_ROOT="$TMP/fakeroot"; mkdir -p "$FAKE_ROOT/.worktrees/feat/x"
+LOGF="$FAKE_ROOT/.worktrees/feat/x/.arachne-agent.log"
+printf '%s\n' \
+  '{"type":"assistant","message":{"content":[{"text":"first event line"}]}}' \
+  '{"type":"assistant","message":{"content":[{"text":"second event line"}]}}' >| "$LOGF"
+cat >| "$BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+for a in "$@"; do
+  case "$a" in
+    '{{.Names}}|{{.State}}|{{.Status}}') echo 'arachne-agent-feat-x|running|Up 3 minutes'; exit 0 ;;
+    '{{.Names}}') echo 'arachne-agent-feat-x'; exit 0 ;;
+  esac
+done
+exit 0
+EOF
+chmod +x "$BIN/docker"
+FEED_CACHE="$TMP/feed-sess.tsv"
+run_feed() { ARACHNE_MONITOR_REPO_ROOT="$FAKE_ROOT" ARACHNE_MONITOR_SESS_CACHE="$FEED_CACHE" \
+             ARACHNE_MONITOR_COLS=120 "$CLI" 2>/dev/null | strip_ansi; }
+run_feed >/dev/null; sleep 2; feed_out=$(run_feed)     # first call warms the background cache
+grep -q 'first event line'  <<<"$feed_out" && pass "first feed line rendered"  || fail "first feed line missing:\n$feed_out"
+grep -q 'second event line' <<<"$feed_out" && pass "second feed line rendered (TAIL_LINES=2)" || fail "second feed line dropped:\n$feed_out"
+# docker stub back to "no containers" for anything that follows.
+printf '#!/usr/bin/env bash\nexit 0\n' >| "$BIN/docker"; chmod +x "$BIN/docker"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"
