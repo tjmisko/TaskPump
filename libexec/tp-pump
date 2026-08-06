@@ -570,7 +570,7 @@ dep_pr_number() {
   local branch="$1"
   [[ "${TASKPUMP_PUMP_NO_GH:-0}" -eq 1 ]] && return 0
   command -v gh >/dev/null 2>&1 || return 0
-  gh pr list --head "$branch" --base main --json number -q '.[0].number // empty' 2>/dev/null || true
+  gh pr list --head "$branch" --base "$INTEGRATION_BASE" --json number -q '.[0].number // empty' 2>/dev/null || true
 }
 
 # phase_cross_blockers <FN> — the unique set of OTHER phases this phase's tasks
@@ -1079,15 +1079,18 @@ reconcile_trunk() {
   return 0
 }
 
-# graduate_trunk — drain tail (real run only): open exactly one auto/trunk → main
-# PR (idempotent: refresh if it exists). main receives no direct commits — the
-# separate trunk buffer keeps integration continuous while review stays batched.
+# graduate_trunk — drain tail (real run only): open exactly one trunk →
+# integration-base PR (idempotent: refresh if it exists). The base receives no
+# direct commits — the separate trunk buffer keeps integration continuous while
+# review stays batched. Every gh call here targets $INTEGRATION_BASE; all three
+# used to hardcode `main` while --integration-base pretended to be configurable,
+# so pointing a run at a release branch silently opened PRs against main.
 graduate_trunk() {
   [[ "$INTEGRATION" -eq 1 ]] || return 0
-  command -v gh >/dev/null 2>&1 || { warn "gh absent; cannot graduate $INTEGRATION_TRUNK → main"; return 0; }
+  command -v gh >/dev/null 2>&1 || { warn "gh absent; cannot graduate $INTEGRATION_TRUNK → $INTEGRATION_BASE"; return 0; }
   local twt; twt="$(trunk_worktree)"
   local existing
-  existing="$(gh pr list --head "$INTEGRATION_TRUNK" --base main --json number -q '.[0].number // empty' 2>/dev/null || true)"
+  existing="$(gh pr list --head "$INTEGRATION_TRUNK" --base "$INTEGRATION_BASE" --json number -q '.[0].number // empty' 2>/dev/null || true)"
   if [[ -n "$existing" ]]; then
     log "graduation PR #$existing already open for $INTEGRATION_TRUNK; left as-is"
     return 0
@@ -1101,11 +1104,11 @@ graduate_trunk() {
   if [[ -n "$quarantined" ]]; then
     body="$(printf '%s\nQuarantined (needs human reconciliation):\n%s\n' "$body" "$quarantined")"
   fi
-  if gh pr create --base main --head "$INTEGRATION_TRUNK" \
+  if gh pr create --base "$INTEGRATION_BASE" --head "$INTEGRATION_TRUNK" \
       --title "auto: integrate $PHASES" --body "$body" >/dev/null 2>&1; then
-    log "opened graduation PR $INTEGRATION_TRUNK → main"
+    log "opened graduation PR $INTEGRATION_TRUNK → $INTEGRATION_BASE"
   else
-    warn "gh pr create for $INTEGRATION_TRUNK → main failed"
+    warn "gh pr create for $INTEGRATION_TRUNK → $INTEGRATION_BASE failed"
   fi
 }
 

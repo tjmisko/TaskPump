@@ -969,6 +969,35 @@ have "$(default_hooks_of_pump)" 'gitignore-repair' && pass "gitignore-repair is 
 have "$(default_hooks_of_pump)" 'fs-guard' && pass "fs-guard is in the default chain" \
   || fail "fs-guard missing from the default chain"
 
+echo "--- Test 26: --integration-base reaches every gh call ---"
+# All three gh invocations used to hardcode `main`, so a run pointed at a
+# release branch silently opened its PRs against main instead. Assert on the
+# argv a gh stub records.
+GHLOG="$TMP/gh.log"
+cat >| "$BIN/gh" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$GHLOG"
+# \`pr list\` must answer empty so graduate_trunk goes on to create one.
+exit 0
+EOF
+chmod +x "$BIN/gh"
+
+: >| "$GHLOG"
+GTMP="$TMP/grad"; mkdir -p "$GTMP"
+git -C "$GTMP" init -q -b main 2>/dev/null || true
+mk F58.0 done
+PATH="$BIN:$PATH" TASKPUMP_NOTIFY_CMD=true TASKPUMP_PUMP_NO_LAUNCH=1 \
+  ARACHNE_PUMP_OPS_DIR="$TMP/noops" ARACHNE_PUMP_STATE_FILE="$TMP/gh.state" \
+  ARACHNE_POOL_CAP_FILE="$TMP/cap" ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+  ARACHNE_PUMP_WORKTREES_DIR="$TMP/ghwt" \
+  "$PUMP" --no-health-gate --phases F58 --integration-trunk \
+          --integration-base release/2.0 >/dev/null 2>&1 || true
+grep -q -- '--base release/2.0' "$GHLOG" \
+  && pass "gh targets the configured integration base" || fail "gh calls: $(cat "$GHLOG")"
+grep -qE -- '--base main( |$)' "$GHLOG" \
+  && fail "a gh call still hardcodes main: $(cat "$GHLOG")" || pass "no gh call hardcodes main"
+rm -f "$BIN/gh"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"
