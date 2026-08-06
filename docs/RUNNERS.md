@@ -59,6 +59,18 @@ is already gone is success, not an error. Used by housekeeping paths, never by
 the feed path — the pump does not stop agents to make room (see
 [GATES.md §1.1](GATES.md#11-two-rules-that-are-not-negotiable)).
 
+"Already gone" is **two** conditions, and a runtime words them differently: the
+agent never existed or has been reaped, and the agent exists but has already
+exited. A runner must treat both as success. The second is the one a real drain
+produces — a session that finished on its own between the supervisor deciding to
+stop it and the call landing — so a runner that handles only the first looks
+correct until it is used.
+
+Tolerating those two is not the same as ignoring failure. Anything else — the
+runtime is unreachable, the name is ambiguous — must still exit non-zero, or a
+teardown that silently did nothing is indistinguishable from one that worked.
+`tests/test-tp-runner-stop.sh` holds the reference runner to both halves.
+
 ### 1.3 What v1 deliberately leaves out
 
 **Liveness is not part of the runner contract in v1.** The pump discovers live
