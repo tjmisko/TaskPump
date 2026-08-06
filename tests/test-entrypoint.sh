@@ -52,14 +52,21 @@ TASKPUMP_TASK_ID TP_TASK_ID ARACHNE_TASK_ID
 TASKPUMP_PHASE TP_PHASE ARACHNE_PHASE
 TASKPUMP_MAX_TURNS TP_MAX_TURNS MAX_TURNS
 TASKPUMP_AGENT_MODEL TP_MODEL AGENT_MODEL
-TASKPUMP_SAFETY_TURNS TASKPUMP_WORKSPACE_TASK_CLI
-TASKPUMP_CONTAINER_USER TASKPUMP_CONTAINER_HOME
+TASKPUMP_SAFETY_TURNS TP_SAFETY_TURNS
+TASKPUMP_WORKSPACE_TASK_CLI TP_WORKSPACE_TASK_CLI
+TASKPUMP_CONTAINER_USER TP_CONTAINER_USER
+TASKPUMP_CONTAINER_HOME TP_CONTAINER_HOME
 TASKPUMP_PRE_FLIGHT TP_PRE_FLIGHT
-TASKPUMP_AGENT_LOG_NAME TASKPUMP_GOAL_NOTE_NAME
-TASKPUMP_RESUME_NOTE_NAME TASKPUMP_RO_PROBE_FILE
-TASKPUMP_HOST_CRED_MOUNT TASKPUMP_HOST_CONFIG_MOUNT
-TASKPUMP_CRED_REFRESH_INTERVAL_S CRED_REFRESH_INTERVAL_S
-TASKPUMP_AGENT_WALL_TIMEOUT_S AGENT_WALL_TIMEOUT_S
+TASKPUMP_TASKS_DIR TP_TASKS_DIR TASKPUMP_TASK_OUT TP_TASK_OUT
+TASKPUMP_TASK_FILE_EXT TP_TASK_FILE_EXT
+TASKPUMP_AGENT_LOG_NAME TP_AGENT_LOG_NAME
+TASKPUMP_GOAL_NOTE_NAME TP_GOAL_NOTE_NAME
+TASKPUMP_RESUME_NOTE_NAME TP_RESUME_NOTE_NAME
+TASKPUMP_RO_PROBE_FILE TP_RO_PROBE_FILE
+TASKPUMP_HOST_CRED_MOUNT TP_HOST_CRED_MOUNT
+TASKPUMP_HOST_CONFIG_MOUNT TP_HOST_CONFIG_MOUNT
+TASKPUMP_CRED_REFRESH_INTERVAL_S TP_CRED_REFRESH_INTERVAL_S CRED_REFRESH_INTERVAL_S
+TASKPUMP_AGENT_WALL_TIMEOUT_S TP_AGENT_WALL_TIMEOUT_S AGENT_WALL_TIMEOUT_S
 TASKPUMP_ENTRYPOINT_TEST_MODE GITHUB_TOKEN
 TP_CONTAINER_NAME ARACHNE_CONTAINER_NAME
 TP_IMAGE ARACHNE_IMAGE TP_ENTRYPOINT ARACHNE_ENTRYPOINT
@@ -372,6 +379,37 @@ grep -q '^task_cli=/usr/local/bin/tp$' <<<"$rep_cli" \
   && pass "an absolute TASKPUMP_WORKSPACE_TASK_CLI is used as given" \
   || fail "absolute task-CLI override wrong:\n$rep_cli"
 
+# The TP_ spelling must work for EVERY key, not just the headline ones. The pump
+# was exporting TP_TASKS_DIR / TP_AGENT_LOG_NAME / TP_GOAL_NOTE_NAME against an
+# entrypoint that read only the TASKPUMP_ spelling of those three, so they were
+# silently inert. A partial rule is worse than no rule.
+rep_tp=$(report "$(run_ep TASKPUMP_ENTRYPOINT_TEST_MODE=plan \
+  TP_WORKSPACE="$R2/wt" TP_REPO_ROOT="$R2" TP_BRIEF="$R2/brief.md" \
+  TP_TASKS_DIR="$R2/tasks" TP_SAFETY_TURNS=9 TP_CONTAINER_USER=agent \
+  TP_WORKSPACE_TASK_CLI=bin/tp)")
+grep -q "^tasks_dir=$R2/tasks$" <<<"$rep_tp"   && pass "TP_TASKS_DIR resolves"   || fail "TP_TASKS_DIR inert:\n$rep_tp"
+grep -q '^safety_turns=9$' <<<"$rep_tp"        && pass "TP_SAFETY_TURNS resolves" || fail "TP_SAFETY_TURNS inert:\n$rep_tp"
+grep -q '^container_user=agent$' <<<"$rep_tp"  && pass "TP_CONTAINER_USER resolves" || fail "TP_CONTAINER_USER inert:\n$rep_tp"
+grep -q "^task_cli=$R2/wt/bin/tp$" <<<"$rep_tp" && pass "TP_WORKSPACE_TASK_CLI resolves" || fail "TP_WORKSPACE_TASK_CLI inert:\n$rep_tp"
+# TP_AGENT_LOG_NAME / TP_GOAL_NOTE_NAME show up as the files that get written.
+R2b=$(mk_ws tpnames)
+out_tp=$(run_ep TASKPUMP_ENTRYPOINT_TEST_MODE=plan \
+  TP_WORKSPACE="$R2b/wt" TP_REPO_ROOT="$R2b" TP_BRIEF="$R2b/brief.md" \
+  TP_TASK_ID=F9.1 TP_TASKS_DIR="$R2b/tasks" \
+  TP_AGENT_LOG_NAME=.agent.log TP_GOAL_NOTE_NAME=.goal.md)
+[[ -f "$R2b/wt/.agent.log" ]] && pass "TP_AGENT_LOG_NAME renames the agent log" \
+  || fail "TP_AGENT_LOG_NAME inert (no $R2b/wt/.agent.log)"
+grep -q "prompt_parts=$R2b/wt/.goal.md " <<<"$(report "$out_tp")" \
+  && pass "TP_GOAL_NOTE_NAME renames the goal note" || fail "TP_GOAL_NOTE_NAME inert:\n$(report "$out_tp")"
+
+# ...and the runner must actually carry both spellings across into the container,
+# or resolving them in the entrypoint changes nothing in production.
+for name in TASKPUMP_TASKS_DIR TP_TASKS_DIR TASKPUMP_AGENT_LOG_NAME TP_AGENT_LOG_NAME \
+            TASKPUMP_GOAL_NOTE_NAME TP_GOAL_NOTE_NAME TASKPUMP_PRE_FLIGHT TP_PRE_FLIGHT; do
+  grep -qF "$name" <<<"$(grep -A30 '^DEFAULT_PASSTHROUGH=' "$RUNNER")" \
+    && pass "runner forwards $name when set" || fail "runner does not forward $name"
+done
+
 echo "--- stdin assembly ordering ---"
 R3=$(mk_ws ordering)
 printf 'resume preamble\n' >| "$R3/wt/.arachne-resume.md"
@@ -504,7 +542,23 @@ for probe in \
     || fail "launch line is missing '$probe'"
 done
 # The read-only primary must not have regressed to a blanket RW mount.
-if grep -qE -- "-v @R@:@R@( |$)" <<<"$got_norm"; then
+#
+# The terminator matters. `( |$)` is what distinguishes a blanket `-v X:X` from
+# the legitimate `-v X:X:ro`; a laxer terminator such as `[^:]` reads the `:` of
+# `:ro` as the "something other than a colon" it is looking for and condemns
+# correct code. So the predicate gets a positive control before it is trusted:
+# a guard that has never been shown to go red is not a guard, it is a comment.
+BLANKET_RE="-v @R@:@R@( |$)"
+grep -qE -- "$BLANKET_RE" <<<"-v @R@:@R@ -v @R@/.git:@R@/.git -w @R@ img /e.sh" \
+  && pass "control: the blanket-mount predicate fires on a mid-line blanket mount" \
+  || fail "control: the blanket-mount predicate MISSED a real blanket mount — the guard is inert"
+grep -qE -- "$BLANKET_RE" <<<"-v @R@/.git:@R@/.git -v @R@:@R@" \
+  && pass "control: it also fires when the blanket mount ends the line" \
+  || fail "control: the predicate misses a line-terminal blanket mount"
+grep -qE -- "$BLANKET_RE" <<<"-v @R@:@R@:ro -v @R@/.git:@R@/.git" \
+  && fail "control: the predicate condemns the correct :ro mount (terminator too lax)" \
+  || pass "control: it does not fire on the correct :ro mount"
+if grep -qE -- "$BLANKET_RE" <<<"$got_norm"; then
   fail "blanket RW primary mount re-introduced (the read-only mount regressed)"
 else
   pass "no blanket RW primary mount"
@@ -607,9 +661,16 @@ want='{{DEPENDS_ON}} {{PHASE}}'
   || fail "brief placeholder set drifted.\n  want: $want\n  got:  $got"
 
 got=$(placeholders_in "$RESUME_T")
-want='{{BRANCH}} {{BUILD_GATE}} {{COMMITS}} {{DIFF_STAT}} {{PHASE}} {{STATUS_SHORT}} {{TASK_CLI}} {{TASK_FILE}} {{TASK_ID}}'
+want='{{BRANCH}} {{COMMITS}} {{DIFF_STAT}} {{PHASE}} {{STATUS_SHORT}} {{TASK_CLI}} {{TASK_FILE}} {{TASK_ID}} {{VERIFY_CMDS}}'
 [[ "$got" == "$want" ]] && pass "resume template uses exactly the documented placeholder set" \
   || fail "resume placeholder set drifted.\n  want: $want\n  got:  $got"
+# BUILD_GATE means the merge queue's gate (TASKPUMP_BUILD_GATE). Reusing the name
+# for the per-task verify commands would give one tool two meanings for it.
+if grep -q '{{BUILD_GATE}}' "$RESUME_T" "$BRIEF_T"; then
+  fail "a template uses {{BUILD_GATE}}, which collides with TASKPUMP_BUILD_GATE — use {{VERIFY_CMDS}}"
+else
+  pass "no template reuses {{BUILD_GATE}} for the per-task verify commands"
+fi
 
 # Every placeholder must be documented, and every documented one must be used.
 for ph in $(placeholders_in "$BRIEF_T") $(placeholders_in "$RESUME_T"); do

@@ -51,7 +51,13 @@ the inserted lines.
 | `{{COMMITS}}` | block | `git log --oneline <base>..<branch>` — what the dead session already landed. |
 | `{{STATUS_SHORT}}` | block | `git status --short`. |
 | `{{DIFF_STAT}}` | block | `git diff --stat`. |
-| `{{BUILD_GATE}}` | block | The project's format/lint/test gate, as commands. |
+| `{{VERIFY_CMDS}}` | block | The project's format/lint/test commands, which must be clean before a task can be completed. |
+
+`{{VERIFY_CMDS}}` is deliberately **not** called `BUILD_GATE`. `TASKPUMP_BUILD_GATE`
+already means something else — the merge queue's gate, which decides whether a
+branch may join the integration trunk. These are the per-task commands an agent
+runs before `complete`. One tool with two meanings for "build gate" would
+eventually cost someone an afternoon.
 
 A template must leave **no unsubstituted `{{...}}`** after rendering. That is
 asserted by the test suite: an unknown placeholder reaches the agent as literal

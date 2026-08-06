@@ -40,10 +40,10 @@ three endings. **All three release the tasks blocked behind this one; leaving it
 claimed and unfinished does not** — that is what stalled the pump.
 
 1. **Finish it.** `{{TASK_CLI}} complete {{TASK_ID}} --commits <shas>`, once the
-   project's gates are clean:
+   project's verification commands are clean:
 
    ```
-   {{BUILD_GATE}}
+   {{VERIFY_CMDS}}
    ```
 
 2. **Split it.** If part of the work is genuinely done and the remainder needs

@@ -50,7 +50,7 @@ spelling. `lib/config.sh` promotes `TASKPUMP_X` to `ARACHNE_X`, so a key set in
 | `TP_MEMORY_MAX` | `AGENT_MEMORY_MAX` | `3g` | `--memory`. |
 | `TP_MEMORY_SWAP` | `AGENT_MEMORY_SWAP` | `5g` | `--memory-swap`. |
 | `TP_CONTAINER_RUN_USER` | — | *(unset)* | Emits `--user` when set. See *Why root*. |
-| `TP_ENV_PASSTHROUGH` | — | *(a list)* | Names of extra variables to forward **when set**. |
+| `TP_ENV_PASSTHROUGH` | — | *(a list)* | Names of extra variables to forward **when set**. Both spellings of every key are in the default list — forwarding only one would leave the other silently inert in a caller's hands. |
 | `GITHUB_TOKEN` | — | *(empty)* | Forwarded for ledger fetch and `gh`. |
 | `DOCKER` | — | `docker` | Container binary override. Test seam. |
 
