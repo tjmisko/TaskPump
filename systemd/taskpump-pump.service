@@ -31,7 +31,7 @@ Environment=ARACHNE_PUMP_JOBS=4
 Environment=ARACHNE_PUMP_CEILING=95
 # ─────────────────────────────────────────────────────────────────────────────
 WorkingDirectory=%h/Projects/Arachne
-ExecStart=/usr/bin/env bash -lc '"$ARACHNE_REPO/scripts/arachne-pump" --phases "$ARACHNE_PUMP_PHASES" --jobs "$ARACHNE_PUMP_JOBS" --usage-ceiling "$ARACHNE_PUMP_CEILING"'
+ExecStart=/usr/bin/env bash -lc '"$ARACHNE_REPO/libexec/tp-pump" --phases "$ARACHNE_PUMP_PHASES" --jobs "$ARACHNE_PUMP_JOBS" --usage-ceiling "$ARACHNE_PUMP_CEILING"'
 # A drained pump exits 0 (success) and should NOT be restarted; only restart on
 # an actual crash. The pump never kills running agents, so a restart re-derives
 # in-flight work from task files + docker ps (design D3/E2) without disruption.

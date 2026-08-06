@@ -36,6 +36,12 @@
 #       disagree about which claim is live.
 set -euo pipefail
 
+# ── TaskPump config core ──────────────────────────────────────────────────────
+_tp_self_root="$(CDPATH= cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+# shellcheck source=../lib/config.sh
+. "$_tp_self_root/lib/config.sh"
+tp_load_config
+
 REPO_ROOT="${ARACHNE_DAG_REPO_ROOT:-$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)}"
 TASKS_DIR="${ARACHNE_TASKS_DIR:-$REPO_ROOT/ops/task-loop/tasks}"
 PUMP_STATE="${ARACHNE_PUMP_STATE_FILE:-$REPO_ROOT/.arachne-pump.state}"
@@ -85,4 +91,4 @@ files=("$TASKS_DIR"/*.md)
 gawk -v phases="$PHASES" -v running="$RUNNING" -v livebranches="$LIVEBRANCHES" \
      -v color="$COLOR" -v compact="$COMPACT" -v panx="$PANX" \
      -v cursor="$CURSOR" -v indexfile="$INDEXFILE" -v cols="$COLS" -v mode="$MODE" \
-     -f "$(dirname "$0")/arachne-dag-layout.awk" "${files[@]}"
+     -f "$TP_LIB_DIR/dag-layout.awk" "${files[@]}"

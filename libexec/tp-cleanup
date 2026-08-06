@@ -34,6 +34,12 @@
 #                           primary even under --include-primary)
 set -uo pipefail
 
+# ── TaskPump config core ──────────────────────────────────────────────────────
+_tp_self_root="$(CDPATH= cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+# shellcheck source=../lib/config.sh
+. "$_tp_self_root/lib/config.sh"
+tp_load_config
+
 # REPO_ROOT is normally the parent of this script's dir; overridable so the
 # target-reclaim sweep can be unit-tested against a fixture tree.
 _default_repo_root="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
@@ -171,7 +177,7 @@ do_stuck() {
         # 3) release the task claim, if known
         local task; task="$(manifest_task_for "$cname" || true)"
         if [[ -n "$task" ]]; then
-            act "'$REPO_ROOT/scripts/arachne-task' release '$task' --reason 'arachne-cleanup: stuck (log idle ${age}min)'"
+            act "'$TP_LIBEXEC_DIR/tp-task' release '$task' --reason 'arachne-cleanup: stuck (log idle ${age}min)'"
         else
             log "  $cname: no manifest task mapping; skipping arachne-task release"
         fi

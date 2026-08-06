@@ -71,6 +71,12 @@
 #                                  so a Hyprland windowrule can float/place it
 set -euo pipefail
 
+# ── TaskPump config core ──────────────────────────────────────────────────────
+_tp_self_root="$(CDPATH= cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+# shellcheck source=../lib/config.sh
+. "$_tp_self_root/lib/config.sh"
+tp_load_config
+
 # REPO_ROOT is the checkout whose .worktrees/ hold the agent workspaces — i.e.
 # the PRIMARY checkout. The override lets a worktree copy of this script report
 # on the primary's sessions instead of looking for a nested .worktrees/.
@@ -100,7 +106,7 @@ DECODE_KEYS=""                                # --decode-keys N: key-decoder pro
 SHOW_HELP=0                                   # --show-help: print the key panel, exit
 # Resolved next to this script, NOT under REPO_ROOT: the two differ whenever
 # ARACHNE_MONITOR_REPO_ROOT points a worktree copy at the primary checkout.
-DAG_BIN="${ARACHNE_DAG_BIN:-$(CDPATH= cd -- "$(dirname "$0")" && pwd)/arachne-dag-render}"
+DAG_BIN="${ARACHNE_DAG_BIN:-$TP_LIBEXEC_DIR/tp-dag-render}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --watch)        WATCH=1 ;;
@@ -360,8 +366,8 @@ cache_age() {  # $1 cache -> seconds since mtime, or empty if absent
     printf '%d' "$(( $(date +%s) - $(stat -c %Y "$1" 2>/dev/null || echo 0) ))"
 }
 
-USAGE_BIN="${ARACHNE_USAGE:-$REPO_ROOT/scripts/arachne-usage}"
-TASK_BIN="${ARACHNE_TASK:-$REPO_ROOT/scripts/arachne-task}"
+USAGE_BIN="${ARACHNE_USAGE:-$TP_GATES_DIR/claude-usage}"
+TASK_BIN="${ARACHNE_TASK:-$TP_LIBEXEC_DIR/tp-task}"
 
 # MAIN_ROOT is the PRIMARY checkout (where .worktrees/ lives), resolved from git
 # so caches/keys are correct even when the monitor runs from inside a worktree.

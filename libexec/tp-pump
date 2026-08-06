@@ -74,10 +74,16 @@
 #                   launched containers (same meaning as run-parallel.sh).
 set -euo pipefail
 
+# ── TaskPump config core ──────────────────────────────────────────────────────
+_tp_self_root="$(CDPATH= cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+# shellcheck source=../lib/config.sh
+. "$_tp_self_root/lib/config.sh"
+tp_load_config
+
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 REPO_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
-# shellcheck source=scripts/arachne-pump-lib.sh
-source "$SCRIPT_DIR/arachne-pump-lib.sh"
+# shellcheck source=../lib/pump-lib.sh
+source "$TP_LIB_DIR/pump-lib.sh"
 
 CLAUDE_DIR="$HOME/.claude"
 CLAUDE_JSON="$HOME/.claude.json"
@@ -86,10 +92,10 @@ OPS_DIR="${ARACHNE_PUMP_OPS_DIR:-$REPO_ROOT/ops}"
 # rendering can be unit-tested against a flat fixture dir.
 TASKS_DIR="${ARACHNE_PUMP_TASKS_DIR:-$OPS_DIR/task-loop/tasks}"
 
-ARACHNE_TASK="${ARACHNE_TASK:-$SCRIPT_DIR/arachne-task}"
-ARACHNE_USAGE="${ARACHNE_USAGE:-$SCRIPT_DIR/arachne-usage}"
-ARACHNE_DISK_WATCHDOG="${ARACHNE_DISK_WATCHDOG:-$SCRIPT_DIR/arachne-disk-watchdog}"
-MONITOR_BIN="${ARACHNE_MONITOR_BIN:-$SCRIPT_DIR/arachne-monitor}"
+ARACHNE_TASK="${ARACHNE_TASK:-$TP_LIBEXEC_DIR/tp-task}"
+ARACHNE_USAGE="${ARACHNE_USAGE:-$TP_GATES_DIR/claude-usage}"
+ARACHNE_DISK_WATCHDOG="${ARACHNE_DISK_WATCHDOG:-$TP_LIBEXEC_DIR/tp-disk-watchdog}"
+MONITOR_BIN="${ARACHNE_MONITOR_BIN:-$TP_LIBEXEC_DIR/tp-monitor}"
 DOCKER="${DOCKER:-docker}"
 ARACHNE_PHASE_BRIEF_TEMPLATE="${ARACHNE_PHASE_BRIEF_TEMPLATE:-$OPS_DIR/task-loop/briefs/_phase-drain-template.md}"
 # Worktrees base — overridable so the reclaim sweep / launcher can be unit-tested

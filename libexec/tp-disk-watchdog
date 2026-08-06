@@ -35,6 +35,12 @@
 #   PANIC_RECLAIM_TARGETS-- on PANIC, cargo clean worktree+primary target/ before docker prune (default 1)
 set -uo pipefail
 
+# ── TaskPump config core ──────────────────────────────────────────────────────
+_tp_self_root="$(CDPATH= cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+# shellcheck source=../lib/config.sh
+. "$_tp_self_root/lib/config.sh"
+tp_load_config
+
 # REPO_ROOT is the parent of this script's dir; overridable so the panic-reclaim
 # path can be unit-tested against a fixture tree with a stub arachne-cleanup.
 _default_repo_root="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
@@ -129,7 +135,7 @@ set_cap() {
 #    logged no-op, never an error.
 reclaim_targets() {
     [[ "${PANIC_RECLAIM_TARGETS:-1}" -eq 1 ]] || return 0
-    local cleanup="$REPO_ROOT/scripts/arachne-cleanup"
+    local cleanup="$TP_LIBEXEC_DIR/tp-cleanup"
     if [[ ! -x "$cleanup" ]]; then
         log "  arachne-cleanup not found/executable at $cleanup — skipping target reclaim"
         return 0
@@ -146,7 +152,7 @@ docker_panic() {
         log "  (dry-run) would run arachne-cleanup --docker"
         return 0
     fi
-    "$REPO_ROOT/scripts/arachne-cleanup" --docker 2>&1 | sed 's/^/    cleanup: /'
+    "$TP_LIBEXEC_DIR/tp-cleanup" --docker 2>&1 | sed 's/^/    cleanup: /'
 }
 
 # ── pressure state machine.

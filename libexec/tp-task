@@ -19,6 +19,14 @@
 
 set -euo pipefail
 
+# ── TaskPump config core ──────────────────────────────────────────────────────
+# Loaded before any default below, so a taskpump.conf key reaches the `: "${X:=}"`
+# defaults through the legacy-alias promotion in lib/config.sh.
+_tp_self_root="$(CDPATH= cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+# shellcheck source=../lib/config.sh
+. "$_tp_self_root/lib/config.sh"
+tp_load_config
+
 # ── Config ────────────────────────────────────────────────────────────────────
 # Resolve the workspace whose ledger we operate on. Env vars still override.
 #
