@@ -587,6 +587,64 @@ out=$(run_runner stop DOCKER="$FAKE_GONE" TP_CONTAINER_NAME=ghost); rc=$?
 out=$(run_runner bogus DOCKER=/bin/echo); rc=$?
 [[ $rc -eq 2 ]] && pass "an unknown verb exits 2 (bad usage)" || fail "unknown verb rc=$rc (expected 2)"
 
+# ── Shipped prompt templates ───────────────────────────────────────────────────
+# The pump refuses to start without a brief template, so the shipped defaults are
+# what keeps a fresh consumer from being dead on arrival. Two things must hold:
+# they render with no placeholder left behind, and they stay generic — the moment
+# one names a build system, the next consumer inherits a lie.
+echo "--- shipped templates ---"
+BRIEF_T="$TP_ROOT/templates/phase-drain-brief.md"
+RESUME_T="$TP_ROOT/templates/resume-note.md"
+[[ -f "$BRIEF_T" ]]  && pass "templates/phase-drain-brief.md ships"  || fail "no templates/phase-drain-brief.md"
+[[ -f "$RESUME_T" ]] && pass "templates/resume-note.md ships"        || fail "no templates/resume-note.md"
+
+# placeholders_in <file> — the distinct {{NAME}} tokens a template uses.
+placeholders_in() { grep -oE '\{\{[A-Z_]+\}\}' "$1" | sort -u | tr '\n' ' ' | sed 's/ $//'; }
+
+got=$(placeholders_in "$BRIEF_T")
+want='{{DEPENDS_ON}} {{PHASE}}'
+[[ "$got" == "$want" ]] && pass "brief template uses exactly the placeholders the pump substitutes" \
+  || fail "brief placeholder set drifted.\n  want: $want\n  got:  $got"
+
+got=$(placeholders_in "$RESUME_T")
+want='{{BRANCH}} {{BUILD_GATE}} {{COMMITS}} {{DIFF_STAT}} {{PHASE}} {{STATUS_SHORT}} {{TASK_CLI}} {{TASK_FILE}} {{TASK_ID}}'
+[[ "$got" == "$want" ]] && pass "resume template uses exactly the documented placeholder set" \
+  || fail "resume placeholder set drifted.\n  want: $want\n  got:  $got"
+
+# Every placeholder must be documented, and every documented one must be used.
+for ph in $(placeholders_in "$BRIEF_T") $(placeholders_in "$RESUME_T"); do
+  grep -qF "\`$ph\`" "$TP_ROOT/templates/README.md" \
+    || fail "$ph is used by a template but not documented in templates/README.md"
+done
+pass "every template placeholder is documented in templates/README.md"
+
+# Render the brief with the pump's own algorithm (sed for the scalar, whole-line
+# replacement for the block) and assert nothing is left unsubstituted.
+DEPS_F="$WORK/deps.txt"
+printf 'Waits on F54.2 (another worktree).\nWaits on F56.1.\n' >| "$DEPS_F"
+RENDERED="$WORK/brief-rendered.md"
+sed 's/{{PHASE}}/F55/g' "$BRIEF_T" \
+  | awk -v df="$DEPS_F" 'index($0, "{{DEPENDS_ON}}") { while ((getline line < df) > 0) print line; close(df); next } {print}' \
+  >| "$RENDERED"
+if grep -q '{{' "$RENDERED"; then
+  fail "brief left unsubstituted placeholders: $(grep -o '{{[A-Z_]*}}' "$RENDERED" | sort -u | tr '\n' ' ')"
+else
+  pass "brief renders with no placeholder left behind"
+fi
+grep -q 'drain phase F55' "$RENDERED" && pass "brief substitutes {{PHASE}} in prose" || fail "{{PHASE}} not substituted"
+grep -q 'Waits on F56.1' "$RENDERED" && pass "brief expands {{DEPENDS_ON}} to the full block" \
+  || fail "{{DEPENDS_ON}} block not expanded"
+grep -q '{{DEPENDS_ON}}' "$RENDERED" && fail "the {{DEPENDS_ON}} line survived expansion" \
+  || pass "the {{DEPENDS_ON}} line is consumed by its block"
+
+# Genericness. A shipped default that names cargo, npm, or a consumer's repo
+# layout is a template only one project can use.
+for word in cargo clippy rustc npm vitest playwright pytest 'ops/planning' 'ops/task-loop' arachne Arachne; do
+  hits=$(grep -lF "$word" "$BRIEF_T" "$RESUME_T" 2>/dev/null)
+  [[ -n "$hits" ]] && fail "shipped template names '$word' (must stay tool-agnostic): $hits"
+done
+pass "shipped templates name no build tool, test runner, or consumer repo layout"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"
