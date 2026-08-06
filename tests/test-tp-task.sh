@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
-# test-arachne-task.sh — fixture-based tests for scripts/arachne-task.
+# test-tp-task.sh — fixture-based tests for libexec/tp-task.
 #
 # Creates a temp directory with fixture task files, runs CLI subcommands
 # against it, asserts expected state transitions.
 #
-# Run: ./scripts/test-arachne-task.sh
+# The fixtures deliberately drive the CLI through the LEGACY ARACHNE_* spellings
+# throughout, so this whole suite doubles as the compatibility guarantee: if
+# lib/config.sh ever stopped promoting a legacy name onto its canonical
+# TASKPUMP_* twin, these 177 assertions would be the ones to notice. The
+# canonical spellings, and the equivalence of the two, are covered in the
+# dual-invocation section near the end.
+#
+# Run: ./tests/test-tp-task.sh
 # Exit non-zero on any failure; prints a PASS/FAIL line per test.
 
 set -euo pipefail
@@ -14,6 +21,31 @@ set -euo pipefail
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 TP_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 CLI="$TP_ROOT/libexec/tp-task"
+
+# ── Environment hermeticity ──────────────────────────────────────────────────
+# Every config key tp-task reads, by suffix. Both spellings of each are cleared
+# from the environment before any fixture is set up, and TP_ENV_UNSET carries
+# the `env -u` arguments that re-establish that clean slate for a subshell.
+#
+# Clearing BOTH spellings is the load-bearing part. lib/config.sh promotes in
+# both directions and gives the canonical TASKPUMP_X precedence when the
+# environment carries both — so an operator with TASKPUMP_TASKS_DIR exported
+# would silently outrank every ARACHNE_TASKS_DIR this suite sets, and the tests
+# would run against their real ledger. For the same reason `env -u ARACHNE_X`
+# alone cannot isolate the default-resolution cases below: the canonical twin
+# has to go too, or it simply takes over from the name that was unset.
+TP_CONFIG_SUFFIXES=(
+  TASKS_DIR TASK_OUT CODE_REPO TASK_PUSH PUSH TASK_NOCOMMIT TASK_DEBUG
+  LEDGER_PROBE COMMITTER_NAME COMMITTER_EMAIL ID_PATTERN PHASE_SIGIL
+  TURN_BUDGET_DEFAULT FAILURE_LIMIT CLAIM_STALE_HOURS LOCK_WAIT PUSH_RETRIES
+  PROG_NAME CONFIG
+)
+TP_ENV_UNSET=()
+for _suffix in "${TP_CONFIG_SUFFIXES[@]}"; do
+  TP_ENV_UNSET+=(-u "ARACHNE_$_suffix" -u "TASKPUMP_$_suffix")
+  unset "ARACHNE_$_suffix" "TASKPUMP_$_suffix" 2>/dev/null || true
+done
+unset _suffix
 
 PASS=0
 FAIL=0
@@ -739,8 +771,11 @@ fi
 # silently drift apart. These cases run the CLI with no ARACHNE_TASKS_DIR set,
 # so they exercise the default-resolution path the rest of the suite overrides.
 resolution_root_of() {
-  # Print the tasks dir the CLI resolves when run from $1, with no env override.
-  ( cd "$1" && env -u ARACHNE_TASKS_DIR -u ARACHNE_TASK_OUT -u ARACHNE_CODE_REPO \
+  # Print the tasks dir the CLI resolves when run from $1, with no config of any
+  # kind in the environment — TP_ENV_UNSET clears both spellings of every key,
+  # which is what makes this the default-resolution path rather than a test of
+  # whichever spelling happened to survive.
+  ( cd "$1" && env "${TP_ENV_UNSET[@]}" \
       ARACHNE_TASK_NOCOMMIT=1 "$2" resolve --tasks-dir 2>/dev/null )
 }
 
@@ -804,6 +839,31 @@ if [[ "$got" == "$TASKS" ]]; then
   pass "ARACHNE_TASKS_DIR overrides workspace resolution"
 else
   fail "env override resolved to '$got', expected '$TASKS'"
+fi
+
+# The same rule, driven by a non-default TASKPUMP_LEDGER_PROBE. A workspace that
+# keeps its ledger somewhere other than ops/task-loop/tasks must be recognised as
+# carrying one — otherwise generalizing the probe would quietly reintroduce the
+# wrong-ledger bug for every consumer that is not shaped like Arachne.
+WS_C="$TMPDIR_TEST/ws-c"
+mkdir -p "$WS_C/tasks"
+git -C "$WS_C" init -q
+got=$( cd "$WS_C" && env "${TP_ENV_UNSET[@]}" TASKPUMP_LEDGER_PROBE=tasks \
+        ARACHNE_TASK_NOCOMMIT=1 "$WS_A/libexec/tp-task" resolve --tasks-dir )
+if [[ "$got" == "$WS_C/tasks" ]]; then
+  pass "a custom ledger probe resolves to the caller's workspace"
+else
+  fail "custom-probe resolution got '$got', expected '$WS_C/tasks'"
+fi
+
+# And the negative: with the default probe, that same workspace does NOT look
+# like it carries a ledger, so resolution falls back to the script's workspace.
+# This is what proves the probe is doing the deciding.
+got=$(resolution_root_of "$WS_C" "$WS_A/libexec/tp-task")
+if [[ "$got" == "$WS_A/ops/task-loop/tasks" ]]; then
+  pass "the default probe does not match a differently-shaped workspace"
+else
+  fail "default-probe fallback got '$got', expected '$WS_A/ops/task-loop/tasks'"
 fi
 
 # ── title / blockers / create verbs ──────────────────────────────────────────
@@ -1167,6 +1227,132 @@ sed -i 's/^consecutive_failed_iterations: 0/consecutive_failed_iterations: 3/' "
 make_task "$TASKS" F93.5 F93 open "Already open"
 "$CLI" reopen F93.5 --reason "nope" >/dev/null 2>&1 \
   && fail "reopen accepted an already-open task" || pass "reopen still refuses an open task"
+
+# ── Test 26: dual-invocation equivalence ─────────────────────────────────────
+# The same operation, configured three ways — a legacy ARACHNE_* export, the
+# canonical TASKPUMP_* export, and a taskpump.conf discovered by walking up from
+# $PWD — must leave byte-identical ledger state. Without this, "the legacy
+# spellings still work" is an assertion about lib/config.sh's internals rather
+# than about what a consumer actually observes, and the two could drift apart
+# key by key as tools migrate.
+echo
+echo "--- Test 26: dual-invocation equivalence ---"
+
+# A deterministic projection of a ledger: every field a mutation is supposed to
+# touch, excluding the wall-clock stamps, which differ between two runs a
+# millisecond apart and would drown the signal.
+ledger_fingerprint() {
+  local dir=$1 f
+  for f in "$dir"/*.md; do
+    [[ -e "$f" ]] || continue
+    printf '%s ' "$(basename "$f")"
+    yq --front-matter=extract -o=json -I=0 \
+      '[.id, .status, .claimed_by, .turn_budget_remaining,
+        .consecutive_failed_iterations, .blockers, .completed_by_commits,
+        .goal, .title, .phase, .files, .milestone]' "$f"
+  done | sort
+}
+
+# The operation under test: file two tasks, wire one behind the other, then
+# claim and complete the blocker. Touches create/blockers/claim/complete, so a
+# spelling that failed to arrive would change the outcome rather than merely the
+# path taken to it.
+seed_ledger() {
+  local runner=$1
+  $runner create F80.1 --title "Blocker task" --goal "Unblock F80.2." >/dev/null
+  $runner create F80.2 --title "Dependent task" --blockers "F80.1" >/dev/null
+  $runner claim F80.1 --branch feat/dual --turns 9 >/dev/null
+  $runner complete F80.1 --commits "abc1234,def5678" >/dev/null </dev/null
+}
+
+DUAL_LEGACY="$TMPDIR_TEST/dual-legacy/tasks"
+DUAL_CANON="$TMPDIR_TEST/dual-canon/tasks"
+DUAL_CONF_WS="$TMPDIR_TEST/dual-conf"
+DUAL_CONF="$DUAL_CONF_WS/tasks"
+mkdir -p "$DUAL_LEGACY" "$DUAL_CANON" "$DUAL_CONF"
+git -C "$DUAL_CONF_WS" init -q
+
+# 1. legacy spelling
+legacy_cli() { env "${TP_ENV_UNSET[@]}" \
+  ARACHNE_TASKS_DIR="$DUAL_LEGACY" ARACHNE_TASK_NOCOMMIT=1 "$CLI" "$@"; }
+seed_ledger legacy_cli
+
+# 2. canonical spelling
+canon_cli() { env "${TP_ENV_UNSET[@]}" \
+  TASKPUMP_TASKS_DIR="$DUAL_CANON" TASKPUMP_TASK_NOCOMMIT=1 "$CLI" "$@"; }
+seed_ledger canon_cli
+
+# 3. taskpump.conf, discovered from $PWD. Nothing about the ledger is in the
+# environment for this one — the config file is the only thing pointing at it.
+cat >| "$DUAL_CONF_WS/taskpump.conf" <<CONF
+TASKPUMP_TASKS_DIR=$DUAL_CONF
+TASKPUMP_TASK_NOCOMMIT=1
+CONF
+conf_cli() { ( cd "$DUAL_CONF_WS" && env "${TP_ENV_UNSET[@]}" "$CLI" "$@" ); }
+seed_ledger conf_cli
+
+fp_legacy=$(ledger_fingerprint "$DUAL_LEGACY")
+fp_canon=$(ledger_fingerprint "$DUAL_CANON")
+fp_conf=$(ledger_fingerprint "$DUAL_CONF")
+
+[[ -n "$fp_legacy" ]] && pass "dual-invocation fixture produced a non-empty ledger" \
+  || fail "dual-invocation fixture produced nothing to compare"
+
+if [[ "$fp_legacy" == "$fp_canon" ]]; then
+  pass "TASKPUMP_TASKS_DIR produces the same ledger as ARACHNE_TASKS_DIR"
+else
+  fail "canonical vs legacy diverged:
+--- legacy ---
+$fp_legacy
+--- canonical ---
+$fp_canon"
+fi
+
+if [[ "$fp_legacy" == "$fp_conf" ]]; then
+  pass "taskpump.conf produces the same ledger as an env export"
+else
+  fail "conf vs legacy diverged:
+--- legacy ---
+$fp_legacy
+--- conf ---
+$fp_conf"
+fi
+
+# Precedence: both spellings in the environment ⇒ the canonical one wins. Two
+# equally-strong sources, and the current name is authoritative. Asserted
+# materially (which directory the task lands in), not just via `resolve`, so it
+# covers the whole config path and not only the reporting verb.
+PREC_LEGACY="$TMPDIR_TEST/prec-legacy/tasks"
+PREC_CANON="$TMPDIR_TEST/prec-canon/tasks"
+mkdir -p "$PREC_LEGACY" "$PREC_CANON"
+
+got=$(env "${TP_ENV_UNSET[@]}" \
+  ARACHNE_TASKS_DIR="$PREC_LEGACY" TASKPUMP_TASKS_DIR="$PREC_CANON" \
+  ARACHNE_TASK_NOCOMMIT=1 "$CLI" resolve --tasks-dir)
+[[ "$got" == "$PREC_CANON" ]] && pass "TASKPUMP_TASKS_DIR outranks ARACHNE_TASKS_DIR" \
+  || fail "precedence resolved to '$got', expected '$PREC_CANON'"
+
+env "${TP_ENV_UNSET[@]}" \
+  ARACHNE_TASKS_DIR="$PREC_LEGACY" TASKPUMP_TASKS_DIR="$PREC_CANON" \
+  ARACHNE_TASK_NOCOMMIT=1 "$CLI" create F81.1 --title "Precedence" >/dev/null
+[[ -f "$PREC_CANON/F81.1.md" && ! -f "$PREC_LEGACY/F81.1.md" ]] \
+  && pass "the write lands in the canonical dir, not the legacy one" \
+  || fail "precedence write went to the wrong ledger"
+
+# An env export must still outrank a config file, in either spelling — otherwise
+# a stale taskpump.conf in a parent directory would silently capture a caller who
+# was explicit about where the ledger is.
+ENV_OVER_CONF="$TMPDIR_TEST/env-over-conf/tasks"
+mkdir -p "$ENV_OVER_CONF"
+got=$( cd "$DUAL_CONF_WS" && env "${TP_ENV_UNSET[@]}" \
+        ARACHNE_TASKS_DIR="$ENV_OVER_CONF" "$CLI" resolve --tasks-dir )
+[[ "$got" == "$ENV_OVER_CONF" ]] && pass "a legacy env export outranks taskpump.conf" \
+  || fail "env-over-conf resolved to '$got', expected '$ENV_OVER_CONF'"
+
+got=$( cd "$DUAL_CONF_WS" && env "${TP_ENV_UNSET[@]}" \
+        TASKPUMP_TASKS_DIR="$ENV_OVER_CONF" "$CLI" resolve --tasks-dir )
+[[ "$got" == "$ENV_OVER_CONF" ]] && pass "a canonical env export outranks taskpump.conf" \
+  || fail "env-over-conf resolved to '$got', expected '$ENV_OVER_CONF'"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo
