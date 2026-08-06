@@ -1,7 +1,0 @@
-{
-  "id": "T2.1",
-  "file": "tasks/T2.1.md",
-  "branch": "feat/t2",
-  "goal": "The daemon reads its settings from a file on disk instead of compiled-in defaults.",
-  "ready": true
-}
