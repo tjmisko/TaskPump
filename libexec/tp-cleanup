@@ -39,14 +39,20 @@ _tp_self_root="$(CDPATH= cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/
 # shellcheck source=../lib/config.sh
 . "$_tp_self_root/lib/config.sh"
 tp_load_config
+# shellcheck source=../lib/pump-lib.sh
+. "$TP_LIB_DIR/pump-lib.sh"
 
 # REPO_ROOT is normally the parent of this script's dir; overridable so the
 # target-reclaim sweep can be unit-tested against a fixture tree.
 _default_repo_root="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
-REPO_ROOT="${ARACHNE_CLEANUP_REPO_ROOT:-$_default_repo_root}"
-MANIFEST="${MANIFEST:-$REPO_ROOT/ops/task-loop/parallel-manifest.tsv}"
-STUCK_THRESHOLD_MIN="${STUCK_THRESHOLD_MIN:-15}"
-DOCKER_GRACE_SEC="${DOCKER_GRACE_SEC:-30}"
+REPO_ROOT="${TASKPUMP_CLEANUP_REPO_ROOT:-$_default_repo_root}"
+# Shared with the pump: cleanup used to hardcode `.worktrees` while the pump had
+# it behind a knob, so a relocated worktrees base broke the rescue path only.
+WORKTREES_DIR="${TASKPUMP_WORKTREES_DIR:-$REPO_ROOT/.worktrees}"
+MANIFEST="${TASKPUMP_MANIFEST:-${MANIFEST:-$REPO_ROOT/ops/task-loop/parallel-manifest.tsv}}"
+STUCK_THRESHOLD_MIN="${TASKPUMP_STUCK_THRESHOLD_MIN:-${STUCK_THRESHOLD_MIN:-15}}"
+DOCKER_GRACE_SEC="${TASKPUMP_STOP_GRACE_SEC:-${DOCKER_GRACE_SEC:-30}}"
+AGENT_LOG_NAME="${TASKPUMP_AGENT_LOG_NAME:-.arachne-agent.log}"
 
 DRY_RUN=0
 MODE=""
@@ -54,7 +60,7 @@ MODE=""
 # target/ (Arachne itself), not just worktrees. Off by default so a human's
 # in-progress build in the primary checkout is never wiped without asking; the
 # disk watchdog turns it on under PANIC to buy maximum space.
-INCLUDE_PRIMARY="${RECLAIM_PRIMARY:-0}"
+INCLUDE_PRIMARY="${TASKPUMP_RECLAIM_PRIMARY:-${RECLAIM_PRIMARY:-0}}"
 
 usage() {
     cat <<EOF
@@ -106,35 +112,38 @@ act() {
 
 # ── manifest_task_for <container-name> -- echo the epic task id for a
 #    running container, or empty if no match. Compares each manifest branch
-#    transliterated to a slug ('/' → '-') against arachne-agent-<slug>.
+#    transliterated to a slug ('/' → '-') against <prefix><slug>.
 manifest_task_for() {
     local cname="$1"
     [[ -f "$MANIFEST" ]] || return 1
+    local prefix; prefix="$(apl_agent_prefix)"
     while IFS=$'\t' read -r name branch _brief task _rest; do
         [[ "$name" =~ ^# ]] && continue
         [[ -z "$name"   ]] && continue
         local slug="${branch//\//-}"
-        if [[ "arachne-agent-$slug" == "$cname" ]]; then
+        if [[ "$prefix$slug" == "$cname" ]]; then
             echo "$task"; return 0
         fi
     done < "$MANIFEST"
     return 1
 }
 
-# ── worktree_for_container <container-name> -- echo the .worktrees path.
+# ── worktree_for_container <container-name> -- echo the worktree path.
+#    KNOWN LIMITATION (deferred): the slug→branch mapping is lossy. It converts
+#    the FIRST '-' back into '/', which round-trips `feat/foo-bar` but not
+#    `feature-x/y`. Correct for the one-slash branch convention the pump
+#    generates; a branch with a '-' before its '/' would resolve to the wrong
+#    worktree. Fixing it needs the branch carried alongside the name rather than
+#    re-derived from it.
 worktree_for_container() {
     local cname="$1"
-    local slug="${cname#arachne-agent-}"
-    # Convert the FIRST '-' (after 'feat'/'ops'/etc) back into '/'. Our branch
-    # convention is exactly one '/' (e.g. feat/f44.8, ops/parallel-run).
+    local slug="${cname#"$(apl_agent_prefix)"}"
     local branch="${slug/-//}"
-    echo "$REPO_ROOT/.worktrees/$branch"
+    echo "$WORKTREES_DIR/$branch"
 }
 
-# ── list_agent_containers -- emit names of running arachne-agent-* containers.
-list_agent_containers() {
-    docker ps --format '{{.Names}}' 2>/dev/null | grep '^arachne-agent-' || true
-}
+# ── list_agent_containers -- emit names of running agent containers.
+list_agent_containers() { apl_live_agent_names; }
 
 # ── log_age_min <path> -- echo the age of <path> in minutes, or "?" if missing.
 log_age_min() {
@@ -155,7 +164,7 @@ do_stuck() {
     while IFS= read -r cname; do
         [[ -z "$cname" ]] && continue
         local wt; wt="$(worktree_for_container "$cname")"
-        local logf="$wt/.arachne-agent.log"
+        local logf="$wt/$AGENT_LOG_NAME"
         local age; age="$(log_age_min "$logf")"
         if [[ "$age" == "?" ]]; then
             log "  $cname: no log file at $logf (skip)"
@@ -173,7 +182,7 @@ do_stuck() {
             act "git -C '$wt' -c user.name=arachne-cleanup -c user.email=cleanup@arachne.local commit -m 'wip: arachne-cleanup pre-stop snapshot' --allow-empty"
         fi
         # 2) stop the container
-        act "docker stop --time=$DOCKER_GRACE_SEC '$cname'"
+        act "$(apl_docker) stop --time=$DOCKER_GRACE_SEC '$cname'"
         # 3) release the task claim, if known
         local task; task="$(manifest_task_for "$cname" || true)"
         if [[ -n "$task" ]]; then
@@ -227,7 +236,7 @@ do_targets() {
     local busy; busy="$(busy_worktrees)"
     local found=0 skipped=0
     local wt
-    for wt in "$REPO_ROOT"/.worktrees/*/*; do
+    for wt in "$WORKTREES_DIR"/*/*; do
         [[ -d "$wt/target" ]] || continue
         if printf '%s\n' "$busy" | grep -Fxq "$wt"; then
             log "  skip: $wt/target — live agent container"
@@ -262,15 +271,16 @@ do_targets() {
 }
 
 # ── do_docker -- prune build cache + dangling containers/images. The
-#    `arachne` image itself is reused, not pruned.
+#    agent image itself is reused, not pruned.
 do_docker() {
     log "docker prune (build cache + system) (dry-run=$DRY_RUN)"
-    if ! command -v docker >/dev/null 2>&1; then
-        log "docker not on PATH; skipping."
+    local docker_bin; docker_bin="$(apl_docker)"
+    if ! command -v "$docker_bin" >/dev/null 2>&1; then
+        log "$docker_bin not on PATH; skipping."
         return
     fi
-    act "docker builder prune -af"
-    act "docker system prune -f"
+    act "$docker_bin builder prune -af"
+    act "$docker_bin system prune -f"
     log "docker prune complete."
 }
 
@@ -279,23 +289,24 @@ do_status() {
     log "arachne-cleanup --status (read-only)"
     echo
     echo "## Agent containers"
-    docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Size}}' 2>/dev/null | grep -E '^NAMES|^arachne-agent-' || echo "(none running)"
+    "$(apl_docker)" ps --format 'table {{.Names}}\t{{.Status}}\t{{.Size}}' 2>/dev/null \
+        | grep -E "^NAMES|^$(apl_agent_prefix)" || echo "(none running)"
     echo
     echo "## Log-stale heuristic (threshold=${STUCK_THRESHOLD_MIN}min)"
     local cname
     while IFS= read -r cname; do
         [[ -z "$cname" ]] && continue
         local wt; wt="$(worktree_for_container "$cname")"
-        local logf="$wt/.arachne-agent.log"
+        local logf="$wt/$AGENT_LOG_NAME"
         local age; age="$(log_age_min "$logf")"
         printf "  %-40s  log_age=%s min\n" "$cname" "$age"
     done < <(list_agent_containers)
     echo
     echo "## Worktree target/ sizes"
-    du -sh "$REPO_ROOT"/.worktrees/*/*/target 2>/dev/null | sort -h | tail -20 || echo "(none)"
+    du -sh "$WORKTREES_DIR"/*/*/target 2>/dev/null | sort -h | tail -20 || echo "(none)"
     echo
     echo "## Docker storage"
-    docker system df 2>/dev/null || echo "(docker not available)"
+    "$(apl_docker)" system df 2>/dev/null || echo "(container runtime not available)"
 }
 
 case "$MODE" in

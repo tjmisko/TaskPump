@@ -81,6 +81,9 @@ TPFIX="$FIX/taskpump"
 mkdir -p "$TPFIX/libexec" "$TPFIX/lib"
 cp "$WATCHDOG" "$TPFIX/libexec/tp-disk-watchdog"
 cp "$TP_ROOT/lib/config.sh" "$TPFIX/lib/config.sh"
+# pump-lib too: the watchdog now counts live agents and prints its help through
+# the shared helpers instead of carrying its own copies.
+cp "$TP_ROOT/lib/pump-lib.sh" "$TPFIX/lib/pump-lib.sh"
 cat > "$TPFIX/libexec/tp-cleanup" <<'EOF'
 #!/bin/bash
 echo "STUB-CLEANUP-CALLED args: $*"
