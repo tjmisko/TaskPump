@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# tp — TaskPump's single entry point.
+#
+# Every subcommand is a thin exec into the real tool under libexec/ or gates/,
+# so `tp task next` and `libexec/tp-task next` are the same program with the
+# same argv. TP_ROOT is resolved through this script's realpath, which means a
+# symlink on PATH (ln -s /opt/taskpump/bin/tp ~/.local/bin/tp) still finds its
+# own installation rather than the symlink's directory.
+set -euo pipefail
+
+TP_ROOT="$(CDPATH= cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+
+usage() {
+  cat <<EOF
+usage: tp <command> [args]
+
+Task ledger
+  task              read and write task state (next, claim, complete, ...)
+
+Running work
+  pump              the usage-governed DAG pump
+  monitor           live supervisor TUI (SESSIONS / GRAPH tabs)
+  dag-render        render the task DAG as a layered ASCII graph
+
+Housekeeping
+  cleanup           rescue stuck agents, reclaim disk, prune docker
+  agent-watchdog    run cleanup --stuck on an interval
+  disk-watchdog     pause launches when free disk runs low
+
+Gates
+  usage             Claude Max-plan usage probe (feed / pause decision)
+
+Utilities
+  stream-fmt        format stream-json agent logs into readable text
+
+  tp --version      print the TaskPump version
+  tp help           this message
+
+Run 'tp <command> --help' for a command's own options.
+EOF
+}
+
+[[ $# -eq 0 ]] && { usage; exit 0; }
+
+cmd=$1
+shift
+
+case "$cmd" in
+  task|pump|cleanup|monitor|dag-render|stream-fmt|agent-watchdog|disk-watchdog)
+    exec "$TP_ROOT/libexec/tp-$cmd" "$@"
+    ;;
+  usage)
+    exec "$TP_ROOT/gates/claude-usage" "$@"
+    ;;
+  --version|-V|version)
+    if [[ -f "$TP_ROOT/VERSION" ]]; then
+      cat "$TP_ROOT/VERSION"
+    else
+      printf 'tp: no VERSION file at %s\n' "$TP_ROOT/VERSION" >&2
+      exit 1
+    fi
+    ;;
+  help|--help|-h)
+    usage
+    ;;
+  *)
+    printf 'tp: unknown command: %s\n' "$cmd" >&2
+    printf "run 'tp help' for the list of commands\n" >&2
+    exit 2
+    ;;
+esac
