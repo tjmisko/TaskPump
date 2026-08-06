@@ -748,6 +748,27 @@ out=$(STUB_LIVE="tp-agent-feat-f56" pump F56)
 have "$out" 'LAUNCH +F56' && pass "a container under another prefix is not ours" \
   || fail "foreign container claimed as ours:\n$out"
 
+echo "--- Test 21: brief-template resolution — explicit, consumer, shipped ---"
+# The consumer's own template lives in its ledger. Absent an explicit override
+# it wins, which is how an existing project keeps rendering exactly what it did.
+RES="$TMP/resolve"; mkdir -p "$RES/ops/task-loop/briefs"
+printf 'consumer template for {{PHASE}}\n' >| "$RES/ops/task-loop/briefs/_phase-drain-template.md"
+out=$(ARACHNE_PUMP_OPS_DIR="$RES/ops" "$PUMP" --render-brief F55 2>&1)
+[[ "$out" == "consumer template for F55" ]] && pass "consumer's ops-side template is used when present" \
+  || fail "consumer template not chosen: '$out'"
+printf 'explicit template for {{PHASE}}\n' >| "$TMP/explicit.md"
+out=$(ARACHNE_PUMP_OPS_DIR="$RES/ops" TASKPUMP_BRIEF_TEMPLATE="$TMP/explicit.md" \
+      "$PUMP" --render-brief F55 2>&1)
+[[ "$out" == "explicit template for F55" ]] && pass "explicit config outranks the consumer template" \
+  || fail "explicit template not chosen: '$out'"
+# No consumer template at all used to be a hard die, which left a fresh project
+# unable to run until it wrote one. It now falls through to the shipped default.
+out=$(ARACHNE_PUMP_OPS_DIR="$TMP/no-such-ops" "$PUMP" --render-brief F55 2>&1)
+grep -qF 'F55' <<<"$out" && pass "a project with no template falls back to the shipped one" \
+  || fail "shipped fallback did not render:\n$out"
+grep -qiF 'not found' <<<"$out" && fail "still dying on a missing consumer template:\n$out" \
+  || pass "no hard die on a missing consumer template"
+
 echo "--- Test 22: TASKPUMP_STATE_DIR relocates the run's dotfiles ---"
 SD="$TMP/state-dir"; mkdir -p "$SD"
 mk F55.0 done; mk F55.1 done; mk F56.0 done; mk F57.0 done
@@ -766,6 +787,41 @@ TASKPUMP_NOTIFY_CMD=true TASKPUMP_PUMP_NO_LAUNCH=1 ARACHNE_PUMP_OPS_DIR="$TMP/no
 [[ -f "$TMP/named.state" ]] && pass "an explicit state filename outranks the state dir" \
   || fail "TASKPUMP_PUMP_STATE_FILE ignored"
 mk F55.0 open; mk F55.1 open F55.0; mk F56.0 open; mk F57.0 open F55.1
+
+echo "--- Test 23: templates carry the prose, and every project word is a key ---"
+# The shipped brief must not smuggle one project's vocabulary into another's.
+out=$(ARACHNE_PUMP_OPS_DIR="$TMP/no-such-ops" \
+      TASKPUMP_TASK_CLI="bin/tp task" \
+      TASKPUMP_VERIFY_CMDS=$'make lint\nmake test' \
+      TASKPUMP_PROJECT_BRIEF="Read HACKING.md first." \
+      "$PUMP" --render-brief F55 2>&1)
+grep -qF 'bin/tp task next' <<<"$out" && pass "TASKPUMP_TASK_CLI reaches the brief" \
+  || fail "task CLI not substituted:\n$out"
+grep -qF '`make lint` and `make test`' <<<"$out" && pass "verify commands render as an inline phrase" \
+  || fail "verify commands not joined:\n$out"
+grep -qF 'Read HACKING.md first.' <<<"$out" && pass "TASKPUMP_PROJECT_BRIEF reaches the brief" \
+  || fail "project brief not substituted:\n$out"
+grep -qiE 'cargo|arachne|CLAUDE\.md' <<<"$out" \
+  && fail "the shipped brief still names one project:\n$out" \
+  || pass "the shipped brief names no particular project"
+grep -qF '{{' <<<"$out" && fail "unsubstituted placeholder left in the brief:\n$out" \
+  || pass "no placeholder survives rendering"
+
+# Same for the resume note, which is what a stalled agent reads first.
+stall_fixture
+note=$(PATH="$BIN:$PATH" ARACHNE_PUMP_OPS_DIR="$TMP/noops" ARACHNE_POOL_CAP_FILE="$TMP/cap" \
+       ARACHNE_PUMP_STATE_FILE="$STATE19" ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+       TASKPUMP_TASK_CLI="bin/tp task" TASKPUMP_VERIFY_CMDS="make check" \
+       STUB_LIVE="" STUB_AHEAD=3 STUB_HEAD=aaaa111 \
+       "$PUMP" --no-health-gate --render-resume-note F97 2>/dev/null)
+grep -qF 'bin/tp task complete' <<<"$note" && pass "resume note uses the configured task CLI" \
+  || fail "resume note kept the default CLI:\n$note"
+grep -qF '`bin/tp task` next' <<<"$note" && fail "bare CLI name should be the basename:\n$note" \
+  || pass "prose uses the CLI basename, invocations use the full path"
+grep -qF '`make check` are clean' <<<"$note" && pass "resume note uses the configured verify commands" \
+  || fail "resume note kept cargo:\n$note"
+grep -qF '{{' <<<"$note" && fail "unsubstituted placeholder left in the resume note:\n$note" \
+  || pass "no placeholder survives the resume note"
 
 echo
 echo "=============================================="

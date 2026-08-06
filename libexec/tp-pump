@@ -126,6 +126,25 @@ ENTRYPOINT="${TASKPUMP_ENTRYPOINT:-/entrypoint-parallel.sh}"
 # against a fixture tree (single source for both launch_phase and reclaim).
 WORKTREES_DIR="${TASKPUMP_PUMP_WORKTREES_DIR:-${TASKPUMP_WORKTREES_DIR:-$REPO_ROOT/.worktrees}}"
 
+# What the templates say about this project. The defaults reproduce Arachne's
+# wording exactly, so a rendered brief or resume note is unchanged for it.
+#   TASKPUMP_TASK_CLI     how an agent invokes the ledger CLI from its worktree
+#   TASKPUMP_VERIFY_CMDS  newline-separated commands a task must leave green;
+#                         rendered mid-sentence as `a` and `b`
+#   TASKPUMP_PROJECT_BRIEF  one paragraph pointing an agent at the project's own
+#                         contributor documentation
+TASK_CLI="${TASKPUMP_TASK_CLI:-scripts/arachne-task}"
+TASK_CLI_NAME="$(basename "$TASK_CLI")"
+# Built outside the expansions: an apostrophe inside a ${x:-word} default is a
+# real quote to bash, and would swallow the rest of the file.
+_tp_default_verify=$'cargo fmt --all\ncargo clippy --workspace -- -D warnings'
+_tp_default_project_brief="Read the contributor documentation for this repository (CLAUDE.md, CONTRIBUTING.md, or equivalent) before writing code, then read the design note that phase {{PHASE}} is built against."
+VERIFY_CMDS="${TASKPUMP_VERIFY_CMDS:-$_tp_default_verify}"
+PROJECT_BRIEF="${TASKPUMP_PROJECT_BRIEF:-$_tp_default_project_brief}"
+# The resume note's own template; resolved like the brief but with no consumer
+# convention to honor, so it is simply the shipped one unless configured.
+RESUME_TEMPLATE="${TASKPUMP_RESUME_TEMPLATE:-$TP_ROOT/templates/resume-note.md}"
+
 # Where the run's dotfiles live. One knob moves them all out of the repo root;
 # each filename is still individually overridable.
 STATE_DIR="${TASKPUMP_STATE_DIR:-$REPO_ROOT}"
@@ -286,6 +305,15 @@ pump_expand_phases() {
       if [[ "$n" =~ ^[0-9]+$ ]]; then printf 'F%s\n' "$n"; else printf '%s\n' "${comp^^}"; fi
     fi
   done
+}
+
+# The tasks dir as an agent inside the worktree would name it. Absolute when the
+# ledger sits outside the code repo, which is also how an agent would reach it.
+tasks_dir_rel() {
+  case "$TASKS_DIR" in
+    "$REPO_ROOT"/*) printf '%s' "${TASKS_DIR#"$REPO_ROOT"/}" ;;
+    *)              printf '%s' "$TASKS_DIR" ;;
+  esac
 }
 
 phase_branch()    { printf '%s%s' "$BRANCH_PREFIX" "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"; }
@@ -603,11 +631,18 @@ render_brief_stream() {
   local phase="$1"
   local depfile; depfile="$(mktemp)"
   phase_dependencies "$phase" >| "$depfile"
-  sed "s/{{PHASE}}/$phase/g" "$BRIEF_TEMPLATE" \
-    | awk -v df="$depfile" '
-        index($0, "{{DEPENDS_ON}}") { while ((getline line < df) > 0) print line; close(df); next }
-        { print }
-      '
+  local -A TPL_VARS TPL_BLOCKS
+  TPL_VARS=(
+    [PHASE]="$phase"
+    [BASE]="$BASE_REF"
+    [TASK_CLI]="$TASK_CLI"
+    [TASK_CLI_NAME]="$TASK_CLI_NAME"
+    [TASK_DIR]="$(tasks_dir_rel)"
+    [VERIFY_CMDS]="$(apl_join_commands "$VERIFY_CMDS")"
+    [PROJECT_BRIEF]="${PROJECT_BRIEF//\{\{PHASE\}\}/$phase}"
+  )
+  TPL_BLOCKS=( [DEPENDS_ON]="$depfile" )
+  apl_render_template "$BRIEF_TEMPLATE"
   rm -f "$depfile" 2>/dev/null || true
 }
 
@@ -632,60 +667,37 @@ render_brief() {
 # The one thing run-parallel.sh's version cannot say is what a *dead* agent
 # already landed: it only reports uncommitted state. A resumed task's whole
 # context is its commits, so those lead here.
+#
+# The prose lives in templates/resume-note.md (TASKPUMP_RESUME_TEMPLATE). It was
+# ~55 lines of heredoc naming one project's CLI path, task-file layout, and
+# verification commands; this function now only gathers the git state the
+# template splices in.
 render_resume_note_stream() {
   local wt="$1" branch="$2" id="$3"
   local phase="${id%%.*}"
-  {
-    cat <<'EOF'
-# RESUME CONTEXT — read this before the kickoff brief below
-EOF
-    printf '\nYou are **resuming `%s`** on this worktree (`%s`). A previous agent\n' "$id" "$branch"
-    printf 'session claimed this task, committed real work, and then died without\n'
-    printf 'finishing it. Your job is to carry it to a conclusion.\n\n'
-    cat <<'EOF'
-## Do NOT start by running `arachne-task next`
-EOF
-    printf '\n`%s` is already claimed to this branch, so it is **invisible** to\n' "$id"
-    printf '`next` and `ready` — both surface only `status: open` tasks. Calling\n'
-    printf '`arachne-task next --phase %s` returns `null`, and reading that as\n' "$phase"
-    printf '"frontier drained" is precisely the stall that stranded this task.\n'
-    printf 'Read the task file directly instead:\n\n'
-    printf '```\ncat ops/task-loop/tasks/%s.md\n```\n\n' "$id"
-    printf '## Work already committed on this branch\n\n```\n'
-    git -C "$wt" log --oneline "$BASE_REF..$branch" 2>/dev/null | head -40 || true
-    printf '```\n\n## Uncommitted state (`git status --short`, then `git diff --stat`)\n\n```\n'
-    git -C "$wt" status --short 2>/dev/null | head -40 || true
-    printf '```\n\n```\n'
-    git -C "$wt" diff --stat 2>/dev/null | tail -20 || true
-    printf '```\n\n'
-    cat <<'EOF'
-## How to finish
+  local commits status_short diff_stat
+  commits="$(mktemp)"; status_short="$(mktemp)"; diff_stat="$(mktemp)"
+  git -C "$wt" log --oneline "$BASE_REF..$branch" 2>/dev/null | head -40 >| "$commits" || true
+  git -C "$wt" status --short 2>/dev/null | head -40 >| "$status_short" || true
+  git -C "$wt" diff --stat 2>/dev/null | tail -20 >| "$diff_stat" || true
 
-Re-read the task's Spec / Scope / Acceptance, work out what the commits above
-already satisfy, and do the rest. Then pick exactly one of these three endings.
-**All three release the tasks blocked behind this one; leaving it claimed and
-unfinished does not** — that is what stalled the pump.
-
-1. **Finish it.** `scripts/arachne-task complete <id> --commits <shas>`, once
-   `cargo fmt --all` and `cargo clippy --workspace -- -D warnings` are clean and
-   the affected crates' tests pass.
-2. **Split it.** If part of the work is genuinely done and the remainder needs
-   judgement, a decision, or scope you cannot settle alone: `complete` the
-   finished portion — stating precisely what you did and did NOT do in the
-   completion notes — and file the remainder as a new task with
-   `scripts/arachne-task create <phase>.<n> --title "..." --goal "..."`, setting
-   its `blockers` if it depends on anything. If only the production wiring is
-   outstanding, `complete --defer-wiring "..."` instead.
-3. **Block it.** If it truly cannot proceed:
-   `scripts/arachne-task block <id> --reason "..."`.
-
-Do not hand-edit task frontmatter; the CLI is its only writer. Commit early and
-often — another interruption must not lose your work.
-
----
-
-EOF
-  }
+  local -A TPL_VARS TPL_BLOCKS
+  TPL_VARS=(
+    [TASK_ID]="$id"
+    [PHASE]="$phase"
+    [BRANCH]="$branch"
+    [TASK_FILE]="$(tasks_dir_rel)/$id.md"
+    [TASK_CLI]="$TASK_CLI"
+    [TASK_CLI_NAME]="$TASK_CLI_NAME"
+    [VERIFY_CMDS]="$(apl_join_commands "$VERIFY_CMDS")"
+  )
+  TPL_BLOCKS=(
+    [COMMITS]="$commits"
+    [STATUS_SHORT]="$status_short"
+    [DIFF_STAT]="$diff_stat"
+  )
+  apl_render_template "$RESUME_TEMPLATE"
+  rm -f "$commits" "$status_short" "$diff_stat" 2>/dev/null || true
 }
 
 # write_resume_note <wt> <branch> <id> — render to the worktree and echo the path

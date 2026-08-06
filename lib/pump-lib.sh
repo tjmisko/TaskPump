@@ -9,6 +9,56 @@
 #
 # This file is sourced, never executed — no `set -e`, no top-level side effects.
 
+# apl_render_template <template-file>
+# Substitute {{KEY}} placeholders, reading two associative arrays from the
+# caller's scope: TPL_VARS maps a key to a scalar, TPL_BLOCKS maps a key to a
+# file whose contents replace a line that consists of nothing but that
+# placeholder. The block form is why this is bash rather than sed — the values
+# it splices are multi-line command output (a git log, a status listing), and
+# every sed-based approach to that either mangles newlines or has to escape the
+# replacement text. Bash parameter substitution needs no escaping at all.
+apl_render_template() {
+  local tpl="$1" line key trimmed
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    if [[ "$trimmed" == '{{'*'}}' ]]; then
+      key="${trimmed:2:${#trimmed}-4}"
+      if [[ -n "${TPL_BLOCKS[$key]:-}" ]]; then
+        cat "${TPL_BLOCKS[$key]}" 2>/dev/null || true
+        continue
+      fi
+    fi
+    for key in "${!TPL_VARS[@]}"; do
+      line="${line//\{\{$key\}\}/${TPL_VARS[$key]}}"
+    done
+    printf '%s\n' "$line"
+  done < "$tpl"
+}
+
+# apl_join_commands <newline-separated-commands>
+# Render a list of shell commands as an inline English phrase, each backticked:
+# "`a`", "`a` and `b`", "`a`, `b` and `c`". Used where a template mentions the
+# project's verification commands mid-sentence.
+apl_join_commands() {
+  local -a cmds=()
+  local c
+  while IFS= read -r c; do [[ -n "$c" ]] && cmds+=("\`$c\`"); done <<<"$1"
+  local n=${#cmds[@]}
+  case "$n" in
+    0) return 0 ;;
+    1) printf '%s' "${cmds[0]}" ;;
+    *)
+      local i
+      for (( i = 0; i < n - 1; i++ )); do
+        printf '%s' "${cmds[$i]}"
+        (( i < n - 2 )) && printf ', '
+      done
+      printf ' and %s' "${cmds[$((n - 1))]}"
+      ;;
+  esac
+}
+
 # apl_help <script> — print a script's leading header comment as its help text.
 # Bounded by an explicit `# HELP-END` marker rather than a hardcoded line range:
 # three tools used to extract their help with `sed -n '2,40p' "$0"`, which
