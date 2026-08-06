@@ -86,38 +86,70 @@ REPO_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=../lib/pump-lib.sh
 source "$TP_LIB_DIR/pump-lib.sh"
 
-CLAUDE_DIR="$HOME/.claude"
-CLAUDE_JSON="$HOME/.claude.json"
-OPS_DIR="${ARACHNE_PUMP_OPS_DIR:-$REPO_ROOT/ops}"
-# Tasks dir — overridable (independent of OPS_DIR) so phase_dependencies / brief
-# rendering can be unit-tested against a flat fixture dir.
-TASKS_DIR="${ARACHNE_PUMP_TASKS_DIR:-$OPS_DIR/task-loop/tasks}"
+# ── Configuration ─────────────────────────────────────────────────────────────
+# Every value here has a default that reproduces what the pump did before any of
+# it was configurable, so a project with no taskpump.conf sees no change. Where a
+# key exists in both a shared and a pump-scoped spelling, the pump-scoped one
+# wins: TASKPUMP_TASKS_DIR is what every tool reads, TASKPUMP_PUMP_TASKS_DIR
+# points this supervisor somewhere else. The legacy ARACHNE_* names still arrive
+# here through the config core.
 
-ARACHNE_TASK="${ARACHNE_TASK:-$TP_LIBEXEC_DIR/tp-task}"
-ARACHNE_USAGE="${ARACHNE_USAGE:-$TP_GATES_DIR/claude-usage}"
-ARACHNE_DISK_WATCHDOG="${ARACHNE_DISK_WATCHDOG:-$TP_LIBEXEC_DIR/tp-disk-watchdog}"
-MONITOR_BIN="${ARACHNE_MONITOR_BIN:-$TP_LIBEXEC_DIR/tp-monitor}"
+# The agent's home and config on the host. Mounted read-only into a launched
+# container, and the credentials file the token gate reads.
+CLAUDE_DIR="${TASKPUMP_AGENT_HOME:-$HOME/.claude}"
+CLAUDE_JSON="${TASKPUMP_AGENT_CONFIG:-$HOME/.claude.json}"
+
+# The ledger: a git checkout the pump pulls at the top of every tick and pushes
+# when the range drains, holding the task files.
+OPS_DIR="${TASKPUMP_PUMP_OPS_DIR:-${TASKPUMP_LEDGER_REPO:-$REPO_ROOT/ops}}"
+# Tasks dir — overridable independently of OPS_DIR so phase_dependencies / brief
+# rendering can be unit-tested against a flat fixture dir.
+TASKS_DIR="${TASKPUMP_PUMP_TASKS_DIR:-${TASKPUMP_TASKS_DIR:-$OPS_DIR/task-loop/tasks}}"
+# The file that tells us a submodule ledger has actually been checked out. Any
+# path inside the ledger that only exists once `submodule update` has run.
+SUBMODULE_PROBE="${TASKPUMP_SUBMODULE_PROBE:-ops/planning/STATUS.md}"
+
+# Sibling tools.
+ARACHNE_TASK="${TASKPUMP_TASK:-$TP_LIBEXEC_DIR/tp-task}"
+ARACHNE_USAGE="${TASKPUMP_USAGE:-$TP_GATES_DIR/claude-usage}"
+ARACHNE_DISK_WATCHDOG="${TASKPUMP_DISK_WATCHDOG:-$TP_LIBEXEC_DIR/tp-disk-watchdog}"
+MONITOR_BIN="${TASKPUMP_MONITOR_BIN:-$TP_LIBEXEC_DIR/tp-monitor}"
+
+# The agent runner. The pump decides WHAT to launch and WHERE; the runner owns
+# HOW — the sandbox, the mounts, the credentials. See runners/claude-docker.
+RUNNER="${TASKPUMP_RUNNER:-$TP_ROOT/runners/claude-docker/runner.sh}"
 DOCKER="${TASKPUMP_DOCKER:-${DOCKER:-docker}}"
-ARACHNE_PHASE_BRIEF_TEMPLATE="${ARACHNE_PHASE_BRIEF_TEMPLATE:-$OPS_DIR/task-loop/briefs/_phase-drain-template.md}"
+IMAGE="${TASKPUMP_IMAGE:-arachne}"
+ENTRYPOINT="${TASKPUMP_ENTRYPOINT:-/entrypoint-parallel.sh}"
+
 # Worktrees base — overridable so the reclaim sweep / launcher can be unit-tested
 # against a fixture tree (single source for both launch_phase and reclaim).
-WORKTREES_DIR="${ARACHNE_PUMP_WORKTREES_DIR:-$REPO_ROOT/.worktrees}"
+WORKTREES_DIR="${TASKPUMP_PUMP_WORKTREES_DIR:-${TASKPUMP_WORKTREES_DIR:-$REPO_ROOT/.worktrees}}"
+
+# Where the run's dotfiles live. One knob moves them all out of the repo root;
+# each filename is still individually overridable.
+STATE_DIR="${TASKPUMP_STATE_DIR:-$REPO_ROOT}"
+AGENT_LOG_NAME="${TASKPUMP_AGENT_LOG_NAME:-.arachne-agent.log}"
+BRIEF_OUT_NAME="${TASKPUMP_BRIEF_OUT_NAME:-.arachne-phase-brief.md}"
+RESUME_NOTE_NAME="${TASKPUMP_RESUME_NOTE_NAME:-.arachne-resume.md}"
+FSGUARD_MARK_FILE="${TASKPUMP_FSGUARD_MARK_FILE:-$STATE_DIR/.arachne-fsguard.notified}"
+DISK_WATCHDOG_LOG="${TASKPUMP_DISK_WATCHDOG_LOG:-$STATE_DIR/.arachne-disk-watchdog.log}"
 
 # Defaults (flags override).
 PHASES=""
 # The supervisor's own default cap. Callers that set nothing at all fall back to
 # pump-lib's TASKPUMP_JOBS_FALLBACK instead; see the note there.
 JOBS="${TASKPUMP_JOBS:-${JOBS:-4}}"
-CEILING="${ARACHNE_USAGE_CEILING:-95}"
+CEILING="${TASKPUMP_USAGE_CEILING:-95}"
 GRAIN="phase"
-TICK="${POOL_TICK:-30}"
-STAGGER="${POOL_STAGGER:-3}"
-HEALTH_WINDOW="${HEALTH_WINDOW:-120}"
+TICK="${TASKPUMP_TICK:-${POOL_TICK:-30}}"
+STAGGER="${TASKPUMP_STAGGER:-${POOL_STAGGER:-3}}"
+HEALTH_WINDOW="${TASKPUMP_HEALTH_WINDOW:-${HEALTH_WINDOW:-120}}"
 HEALTH_GATE=1
 USAGE_GATE=1
 DISK_GATE=1
-BRANCH_PREFIX="${ARACHNE_PUMP_BRANCH_PREFIX:-feat/}"
-BASE_REF="${ARACHNE_PUMP_BASE:-main}"
+BRANCH_PREFIX="${TASKPUMP_PUMP_BRANCH_PREFIX:-${TASKPUMP_BRANCH_PREFIX:-feat/}}"
+BASE_REF="${TASKPUMP_PUMP_BASE:-${TASKPUMP_BASE:-main}}"
 BASE_GIVEN=0      # set when --base is passed explicitly (gates the trunk override)
 # ── Autonomous integration trunk (A3 / F65.6) ────────────────────────────────
 # Opt-in behind --integration-trunk (default OFF): when on, the run cuts every
@@ -126,38 +158,42 @@ BASE_GIVEN=0      # set when --base is passed explicitly (gates the trunk overri
 # graduates the whole drain as one auto/trunk → main PR. Flag off ⇒ byte-for-byte
 # the prior pump.
 INTEGRATION=0
-INTEGRATION_TRUNK="${ARACHNE_PUMP_TRUNK:-auto/trunk}"
-INTEGRATION_BASE="${ARACHNE_PUMP_INTEGRATION_BASE:-main}"
+INTEGRATION_TRUNK="${TASKPUMP_PUMP_TRUNK:-${TASKPUMP_TRUNK:-auto/trunk}}"
+INTEGRATION_BASE="${TASKPUMP_PUMP_INTEGRATION_BASE:-${TASKPUMP_INTEGRATION:-main}}"
 # Build gate run on each merge into the trunk (empty ⇒ default cargo check +
 # smoke). Overridable for tests (ARACHNE_PUMP_BUILD_CMD='false' forces red).
-BUILD_GATE_CMD="${ARACHNE_PUMP_BUILD_CMD:-}"
-TRUNK_LOCK_FILE="${ARACHNE_PUMP_TRUNK_LOCK_FILE:-$REPO_ROOT/.auto-trunk.lock}"
-QUARANTINE_FILE="${ARACHNE_PUMP_QUARANTINE_FILE:-$REPO_ROOT/.auto-trunk-quarantine}"
-MAX_TURNS="${MAX_TURNS:-600}"
-AGENT_MODEL="${AGENT_MODEL:-opus}"
+BUILD_GATE_CMD="${TASKPUMP_PUMP_BUILD_CMD:-${TASKPUMP_BUILD_GATE:-}}"
+TRUNK_LOCK_FILE="${TASKPUMP_PUMP_TRUNK_LOCK_FILE:-$STATE_DIR/.auto-trunk.lock}"
+QUARANTINE_FILE="${TASKPUMP_PUMP_QUARANTINE_FILE:-$STATE_DIR/.auto-trunk-quarantine}"
+# Reclaim of a finished phase's build artifacts. Empty ⇒ the default cargo
+# clean / rm -rf of <worktree>/target; a configured command is run with the
+# worktree as $1 and its cwd.
+RECLAIM_CMD="${TASKPUMP_RECLAIM_CMD:-}"
+MAX_TURNS="${TASKPUMP_MAX_TURNS:-${MAX_TURNS:-600}}"
+AGENT_MODEL="${TASKPUMP_AGENT_MODEL:-${AGENT_MODEL:-opus}}"
 # ── Stalled-claim auto-resume (2026-08-05) ───────────────────────────────────
 # A phase starved solely by its own orphaned-but-committed claim is relaunched
 # to *continue* that task, bounded by RESUME_MAX no-progress attempts. Default
 # ON: the behaviour it replaces is a permanent, silent idle loop.
 RESUME_STALLED=1
-RESUME_MAX="${ARACHNE_PUMP_RESUME_MAX:-3}"
+RESUME_MAX="${TASKPUMP_PUMP_RESUME_MAX:-${TASKPUMP_RESUME_MAX:-3}}"
 # Consecutive fully-deadlocked ticks before the pump gives up and pages a human.
 # >1 so a container dying mid-tick cannot trip it.
-STALL_EXIT_TICKS="${ARACHNE_PUMP_STALL_EXIT_TICKS:-3}"
+STALL_EXIT_TICKS="${TASKPUMP_PUMP_STALL_EXIT_TICKS:-${TASKPUMP_STALL_EXIT_TICKS:-3}}"
 STALL_TICKS=0
 RESUME_TASK_ID=""
 LAST_PARKED_FP=""
-CAP_FILE="${ARACHNE_POOL_CAP_FILE:-$REPO_ROOT/.arachne-pool-cap}"
-RESET_FILE="${ARACHNE_USAGE_RESET_FILE:-$REPO_ROOT/.arachne-usage-reset}"
+CAP_FILE="${TASKPUMP_POOL_CAP_FILE:-$STATE_DIR/.arachne-pool-cap}"
+RESET_FILE="${TASKPUMP_USAGE_RESET_FILE:-$STATE_DIR/.arachne-usage-reset}"
 MODE="run"        # run | dry | list | once | render | resume-note | help
 DETACH=0
 # After --detach hands the supervisor to systemd, the launching terminal is free
 # — and watching the monitor is what you almost always want next, so take it
 # over by default. ARACHNE_PUMP_MONITOR=0 or --no-monitor opts out; a non-tty
 # (cron, CI, a nested pump re-exec) opts out automatically.
-MONITOR="${ARACHNE_PUMP_MONITOR:-1}"
-STATE_FILE="${ARACHNE_PUMP_STATE_FILE:-$REPO_ROOT/.arachne-pump.state}"
-PUMP_LOG="${ARACHNE_PUMP_LOG:-$REPO_ROOT/.arachne-pump.log}"
+MONITOR="${TASKPUMP_PUMP_MONITOR:-1}"
+STATE_FILE="${TASKPUMP_PUMP_STATE_FILE:-$STATE_DIR/.arachne-pump.state}"
+PUMP_LOG="${TASKPUMP_PUMP_LOG:-$STATE_DIR/.arachne-pump.log}"
 PUMP_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 warn() { printf 'arachne-pump: %s\n' "$*" >&2; }
@@ -165,7 +201,7 @@ die()  { warn "$*"; exit 1; }
 log()  { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
 # Quiet per-tick skip traces (e.g. "already integrated") — off unless
 # ARACHNE_PUMP_DEBUG=1, so reconcile doesn't spam the log every TICK seconds.
-dbg_log() { [[ "${ARACHNE_PUMP_DEBUG:-0}" -eq 1 ]] && log "$*"; return 0; }
+dbg_log() { [[ "${TASKPUMP_PUMP_DEBUG:-0}" -eq 1 ]] && log "$*"; return 0; }
 
 # Keep the verbatim argv so --detach can re-exec the same command minus --detach.
 ORIG_ARGS=("$@")
@@ -428,7 +464,8 @@ feed_gate() {
   fi
   if [[ "$USAGE_GATE" -eq 1 ]]; then
     local reason rc
-    reason="$(ARACHNE_USAGE_RESET_FILE="$RESET_FILE" "$ARACHNE_USAGE" --gate --ceiling "$CEILING" 2>&1)"; rc=$?
+    reason="$(TASKPUMP_USAGE_RESET_FILE="$RESET_FILE" ARACHNE_USAGE_RESET_FILE="$RESET_FILE" \
+      "$ARACHNE_USAGE" --gate --ceiling "$CEILING" 2>&1)"; rc=$?
     if [[ "$rc" -eq 10 ]]; then
       GATE_REASON="${reason#arachne-usage: }"
       return 10
@@ -451,7 +488,7 @@ feed_gate() {
 # hermetic tests) / errors.
 dep_pr_number() {
   local branch="$1"
-  [[ "${ARACHNE_PUMP_NO_GH:-0}" -eq 1 ]] && return 0
+  [[ "${TASKPUMP_PUMP_NO_GH:-0}" -eq 1 ]] && return 0
   command -v gh >/dev/null 2>&1 || return 0
   gh pr list --head "$branch" --base main --json number -q '.[0].number // empty' 2>/dev/null || true
 }
@@ -532,6 +569,29 @@ phase_dependencies() {
   done
 }
 
+# ── Brief-template resolution ─────────────────────────────────────────────────
+# Three places to look, in order: what the operator configured, the consumer's
+# own template inside its ledger (Arachne's path — so an existing project keeps
+# rendering exactly what it did), and finally the generic one shipped with
+# TaskPump. Previously a missing consumer template was a hard die, which made a
+# fresh project unable to run at all until it wrote one.
+resolve_brief_template() {
+  local explicit="${TASKPUMP_PHASE_BRIEF_TEMPLATE:-${TASKPUMP_BRIEF_TEMPLATE:-}}"
+  [[ -n "$explicit" ]] && { printf '%s' "$explicit"; return 0; }
+  local consumer="$OPS_DIR/task-loop/briefs/_phase-drain-template.md"
+  [[ -f "$consumer" ]] && { printf '%s' "$consumer"; return 0; }
+  printf '%s' "$TP_ROOT/templates/phase-drain-brief.md"
+}
+BRIEF_TEMPLATE="$(resolve_brief_template)"
+
+# Only reachable when the resolved template is genuinely absent — an explicit
+# TASKPUMP_BRIEF_TEMPLATE pointing nowhere, or a broken install.
+missing_brief_template_msg() {
+  printf 'phase-drain brief template not found: %s\n' "$BRIEF_TEMPLATE"
+  printf '  looked at: $TASKPUMP_BRIEF_TEMPLATE, then %s/task-loop/briefs/_phase-drain-template.md,\n' "$OPS_DIR"
+  printf '  then the one shipped at %s/templates/phase-drain-brief.md\n' "$TP_ROOT"
+}
+
 # ── Brief rendering (D6 / F64.4; deps A3 v1) ───────────────────────────────────
 # render_brief_stream <phase> — render the parameterized phase-drain template to
 # stdout: substitute {{PHASE}} (plain sed — no envsubst, no clash with the
@@ -543,7 +603,7 @@ render_brief_stream() {
   local phase="$1"
   local depfile; depfile="$(mktemp)"
   phase_dependencies "$phase" >| "$depfile"
-  sed "s/{{PHASE}}/$phase/g" "$ARACHNE_PHASE_BRIEF_TEMPLATE" \
+  sed "s/{{PHASE}}/$phase/g" "$BRIEF_TEMPLATE" \
     | awk -v df="$depfile" '
         index($0, "{{DEPENDS_ON}}") { while ((getline line < df) > 0) print line; close(df); next }
         { print }
@@ -555,9 +615,8 @@ render_brief_stream() {
 # and echo its path (the launcher passes the path to the container).
 render_brief() {
   local phase="$1"
-  [[ -f "$ARACHNE_PHASE_BRIEF_TEMPLATE" ]] \
-    || die "phase-drain brief template not found: $ARACHNE_PHASE_BRIEF_TEMPLATE (built by F64.4)"
-  local out="$WORKTREES_DIR/$(phase_branch "$phase")/.arachne-phase-brief.md"
+  [[ -f "$BRIEF_TEMPLATE" ]] || die "$(missing_brief_template_msg)"
+  local out="$WORKTREES_DIR/$(phase_branch "$phase")/$BRIEF_OUT_NAME"
   mkdir -p "$(dirname "$out")" 2>/dev/null || true
   render_brief_stream "$phase" >| "$out"
   printf '%s' "$out"
@@ -633,7 +692,7 @@ EOF
 # (the launcher passes the path to the container via ARACHNE_RESUME_NOTE).
 write_resume_note() {
   local wt="$1" branch="$2" id="$3"
-  local out="$wt/.arachne-resume.md"
+  local out="$wt/$RESUME_NOTE_NAME"
   render_resume_note_stream "$wt" "$branch" "$id" >| "$out"
   printf '%s' "$out"
 }
@@ -694,7 +753,7 @@ launch_phase() {
   local phase="$1"
   # Test/maintenance hook: tick through the gate + plan + state logic without
   # materialising worktrees or containers.
-  if [[ "${ARACHNE_PUMP_NO_LAUNCH:-0}" -eq 1 ]]; then
+  if [[ "${TASKPUMP_PUMP_NO_LAUNCH:-0}" -eq 1 ]]; then
     if [[ -n "$RESUME_TASK_ID" ]]; then
       log "would launch $phase -> $(phase_branch "$phase") (NO_LAUNCH, resume $RESUME_TASK_ID)"
     else
@@ -726,7 +785,7 @@ launch_phase() {
       git -C "$REPO_ROOT" worktree add "$wt" -b "$branch" "$BASE_REF" >/dev/null
     fi
   fi
-  [[ -f "$wt/ops/planning/STATUS.md" ]] || git -C "$wt" submodule update --init --recursive 2>&1 | tail -1 || true
+  [[ -f "$wt/$SUBMODULE_PROBE" ]] || git -C "$wt" submodule update --init --recursive 2>&1 | tail -1 || true
   apl_repair_worktree_gitignore "$REPO_ROOT"
   if (cd "$REPO_ROOT" && git check-ignore -q "$wt" 2>/dev/null); then
     warn "worktree still gitignored: $wt — fix .gitignore; skipping $phase"; return 1
@@ -755,7 +814,7 @@ launch_phase() {
   if [[ -n "$RESUME_TASK_ID" ]]; then
     resume_note="$(write_resume_note "$wt" "$branch" "$RESUME_TASK_ID")"
   else
-    rm -f "$wt/.arachne-resume.md" 2>/dev/null || true
+    rm -f "$wt/$RESUME_NOTE_NAME" 2>/dev/null || true
   fi
 
   "$DOCKER" rm -f "$cname" >/dev/null 2>&1 || true
@@ -804,7 +863,7 @@ ensure_trunk() {
       || die "cannot add trunk worktree $twt"
     log "integration trunk worktree at $twt"
   fi
-  [[ -f "$twt/ops/planning/STATUS.md" ]] || git -C "$twt" submodule update --init --recursive 2>&1 | tail -1 || true
+  [[ -f "$twt/$SUBMODULE_PROBE" ]] || git -C "$twt" submodule update --init --recursive 2>&1 | tail -1 || true
   apl_repair_worktree_gitignore "$REPO_ROOT"
 }
 
@@ -841,7 +900,7 @@ quarantine_phase() {
   local phase="$1" sha="$2" reason="$3"
   local lead; lead="$(phase_lead_task "$phase")"
   [[ -z "$lead" ]] && lead="$phase.0"
-  if [[ "${ARACHNE_PUMP_INTEGRATE_DRYRUN:-0}" -eq 1 ]]; then
+  if [[ "${TASKPUMP_PUMP_INTEGRATE_DRYRUN:-0}" -eq 1 ]]; then
     log "would quarantine $phase: $reason"
     log "would needs-review $lead: $reason"
   else
@@ -862,7 +921,7 @@ integrate_one_phase() {
     dbg_log "skip integrate $phase: live container (not quiescent)"
     return 0
   fi
-  if [[ "${ARACHNE_PUMP_INTEGRATE_DRYRUN:-0}" -eq 1 ]]; then
+  if [[ "${TASKPUMP_PUMP_INTEGRATE_DRYRUN:-0}" -eq 1 ]]; then
     integrate_one_phase_dryrun "$phase" "$branch"
   else
     integrate_one_phase_real "$phase" "$branch"
@@ -918,7 +977,7 @@ integrate_one_phase_real() {
     fi
     local post; post="$(git -C "$twt" rev-parse HEAD 2>/dev/null)"
     log "integrated $phase @ $(printf '%s' "$post" | cut -c1-12)"
-    [[ "${ARACHNE_PUMP_TRUNK_PUSH:-0}" -eq 1 ]] && git -C "$twt" push >/dev/null 2>&1 || true
+    [[ "${TASKPUMP_PUMP_TRUNK_PUSH:-0}" -eq 1 ]] && git -C "$twt" push >/dev/null 2>&1 || true
     exit 0
   ) || true
 }
@@ -1042,7 +1101,7 @@ print_plan() {
 # disk-pressure pause can self-heal as completed phases free their target/ dirs.
 # Disabled with ARACHNE_DISK_RECLAIM=0.
 reclaim_done_targets() {
-  [[ "${ARACHNE_DISK_RECLAIM:-1}" -eq 1 ]] || return 0
+  [[ "${TASKPUMP_DISK_RECLAIM:-1}" -eq 1 ]] || return 0
   local p wt sz
   for p in "${PLAN_DONE[@]:-}"; do
     [[ -z "$p" ]] && continue
@@ -1050,11 +1109,17 @@ reclaim_done_targets() {
     [[ -d "$wt/target" ]] || continue
     phase_live "$p" && continue
     sz="$(du -sh "$wt/target" 2>/dev/null | cut -f1)"
-    if command -v cargo >/dev/null 2>&1; then
+    if [[ -n "$RECLAIM_CMD" ]]; then
+      if ( cd "$wt" && eval "$RECLAIM_CMD" ) >/dev/null 2>&1; then
+        log "reclaimed $p target/ (${sz:-?}) via TASKPUMP_RECLAIM_CMD"
+      else
+        warn "TASKPUMP_RECLAIM_CMD failed for $p ($wt)"
+      fi
+    elif command -v cargo >/dev/null 2>&1; then
       if cargo clean --manifest-path "$wt/Cargo.toml" >/dev/null 2>&1; then
         log "reclaimed $p target/ (${sz:-?}) via cargo clean"
       else
-        warn "cargo clean failed for $p ($wt); run scripts/arachne-cleanup --targets to reclaim"
+        warn "cargo clean failed for $p ($wt); run '\''tp cleanup --targets'\'' to reclaim"
       fi
     elif rm -rf "$wt/target"; then
       log "reclaimed $p target/ (${sz:-?}) via rm -rf (no cargo)"
@@ -1093,7 +1158,7 @@ do_tick() {
   # log it, but desktop-notify only when the contamination CHANGES — otherwise a
   # persistent dirty tree spams a notification every tick (TICK seconds). The
   # fingerprint persists in a gitignored marker so dedup survives restarts.
-  local fs_dirt fsg_mark="$REPO_ROOT/.arachne-fsguard.notified"
+  local fs_dirt fsg_mark="$FSGUARD_MARK_FILE"
   fs_dirt="$(apl_fs_guard "$REPO_ROOT")"
   if [[ -n "$fs_dirt" ]]; then
     log "$fs_dirt"
@@ -1204,8 +1269,8 @@ write_state() {  # $1=status(running|paused|drained) $2=paused_reason
 pump_notify() {
   local msg="$1"
   log "$msg"
-  if [[ -n "${ARACHNE_NOTIFY_CMD:-}" ]]; then
-    printf '%s\n' "$msg" | ${ARACHNE_NOTIFY_CMD} >/dev/null 2>&1 || true
+  if [[ -n "${TASKPUMP_NOTIFY_CMD:-}" ]]; then
+    printf '%s\n' "$msg" | ${TASKPUMP_NOTIFY_CMD} >/dev/null 2>&1 || true
   elif command -v notify-send >/dev/null 2>&1; then
     notify-send "arachne-pump" "$msg" >/dev/null 2>&1 || true
   fi
@@ -1248,7 +1313,7 @@ detach_and_exit() {
 exec_monitor() {
   [[ "$MONITOR" -eq 1 ]] || return 0
   [[ -t 0 && -t 1 ]] || { log "not a tty — skipping the monitor (run: $MONITOR_BIN --watch)"; return 0; }
-  [[ -x "$MONITOR_BIN" ]] || { log "no arachne-monitor at $MONITOR_BIN — skipping"; return 0; }
+  [[ -x "$MONITOR_BIN" ]] || { log "no monitor at $MONITOR_BIN — skipping"; return 0; }
   # The supervisor writes .arachne-pump.state on its first tick; give it a beat
   # so the monitor's opening frame shows the run instead of "no pump".
   sleep 2
@@ -1261,8 +1326,7 @@ case "$MODE" in
   render)
     # Print the phase-drain brief rendered for $PHASES to stdout (debug / test).
     # Goes through render_brief_stream so {{DEPENDS_ON}} is expanded too (v1).
-    [[ -f "$ARACHNE_PHASE_BRIEF_TEMPLATE" ]] \
-      || die "phase-drain brief template not found: $ARACHNE_PHASE_BRIEF_TEMPLATE (built by F64.4)"
+    [[ -f "$BRIEF_TEMPLATE" ]] || die "$(missing_brief_template_msg)"
     render_brief_stream "$PHASES"
     exit 0
     ;;
@@ -1304,23 +1368,22 @@ fi
 if [[ -z "${GITHUB_TOKEN:-}" ]] && command -v gh >/dev/null 2>&1; then
   GITHUB_TOKEN="$(gh auth token 2>/dev/null || true)"; export GITHUB_TOKEN
 fi
-[[ -f "$ARACHNE_PHASE_BRIEF_TEMPLATE" ]] \
-  || die "phase-drain brief template missing: $ARACHNE_PHASE_BRIEF_TEMPLATE (build F64.4 first)"
+[[ -f "$BRIEF_TEMPLATE" ]] || die "$(missing_brief_template_msg)"
 
 # Seed the live cap file for discoverability / retuning.
 [[ -f "$CAP_FILE" ]] || echo "$JOBS" >| "$CAP_FILE" 2>/dev/null || true
 
 # Skip the (~9 GB) image build when we will not launch containers — keeps the
 # NO_LAUNCH tick (tests / live read-only validation) side-effect-free.
-if [[ "${ARACHNE_PUMP_NO_LAUNCH:-0}" -ne 1 ]]; then
-  log "Building arachne image ..."
-  "$DOCKER" build -t arachne "$REPO_ROOT" >/dev/null || die "image build failed"
+if [[ "${TASKPUMP_PUMP_NO_LAUNCH:-0}" -ne 1 ]]; then
+  log "Building $IMAGE image ..."
+  "$DOCKER" build -t "$IMAGE" "$REPO_ROOT" >/dev/null || die "image build failed"
 fi
 
 # Materialise auto/trunk + its worktree once, before the loop (A3). Real run
 # only — skipped under NO_LAUNCH (tests / read-only validation) and a no-op when
 # --integration-trunk is off.
-if [[ "${ARACHNE_PUMP_NO_LAUNCH:-0}" -ne 1 ]]; then
+if [[ "${TASKPUMP_PUMP_NO_LAUNCH:-0}" -ne 1 ]]; then
   ensure_trunk
 fi
 
@@ -1328,15 +1391,15 @@ fi
 # run-parallel.sh does, so disk pressure also drops the live pool cap (cap-file
 # path) on top of the feed gate. --auto-exit retires it once no agents remain.
 # Skipped for --once / NO_LAUNCH ticks and when the disk gate is disabled.
-if [[ "$MODE" == "run" && "$DISK_GATE" -eq 1 && "${ARACHNE_PUMP_NO_LAUNCH:-0}" -ne 1 ]]; then
+if [[ "$MODE" == "run" && "$DISK_GATE" -eq 1 && "${TASKPUMP_PUMP_NO_LAUNCH:-0}" -ne 1 ]]; then
   nohup "$ARACHNE_DISK_WATCHDOG" --auto-exit \
-    >>"$REPO_ROOT/.arachne-disk-watchdog.log" 2>&1 </dev/null &
+    >>"$DISK_WATCHDOG_LOG" 2>&1 </dev/null &
   disown "$!" 2>/dev/null || true
-  log "disk watchdog started (cap-file path; log: .arachne-disk-watchdog.log)"
+  log "disk watchdog started (cap-file path; log: $DISK_WATCHDOG_LOG)"
 fi
 
 log "Pump: phases=$PHASES grain=$GRAIN cap=$JOBS (live via $CAP_FILE) ceiling=${CEILING}% tick=${TICK}s"
-log "Singular supervisor; Ctrl-C stops feeding but leaves running agents. Monitor: scripts/arachne-monitor --watch"
+log "Singular supervisor; Ctrl-C stops feeding but leaves running agents. Monitor: $MONITOR_BIN --watch"
 
 if [[ "$MODE" == "once" ]]; then
   do_tick

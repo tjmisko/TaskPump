@@ -151,8 +151,8 @@ NOTIFY="$TMP/notify.txt"; : >| "$NOTIFY"
 pump_tick() {  # $1=phases ; extra env via caller
   # Suppress real desktop notifications by default (the fs-guard now runs in
   # do_tick and would notify-send against this dirty worktree); a caller can
-  # still override ARACHNE_NOTIFY_CMD to capture, as the drain test does.
-  ARACHNE_NOTIFY_CMD="${ARACHNE_NOTIFY_CMD:-true}" \
+  # still override TASKPUMP_NOTIFY_CMD to capture, as the drain test does.
+  TASKPUMP_NOTIFY_CMD="${TASKPUMP_NOTIFY_CMD:-true}" \
   ARACHNE_PUMP_NO_LAUNCH=1 \
   ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
   ARACHNE_PUMP_STATE_FILE="$STATE" \
@@ -175,9 +175,9 @@ STUB_GATE_RC=10 pump_tick F55..F57 --once >/dev/null 2>&1
 
 # 8c: a fully-drained range exits → status=drained + one notification.
 mk F55.0 done; mk F55.1 done; mk F56.0 done; mk F57.0 done
-STUB_GATE_RC=0 ARACHNE_NOTIFY_CMD="tee -a $NOTIFY" pump_tick F55..F57 >/dev/null 2>&1
+STUB_GATE_RC=0 TASKPUMP_NOTIFY_CMD="tee -a $NOTIFY" pump_tick F55..F57 >/dev/null 2>&1
 [[ "$(jq -r '.status' "$STATE" 2>/dev/null)" == "drained" ]] && pass "state.status = drained when range empties" || fail "state.status not drained: $(cat "$STATE" 2>/dev/null)"
-grep -qi 'drained' "$NOTIFY" && pass "drain notification fired via ARACHNE_NOTIFY_CMD" || fail "no drain notification: $(cat "$NOTIFY" 2>/dev/null)"
+grep -qi 'drained' "$NOTIFY" && pass "drain notification fired via TASKPUMP_NOTIFY_CMD" || fail "no drain notification: $(cat "$NOTIFY" 2>/dev/null)"
 
 # 8d: restart detection logs a resume for the same range.
 out=$(STUB_GATE_RC=0 pump_tick F55..F57 --once 2>&1 >/dev/null; STUB_GATE_RC=0 pump_tick F55..F57 --once 2>&1)
@@ -232,7 +232,7 @@ plant_target() {  # fake done-phase worktree with a target/ dir + sentinel
 }
 reclaim_tick() {  # one real tick with the reclaim sweep active, fixture-wired
   PATH="$BIN:$PATH" \
-  ARACHNE_NOTIFY_CMD="${ARACHNE_NOTIFY_CMD:-true}" \
+  TASKPUMP_NOTIFY_CMD="${TASKPUMP_NOTIFY_CMD:-true}" \
   ARACHNE_PUMP_WORKTREES_DIR="$WT" \
   ARACHNE_PUMP_NO_LAUNCH=1 \
   ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
@@ -319,7 +319,7 @@ echo "--- Test 13: integration trunk — selection, build-gate, conflict (A3 v0)
 # drive branch-exists / already-integrated / conflict / build-red.
 QFILE="$TMP/quarantine"; ISTATE="$TMP/ipump.state"
 itick() {  # integration dry-run --once tick: $1=phases ; extra env via caller
-  ARACHNE_NOTIFY_CMD="${ARACHNE_NOTIFY_CMD:-true}" \
+  TASKPUMP_NOTIFY_CMD="${TASKPUMP_NOTIFY_CMD:-true}" \
   ARACHNE_PUMP_NO_LAUNCH=1 \
   ARACHNE_PUMP_INTEGRATE_DRYRUN=1 \
   ARACHNE_PUMP_QUARANTINE_FILE="$QFILE" \
@@ -365,7 +365,7 @@ grep -qE '^F55 .*conflict$' "$QFILE" && pass "quarantine marker written for conf
 # 13f: --integration-trunk OFF ⇒ no integration whatsoever (opt-out regression).
 : >| "$QFILE"
 out=$(STUB_GATE_RC=0 ARACHNE_PUMP_BUILD_CMD='false' \
-  ARACHNE_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 ARACHNE_PUMP_INTEGRATE_DRYRUN=1 \
+  TASKPUMP_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 ARACHNE_PUMP_INTEGRATE_DRYRUN=1 \
   ARACHNE_PUMP_QUARANTINE_FILE="$QFILE" ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
   ARACHNE_PUMP_STATE_FILE="$ISTATE" ARACHNE_POOL_CAP_FILE="$TMP/cap" \
   ARACHNE_PUMP_LOG="$TMP/pump.log" ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
@@ -470,7 +470,7 @@ EOF
 }
 status_of() { sed -n 's/^status: *//p' "$TASKS/$1.md" | head -1; }
 claim_tick() {  # $1 = phases ; STUB_LIVE/STUB_AHEAD supplied by caller
-  PATH="$BIN:$PATH" ARACHNE_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 \
+  PATH="$BIN:$PATH" TASKPUMP_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 \
   ARACHNE_CLAIM_STALE_HOURS=99999 ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
   ARACHNE_PUMP_STATE_FILE="$STATE17" ARACHNE_POOL_CAP_FILE="$TMP/cap" \
   ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
@@ -505,7 +505,7 @@ echo "--- Test 18: scrub integrity findings reach the pump log with their paths 
 # could not tell a corrupt ledger from scrub itself crashing.
 STATE18="$TMP/pump18.state"
 tick18() {
-  ARACHNE_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 \
+  TASKPUMP_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 \
   ARACHNE_PUMP_OPS_DIR="$TMP/noops" ARACHNE_PUMP_STATE_FILE="$STATE18" \
   ARACHNE_POOL_CAP_FILE="$TMP/cap" ARACHNE_PUMP_LOG="$TMP/pump18.log" \
   ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
@@ -568,7 +568,7 @@ EOF
 chmod +x "$BIN/git"
 STATE19="$TMP/pump19.state"
 rtick() {  # one --once tick over F97; extra flags forwarded
-  PATH="$BIN:$PATH" ARACHNE_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 \
+  PATH="$BIN:$PATH" TASKPUMP_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 \
   ARACHNE_CLAIM_STALE_HOURS=99999 ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
   ARACHNE_PUMP_STATE_FILE="$STATE19" ARACHNE_POOL_CAP_FILE="$TMP/cap" \
   ARACHNE_PUMP_LOG="$TMP/pump19.log" ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
@@ -624,7 +624,7 @@ have "$out" 'resuming F97' && fail "resumed a foreign-branch claim:\n$out" || pa
 # the RESUME arm was tested ahead of `oc`, this phase was classified DONE and
 # is_drained declared the range finished over committed, unfinished work.
 rm -f "$TASKS"/*.md; mk F97.0 done; mkclaim F97.1 feat/f97
-out=$(PATH="$BIN:$PATH" ARACHNE_NOTIFY_CMD=true ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
+out=$(PATH="$BIN:$PATH" TASKPUMP_NOTIFY_CMD=true ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
       ARACHNE_PUMP_STATE_FILE="$STATE19" ARACHNE_POOL_CAP_FILE="$TMP/cap" \
       ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" STUB_LIVE="" STUB_AHEAD=3 STUB_HEAD=aaaa111 \
       "$PUMP" --no-health-gate --dry-run --phases F97 2>&1)
@@ -666,7 +666,7 @@ have "$note" 'Split it' && pass "note authorises split-and-unblock" || fail "not
 stall_fixture
 for _ in 1 2 3; do STUB_LIVE="" STUB_AHEAD=3 STUB_HEAD=9999aaa rtick >/dev/null 2>&1; done
 rc=0
-out=$(PATH="$BIN:$PATH" ARACHNE_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 \
+out=$(PATH="$BIN:$PATH" TASKPUMP_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 \
       ARACHNE_CLAIM_STALE_HOURS=99999 ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
       ARACHNE_PUMP_STATE_FILE="$STATE19" ARACHNE_POOL_CAP_FILE="$TMP/cap" \
       ARACHNE_PUMP_LOG="$TMP/pump19.log" ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
@@ -726,8 +726,46 @@ out=$(PATH="$BIN:$PATH" ARACHNE_PUMP_MONITOR=0 ARACHNE_MONITOR_BIN="$BIN/fake-mo
       ARACHNE_TASKS_DIR="$TASKS" timeout 60 "$PUMP" --phases F98 --detach 2>&1) || true
 have "$out" 'not a tty' && fail "ARACHNE_PUMP_MONITOR=0 ignored:\n$out" \
                         || pass "ARACHNE_PUMP_MONITOR=0 opts out"
-have "$(sed -n '2,60p' "$PUMP")" 'no-monitor' && pass "--no-monitor is documented in --help" \
-                                              || fail "--no-monitor missing from the help block"
+have "$("$PUMP" --help)" 'no-monitor' && pass "--no-monitor is documented in --help" \
+                                      || fail "--no-monitor missing from the help block"
+
+echo "--- Test 20: naming and layout knobs, all defaulting to today's values ---"
+mk F55.0 open; mk F55.1 open F55.0; mk F56.0 open; mk F57.0 open F55.1
+# Branch and container naming are what join the ledger, the worktrees, and the
+# live-container check. They used to be literals in five places each.
+out=$(pump F56)
+have "$out" 'LAUNCH +F56 +-> feat/f56' && pass "default branch prefix is feat/" \
+  || fail "default branch naming changed:\n$out"
+out=$(TASKPUMP_BRANCH_PREFIX="epic/" pump F56)
+have "$out" 'LAUNCH +F56 +-> epic/f56' && pass "TASKPUMP_BRANCH_PREFIX renames the branch" \
+  || fail "branch prefix override ignored:\n$out"
+# A live container is matched through the same prefix, so renaming one without
+# the other must not silently mark a running phase launchable.
+out=$(STUB_LIVE="tp-agent-feat-f56" TASKPUMP_AGENT_PREFIX="tp-agent-" pump F56)
+have "$out" 'RUNNING +F56' && pass "TASKPUMP_AGENT_PREFIX drives the liveness join" \
+  || fail "agent prefix override ignored:\n$out"
+out=$(STUB_LIVE="tp-agent-feat-f56" pump F56)
+have "$out" 'LAUNCH +F56' && pass "a container under another prefix is not ours" \
+  || fail "foreign container claimed as ours:\n$out"
+
+echo "--- Test 22: TASKPUMP_STATE_DIR relocates the run's dotfiles ---"
+SD="$TMP/state-dir"; mkdir -p "$SD"
+mk F55.0 done; mk F55.1 done; mk F56.0 done; mk F57.0 done
+TASKPUMP_NOTIFY_CMD=true TASKPUMP_PUMP_NO_LAUNCH=1 ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
+  TASKPUMP_STATE_DIR="$SD" ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+  "$PUMP" --no-health-gate --phases F55..F57 --once >/dev/null 2>&1
+[[ -f "$SD/.arachne-pump.state" ]] && pass "state file follows TASKPUMP_STATE_DIR" \
+  || fail "state file not written under $SD"
+[[ -f "$SD/.arachne-pool-cap" ]] && pass "pool-cap file follows TASKPUMP_STATE_DIR" \
+  || fail "cap file not written under $SD"
+# An individual filename still overrides the directory.
+TASKPUMP_NOTIFY_CMD=true TASKPUMP_PUMP_NO_LAUNCH=1 ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
+  TASKPUMP_STATE_DIR="$SD" TASKPUMP_PUMP_STATE_FILE="$TMP/named.state" \
+  ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+  "$PUMP" --no-health-gate --phases F55..F57 --once >/dev/null 2>&1
+[[ -f "$TMP/named.state" ]] && pass "an explicit state filename outranks the state dir" \
+  || fail "TASKPUMP_PUMP_STATE_FILE ignored"
+mk F55.0 open; mk F55.1 open F55.0; mk F56.0 open; mk F57.0 open F55.1
 
 echo
 echo "=============================================="
