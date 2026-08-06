@@ -1,96 +1,205 @@
 #!/bin/bash
-# entrypoint-parallel.sh -- firewall -> smoke test -> drop to dev user ->
-# run ONE long Auto Mode session against an assigned kickoff brief.
+# runners/claude-docker/entrypoint.sh — the generic in-container half of the
+# claude-docker runner. Baked into the agent image; started by runner.sh.
 #
-# This is the parallel-fan-out successor to entrypoint.sh's ralph loop.
-# Differences:
-#   * No iteration loop, no `arachne-task next`, no scrub. Each container is
-#     pre-assigned exactly one worktree + brief by run-parallel.sh, so there
-#     is no shared-queue claim race between concurrent agents.
-#   * Permission posture is Auto Mode (--permission-mode auto), NOT
-#     --dangerously-skip-permissions. The iptables egress allowlist remains
-#     the hard sandbox; the classifier is the second layer.
-#   * The agent claims/completes its OWN F4x task(s) (the brief instructs it);
-#     this entrypoint only claims the epic task as a safety net and never
-#     auto-completes (done = green build + tests + PR, which the agent asserts).
+# One container runs ONE long agent session against one assigned workspace and
+# one assigned brief. There is no iteration loop and no queue read here: the
+# supervisor decided what this container is for before it existed, so there is
+# no claim race between concurrent agents.
 #
-# Required env (set by run-parallel.sh):
-#   WORKSPACE_PATH   -- the worktree path (container workdir)
-#   REPO_ROOT        -- main checkout root; canonical ops/ lives here
-#   ARACHNE_BRIEF    -- path to the kickoff brief .md (the agent's prompt)
-#   ARACHNE_TASK_ID  -- epic/top task ID for this worktree (e.g. F41.3)
-# Optional env:
-#   GITHUB_TOKEN        -- for ops/ submodule fetch + gh
-#   MAX_TURNS           -- max turns for the single session (default 600)
-#   AGENT_MODEL         -- model alias (default opus)
-#   ARACHNE_RESUME_NOTE -- path to a resume preamble (run-parallel.sh --resume);
-#                          prepended to the brief on stdin when present.
+# What this file owns is everything that is true of *any* consumer:
+#
+#   * the environment contract (canonical TASKPUMP_*/TP_* names, legacy
+#     ARACHNE_* fallbacks) — see the table below;
+#   * the access-token-only credential install, which is a hardening lesson
+#     rather than a preference (see install_access_only_credentials);
+#   * stdin assembly for the session: goal, then resume note, then brief;
+#   * the safety-net claim + heartbeat discipline around the session;
+#   * exit-code discipline, in particular exit 75 before `heartbeat --start`.
+#
+# What it does NOT own is anything that knows the shape of a particular repo:
+# the egress allowlist, the toolchain, the smoke test, the agent's settings
+# files. Those go in a pre-flight hook — see TASKPUMP_PRE_FLIGHT below and
+# preflight-example.sh next door.
+#
+# ── Environment contract ──────────────────────────────────────────────────────
+#
+# Each row is read canonical-first: TASKPUMP_<NAME>, then TP_<NAME>, then the
+# legacy spelling, then the default. Both spellings are supplied by runner.sh.
+#
+#   canonical                        legacy               default
+#   TASKPUMP_WORKSPACE_PATH          WORKSPACE_PATH       /workspace
+#   TASKPUMP_REPO_ROOT               REPO_ROOT            $WORKSPACE_PATH
+#   TASKPUMP_LEDGER_REPO             —                    $REPO_ROOT/ops
+#   TASKPUMP_TASKS_DIR               ARACHNE_TASKS_DIR    $LEDGER_REPO/task-loop/tasks
+#   TASKPUMP_TASK_OUT                ARACHNE_TASK_OUT     $LEDGER_REPO/task-loop/.next-task
+#   TASKPUMP_TASK_FILE_EXT           —                    .md
+#   TASKPUMP_BRIEF                   ARACHNE_BRIEF        (required)
+#   TASKPUMP_RESUME_NOTE             ARACHNE_RESUME_NOTE  (none)
+#   TASKPUMP_TASK_ID                 ARACHNE_TASK_ID      (none)
+#   TASKPUMP_PHASE                   ARACHNE_PHASE        (none)
+#   TASKPUMP_MAX_TURNS               MAX_TURNS            600
+#   TASKPUMP_AGENT_MODEL             AGENT_MODEL          opus
+#   TASKPUMP_SAFETY_TURNS            —                    3
+#   TASKPUMP_WORKSPACE_TASK_CLI      —                    scripts/arachne-task
+#   TASKPUMP_CONTAINER_USER          —                    dev
+#   TASKPUMP_CONTAINER_HOME          —                    /home/$CONTAINER_USER
+#   TASKPUMP_PRE_FLIGHT              —                    (none; see below)
+#   TASKPUMP_AGENT_LOG_NAME          —                    .arachne-agent.log
+#   TASKPUMP_GOAL_NOTE_NAME          —                    .arachne-goal.md
+#   TASKPUMP_RESUME_NOTE_NAME        —                    .arachne-resume.md
+#   TASKPUMP_RO_PROBE_FILE           —                    .arachne-rotest
+#   TASKPUMP_HOST_CRED_MOUNT         —                    /tmp/claude-home
+#   TASKPUMP_HOST_CONFIG_MOUNT       —                    /tmp/claude-home-json/.claude.json
+#   TASKPUMP_CRED_REFRESH_INTERVAL_S CRED_REFRESH_INTERVAL_S  300
+#   TASKPUMP_AGENT_WALL_TIMEOUT_S    AGENT_WALL_TIMEOUT_S (unset)
+#   GITHUB_TOKEN                     —                    (unset)
+#
+# The dotfile names default to their pre-TaskPump values on purpose. The monitor
+# and the cleanup sweeper find a running agent by looking for
+# `<worktree>/.arachne-agent.log`; renaming it here would make live agents
+# invisible to the tools that supervise them.
+#
+# ── The pre-flight hook ───────────────────────────────────────────────────────
+#
+# TASKPUMP_PRE_FLIGHT names an executable *inside the container*. It runs as
+# root after credentials are installed and before the session starts, with
+# WORKSPACE_PATH / REPO_ROOT / LEDGER_REPO / LOG_FILE / TASKPUMP_CONTAINER_USER /
+# TASKPUMP_CONTAINER_HOME / TASKPUMP_TASK_ID / TASKPUMP_PHASE exported. A
+# non-zero exit aborts with 75 (EX_TEMPFAIL), before the heartbeat starts.
+#
+# Unset means no pre-flight — EXCEPT for one transitional fallback. A container
+# built before the hook existed has no TASKPUMP_PRE_FLIGHT to set, so if the
+# variable is unset AND the legacy marker file (claude-settings-auto.json, in
+# either REPO_ROOT or WORKSPACE_PATH) is present, the old inline pre-flight runs
+# instead. That keeps today's images working across the transition. It is
+# scheduled for deletion once consumers set the hook; nothing new should rely on
+# it, and a consumer that sets TASKPUMP_PRE_FLIGHT never reaches it.
+#
+# ── Exit codes ────────────────────────────────────────────────────────────────
+#
+#   0    session finished (whatever the agent concluded)
+#   1    misconfiguration the operator must fix (no workspace, no brief)
+#   75   EX_TEMPFAIL — retryable, raised BEFORE `heartbeat --start` so a failure
+#        here never consumes an iteration on the task's tripwire counter
+#   124  the optional wall-clock cap fired
 set -euo pipefail
 
+# ── Environment resolution ────────────────────────────────────────────────────
+
+# ep_first <name>... — value of the first variable that is set and non-empty.
+# Indirect expansion rather than eval: a value containing shell metacharacters,
+# spaces, or newlines is never re-parsed.
+ep_first() {
+    local name
+    for name in "$@"; do
+        if [[ -n "${!name-}" ]]; then
+            printf '%s' "${!name}"
+            return 0
+        fi
+    done
+    printf ''
+}
+
+WORKSPACE_PATH="$(ep_first TASKPUMP_WORKSPACE_PATH TP_WORKSPACE WORKSPACE_PATH)"
 : "${WORKSPACE_PATH:=/workspace}"
 [[ -d "$WORKSPACE_PATH" ]] || { echo "ERROR: WORKSPACE_PATH=$WORKSPACE_PATH missing" >&2; exit 1; }
 cd "$WORKSPACE_PATH"
 
+REPO_ROOT="$(ep_first TASKPUMP_REPO_ROOT TP_REPO_ROOT REPO_ROOT)"
 : "${REPO_ROOT:=$WORKSPACE_PATH}"
-OPS_DIR="$REPO_ROOT/ops"
+LEDGER_REPO="$(ep_first TASKPUMP_LEDGER_REPO TP_LEDGER_REPO)"
+: "${LEDGER_REPO:=$REPO_ROOT/ops}"
 
-LOG_FILE="$WORKSPACE_PATH/.arachne-agent.log"
-echo "Arachne parallel agent started at $(date -u) (workspace: $WORKSPACE_PATH)" | tee "$LOG_FILE"
+TASKS_DIR="$(ep_first TASKPUMP_TASKS_DIR ARACHNE_TASKS_DIR)"
+: "${TASKS_DIR:=$LEDGER_REPO/task-loop/tasks}"
+TASK_OUT="$(ep_first TASKPUMP_TASK_OUT ARACHNE_TASK_OUT)"
+: "${TASK_OUT:=$LEDGER_REPO/task-loop/.next-task}"
+TASK_FILE_EXT="$(ep_first TASKPUMP_TASK_FILE_EXT)"
+: "${TASK_FILE_EXT:=.md}"
 
-# ── Firewall (identical allowlist to the serial entrypoint) ────────────────────
-echo "Configuring firewall..." | tee -a "$LOG_FILE"
-iptables -A OUTPUT -o lo -j ACCEPT
-iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
-iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
-iptables -A OUTPUT -d api.anthropic.com -j ACCEPT
-iptables -A OUTPUT -d registry.npmjs.org -j ACCEPT
-iptables -A OUTPUT -d registry.yarnpkg.com -j ACCEPT
-# GitHub CIDR ranges (see entrypoint.sh comment; refresh from api.github.com/meta)
-iptables -A OUTPUT -d 140.82.112.0/20 -j ACCEPT
-iptables -A OUTPUT -d 143.55.64.0/20  -j ACCEPT
-iptables -A OUTPUT -d 192.30.252.0/22 -j ACCEPT
-iptables -A OUTPUT -d 185.199.108.0/22 -j ACCEPT
-iptables -A OUTPUT -d 20.201.28.0/22  -j ACCEPT
-iptables -A OUTPUT -d 20.205.243.0/24 -j ACCEPT
-iptables -A OUTPUT -d 20.207.73.0/24  -j ACCEPT
-iptables -A OUTPUT -d 20.233.83.0/24  -j ACCEPT
-iptables -A OUTPUT -d 20.248.137.0/24 -j ACCEPT
-iptables -A OUTPUT -d crates.io -j ACCEPT
-iptables -A OUTPUT -d static.crates.io -j ACCEPT
-iptables -A OUTPUT -d index.crates.io -j ACCEPT
-iptables -A OUTPUT -d mcp.context7.com -j ACCEPT
-iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-iptables -A OUTPUT -j DROP
-echo "Firewall configured" | tee -a "$LOG_FILE"
+BRIEF="$(ep_first TASKPUMP_BRIEF TP_BRIEF ARACHNE_BRIEF)"
+RESUME_NOTE="$(ep_first TASKPUMP_RESUME_NOTE TP_RESUME_NOTE ARACHNE_RESUME_NOTE)"
+TASK_ID="$(ep_first TASKPUMP_TASK_ID TP_TASK_ID ARACHNE_TASK_ID)"
+PHASE="$(ep_first TASKPUMP_PHASE TP_PHASE ARACHNE_PHASE)"
 
-# ── Credential handler: ACCESS-TOKEN-ONLY (RC-1 / F65.1 / A2; hardened 2026-06-24)
-# The host ~/.claude is bind-mounted READ-ONLY at /tmp/claude-home, so
-# /tmp/claude-home/.credentials.json always reflects the LIVE host token (the
-# host's Claude Code auth daemon rewrites it in place). We copy it into the dev
-# home — but with the refreshToken STRIPPED.
+MAX_TURNS="$(ep_first TASKPUMP_MAX_TURNS TP_MAX_TURNS MAX_TURNS)"
+: "${MAX_TURNS:=600}"
+AGENT_MODEL="$(ep_first TASKPUMP_AGENT_MODEL TP_MODEL AGENT_MODEL)"
+: "${AGENT_MODEL:=opus}"
+SAFETY_TURNS="$(ep_first TASKPUMP_SAFETY_TURNS)"
+: "${SAFETY_TURNS:=3}"
+
+WORKSPACE_TASK_CLI="$(ep_first TASKPUMP_WORKSPACE_TASK_CLI)"
+: "${WORKSPACE_TASK_CLI:=scripts/arachne-task}"
+TASK_CLI="$WORKSPACE_TASK_CLI"
+[[ "$TASK_CLI" == /* ]] || TASK_CLI="$WORKSPACE_PATH/$TASK_CLI"
+
+CONTAINER_USER="$(ep_first TASKPUMP_CONTAINER_USER)"
+: "${CONTAINER_USER:=dev}"
+CONTAINER_HOME="$(ep_first TASKPUMP_CONTAINER_HOME)"
+: "${CONTAINER_HOME:=/home/$CONTAINER_USER}"
+AGENT_CLAUDE_DIR="$CONTAINER_HOME/.claude"
+AGENT_CLAUDE_JSON="$CONTAINER_HOME/.claude.json"
+
+PRE_FLIGHT="$(ep_first TASKPUMP_PRE_FLIGHT TP_PRE_FLIGHT)"
+
+AGENT_LOG_NAME="$(ep_first TASKPUMP_AGENT_LOG_NAME)"
+: "${AGENT_LOG_NAME:=.arachne-agent.log}"
+GOAL_NOTE_NAME="$(ep_first TASKPUMP_GOAL_NOTE_NAME)"
+: "${GOAL_NOTE_NAME:=.arachne-goal.md}"
+RESUME_NOTE_NAME="$(ep_first TASKPUMP_RESUME_NOTE_NAME)"
+: "${RESUME_NOTE_NAME:=.arachne-resume.md}"
+RO_PROBE_FILE="$(ep_first TASKPUMP_RO_PROBE_FILE)"
+: "${RO_PROBE_FILE:=.arachne-rotest}"
+
+HOST_CRED_MOUNT="$(ep_first TASKPUMP_HOST_CRED_MOUNT)"
+: "${HOST_CRED_MOUNT:=/tmp/claude-home}"
+HOST_CONFIG_MOUNT="$(ep_first TASKPUMP_HOST_CONFIG_MOUNT)"
+: "${HOST_CONFIG_MOUNT:=/tmp/claude-home-json/.claude.json}"
+CRED_REFRESH_INTERVAL_S="$(ep_first TASKPUMP_CRED_REFRESH_INTERVAL_S CRED_REFRESH_INTERVAL_S)"
+: "${CRED_REFRESH_INTERVAL_S:=300}"
+AGENT_WALL_TIMEOUT_S="$(ep_first TASKPUMP_AGENT_WALL_TIMEOUT_S AGENT_WALL_TIMEOUT_S)"
+
+# Test seam. `plan` resolves the environment, assembles the prompt, reports, and
+# exits without touching credentials, the firewall, or the session. `preflight`
+# additionally installs credentials and runs the pre-flight hook, then stops
+# short of the session. Neither is used in production; both exist so the harness
+# can exercise this file's real logic instead of grepping it.
+TEST_MODE="$(ep_first TASKPUMP_ENTRYPOINT_TEST_MODE)"
+
+LOG_FILE="$WORKSPACE_PATH/$AGENT_LOG_NAME"
+echo "TaskPump agent started at $(date -u) (workspace: $WORKSPACE_PATH)" | tee "$LOG_FILE"
+
+log() { echo "$*" | tee -a "$LOG_FILE"; }
+
+# ── Credential handler: ACCESS-TOKEN-ONLY (hardened 2026-06-24) ────────────────
+# The host agent home is bind-mounted READ-ONLY, so its credentials file always
+# reflects the LIVE host token (the host's auth daemon rewrites it in place). We
+# copy it into the container user's home — but with the refreshToken STRIPPED.
 #
-# WHY strip it: the OAuth refresh token ROTATES on every refresh (Anthropic issues
-# a new one and invalidates the old). If a container performed a refresh it could
+# WHY strip it: the OAuth refresh token ROTATES on every refresh (a new one is
+# issued and the old invalidated). If a container performed a refresh it could
 # not write the new refresh token back across the READ-ONLY mount, so the host —
-# and every other client sharing the token, including the user's own interactive
-# sessions — would be left holding a dead refresh token and be forced to log in
-# again. (Reported 2026-06-24: host sessions logged out whenever the pump ran.)
-# Removing the refresh token makes a container PHYSICALLY UNABLE to rotate it: the
-# HOST owns rotation, and the container tracks it by re-copying the host's
-# freshly-issued accessToken each tick.
+# and every other client sharing the token, including the operator's own
+# interactive sessions — would be left holding a dead refresh token and be forced
+# to log in again. (Reported 2026-06-24: host sessions logged out whenever the
+# pump ran.) Removing the refresh token makes a container PHYSICALLY UNABLE to
+# rotate it: the HOST owns rotation, and the container tracks it by re-copying
+# the host's freshly-issued accessToken each tick.
 #
 # CONSEQUENCE: a container can no longer self-refresh, so it depends on the host
-# keeping its token fresh (a live host `claude` session, or a host-side refresh).
-# If the ~6h access-token TTL elapses with no host refresh, API calls 401 and the
-# session dies — recoverable: the pump's A1 liveness-reclaim relaunches it with
-# the next fresh token, and the pump's feed gate (apl_host_token_stale) pauses
-# LAUNCHING while the host token is stale so dead containers aren't churned.
+# keeping its token fresh (a live host session, or a host-side refresh). If the
+# ~6h access-token TTL elapses with no host refresh, API calls 401 and the
+# session dies — recoverable: the supervisor's liveness reclaim relaunches it
+# with the next fresh token, and the supervisor's feed gate pauses LAUNCHING
+# while the host token is stale so dead containers aren't churned.
 #
-# SPEC_GAP: whether `claude -p` re-reads .credentials.json per request (Case A:
-# the periodic re-copy rescues the in-flight session) or caches the token at
-# startup (Case B: the re-copy only helps the NEXT container) is still unproven —
-# see the F64 canary runbook. The access-token-only model is correct under both;
-# only the in-flight-rescue benefit depends on Case A.
+# SPEC_GAP: whether the agent CLI re-reads its credentials file per request
+# (Case A: the periodic re-copy rescues the in-flight session) or caches the
+# token at startup (Case B: the re-copy only helps the NEXT container) is still
+# unproven. The access-token-only model is correct under both; only the
+# in-flight-rescue benefit depends on Case A.
 
 # install_access_only_credentials <src> <dst> — write <dst> as an access-token-only
 # copy of <src> (drop .claudeAiOauth.refreshToken) via a validated atomic swap.
@@ -102,7 +211,7 @@ install_access_only_credentials() {
     if jq 'del(.claudeAiOauth.refreshToken)' "$src" > "$tmp" 2>/dev/null \
        && jq -e '.claudeAiOauth.accessToken' "$tmp" >/dev/null 2>&1; then
         mv "$tmp" "$dst"
-        chown dev:dev "$dst" 2>/dev/null || true
+        chown "$CONTAINER_USER:$CONTAINER_USER" "$dst" 2>/dev/null || true
         chmod u+rw "$dst" 2>/dev/null || true
         return 0
     fi
@@ -111,169 +220,268 @@ install_access_only_credentials() {
 }
 
 refresh_credentials() {
-    # .credentials.json — re-copy the host's freshly-rotated accessToken with the
+    # Credentials — re-copy the host's freshly-rotated accessToken with the
     # refreshToken stripped (see install_access_only_credentials). On any failure
     # leave the previous (stale-but-valid) copy in place and retry next tick.
     if install_access_only_credentials \
-         "/tmp/claude-home/.credentials.json" \
-         "/home/dev/.claude/.credentials.json"; then
-        echo "$(date -u) [cred-refresh] .credentials.json refreshed (access-token-only)" >> "$LOG_FILE"
+         "$HOST_CRED_MOUNT/.credentials.json" \
+         "$AGENT_CLAUDE_DIR/.credentials.json"; then
+        echo "$(date -u) [cred-refresh] credentials refreshed (access-token-only)" >> "$LOG_FILE"
     else
-        echo "$(date -u) [cred-refresh] WARNING: .credentials.json invalid after transform; keeping previous" >> "$LOG_FILE"
+        echo "$(date -u) [cred-refresh] WARNING: credentials invalid after transform; keeping previous" >> "$LOG_FILE"
     fi
 
-    # .claude.json — config/telemetry only (no OAuth refresh token), copied whole
+    # Agent config — config/telemetry only (no OAuth refresh token), copied whole
     # via the same validated atomic-swap pattern as the startup copy.
-    local src_cj="/tmp/claude-home-json/.claude.json"
-    local dst_cj="/home/dev/.claude.json"
-    local tmp_cj="${dst_cj}.tmp.$$"
-    if [[ -f "$src_cj" ]]; then
-        if cp "$src_cj" "$tmp_cj" 2>/dev/null && jq -e . "$tmp_cj" >/dev/null 2>&1; then
-            mv "$tmp_cj" "$dst_cj"
-            chown dev:dev "$dst_cj" 2>/dev/null || true
-            chmod u+rw "$dst_cj" 2>/dev/null || true
+    local tmp_cj="${AGENT_CLAUDE_JSON}.tmp.$$"
+    if [[ -f "$HOST_CONFIG_MOUNT" ]]; then
+        if cp "$HOST_CONFIG_MOUNT" "$tmp_cj" 2>/dev/null && jq -e . "$tmp_cj" >/dev/null 2>&1; then
+            mv "$tmp_cj" "$AGENT_CLAUDE_JSON"
+            chown "$CONTAINER_USER:$CONTAINER_USER" "$AGENT_CLAUDE_JSON" 2>/dev/null || true
+            chmod u+rw "$AGENT_CLAUDE_JSON" 2>/dev/null || true
         else
-            echo "$(date -u) [cred-refresh] WARNING: .claude.json invalid after copy; keeping previous" >> "$LOG_FILE"
+            echo "$(date -u) [cred-refresh] WARNING: agent config invalid after copy; keeping previous" >> "$LOG_FILE"
             rm -f "$tmp_cj"
         fi
     fi
     return 0
 }
 
-# ── Configure dev user's Claude home + Auto Mode settings ──────────────────────
-mkdir -p /home/dev/.claude
-if [[ -d /tmp/claude-home ]]; then
-    cp -a /tmp/claude-home/. /home/dev/.claude/
-    # The blanket copy above brought the host's full .credentials.json (with the
-    # refreshToken). Immediately replace it with an access-token-only copy so the
-    # container is non-rotating from t=0 — otherwise a refresh inside the first
-    # CRED_REFRESH_INTERVAL_S window would rotate the host's shared token and log
-    # the host out (see install_access_only_credentials).
-    install_access_only_credentials \
-        "/tmp/claude-home/.credentials.json" \
-        "/home/dev/.claude/.credentials.json" \
-        || echo "WARNING: could not strip refreshToken from startup credentials; refresher will retry" | tee -a "$LOG_FILE"
-fi
-# Merge MCP config + Auto Mode settings into one settings.json so MCP servers
-# and the auto permission mode + allow rules coexist. Auto settings win on
-# conflicting keys. These live with the orchestrator in the primary checkout
-# (REPO_ROOT), NOT in the worktree, so connector worktrees stay pure-from-main.
-MCP_JSON="$REPO_ROOT/claude-mcp.json"
-AUTO_JSON="$REPO_ROOT/claude-settings-auto.json"
-if [[ -f "$MCP_JSON" && -f "$AUTO_JSON" ]]; then
-    jq -s '.[0] * .[1]' "$MCP_JSON" "$AUTO_JSON" > /home/dev/.claude/settings.json
-elif [[ -f "$AUTO_JSON" ]]; then
-    cp "$AUTO_JSON" /home/dev/.claude/settings.json
-elif [[ -f "$MCP_JSON" ]]; then
-    cp "$MCP_JSON" /home/dev/.claude/settings.json
-fi
-if [[ -f /tmp/claude-home-json/.claude.json ]]; then
-    # Validated copy with retry. The host file is actively written by the
-    # user's primary claude session (telemetry, recently-used, etc.), so a
-    # naive cp can capture a mid-write torn state — observed 2026-05-28 when
-    # a parallel cohort silently died on `Unexpected EOF` parsing the
-    # corrupted /home/dev/.claude.json. Retry the copy a few times against
-    # `jq -e .` (≈ "parses as valid JSON"); if every attempt loses the race,
-    # bail BEFORE arachne-task heartbeat --start so the failure doesn't
-    # consume an iteration on the task tripwire counter.
-    attempt=0; max_attempts=6; sleep_s=2
-    while (( attempt < max_attempts )); do
-        cp /tmp/claude-home-json/.claude.json /home/dev/.claude.json
-        if jq -e . /home/dev/.claude.json >/dev/null 2>&1; then
-            break
+install_credentials() {
+    mkdir -p "$AGENT_CLAUDE_DIR"
+    if [[ -d "$HOST_CRED_MOUNT" ]]; then
+        cp -a "$HOST_CRED_MOUNT"/. "$AGENT_CLAUDE_DIR"/
+        # The blanket copy above brought the host's full credentials (with the
+        # refreshToken). Immediately replace them with an access-token-only copy
+        # so the container is non-rotating from t=0 — otherwise a refresh inside
+        # the first CRED_REFRESH_INTERVAL_S window would rotate the host's shared
+        # token and log the host out.
+        install_access_only_credentials \
+            "$HOST_CRED_MOUNT/.credentials.json" \
+            "$AGENT_CLAUDE_DIR/.credentials.json" \
+            || log "WARNING: could not strip refreshToken from startup credentials; refresher will retry"
+    fi
+
+    if [[ -f "$HOST_CONFIG_MOUNT" ]]; then
+        # Validated copy with retry. The host file is actively written by the
+        # operator's own session (telemetry, recently-used, etc.), so a naive cp
+        # can capture a mid-write torn state — observed 2026-05-28 when a
+        # parallel cohort silently died on `Unexpected EOF` parsing a corrupted
+        # config. Retry a few times against `jq -e .` ("parses as valid JSON");
+        # if every attempt loses the race, bail BEFORE the task heartbeat starts
+        # so the failure doesn't consume an iteration on the tripwire counter.
+        local attempt=0 max_attempts=6 sleep_s=2
+        while (( attempt < max_attempts )); do
+            cp "$HOST_CONFIG_MOUNT" "$AGENT_CLAUDE_JSON"
+            if jq -e . "$AGENT_CLAUDE_JSON" >/dev/null 2>&1; then
+                break
+            fi
+            attempt=$((attempt + 1))
+            log "WARNING: $AGENT_CLAUDE_JSON invalid after copy (attempt $attempt/$max_attempts); retrying in ${sleep_s}s"
+            sleep "$sleep_s"
+        done
+        if ! jq -e . "$AGENT_CLAUDE_JSON" >/dev/null 2>&1; then
+            log "ERROR: failed to obtain a valid $AGENT_CLAUDE_JSON after $max_attempts attempts (host file may be in flux). Exiting before the task heartbeat starts so no failed-iteration is recorded."
+            exit 75  # EX_TEMPFAIL — operator-recoverable
         fi
-        attempt=$((attempt + 1))
-        echo "WARNING: /home/dev/.claude.json invalid after copy (attempt $attempt/$max_attempts); retrying in ${sleep_s}s" | tee -a "$LOG_FILE"
-        sleep "$sleep_s"
-    done
-    if ! jq -e . /home/dev/.claude.json >/dev/null 2>&1; then
-        echo "ERROR: failed to obtain a valid /home/dev/.claude.json after $max_attempts attempts (host file may be in flux). Exiting before the task heartbeat starts so no failed-iteration is recorded." | tee -a "$LOG_FILE"
-        exit 75  # EX_TEMPFAIL — operator-recoverable
+    fi
+}
+
+# ── Pre-flight ────────────────────────────────────────────────────────────────
+
+# legacy_markers_present — true when this looks like a pre-hook consumer image.
+legacy_markers_present() {
+    [[ -f "$REPO_ROOT/claude-settings-auto.json" || -f "$WORKSPACE_PATH/claude-settings-auto.json" ]]
+}
+
+# determine_pre_flight — decide, without running anything, which pre-flight path
+# applies. Separated from execution so the plan can be reported in test mode and
+# logged before it runs.
+PRE_FLIGHT_PLAN=""
+determine_pre_flight() {
+    if [[ -n "$PRE_FLIGHT" ]]; then
+        PRE_FLIGHT_PLAN="hook:$PRE_FLIGHT"
+        return 0
+    fi
+    if legacy_markers_present; then
+        PRE_FLIGHT_PLAN="legacy-inline"
+        return 0
+    fi
+    PRE_FLIGHT_PLAN="none"
+}
+
+# legacy_pre_flight — TRANSITIONAL. The pre-split inline pre-flight, kept so an
+# image built before TASKPUMP_PRE_FLIGHT existed keeps working. The maintained
+# copy of this logic is preflight-example.sh; this one is scheduled for deletion
+# once consumers set the hook. Do not extend it.
+legacy_pre_flight() {
+    log "Configuring firewall..."
+    iptables -A OUTPUT -o lo -j ACCEPT
+    iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
+    iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
+    iptables -A OUTPUT -d api.anthropic.com -j ACCEPT
+    iptables -A OUTPUT -d registry.npmjs.org -j ACCEPT
+    iptables -A OUTPUT -d registry.yarnpkg.com -j ACCEPT
+    iptables -A OUTPUT -d 140.82.112.0/20 -j ACCEPT
+    iptables -A OUTPUT -d 143.55.64.0/20  -j ACCEPT
+    iptables -A OUTPUT -d 192.30.252.0/22 -j ACCEPT
+    iptables -A OUTPUT -d 185.199.108.0/22 -j ACCEPT
+    iptables -A OUTPUT -d 20.201.28.0/22  -j ACCEPT
+    iptables -A OUTPUT -d 20.205.243.0/24 -j ACCEPT
+    iptables -A OUTPUT -d 20.207.73.0/24  -j ACCEPT
+    iptables -A OUTPUT -d 20.233.83.0/24  -j ACCEPT
+    iptables -A OUTPUT -d 20.248.137.0/24 -j ACCEPT
+    iptables -A OUTPUT -d crates.io -j ACCEPT
+    iptables -A OUTPUT -d static.crates.io -j ACCEPT
+    iptables -A OUTPUT -d index.crates.io -j ACCEPT
+    iptables -A OUTPUT -d mcp.context7.com -j ACCEPT
+    iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+    iptables -A OUTPUT -j DROP
+    log "Firewall configured"
+
+    local mcp_json="$REPO_ROOT/claude-mcp.json"
+    local auto_json="$REPO_ROOT/claude-settings-auto.json"
+    if [[ -f "$mcp_json" && -f "$auto_json" ]]; then
+        jq -s '.[0] * .[1]' "$mcp_json" "$auto_json" > "$AGENT_CLAUDE_DIR/settings.json"
+    elif [[ -f "$auto_json" ]]; then
+        cp "$auto_json" "$AGENT_CLAUDE_DIR/settings.json"
+    elif [[ -f "$mcp_json" ]]; then
+        cp "$mcp_json" "$AGENT_CLAUDE_DIR/settings.json"
+    fi
+
+    log "Running smoke test..."
+    if [[ -x /smoke_test.sh ]]; then
+        WORKSPACE_PATH="$WORKSPACE_PATH" /smoke_test.sh 2>&1 | tee -a "$LOG_FILE" \
+            || log "WARNING: Smoke test had failures (continuing)"
+    fi
+}
+
+run_pre_flight() {
+    case "$PRE_FLIGHT_PLAN" in
+        hook:*)
+            local hook="${PRE_FLIGHT_PLAN#hook:}"
+            if [[ ! -x "$hook" ]]; then
+                log "ERROR: TASKPUMP_PRE_FLIGHT is not an executable in this container: $hook"
+                exit 75
+            fi
+            log "Pre-flight hook: $hook"
+            export WORKSPACE_PATH REPO_ROOT LEDGER_REPO LOG_FILE
+            export TASKPUMP_CONTAINER_USER="$CONTAINER_USER"
+            export TASKPUMP_CONTAINER_HOME="$CONTAINER_HOME"
+            export TASKPUMP_TASK_ID="$TASK_ID"
+            export TASKPUMP_PHASE="$PHASE"
+            local rc=0
+            "$hook" || rc=$?
+            if (( rc != 0 )); then
+                log "ERROR: pre-flight hook failed (rc=$rc); exiting before the task heartbeat starts"
+                exit 75
+            fi
+            ;;
+        legacy-inline)
+            log "Pre-flight: TASKPUMP_PRE_FLIGHT unset and legacy markers present — running the transitional inline pre-flight"
+            legacy_pre_flight
+            ;;
+        *)
+            log "Pre-flight: none configured (set TASKPUMP_PRE_FLIGHT to run one)"
+            ;;
+    esac
+}
+
+# ── Startup ───────────────────────────────────────────────────────────────────
+
+determine_pre_flight
+
+if [[ "$TEST_MODE" != "plan" ]]; then
+    install_credentials
+    run_pre_flight
+
+    # After the hook, not before: a hook that writes into the agent's home (an
+    # agent settings file, say) does so as root, and the session runs as the
+    # unprivileged container user.
+    chown -R "$CONTAINER_USER:$CONTAINER_USER" "$AGENT_CLAUDE_DIR" "$AGENT_CLAUDE_JSON" 2>/dev/null || true
+    chmod -R u+rw "$AGENT_CLAUDE_DIR" 2>/dev/null || true
+    chmod u+rw "$AGENT_CLAUDE_JSON" 2>/dev/null || true
+    log "Credentials + agent settings configured"
+    log "permission mode: $(jq -r '.permissions.defaultMode // "default"' "$AGENT_CLAUDE_DIR/settings.json" 2>/dev/null)"
+fi
+
+if [[ -z "$TEST_MODE" ]]; then
+    # ── Background credential refresher ───────────────────────────────────────
+    # Periodically re-copies credentials (and the agent config) from the live
+    # read-only mount so a long-running container tracks host token refreshes and
+    # does not 401 once the startup token's TTL elapses. Runs as root in a child
+    # subshell; container teardown (or the `exec` below) reaps it — no explicit
+    # cleanup needed. A failed tick (`|| true`) never kills the loop.
+    (
+        while true; do
+            sleep "$CRED_REFRESH_INTERVAL_S"
+            refresh_credentials || true
+        done
+    ) &
+    log "Credential refresher started (interval=${CRED_REFRESH_INTERVAL_S}s, pid=$!)"
+
+    # ── Git HTTPS auth ────────────────────────────────────────────────────────
+    if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+        su "$CONTAINER_USER" -c "git config --global url.'https://x-access-token:${GITHUB_TOKEN}@github.com/'.insteadOf 'https://github.com/'"
+        log "Git HTTPS auth configured"
+    else
+        log "WARNING: GITHUB_TOKEN not set; ledger fetch + gh will fail"
+    fi
+
+    # ── Read-only-primary self-check ──────────────────────────────────────────
+    # The primary source tree is mounted read-only; only the workspace, .git, and
+    # the ledger are writable. A writable primary root means the mount set
+    # regressed to a blanket RW REPO_ROOT — flag it loudly, because a silent
+    # regression here lets an agent edit the primary checkout out from under
+    # every other worktree.
+    if touch "$REPO_ROOT/$RO_PROBE_FILE" 2>/dev/null; then
+        rm -f "$REPO_ROOT/$RO_PROBE_FILE" 2>/dev/null || true
+        echo "WARNING: primary checkout ($REPO_ROOT) is WRITABLE — read-only mount regression" | tee -a "$LOG_FILE" >&2
+    else
+        log "mount self-check: primary checkout is read-only (expected)"
     fi
 fi
-chown -R dev:dev /home/dev/.claude /home/dev/.claude.json 2>/dev/null || true
-chmod -R u+rw /home/dev/.claude 2>/dev/null || true
-chmod u+rw /home/dev/.claude.json 2>/dev/null || true
-echo "Credentials + Auto Mode settings configured" | tee -a "$LOG_FILE"
-echo "permission mode: $(jq -r '.permissions.defaultMode // "default"' /home/dev/.claude/settings.json 2>/dev/null)" | tee -a "$LOG_FILE"
 
-# ── Background credential refresher (RC-1 fix, F65.1 / A2) ──────────────────────
-# Periodically re-copies .credentials.json (and .claude.json) from the live
-# read-only mount so a long-running container tracks host token refreshes and
-# does not 401 once the startup token's TTL elapses. Runs as root in a child
-# subshell; the container teardown on exit (or `exec su dev` below) reaps it —
-# no explicit cleanup needed. A failed tick (`|| true`) never kills the loop.
-CRED_REFRESH_INTERVAL_S="${CRED_REFRESH_INTERVAL_S:-300}"
-(
-    while true; do
-        sleep "$CRED_REFRESH_INTERVAL_S"
-        refresh_credentials || true
-    done
-) &
-CRED_REFRESH_PID=$!
-echo "Credential refresher started (interval=${CRED_REFRESH_INTERVAL_S}s, pid=$CRED_REFRESH_PID)" | tee -a "$LOG_FILE"
-
-# ── Git HTTPS auth ─────────────────────────────────────────────────────────────
-if [[ -n "${GITHUB_TOKEN:-}" ]]; then
-    su dev -c "git config --global url.'https://x-access-token:${GITHUB_TOKEN}@github.com/'.insteadOf 'https://github.com/'"
-    echo "Git HTTPS auth configured" | tee -a "$LOG_FILE"
-else
-    echo "WARNING: GITHUB_TOKEN not set; ops/ fetch + gh pr will fail" | tee -a "$LOG_FILE"
-fi
-
-# ── Smoke test ─────────────────────────────────────────────────────────────────
-echo "Running smoke test..." | tee -a "$LOG_FILE"
-WORKSPACE_PATH="$WORKSPACE_PATH" /smoke_test.sh 2>&1 | tee -a "$LOG_FILE" || echo "WARNING: Smoke test had failures (continuing)" | tee -a "$LOG_FILE"
-
-# ── A8 (F65.5) read-only-primary self-check ────────────────────────────────────
-# The primary source tree is mounted read-only; only the worktree, .git, and ops/
-# are writable. A writable primary root means the A8 mount set regressed to a
-# blanket RW $REPO_ROOT — flag it loudly (a silent regression is the RC-4 footgun).
-if touch "$REPO_ROOT/.arachne-rotest" 2>/dev/null; then
-    rm -f "$REPO_ROOT/.arachne-rotest" 2>/dev/null || true
-    echo "WARNING: primary checkout ($REPO_ROOT) is WRITABLE — A8 read-only mount regression" | tee -a "$LOG_FILE" >&2
-else
-    echo "A8 self-check: primary checkout is read-only (expected)" | tee -a "$LOG_FILE"
-fi
-
-# ── Resolve the kickoff brief (the agent's prompt) ─────────────────────────────
-: "${ARACHNE_BRIEF:=}"
-if [[ -z "$ARACHNE_BRIEF" ]]; then
-    echo "ERROR: ARACHNE_BRIEF not set; parallel mode requires an assigned brief" | tee -a "$LOG_FILE" >&2
+# ── Resolve the kickoff brief (the agent's prompt) ────────────────────────────
+if [[ -z "$BRIEF" ]]; then
+    echo "ERROR: no brief set (TASKPUMP_BRIEF / ARACHNE_BRIEF); this runner requires an assigned brief" | tee -a "$LOG_FILE" >&2
     exit 1
 fi
-# Allow brief paths relative to the canonical ops/ or the repo root.
-if [[ ! -f "$ARACHNE_BRIEF" ]]; then
-    for cand in "$OPS_DIR/$ARACHNE_BRIEF" "$REPO_ROOT/$ARACHNE_BRIEF" "$WORKSPACE_PATH/$ARACHNE_BRIEF"; do
-        [[ -f "$cand" ]] && ARACHNE_BRIEF="$cand" && break
+# Allow brief paths relative to the ledger checkout, the repo root, or the workspace.
+if [[ ! -f "$BRIEF" ]]; then
+    for cand in "$LEDGER_REPO/$BRIEF" "$REPO_ROOT/$BRIEF" "$WORKSPACE_PATH/$BRIEF"; do
+        if [[ -f "$cand" ]]; then BRIEF="$cand"; break; fi
     done
 fi
-[[ -f "$ARACHNE_BRIEF" ]] || { echo "ERROR: brief not found: $ARACHNE_BRIEF" | tee -a "$LOG_FILE" >&2; exit 1; }
-echo "Brief: $ARACHNE_BRIEF" | tee -a "$LOG_FILE"
+[[ -f "$BRIEF" ]] || { echo "ERROR: brief not found: $BRIEF" | tee -a "$LOG_FILE" >&2; exit 1; }
+log "Brief: $BRIEF"
 
 # Optional resume preamble. Bind-mounted at the same absolute path as the host,
 # so the env value resolves directly; fall back to the conventional location.
-: "${ARACHNE_RESUME_NOTE:=}"
-if [[ -n "$ARACHNE_RESUME_NOTE" && ! -f "$ARACHNE_RESUME_NOTE" && -f "$WORKSPACE_PATH/.arachne-resume.md" ]]; then
-    ARACHNE_RESUME_NOTE="$WORKSPACE_PATH/.arachne-resume.md"
+if [[ -n "$RESUME_NOTE" && ! -f "$RESUME_NOTE" && -f "$WORKSPACE_PATH/$RESUME_NOTE_NAME" ]]; then
+    RESUME_NOTE="$WORKSPACE_PATH/$RESUME_NOTE_NAME"
 fi
-if [[ -n "$ARACHNE_RESUME_NOTE" && -f "$ARACHNE_RESUME_NOTE" ]]; then
-    echo "Resume preamble: $ARACHNE_RESUME_NOTE (prepended to brief)" | tee -a "$LOG_FILE"
+if [[ -n "$RESUME_NOTE" && -f "$RESUME_NOTE" ]]; then
+    log "Resume preamble: $RESUME_NOTE (prepended to brief)"
 else
-    ARACHNE_RESUME_NOTE=""
+    RESUME_NOTE=""
 fi
 
-# ── Goal preamble ──────────────────────────────────────────────────────────────
-# Every task handed to an agent gets a clear goal up front. Read the epic's
-# one-line goal from its task file (canonical ops/) and write a small preamble
-# that is prepended to the brief on stdin ahead of any resume note — mirroring
-# the resume-preamble mechanism, so the hand-authored briefs stay pure.
+# ── Goal preamble ─────────────────────────────────────────────────────────────
+# Every task handed to an agent gets a clear goal up front. Read the lead task's
+# one-line goal from its task file and write a small preamble that is prepended
+# to the brief on stdin ahead of any resume note — mirroring the resume-preamble
+# mechanism, so hand-authored briefs stay pure.
+#
+# SPEC_GAP: this reads the task file directly rather than asking the task CLI,
+# because the CLI lives in the workspace and its output format is the consumer's
+# to change. The cost is that the ledger's on-disk layout is known in two places.
 GOAL_NOTE=""
-if [[ -n "${ARACHNE_TASK_ID:-}" ]]; then
-    GOAL_TEXT="$(yq --front-matter=extract '.goal' "$OPS_DIR/task-loop/tasks/${ARACHNE_TASK_ID}.md" 2>/dev/null || echo '')"
-    [[ "$GOAL_TEXT" == "null" ]] && GOAL_TEXT=""
+if [[ -n "$TASK_ID" ]]; then
+    GOAL_TEXT="$(yq --front-matter=extract '.goal' "$TASKS_DIR/${TASK_ID}${TASK_FILE_EXT}" 2>/dev/null || echo '')"
+    if [[ "$GOAL_TEXT" == "null" ]]; then GOAL_TEXT=""; fi
     if [[ -n "$GOAL_TEXT" ]]; then
-        GOAL_NOTE="$WORKSPACE_PATH/.arachne-goal.md"
+        GOAL_NOTE="$WORKSPACE_PATH/$GOAL_NOTE_NAME"
         {
             echo "# GOAL — the outcome this session must achieve"
             echo
@@ -287,30 +495,59 @@ if [[ -n "${ARACHNE_TASK_ID:-}" ]]; then
             echo
         } > "$GOAL_NOTE"
         chmod 666 "$GOAL_NOTE" 2>/dev/null || true
-        echo "Goal: $GOAL_TEXT" | tee -a "$LOG_FILE"
+        log "Goal: $GOAL_TEXT"
     else
-        echo "WARNING: epic ${ARACHNE_TASK_ID} has no goal — set one with 'arachne-task goal ${ARACHNE_TASK_ID} --set \"...\"'" | tee -a "$LOG_FILE"
+        log "WARNING: lead task ${TASK_ID} has no goal — set one with '$WORKSPACE_TASK_CLI goal ${TASK_ID} --set \"...\"'"
     fi
 fi
 
+# ── Stdin assembly ────────────────────────────────────────────────────────────
+# Order is load-bearing: goal, then resume context, then the brief. The goal is
+# first because it is what the other two are in service of; a resume note read
+# after the brief would look like an amendment rather than the premise it is.
+PROMPT_PARTS=()
+if [[ -n "$GOAL_NOTE" && -f "$GOAL_NOTE" ]]; then PROMPT_PARTS+=("$GOAL_NOTE"); fi
+if [[ -n "$RESUME_NOTE" && -f "$RESUME_NOTE" ]]; then PROMPT_PARTS+=("$RESUME_NOTE"); fi
+PROMPT_PARTS+=("$BRIEF")
+
+PROMPT_ARGS=""
+for part in "${PROMPT_PARTS[@]}"; do
+    PROMPT_ARGS+="$(printf '%q' "$part") "
+done
+
+if [[ -n "$TEST_MODE" ]]; then
+    # Deterministic, greppable report of everything resolution decided.
+    echo "REPORT workspace=$WORKSPACE_PATH"
+    echo "REPORT repo_root=$REPO_ROOT"
+    echo "REPORT ledger_repo=$LEDGER_REPO"
+    echo "REPORT tasks_dir=$TASKS_DIR"
+    echo "REPORT task_id=$TASK_ID"
+    echo "REPORT phase=$PHASE"
+    echo "REPORT model=$AGENT_MODEL"
+    echo "REPORT max_turns=$MAX_TURNS"
+    echo "REPORT safety_turns=$SAFETY_TURNS"
+    echo "REPORT task_cli=$TASK_CLI"
+    echo "REPORT container_user=$CONTAINER_USER"
+    echo "REPORT container_home=$CONTAINER_HOME"
+    echo "REPORT pre_flight=$PRE_FLIGHT_PLAN"
+    echo "REPORT prompt_parts=${PROMPT_PARTS[*]}"
+    exit 0
+fi
+
 chmod 666 "$LOG_FILE"
-chown -R dev:dev "$WORKSPACE_PATH/.arachne-agent.log" 2>/dev/null || true
-
-MAX_TURNS="${MAX_TURNS:-600}"
-AGENT_MODEL="${AGENT_MODEL:-opus}"
-TASK_ID="${ARACHNE_TASK_ID:-}"
+chown -R "$CONTAINER_USER:$CONTAINER_USER" "$LOG_FILE" 2>/dev/null || true
 
 echo | tee -a "$LOG_FILE"
-echo "Starting single Auto Mode session" | tee -a "$LOG_FILE"
-echo "  Workspace: $WORKSPACE_PATH" | tee -a "$LOG_FILE"
-echo "  Task:      ${TASK_ID:-<none>}" | tee -a "$LOG_FILE"
-echo "  Model:     $AGENT_MODEL    Max turns: $MAX_TURNS" | tee -a "$LOG_FILE"
+log "Starting single Auto Mode session"
+log "  Workspace: $WORKSPACE_PATH"
+log "  Task:      ${TASK_ID:-<none>}"
+log "  Model:     $AGENT_MODEL    Max turns: $MAX_TURNS"
 echo | tee -a "$LOG_FILE"
 
-# The single dev-user session script. Captured in a variable so it can be run
-# either with `exec` (default) or wrapped in `timeout` (when a wall-clock cap is
-# set) without duplicating the body. Host-side vars are expanded here at
-# assignment; `\$...` stay literal for the dev shell to expand at run time.
+# The single unprivileged-user session script. Captured in a variable so it can
+# be run either with `exec` (default) or wrapped in `timeout` (when a wall-clock
+# cap is set) without duplicating the body. Host-side vars are expanded here at
+# assignment; `\$...` stay literal for the session shell to expand at run time.
 DEV_SESSION_SCRIPT="
     cd '$WORKSPACE_PATH'
     export PATH=/usr/local/cargo/bin:\$PATH
@@ -319,32 +556,35 @@ DEV_SESSION_SCRIPT="
     export DISABLE_TELEMETRY=1
     export DISABLE_ERROR_REPORTING=1
 
-    # All arachne-task ops target the canonical ops/ in the main repo; code
-    # productivity is measured against the worktree (this branch).
-    export ARACHNE_TASKS_DIR='$OPS_DIR/task-loop/tasks'
-    export ARACHNE_TASK_OUT='$OPS_DIR/task-loop/.next-task'
+    # All task-state operations target the canonical ledger checkout; code
+    # productivity is measured against the workspace (this branch). Both
+    # spellings are exported: the canonical one for a migrated task CLI, the
+    # legacy one for a consumer shim that has not migrated yet.
+    export TASKPUMP_TASKS_DIR='$TASKS_DIR'
+    export TASKPUMP_TASK_OUT='$TASK_OUT'
+    export TASKPUMP_CODE_REPO='$WORKSPACE_PATH'
+    export TASKPUMP_TASK_PUSH=1
+    export ARACHNE_TASKS_DIR='$TASKS_DIR'
+    export ARACHNE_TASK_OUT='$TASK_OUT'
     export ARACHNE_CODE_REPO='$WORKSPACE_PATH'
     export ARACHNE_TASK_PUSH=1
 
     CURRENT_BRANCH=\$(git -C '$WORKSPACE_PATH' branch --show-current)
     echo \"Branch: \$CURRENT_BRANCH\" | tee -a '$LOG_FILE'
 
-    # Safety-net claim of the epic task (the agent re-claims/sub-claims as the
+    # Safety-net claim of the lead task (the agent re-claims/sub-claims as the
     # brief directs). Harmless if already claimed by this branch (idempotent).
     if [ -n '$TASK_ID' ]; then
-        '$WORKSPACE_PATH/scripts/arachne-task' claim '$TASK_ID' --branch \"\$CURRENT_BRANCH\" --turns 3 2>&1 | tee -a '$LOG_FILE' || true
-        '$WORKSPACE_PATH/scripts/arachne-task' heartbeat '$TASK_ID' --start 2>&1 | tee -a '$LOG_FILE' || true
+        '$TASK_CLI' claim '$TASK_ID' --branch \"\$CURRENT_BRANCH\" --turns $SAFETY_TURNS 2>&1 | tee -a '$LOG_FILE' || true
+        '$TASK_CLI' heartbeat '$TASK_ID' --start 2>&1 | tee -a '$LOG_FILE' || true
     fi
 
     # ── The single long session ──────────────────────────────────────────────
-    # --permission-mode auto: server-side classifier gates dangerous actions;
-    # no --dangerously-skip-permissions. In headless -p, the session aborts
-    # after repeated classifier blocks; we treat that as park-for-review.
+    # --permission-mode auto: the server-side classifier gates dangerous actions;
+    # no --dangerously-skip-permissions. In headless -p, the session aborts after
+    # repeated classifier blocks; we treat that as park-for-review.
     # Stdin order: goal preamble, then resume preamble (if any), then the brief.
-    PROMPT_PARTS=''
-    [ -n '$GOAL_NOTE' ] && [ -f '$GOAL_NOTE' ] && PROMPT_PARTS=\"\$PROMPT_PARTS$GOAL_NOTE \"
-    [ -n '$ARACHNE_RESUME_NOTE' ] && [ -f '$ARACHNE_RESUME_NOTE' ] && PROMPT_PARTS=\"\$PROMPT_PARTS$ARACHNE_RESUME_NOTE \"
-    cat \$PROMPT_PARTS '$ARACHNE_BRIEF' | claude -p \
+    cat $PROMPT_ARGS | claude -p \
         --permission-mode auto \
         --model '$AGENT_MODEL' \
         --verbose \
@@ -354,40 +594,40 @@ DEV_SESSION_SCRIPT="
     SESSION_RC=\$?
     echo \"Session exited (rc=\$SESSION_RC)\" | tee -a '$LOG_FILE'
 
-    # End heartbeat only if the agent left the epic in_progress (i.e. didn't
-    # call complete/block itself). Never auto-complete: 'done' requires the
-    # agent to have asserted green build + tests + PR via arachne-task complete.
+    # End heartbeat only if the agent left the lead task in_progress (i.e. didn't
+    # call complete/block itself). Never auto-complete: 'done' requires the agent
+    # to have asserted green build + tests + PR via the task CLI's complete verb.
     if [ -n '$TASK_ID' ]; then
-        TASK_FILE='$OPS_DIR/task-loop/tasks/$TASK_ID.md'
+        TASK_FILE='$TASKS_DIR/$TASK_ID$TASK_FILE_EXT'
         TASK_STATUS=\$(yq --front-matter=extract '.status' \"\$TASK_FILE\" 2>/dev/null || echo '')
         if [ \"\$TASK_STATUS\" = 'in_progress' ]; then
-            '$WORKSPACE_PATH/scripts/arachne-task' heartbeat '$TASK_ID' --end 2>&1 | tee -a '$LOG_FILE' || true
-            echo \"Epic $TASK_ID left in_progress — parked for review.\" | tee -a '$LOG_FILE'
+            '$TASK_CLI' heartbeat '$TASK_ID' --end 2>&1 | tee -a '$LOG_FILE' || true
+            echo \"Lead task $TASK_ID left in_progress — parked for review.\" | tee -a '$LOG_FILE'
         else
-            echo \"Epic $TASK_ID final status: \$TASK_STATUS\" | tee -a '$LOG_FILE'
+            echo \"Lead task $TASK_ID final status: \$TASK_STATUS\" | tee -a '$LOG_FILE'
         fi
     fi
 
-    # Push canonical ops/ so the host + monitor see final state.
-    (cd '$OPS_DIR' && git push 2>&1) | tee -a '$LOG_FILE' || true
-    echo \"Parallel agent finished at \$(date -u).\" | tee -a '$LOG_FILE'
+    # Push the ledger so the host + monitor see final state.
+    (cd '$LEDGER_REPO' && git push 2>&1) | tee -a '$LOG_FILE' || true
+    echo \"Agent finished at \$(date -u).\" | tee -a '$LOG_FILE'
 "
 
 # ── Launch the session: optional wall-clock backstop, else exec ────────────────
-# AGENT_WALL_TIMEOUT_S (opt-in; unset = backward-compatible exec path) caps the
-# session wall-clock as a last-resort guard below the token TTL. `timeout` needs
-# a child to signal, so we cannot `exec` in that branch — a desirable side
-# effect is that the end-heartbeat + ops-push inside the script run on a
-# wall-clock kill, whereas `exec` silently drops them when the process is
-# replaced. `|| WALL_RC=$?` keeps `set -e` from aborting before we capture rc.
-if [[ -n "${AGENT_WALL_TIMEOUT_S:-}" ]]; then
-    echo "Wall-clock cap: ${AGENT_WALL_TIMEOUT_S}s" | tee -a "$LOG_FILE"
+# The wall-clock cap is opt-in (unset = the plain exec path) and acts as a
+# last-resort guard below the token TTL. `timeout` needs a child to signal, so we
+# cannot `exec` in that branch — a desirable side effect is that the end-heartbeat
+# and ledger push inside the script run on a wall-clock kill, whereas `exec`
+# silently drops them when the process is replaced. `|| WALL_RC=$?` keeps `set -e`
+# from aborting before we capture rc.
+if [[ -n "$AGENT_WALL_TIMEOUT_S" ]]; then
+    log "Wall-clock cap: ${AGENT_WALL_TIMEOUT_S}s"
     WALL_RC=0
-    timeout "$AGENT_WALL_TIMEOUT_S" su dev -c "$DEV_SESSION_SCRIPT" || WALL_RC=$?
+    timeout "$AGENT_WALL_TIMEOUT_S" su "$CONTAINER_USER" -c "$DEV_SESSION_SCRIPT" || WALL_RC=$?
     if [[ "$WALL_RC" -eq 124 ]]; then
         echo "$(date -u) [wall-cap] session killed by wall-clock timeout (${AGENT_WALL_TIMEOUT_S}s)" | tee -a "$LOG_FILE"
     fi
     exit "$WALL_RC"
 else
-    exec su dev -c "$DEV_SESSION_SCRIPT"
+    exec su "$CONTAINER_USER" -c "$DEV_SESSION_SCRIPT"
 fi
