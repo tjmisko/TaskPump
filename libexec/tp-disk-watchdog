@@ -1,38 +1,38 @@
 #!/bin/bash
-# arachne-disk-watchdog -- pause new agent launches when free disk drops below
-# a threshold, and when space gets critical buy it back by cargo-cleaning
-# worktree + primary target/ dirs (arachne-cleanup --targets --include-primary,
-# which skips worktrees with a live agent) and pruning docker.
+# tp-disk-watchdog -- pause new agent launches when free disk drops below a
+# threshold, and when space gets critical buy it back by cleaning worktree and
+# primary build dirs (`tp cleanup --targets --include-primary`, which skips any
+# worktree with a live agent) and pruning the container runtime.
 #
-# Background: 4-6 parallel agents each maintain ~3 GB of cargo target/ plus
-# the docker build cache, image storage, container writable layers. A box
-# with 50 GB free can become a box with 0 GB free in 30 minutes once cargo
-# rebuilds kick in. When that happens mid-run, cargo writes start ENOSPC'ing
-# and the agents wedge inside half-finished bash tool calls — observed
-# 2026-05-28. The pool cap file (.arachne-pool-cap) is the documented choke
-# point on run-parallel.sh's launch loop; this watchdog drives it from disk
-# pressure.
+# Background: several parallel agents each maintain GB of build output plus the
+# container build cache, image storage, and writable layers. A box with 50 GB
+# free can become a box with 0 GB free in half an hour once rebuilds kick in.
+# When that happens mid-run, writes start ENOSPC'ing and agents wedge inside
+# half-finished tool calls. The pool cap file is the documented choke point on
+# the launch loop; this watchdog drives it from disk pressure.
 #
 # Usage:
-#   ./scripts/arachne-disk-watchdog                # watch + auto-throttle
-#   ./scripts/arachne-disk-watchdog --dry-run      # detect + log only
-#   ./scripts/arachne-disk-watchdog --once         # one check, exit
-#   ./scripts/arachne-disk-watchdog --auto-exit    # exit cleanly when no agents remain
-#   ./scripts/arachne-disk-watchdog --gate         # one-shot feed gate: exit 0=ok, 10=low disk
+#   tp disk-watchdog                # watch + auto-throttle
+#   tp disk-watchdog --dry-run      # detect + log only
+#   tp disk-watchdog --once         # one check, exit
+#   tp disk-watchdog --auto-exit    # exit cleanly when no agents remain
+#   tp disk-watchdog --gate         # one-shot feed gate: exit 0=ok, 10=low disk
 #
-# Env:
-#   POLL                 -- seconds between checks (default 30)
-#   PAUSE_THRESHOLD_GB   -- free below this GB → set pool cap to 0, and the
-#                           free-space floor for --gate (default 10)
-#   PANIC_THRESHOLD_GB   -- free below this GB → cargo clean target/ dirs + cleanup --docker (default 5)
-#   RECOVER_THRESHOLD_GB -- free above this GB → restore original cap (default 20)
-#   ORIGINAL_CAP         -- cap to restore when recovered (default: contents of CAP_FILE at start, else 6)
-#   CAP_FILE             -- pool cap file (default <repo-root>/.arachne-pool-cap)
-#   COOLDOWN             -- seconds to wait after cleanup before re-arming (default 180)
-#   MOUNT                -- mount to check (default /; the partition that holds $HOME)
-#   STARTUP_GRACE_SEC    -- with --auto-exit, ignore zero-agent state for this long after start (default 120)
-#   EMPTY_GRACE_CHECKS   -- with --auto-exit, exit after this many consecutive empty checks (default 3)
-#   PANIC_RECLAIM_TARGETS-- on PANIC, cargo clean worktree+primary target/ before docker prune (default 1)
+# Configuration (taskpump.conf or the environment; legacy names still work):
+#   TASKPUMP_DISK_POLL          seconds between checks (default 30)
+#   TASKPUMP_DISK_PAUSE_GB      free below this → pool cap 0, and the floor
+#                               --gate answers against (default 10)
+#   TASKPUMP_DISK_PANIC_GB      free below this → reclaim build dirs + prune
+#                               (default 5)
+#   TASKPUMP_DISK_RECOVER_GB    free above this → restore the original cap
+#                               (default 20)
+#   TASKPUMP_DISK_COOLDOWN      seconds to wait after a reclaim (default 180)
+#   TASKPUMP_DISK_MOUNT         mount to measure (default /)
+#   TASKPUMP_DISK_PROBE         command that reports free space
+#   TASKPUMP_POOL_CAP_FILE      the live pool cap this drives
+#   TASKPUMP_ORIGINAL_CAP       cap to restore (default: the cap file at start)
+#   TASKPUMP_PANIC_RECLAIM      0 = prune only, never clean build dirs
+#   TASKPUMP_STARTUP_GRACE_SEC / TASKPUMP_EMPTY_GRACE_CHECKS  as --auto-exit above
 # HELP-END
 set -uo pipefail
 
@@ -139,7 +139,7 @@ reclaim_targets() {
     [[ "${TASKPUMP_PANIC_RECLAIM:-${PANIC_RECLAIM_TARGETS:-1}}" -eq 1 ]] || return 0
     local cleanup="$TP_LIBEXEC_DIR/tp-cleanup"
     if [[ ! -x "$cleanup" ]]; then
-        log "  arachne-cleanup not found/executable at $cleanup — skipping target reclaim"
+        log "  tp-cleanup not found/executable at $cleanup — skipping target reclaim"
         return 0
     fi
     local args=(--targets --include-primary)
@@ -151,7 +151,7 @@ reclaim_targets() {
 # ── docker_panic -- run cleanup --docker to free space immediately.
 docker_panic() {
     if [[ "$DRY_RUN" -eq 1 ]]; then
-        log "  (dry-run) would run arachne-cleanup --docker"
+        log "  (dry-run) would run tp-cleanup --docker"
         return 0
     fi
     "$TP_LIBEXEC_DIR/tp-cleanup" --docker 2>&1 | sed 's/^/    cleanup: /'
@@ -211,7 +211,7 @@ if [[ "$GATE" -eq 1 ]]; then
 fi
 
 mode="watch"; [[ "$ONCE" -eq 1 ]] && mode="once"; [[ "$DRY_RUN" -eq 1 ]] && mode="$mode/dry-run"
-log "arachne-disk-watchdog starting ($mode): mount=$MOUNT poll=${POLL}s pause<${PAUSE_THRESHOLD_GB}G panic<${PANIC_THRESHOLD_GB}G recover>${RECOVER_THRESHOLD_GB}G original_cap=$ORIGINAL_CAP"
+log "tp-disk-watchdog starting ($mode): mount=$MOUNT poll=${POLL}s pause<${PAUSE_THRESHOLD_GB}G panic<${PANIC_THRESHOLD_GB}G recover>${RECOVER_THRESHOLD_GB}G original_cap=$ORIGINAL_CAP"
 
 if [[ "$ONCE" -eq 1 ]]; then
     react

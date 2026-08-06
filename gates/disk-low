@@ -30,7 +30,7 @@ tp_load_config
 
 [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { apl_help "$0"; exit 0; }
 
-export ARACHNE_DISK_WATCHDOG="${TASKPUMP_DISK_WATCHDOG:-$TP_LIBEXEC_DIR/tp-disk-watchdog}"
+export TASKPUMP_DISK_WATCHDOG="${TASKPUMP_DISK_WATCHDOG:-$TP_LIBEXEC_DIR/tp-disk-watchdog}"
 
 reason="$(apl_disk_low)" || rc=$?
 rc="${rc:-0}"

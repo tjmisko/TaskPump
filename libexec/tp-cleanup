@@ -1,37 +1,40 @@
 #!/bin/bash
-# arachne-cleanup -- one-button rescue for parallel-run agents.
+# tp-cleanup -- one-button rescue for a parallel run.
 #
-# Background: a parallel run can leave the box in an awkward state — agents
-# hung on cargo locks after an ENOSPC, runaway dev-server zombies, 30 GB of
-# docker build cache, 4×3 GB cargo target dirs across worktrees. This script
-# packages the cleanup steps so the recovery is one command and not a
-# 20-step muscle-memory ritual.
+# Background: a parallel run can leave the box in an awkward state — agents hung
+# on build locks after an ENOSPC, runaway dev-server zombies, tens of GB of
+# container build cache, several GB of build output per worktree. This packages
+# the recovery so it is one command and not a 20-step muscle-memory ritual.
 #
 # Usage:
-#   ./scripts/arachne-cleanup --status        # what would be cleaned (read-only)
-#   ./scripts/arachne-cleanup --stuck         # stop hung containers, release tasks
-#   ./scripts/arachne-cleanup --targets       # cargo clean worktree target/ (skips live agents)
-#   ./scripts/arachne-cleanup --targets --include-primary  # ...and Arachne's own target/
-#   ./scripts/arachne-cleanup --docker        # builder prune + system prune
-#   ./scripts/arachne-cleanup --all           # all three, in that order
-#   ./scripts/arachne-cleanup --all --dry-run # preview the full --all sweep
+#   tp cleanup --status        # what would be cleaned (read-only)
+#   tp cleanup --stuck         # stop hung containers, release their tasks
+#   tp cleanup --targets       # clean worktree build dirs (skips live agents)
+#   tp cleanup --targets --include-primary  # ...and the primary checkout's
+#   tp cleanup --docker        # builder prune + system prune
+#   tp cleanup --all           # all three, in that order
+#   tp cleanup --all --dry-run # preview the full --all sweep
 #
-# Stuck-detection heuristic: a running arachne-agent-* container whose
-# .arachne-agent.log mtime is older than STUCK_THRESHOLD_MIN (default 15)
-# is considered stuck. The script then:
+# Stuck-detection heuristic: a running agent container whose agent log's mtime
+# is older than TASKPUMP_STUCK_THRESHOLD_MIN (default 15) is considered stuck.
+# The script then:
 #   1. WIP-commits its worktree (so in-flight edits survive the kill).
-#   2. docker stops the container (graceful SIGTERM + 30 s grace, then SIGKILL).
-#   3. arachne-task release <epic> --reason "stuck (no log activity for Nmin)"
-#      so the next run can re-pick or another agent claims it.
+#   2. Stops the container (graceful SIGTERM + grace period, then SIGKILL).
+#   3. Releases the task claim so the next run can re-pick it.
 #
-# Env:
-#   STUCK_THRESHOLD_MIN  -- log-stale cutoff, minutes (default 15)
-#   MANIFEST             -- manifest path (default ops/task-loop/parallel-manifest.tsv)
-#   DOCKER_GRACE_SEC     -- docker stop grace period (default 30)
-#   EXTRA_BUSY_DIRS      -- newline-separated workspace roots --targets must
-#                           also skip (arachne-disk-guard passes compiler-busy
-#                           workspaces here; a listed primary root skips the
-#                           primary even under --include-primary)
+# Configuration (taskpump.conf or the environment; legacy names still work):
+#   TASKPUMP_STUCK_THRESHOLD_MIN  log-stale cutoff, minutes (default 15)
+#   TASKPUMP_STOP_GRACE_SEC       stop grace period, seconds (default 30)
+#   TASKPUMP_MANIFEST             manifest mapping containers to tasks
+#   TASKPUMP_WORKTREES_DIR        base dir holding the agent worktrees
+#   TASKPUMP_AGENT_LOG_NAME       the agent log inside each worktree
+#   TASKPUMP_RECLAIM_PRIMARY      1 = same as --include-primary
+#   TASKPUMP_EXTRA_BUSY_DIRS      newline-separated workspace roots --targets
+#                                 must also skip (the disk guard passes
+#                                 compiler-busy workspaces here; a listed
+#                                 primary root skips the primary even under
+#                                 --include-primary)
+# HELP-END
 set -uo pipefail
 
 # ── TaskPump config core ──────────────────────────────────────────────────────
@@ -62,30 +65,7 @@ MODE=""
 # disk watchdog turns it on under PANIC to buy maximum space.
 INCLUDE_PRIMARY="${TASKPUMP_RECLAIM_PRIMARY:-${RECLAIM_PRIMARY:-0}}"
 
-usage() {
-    cat <<EOF
-usage: arachne-cleanup <mode> [--dry-run]
-
-Modes (exactly one):
-  --status     Read-only: print what would be cleaned. Implies --dry-run.
-  --stuck      Stop hung agent containers and release their tasks.
-  --targets    cargo clean every .worktrees/*/ target/ (skipping any with a
-               live agent container); add --include-primary to also clean
-               Arachne's own target/.
-  --docker     docker builder prune -af + docker system prune -f.
-  --all        --stuck, then --targets, then --docker.
-
-Flags:
-  --dry-run          Print actions, don't perform them.
-  --include-primary  With --targets/--all, also reclaim the primary checkout's
-                     target/ (RECLAIM_PRIMARY=1 env does the same).
-
-Env:
-  STUCK_THRESHOLD_MIN (default 15) — log-stale cutoff, minutes.
-  DOCKER_GRACE_SEC    (default 30) — docker stop grace period.
-  RECLAIM_PRIMARY     (default 0)  — same as --include-primary.
-EOF
-}
+usage() { apl_help "$0"; }
 
 for a in "$@"; do
     case "$a" in
@@ -179,16 +159,16 @@ do_stuck() {
         # 1) snapshot worktree progress
         if [[ -d "$wt/.git" || -f "$wt/.git" ]]; then
             act "git -C '$wt' add -A"
-            act "git -C '$wt' -c user.name=arachne-cleanup -c user.email=cleanup@arachne.local commit -m 'wip: arachne-cleanup pre-stop snapshot' --allow-empty"
+            act "git -C '$wt' -c user.name=arachne-cleanup -c user.email=cleanup@arachne.local commit -m 'wip: tp-cleanup pre-stop snapshot' --allow-empty"
         fi
         # 2) stop the container
         act "$(apl_docker) stop --time=$DOCKER_GRACE_SEC '$cname'"
         # 3) release the task claim, if known
         local task; task="$(manifest_task_for "$cname" || true)"
         if [[ -n "$task" ]]; then
-            act "'$TP_LIBEXEC_DIR/tp-task' release '$task' --reason 'arachne-cleanup: stuck (log idle ${age}min)'"
+            act "'$TP_LIBEXEC_DIR/tp-task' release '$task' --reason 'tp-cleanup: stuck (log idle ${age}min)'"
         else
-            log "  $cname: no manifest task mapping; skipping arachne-task release"
+            log "  $cname: no manifest task mapping; skipping the task release"
         fi
     done < <(list_agent_containers)
     if (( found == 0 )); then
@@ -236,6 +216,10 @@ do_targets() {
     local busy; busy="$(busy_worktrees)"
     local found=0 skipped=0
     local wt
+    # DEFERRED (documented, not fixed): this glob is two levels deep while the
+    # pump addresses a worktree as <base>/<branch-with-a-slash>. The two agree
+    # only because the generated branches happen to contain exactly one slash;
+    # a flat branch name would be invisible here.
     for wt in "$WORKTREES_DIR"/*/*; do
         [[ -d "$wt/target" ]] || continue
         if printf '%s\n' "$busy" | grep -Fxq "$wt"; then
@@ -286,7 +270,7 @@ do_docker() {
 
 # ── status -- read-only summary.
 do_status() {
-    log "arachne-cleanup --status (read-only)"
+    log "tp-cleanup --status (read-only)"
     echo
     echo "## Agent containers"
     "$(apl_docker)" ps --format 'table {{.Names}}\t{{.Status}}\t{{.Size}}' 2>/dev/null \

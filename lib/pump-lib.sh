@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# arachne-pump-lib.sh — shared pool-supervisor helpers, sourced by both the
-# manifest launcher (run-parallel.sh) and the DAG pump (arachne-pump).
+# pump-lib.sh — shared helpers for the supervisor, its gates, its hooks, and the
+# rescue tools.
 #
-# These are the stable, behavior-identical bits the 2026-06-22 design asked to
-# EXTRACT rather than fork-copy. They read the sourcing script's globals
-# (HEALTH_GATE, HEALTH_WINDOW, JOBS, CAP_FILE) at call time, so each script keeps
-# owning its own configuration; the helpers just centralize the logic.
+# These read the sourcing script's globals (HEALTH_GATE, HEALTH_WINDOW, JOBS,
+# CAP_FILE) at call time, so each tool keeps owning its own configuration; the
+# helpers only centralize the logic — which is the point, since every one of
+# them existed in two to five diverging copies before it landed here.
 #
 # This file is sourced, never executed — no `set -e`, no top-level side effects.
+#
+# It reads the canonical TASKPUMP_* names with the legacy ARACHNE_* ones as a
+# fallback, rather than relying on lib/config.sh to promote between them: the
+# test harnesses source this file on its own, without the config core.
 
 # apl_render_template <template-file>
 # Substitute {{KEY}} placeholders, reading two associative arrays from the
@@ -175,8 +179,8 @@ apl_count_live_agents() {
 # disabled (ARACHNE_DISK_GATE != 1) or the watchdog binary is absent / not
 # executable — a missing tool never blocks launches.
 apl_disk_low() {
-  [[ "${ARACHNE_DISK_GATE:-1}" -eq 1 ]] || return 0
-  local wd="${ARACHNE_DISK_WATCHDOG:-}"
+  [[ "${TASKPUMP_DISK_GATE:-${ARACHNE_DISK_GATE:-1}}" -eq 1 ]] || return 0
+  local wd="${TASKPUMP_DISK_WATCHDOG:-${ARACHNE_DISK_WATCHDOG:-}}"
   [[ -n "$wd" && -x "$wd" ]] || return 0
   local reason rc
   reason="$("$wd" --gate 2>&1)"; rc=$?
@@ -200,15 +204,15 @@ apl_disk_low() {
 # `expiresAt` is epoch MILLISECONDS in Claude Code's credentials file.
 # ARACHNE_NOW_S overrides "now" (epoch seconds) for tests.
 apl_host_token_stale() {
-  [[ "${ARACHNE_TOKEN_GATE:-1}" -eq 1 ]] || return 0
+  [[ "${TASKPUMP_TOKEN_GATE:-${ARACHNE_TOKEN_GATE:-1}}" -eq 1 ]] || return 0
   command -v jq >/dev/null 2>&1 || return 0
-  local cred="$1" margin="${2:-${ARACHNE_TOKEN_MARGIN_S:-600}}"
+  local cred="$1" margin="${2:-${TASKPUMP_TOKEN_MARGIN_S:-${ARACHNE_TOKEN_MARGIN_S:-600}}}"
   [[ -f "$cred" ]] || return 0
   local exp_ms exp_s now left
   exp_ms="$(jq -r '.claudeAiOauth.expiresAt // empty' "$cred" 2>/dev/null || true)"
   [[ "$exp_ms" =~ ^[0-9]+$ ]] || return 0
   exp_s=$(( exp_ms / 1000 ))
-  now="${ARACHNE_NOW_S:-$(date +%s)}"
+  now="${TASKPUMP_NOW_S:-${ARACHNE_NOW_S:-$(date +%s)}}"
   left=$(( exp_s - now ))
   if (( left <= margin )); then
     if (( left < 0 )); then
@@ -231,7 +235,7 @@ apl_host_token_stale() {
 # (returns 0) where flock is unavailable, falling back on the singular-pump
 # serialization. Returns 0 on success / no-flock; non-zero only on lock timeout.
 apl_acquire_trunk_lock() {
-  local lockfile="$1" wait="${2:-${ARACHNE_TRUNK_LOCK_WAIT:-300}}"
+  local lockfile="$1" wait="${2:-${TASKPUMP_TRUNK_LOCK_WAIT:-${ARACHNE_TRUNK_LOCK_WAIT:-300}}}"
   command -v flock >/dev/null 2>&1 || return 0
   { exec 8>"$lockfile"; } 2>/dev/null || return 0
   flock -w "$wait" 8 || return 1

@@ -96,13 +96,13 @@ out="$(ARACHNE_DISK_REPO_ROOT="$FIX" FREE_GB_OVERRIDE=3 PANIC_THRESHOLD_GB=5 PAU
 assert_has "panic state entered (free=3 < panic=5)" "$out" "HEALTHY → PANIC"
 assert_has "reclaim_targets ran"                    "$out" "reclaiming cargo target/ dirs (worktrees + primary)"
 assert_has "cleanup invoked with targets+primary+dry-run" "$out" "STUB-CLEANUP-CALLED args: --targets --include-primary --dry-run"
-assert_has "docker prune still attempted"           "$out" "would run arachne-cleanup --docker"
+assert_has "docker prune still attempted"           "$out" "would run tp-cleanup --docker"
 
 echo "--- Test 5: PANIC_RECLAIM_TARGETS=0 disables the target reclaim ---"
 out="$(ARACHNE_DISK_REPO_ROOT="$FIX" FREE_GB_OVERRIDE=3 PANIC_THRESHOLD_GB=5 PANIC_RECLAIM_TARGETS=0 \
        "$WATCHDOG" --once --dry-run 2>&1)"
 assert_no  "no target reclaim when disabled"        "$out" "STUB-CLEANUP-CALLED"
-assert_has "docker prune still runs when disabled"  "$out" "would run arachne-cleanup --docker"
+assert_has "docker prune still runs when disabled"  "$out" "would run tp-cleanup --docker"
 
 echo "--- Test 6: PAUSED (free in pause band) does NOT reclaim targets ---"
 out="$(ARACHNE_DISK_REPO_ROOT="$FIX" FREE_GB_OVERRIDE=7 PANIC_THRESHOLD_GB=5 PAUSE_THRESHOLD_GB=10 \
