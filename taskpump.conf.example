@@ -18,109 +18,382 @@
 #
 # Legacy ARACHNE_* names are honored everywhere during the transition. An
 # ARACHNE_X in the environment sets TASKPUMP_X and still outranks this file;
-# every TASKPUMP_X set here is mirrored to ARACHNE_X, which is what the tools
-# currently read. Where both spellings are in the environment, TASKPUMP_X wins.
+# every TASKPUMP_X set here is mirrored to ARACHNE_X, so a config written in
+# canonical names reaches a tool that still reads the legacy spelling. Where
+# both spellings are in the environment, TASKPUMP_X wins.
 #
 # ── Syntax ───────────────────────────────────────────────────────────────────
 # This file is sourced by bash with allexport on, so it is `KEY=value` per line.
 # Quote any value containing spaces: `TASKPUMP_NOTIFY_CMD='notify-send -u low'`.
 #
-# Defaults are filled in by the tools, not repeated here — the point of this
-# file is to document the key surface. Uncomment only what you need to change.
+# ── Reading this file ────────────────────────────────────────────────────────
+# Every key is commented out and annotated with the default the tool falls back
+# to. Uncomment only what you need to change. Where two spellings resolve to one
+# setting, the canonical name is the one listed and its accepted fallback is
+# named in the description — set the canonical one.
+#
+# Anything a consumer never sets — values the pump hands its runner, or the
+# runner hands the container — is listed at the very bottom under "Runtime
+# contract", for reading rather than setting.
+
+# ── Discovery ────────────────────────────────────────────────────────────────
+# TASKPUMP_CONFIG=          # this file's path; skips the upward walk. Pointing it
+#                           #   at a missing file is an error, never a fallback.
 
 # ── Ledger (tp task) ─────────────────────────────────────────────────────────
-# TASKPUMP_TASKS_DIR=          # (ARACHNE_TASKS_DIR) directory of task markdown files
-# TASKPUMP_TASK_OUT=           # (ARACHNE_TASK_OUT) JSON "next task" surface file
-# TASKPUMP_CODE_REPO=          # (ARACHNE_CODE_REPO) repo whose commits heartbeat measures
-# TASKPUMP_TASK_PUSH=          # (ARACHNE_TASK_PUSH) 1 = git push after each state commit
-# TASKPUMP_TASK_NOCOMMIT=      # (ARACHNE_TASK_NOCOMMIT) 1 = never commit state (fixture mode)
-# TASKPUMP_TASK_DEBUG=         # (ARACHNE_TASK_DEBUG) 1 = trace resolution to stderr
-# TASKPUMP_TASK=               # (ARACHNE_TASK) path to the task CLI other tools invoke
-# TASKPUMP_TASK_ID=            # (ARACHNE_TASK_ID) task a launched agent is assigned
-# TASKPUMP_CLAIM_STALE_HOURS=  # (ARACHNE_CLAIM_STALE_HOURS) age at which scrub relabels a claim
-# TASKPUMP_LOCK_WAIT=          # (ARACHNE_LOCK_WAIT) seconds to wait for the state lock
-# TASKPUMP_PHASE=              # (ARACHNE_PHASE) phase a launched agent drains
-# TASKPUMP_REPO=               # (ARACHNE_REPO) repo root for the systemd unit
+# TASKPUMP_TASKS_DIR=       # directory of task files (default: <repo root>/$TASKPUMP_LEDGER_PROBE)
+# TASKPUMP_LEDGER_PROBE=    # path, relative to a candidate workspace, whose presence
+#                           #   means "this workspace owns a ledger" — how a worktree's
+#                           #   own ledger is told from the primary's
+#                           #   (default: ops/task-loop/tasks; TASKPUMP_TASKS_SUBDIR accepted)
+# TASKPUMP_LEDGER_REPO=     # the ledger checkout the pump refreshes and pushes
+#                           #   (default: <repo root>/ops)
+# TASKPUMP_CODE_REPO=       # repo whose commits the heartbeat productivity check
+#                           #   measures — the code, not the ledger (default: the
+#                           #   resolved repo root)
+# TASKPUMP_TASK_OUT=        # JSON "next task" surface file
+#                           #   (default: <parent of tasks dir>/.next-task)
+# TASKPUMP_TASK_EXT=        # task-file extension (default: .md;
+#                           #   TASKPUMP_TASK_FILE_EXT accepted)
+# TASKPUMP_ID_PATTERN=      # regex `create` validates a new id against
+#                           #   (default: ^F[0-9]+(\.[0-9]+)?$)
+# TASKPUMP_TASK_PUSH=       # 1 = git push after each state commit (default: 0;
+#                           #   TASKPUMP_PUSH accepted)
+# TASKPUMP_PUSH_RETRIES=    # push attempts before giving up (default: 6)
+# TASKPUMP_TASK_NOCOMMIT=   # 1 = never commit state — fixture and dry-run mode (default: 0)
+# TASKPUMP_TASK_DEBUG=      # 1 = trace resolution to stderr (default: 0)
+# TASKPUMP_CLAIM_STALE_HOURS=  # age at which scrub relabels a claim that stopped
+#                           #   beating (default: 24)
+# TASKPUMP_FAILURE_LIMIT=   # consecutive unproductive iterations before scrub marks
+#                           #   a task stuck (default: 3)
+# TASKPUMP_TURN_BUDGET_DEFAULT=  # `claim` budget when --turns is omitted (default: 50)
+# TASKPUMP_LOCK_WAIT=       # seconds to wait for the state lock (default: 120)
+# TASKPUMP_COMMITTER_NAME=  # identity for ledger commits (default: arachne-task)
+# TASKPUMP_COMMITTER_EMAIL= # (default: task@arachne.local)
+# TASKPUMP_PROG_NAME=       # the name the CLI calls itself in diagnostics
+#                           #   (default: arachne-task)
+# TASKPUMP_TASK=            # path to the task CLI other tools invoke; set it when the
+#                           #   tools are not co-installed (default: <install>/libexec/tp-task)
 
-# ── Pump (tp pump) ───────────────────────────────────────────────────────────
-# TASKPUMP_PUMP_PHASES=        # (ARACHNE_PUMP_PHASES) phase range to drain, e.g. F55..F63
-# TASKPUMP_PUMP_JOBS=          # (ARACHNE_PUMP_JOBS) concurrent worktree pool cap
-# TASKPUMP_PUMP_BASE=          # (ARACHNE_PUMP_BASE) base ref new branches are cut from
-# TASKPUMP_PUMP_BRANCH_PREFIX= # (ARACHNE_PUMP_BRANCH_PREFIX) prefix for per-phase branches
-# TASKPUMP_PUMP_TASKS_DIR=     # (ARACHNE_PUMP_TASKS_DIR) tasks dir, independent of the ops dir
-# TASKPUMP_PUMP_OPS_DIR=       # (ARACHNE_PUMP_OPS_DIR) ledger checkout the pump pushes
-# TASKPUMP_PUMP_WORKTREES_DIR= # (ARACHNE_PUMP_WORKTREES_DIR) base dir holding agent worktrees
-# TASKPUMP_PUMP_STATE_FILE=    # (ARACHNE_PUMP_STATE_FILE) supervisor state across restarts
-# TASKPUMP_PUMP_QUARANTINE_FILE= # (ARACHNE_PUMP_QUARANTINE_FILE) phases held out of the frontier
-# TASKPUMP_PUMP_LOG=           # (ARACHNE_PUMP_LOG) supervisor log path
-# TASKPUMP_PUMP_CEILING=       # (ARACHNE_PUMP_CEILING) usage ceiling for the systemd unit
-# TASKPUMP_PUMP_RESUME_MAX=    # (ARACHNE_PUMP_RESUME_MAX) no-progress resumes before escalating
-# TASKPUMP_PUMP_STALL_EXIT_TICKS= # (ARACHNE_PUMP_STALL_EXIT_TICKS) idle ticks before deadlock exit
-# TASKPUMP_PUMP_BUILD_CMD=     # (ARACHNE_PUMP_BUILD_CMD) build gate for the merge queue
-# TASKPUMP_PUMP_MONITOR=       # (ARACHNE_PUMP_MONITOR) 0 = do not hand the terminal to the monitor
-# TASKPUMP_PUMP_NO_LAUNCH=     # (ARACHNE_PUMP_NO_LAUNCH) 1 = plan only, never start a container
-# TASKPUMP_PUMP_NO_GH=         # (ARACHNE_PUMP_NO_GH) 1 = skip all gh CLI calls
-# TASKPUMP_PUMP_DEBUG=         # (ARACHNE_PUMP_DEBUG) 1 = verbose supervisor tracing
-# TASKPUMP_PUMP_TRUNK=         # (ARACHNE_PUMP_TRUNK) integration trunk branch name
-# TASKPUMP_PUMP_TRUNK_PUSH=    # (ARACHNE_PUMP_TRUNK_PUSH) 1 = push the trunk after each merge
-# TASKPUMP_PUMP_TRUNK_LOCK_FILE= # (ARACHNE_PUMP_TRUNK_LOCK_FILE) flock guarding the merge queue
-# TASKPUMP_PUMP_INTEGRATION_BASE= # (ARACHNE_PUMP_INTEGRATION_BASE) base the trunk is cut from
-# TASKPUMP_PUMP_INTEGRATE_DRYRUN= # (ARACHNE_PUMP_INTEGRATE_DRYRUN) 1 = rehearse the merge queue
-# TASKPUMP_TRUNK_LOCK_WAIT=    # (ARACHNE_TRUNK_LOCK_WAIT) seconds to wait for the trunk lock
-# TASKPUMP_PUSH_RETRIES=       # (ARACHNE_PUSH_RETRIES) retries for a contended push
-# TASKPUMP_PHASE_BRIEF_TEMPLATE= # (ARACHNE_PHASE_BRIEF_TEMPLATE) phase-drain brief template
-# TASKPUMP_BRIEF=              # (ARACHNE_BRIEF) rendered brief handed to a launched agent
-# TASKPUMP_RESUME_NOTE=        # (ARACHNE_RESUME_NOTE) resume preamble for a stalled claim
-# TASKPUMP_POOL_CAP_FILE=      # (ARACHNE_POOL_CAP_FILE) live-editable pool cap
-# TASKPUMP_CREDENTIALS=        # (ARACHNE_CREDENTIALS) OAuth credentials file to copy from
-# TASKPUMP_TOKEN_GATE=         # (ARACHNE_TOKEN_GATE) 0 = disable the stale-token feed gate
-# TASKPUMP_TOKEN_MARGIN_S=     # (ARACHNE_TOKEN_MARGIN_S) seconds of TTL headroom the gate wants
-# TASKPUMP_NOW_S=              # (ARACHNE_NOW_S) clock override, for tests
-# TASKPUMP_NOTIFY_CMD=         # (ARACHNE_NOTIFY_CMD) command that delivers notifications
+# ── Id grammar (tp monitor, tp dag-render) ───────────────────────────────────
+# How an id is split into phase and sub-task for grouping and layout. These are
+# the parsing half of TASKPUMP_ID_PATTERN above; keep the three consistent.
+# TASKPUMP_PHASE_SIGIL=     # letter a phase token starts with (default: F)
+# TASKPUMP_PHASE_SEPARATOR= # what ends the phase within an id (default: .)
 
-# ── Usage gate (tp usage) ────────────────────────────────────────────────────
-# TASKPUMP_USAGE=              # (ARACHNE_USAGE) path to the usage-gate binary
-# TASKPUMP_USAGE_ENDPOINT=     # (ARACHNE_USAGE_ENDPOINT) OAuth usage endpoint URL
-# TASKPUMP_USAGE_CEILING=      # (ARACHNE_USAGE_CEILING) utilization percent at which to pause
-# TASKPUMP_USAGE_CACHE=        # (ARACHNE_USAGE_CACHE) cached usage payload path
-# TASKPUMP_USAGE_TTL=          # (ARACHNE_USAGE_TTL) cache freshness, seconds
-# TASKPUMP_USAGE_RESET_FILE=   # (ARACHNE_USAGE_RESET_FILE) reset-backstop file
-# TASKPUMP_USAGE_HTTP_TIMEOUT= # (ARACHNE_USAGE_HTTP_TIMEOUT) curl timeout, seconds
-# TASKPUMP_USAGE_DEBUG=        # (ARACHNE_USAGE_DEBUG) 1 = trace the probe to stderr
+# ── Pump scheduling (tp pump) ────────────────────────────────────────────────
+# TASKPUMP_JOBS=            # concurrent worktree pool cap (default: 4). This is the
+#                           #   key the pump reads; TASKPUMP_PUMP_JOBS is the systemd
+#                           #   unit's name for the same number, passed as --jobs.
+# TASKPUMP_JOBS_FALLBACK=   # cap used when neither --jobs nor the cap file yields one
+#                           #   (default: 6)
+# TASKPUMP_POOL_CAP_FILE=   # live-editable pool cap, re-read each tick
+#                           #   (default: <state dir>/.arachne-pool-cap)
+# TASKPUMP_TICK=            # seconds between supervisor ticks (default: 30)
+# TASKPUMP_STAGGER=         # seconds between launches within one tick (default: 3)
+# TASKPUMP_PUMP_TASKS_DIR=  # tasks dir for the pump alone, independent of the ledger
+#                           #   checkout (default: TASKPUMP_TASKS_DIR, else
+#                           #   <ledger>/task-loop/tasks)
+# TASKPUMP_PUMP_OPS_DIR=    # ledger checkout the pump refreshes and pushes
+#                           #   (default: TASKPUMP_LEDGER_REPO, else <repo root>/ops)
+# TASKPUMP_WORKTREES_DIR=   # where agent worktrees live. The pump reads it as a path,
+#                           #   the monitor and cleanup as a bare directory name
+#                           #   (defaults: <repo root>/.worktrees and .worktrees)
+# TASKPUMP_PUMP_WORKTREES_DIR=  # pump-only override of the above
+# TASKPUMP_BRANCH_PREFIX=   # prefix for per-phase branches (default: feat/;
+#                           #   TASKPUMP_PUMP_BRANCH_PREFIX overrides for the pump)
+# TASKPUMP_BASE=            # base ref new branches are cut from (default: main;
+#                           #   TASKPUMP_PUMP_BASE overrides for the pump)
+# TASKPUMP_RESUME_MAX=      # no-progress resumes of a stalled claim before escalating
+#                           #   (default: 3; TASKPUMP_PUMP_RESUME_MAX overrides)
+# TASKPUMP_STALL_EXIT_TICKS=  # consecutive deadlocked ticks before exiting 3
+#                           #   (default: 3; TASKPUMP_PUMP_STALL_EXIT_TICKS overrides)
+# TASKPUMP_PUMP_QUARANTINE_FILE=  # phases held out of the frontier
+#                           #   (default: <state dir>/.auto-trunk-quarantine)
+# TASKPUMP_PUMP_MONITOR=    # 0 = do not hand the terminal to the monitor after
+#                           #   --detach (default: 1)
+# TASKPUMP_PUMP_DEBUG=      # 1 = verbose supervisor tracing (default: 0)
+# TASKPUMP_PUMP_NO_LAUNCH=  # 1 = plan only, never start a container (default: 0)
+# TASKPUMP_PUMP_NO_GH=      # 1 = skip all gh CLI calls (default: 0)
+# TASKPUMP_NOTIFY_CMD=      # command that reads a notification on stdin. Unset falls
+#                           #   back to notify-send when present, else log only. Set to
+#                           #   `true` to silence.
+
+# ── Run state and file names (tp pump) ───────────────────────────────────────
+# One knob moves every dotfile a run drops; each name is still individually
+# overridable.
+# TASKPUMP_STATE_DIR=       # where the run's dotfiles live (default: the repo root)
+# TASKPUMP_PUMP_STATE_FILE= # absolute path of the supervisor state file, overriding
+#                           #   both the state dir and the name below
+#                           #   (default: <state dir>/<TASKPUMP_PUMP_STATE_NAME>)
+# TASKPUMP_PUMP_STATE_NAME= # its filename within the state dir
+#                           #   (default: .arachne-pump.state)
+# TASKPUMP_PUMP_LOG=        # supervisor log path (default: <state dir>/.arachne-pump.log)
+# TASKPUMP_AGENT_LOG_NAME=  # per-worktree agent log. The monitor and the cleanup
+#                           #   sweeper find a live agent by this filename, so renaming
+#                           #   it makes running agents invisible to them
+#                           #   (default: .arachne-agent.log)
+# TASKPUMP_BRIEF_OUT_NAME=  # rendered brief written into each worktree
+#                           #   (default: .arachne-phase-brief.md)
+# TASKPUMP_GOAL_NOTE_NAME=  # goal note written into each worktree (default: .arachne-goal.md)
+# TASKPUMP_RESUME_NOTE_NAME=  # resume preamble written into a resumed worktree
+#                           #   (default: .arachne-resume.md)
+
+# ── Project-shaped behavior (tp pump) ────────────────────────────────────────
+# The keys that make the pump fit a language and a toolchain. The defaults here
+# are Rust-shaped for historical reasons; a non-Rust consumer should set them.
+# TASKPUMP_BUILD_GATE=      # command that must pass before work is integrated
+#                           #   (default: empty = no build gate;
+#                           #   TASKPUMP_PUMP_BUILD_CMD overrides for the merge queue)
+# TASKPUMP_VERIFY_CMDS=     # newline-separated commands a task must leave green,
+#                           #   quoted into the brief (default: `cargo fmt --all` and
+#                           #   `cargo clippy --workspace -- -D warnings`)
+# TASKPUMP_PROJECT_BRIEF=   # one paragraph pointing an agent at the project's own
+#                           #   contributor docs (default: a generic "read CLAUDE.md,
+#                           #   CONTRIBUTING.md, or equivalent" paragraph)
+# TASKPUMP_BRIEF_TEMPLATE=  # the parameterized brief a launched agent is handed.
+#                           #   Resolution: this key (or TASKPUMP_PHASE_BRIEF_TEMPLATE),
+#                           #   then <ledger>/task-loop/briefs/_phase-drain-template.md,
+#                           #   then <install>/templates/phase-drain-brief.md
+# TASKPUMP_RESUME_TEMPLATE= # resume preamble a stalled task's agent gets ahead of that
+#                           #   brief; resolves the same three ways, ending at
+#                           #   <install>/templates/resume-note.md
+# TASKPUMP_TASK_CLI=        # how an agent invokes the ledger CLI from inside its
+#                           #   worktree (default: scripts/arachne-task)
+# TASKPUMP_SUBMODULE_PROBE= # a path that proves the ledger submodule is populated
+#                           #   (default: ops/planning/STATUS.md)
+# TASKPUMP_RECLAIM_CMD=     # how to reclaim build output from a finished workspace, so
+#                           #   a multi-day run's disk footprint stays bounded
+#                           #   (default: empty = built-in target/ removal)
+# TASKPUMP_DISK_RECLAIM=    # 0 = never reclaim build dirs on disk pressure (default: 1)
+# TASKPUMP_GATES=           # ordered, newline-separated list of gate COMMAND LINES —
+#                           #   each entry's first word must be an executable path; a
+#                           #   non-executable entry is skipped with a warning.
+#                           #   (default: <install>/gates/net-health,
+#                           #   gates/claude-token-fresh, `<usage bin> --gate`,
+#                           #   gates/disk-low — each included only while its own
+#                           #   enable flag is 1)
+# TASKPUMP_PRE_TICK_HOOKS=  # newline-separated hook command lines run at the start of
+#                           #   each tick, same executable-path rule as gates
+#                           #   (default: <install>/hooks/gitignore-repair and
+#                           #   <install>/hooks/fs-guard)
+# TASKPUMP_MANIFEST=        # v1 parallel-run manifest mapping containers to tasks
+#                           #   (default: <repo root>/$TASKPUMP_MANIFEST_SUBPATH)
+# TASKPUMP_MANIFEST_SUBPATH=  # its path within the repo
+#                           #   (default: ops/task-loop/parallel-manifest.tsv)
+
+# ── Integration trunk (opt-in; off unless a trunk flag is passed) ────────────
+# TASKPUMP_TRUNK=           # integration trunk branch name (default: auto/trunk;
+#                           #   TASKPUMP_PUMP_TRUNK overrides)
+# TASKPUMP_PUMP_TRUNK_PUSH= # 1 = push the trunk after each merge (default: 0)
+# TASKPUMP_PUMP_TRUNK_LOCK_FILE=  # flock guarding the merge queue
+#                           #   (default: <state dir>/.auto-trunk.lock)
+# TASKPUMP_TRUNK_LOCK_WAIT= # seconds to wait for the trunk lock (default: 300)
+# TASKPUMP_INTEGRATION=     # base the trunk is cut from (default: main;
+#                           #   TASKPUMP_PUMP_INTEGRATION_BASE overrides)
+# TASKPUMP_PUMP_INTEGRATE_DRYRUN=  # 1 = rehearse the merge queue without merging
+#                           #   (default: 0)
+
+# ── Hooks (hooks/fs-guard, hooks/gitignore-repair) ───────────────────────────
+# TASKPUMP_FS_GUARD_ALLOWLIST=  # extended regex of paths allowed to be dirty in the
+#                           #   primary checkout; anything else dirty means a container
+#                           #   wrote where it should not have. (default:
+#                           #   ^(\.worktrees/|ops$|ops/|\.auto-trunk\.lock$|\.auto-trunk-quarantine$))
+# TASKPUMP_WORKTREES_IGNORE_LINE=  # the bare ignore line the repair hook strips out of
+#                           #   .gitignore (default: .worktrees/)
+
+# ── Gate: net-health (gates/net-health) ──────────────────────────────────────
+# Host-hardware policy, not a general one — it looks for the kernel signatures of
+# a specific WiFi firmware wedge. A consumer on other hardware drops this gate.
+# TASKPUMP_HEALTH_GATE=     # 0 disables the gate entirely (default: 1)
+# TASKPUMP_HEALTH_WINDOW=   # how far back to look, seconds (default: 120)
+# TASKPUMP_HEALTH_PROBE_CMD=  # command whose output is searched (default: empty =
+#                           #   `journalctl -k -b 0 --since '<window> sec ago'`)
+# TASKPUMP_HEALTH_SIGNATURES=  # extended-regex alternation of failure strings
+#                           #   (default: Failed to alloc SKB|Firmware reported general
+#                           #   error|Timeout on response for query command)
+
+# ── Gate: claude-token-fresh (gates/claude-token-fresh) ──────────────────────
+# TASKPUMP_TOKEN_GATE=      # 0 disables the gate (default: 1)
+# TASKPUMP_TOKEN_MARGIN_S=  # seconds of TTL headroom the gate wants (default: 600)
+# TASKPUMP_CREDENTIALS=     # credentials file to read and copy from
+#                           #   (default: $HOME/.claude/.credentials.json)
+
+# ── Gate: disk-low (gates/disk-low) ──────────────────────────────────────────
+# TASKPUMP_DISK_GATE=       # 0 disables the low-disk feed gate (default: 1)
+# TASKPUMP_DISK_WATCHDOG=   # path to the watchdog the gate consults
+#                           #   (default: <install>/libexec/tp-disk-watchdog)
+# The floor itself is TASKPUMP_DISK_PAUSE_GB, under the watchdog section below.
+
+# ── Gate: claude-usage (gates/claude-usage) ──────────────────────────────────
+# TASKPUMP_USAGE_GATE=      # 0 disables the usage gate (default: 1)
+# TASKPUMP_USAGE=           # path to the usage-gate binary
+#                           #   (default: <install>/gates/claude-usage)
+# TASKPUMP_USAGE_CEILING=   # utilization percent at which to pause launching (default: 95)
+# TASKPUMP_USAGE_ENDPOINT=  # OAuth usage endpoint URL
+#                           #   (default: https://api.anthropic.com/api/oauth/usage)
+# TASKPUMP_USAGE_CACHE=     # cached usage payload path
+#                           #   (default: /tmp/claude-plan-usage.json)
+# TASKPUMP_USAGE_TTL=       # cache freshness, seconds (default: 60)
+# TASKPUMP_USAGE_HTTP_TIMEOUT=  # curl timeout, seconds (default: 8)
+# TASKPUMP_USAGE_RESET_FILE=  # reset-backstop file
+#                           #   (default: <repo root>/.claude-usage-reset)
+# TASKPUMP_USAGE_DEBUG=     # 1 = trace the probe to stderr (default: 0)
+
+# ── Runner selection and launch (runners/claude-docker/runner.sh) ────────────
+# TASKPUMP_RUNNER=          # path to the runner EXECUTABLE the pump launches agents
+#                           #   with — not a runner name
+#                           #   (default: <install>/runners/claude-docker/runner.sh)
+# TASKPUMP_DOCKER=          # container-runtime binary (default: docker)
+# TASKPUMP_IMAGE=           # container image name (default: arachne)
+# TASKPUMP_IMAGE_BUILD=     # command that builds the image before the first launch
+#                           #   (default: unset = never built)
+# TASKPUMP_ENTRYPOINT=      # in-image entrypoint path (default: /entrypoint-parallel.sh)
+# TASKPUMP_AGENT_PREFIX=    # container-name prefix, INCLUDING the trailing dash —
+#                           #   liveness enumeration matches on it, so it must be
+#                           #   distinctive on the host (default: arachne-agent-;
+#                           #   the dashless TASKPUMP_AGENT_CONTAINER_PREFIX accepted)
+# TASKPUMP_AGENT_MODEL=     # model alias forwarded to each agent (default: opus)
+# TASKPUMP_MAX_TURNS=       # turn cap for a session (default: 600)
+# TASKPUMP_AGENT_HOME=      # host agent home copied into the container
+#                           #   (default: $HOME/.claude)
+# TASKPUMP_AGENT_CONFIG=    # host agent config file (default: $HOME/.claude.json)
+
+# ── Runner, container side (runners/claude-docker/entrypoint.sh) ─────────────
+# TASKPUMP_PRE_FLIGHT=      # an executable INSIDE the container, run as root before the
+#                           #   session — toolchain setup, smoke tests, anything
+#                           #   project-shaped. Non-zero exit aborts the launch with 75.
+#                           #   (default: none)
+# TASKPUMP_CONTAINER_USER=  # user the session runs as (default: dev)
+# TASKPUMP_CONTAINER_HOME=  # its home (default: /home/<container user>)
+# TASKPUMP_WORKSPACE_TASK_CLI=  # the ledger CLI's path within the workspace, as the
+#                           #   container invokes it (default: scripts/arachne-task)
+# TASKPUMP_SAFETY_TURNS=    # turn budget for the entrypoint's safety-net claim (default: 3)
+# TASKPUMP_AGENT_WALL_TIMEOUT_S=  # wall-clock cap on a session; firing exits 124
+#                           #   (default: unset = no cap)
+# TASKPUMP_CRED_REFRESH_INTERVAL_S=  # how often the container re-copies the host's
+#                           #   access token (default: 300)
+# TASKPUMP_HOST_CRED_MOUNT= # where the host credential dir is mounted
+#                           #   (default: /tmp/claude-home)
+# TASKPUMP_HOST_CONFIG_MOUNT=  # where the host agent config is mounted
+#                           #   (default: /tmp/claude-home-json/.claude.json)
+# TASKPUMP_RO_PROBE_FILE=   # filename used to prove the primary mount is read-only
+#                           #   (default: .arachne-rotest)
 
 # ── Monitor (tp monitor) ─────────────────────────────────────────────────────
-# TASKPUMP_MONITOR_BIN=        # (ARACHNE_MONITOR_BIN) path to the monitor the pump hands off to
-# TASKPUMP_MONITOR_REPO_ROOT=  # (ARACHNE_MONITOR_REPO_ROOT) checkout whose worktrees to report on
-# TASKPUMP_MONITOR_MAIN_ROOT=  # (ARACHNE_MONITOR_MAIN_ROOT) primary checkout, for cache keys
-# TASKPUMP_MONITOR_INTERVAL=   # (ARACHNE_MONITOR_INTERVAL) --watch refresh seconds
-# TASKPUMP_MONITOR_COLS=       # (ARACHNE_MONITOR_COLS) terminal width override
-# TASKPUMP_MONITOR_LINES=      # (ARACHNE_MONITOR_LINES) terminal height override
-# TASKPUMP_MONITOR_TERM=       # (ARACHNE_MONITOR_TERM) terminal type override
-# TASKPUMP_MONITOR_LOG=        # (ARACHNE_MONITOR_LOG) redraw-instrumentation log
-# TASKPUMP_MONITOR_TAIL_LINES= # (ARACHNE_MONITOR_TAIL_LINES) agent-log lines in the detail pane
-# TASKPUMP_MONITOR_DISK=       # (ARACHNE_MONITOR_DISK) 0 = hide the disk gauge
-# TASKPUMP_MONITOR_DISK_CACHE= # (ARACHNE_MONITOR_DISK_CACHE) disk probe cache file
-# TASKPUMP_MONITOR_DISK_TTL=   # (ARACHNE_MONITOR_DISK_TTL) disk probe cache seconds
-# TASKPUMP_MONITOR_DISK_PAUSE_GB= # (ARACHNE_MONITOR_DISK_PAUSE_GB) gauge's pause threshold
-# TASKPUMP_MONITOR_DISK_PANIC_GB= # (ARACHNE_MONITOR_DISK_PANIC_GB) gauge's panic threshold
-# TASKPUMP_MONITOR_SESS_CACHE= # (ARACHNE_MONITOR_SESS_CACHE) session probe cache file
-# TASKPUMP_MONITOR_SESS_TTL=   # (ARACHNE_MONITOR_SESS_TTL) session probe cache seconds
-# TASKPUMP_MONITOR_PUMP_CACHE= # (ARACHNE_MONITOR_PUMP_CACHE) pump-state cache file
-# TASKPUMP_MONITOR_PUMP_TTL=   # (ARACHNE_MONITOR_PUMP_TTL) pump-state cache seconds
-# TASKPUMP_MONITOR_NOTES_DIR=  # (ARACHNE_MONITOR_NOTES_DIR) directory of session notes
-# TASKPUMP_MONITOR_NOTES_FILE= # (ARACHNE_MONITOR_NOTES_FILE) single notes file to tail
-# TASKPUMP_MONITOR_NOTES_TAIL= # (ARACHNE_MONITOR_NOTES_TAIL) notes lines to show
-# TASKPUMP_MONITOR_NOTES_COLW= # (ARACHNE_MONITOR_NOTES_COLW) notes column width
-# TASKPUMP_MONITOR_OPEN_CMD=   # (ARACHNE_MONITOR_OPEN_CMD) command `o` runs on a task file
-# TASKPUMP_MONITOR_TASK_CLASS= # (ARACHNE_MONITOR_TASK_CLASS) window class for a spawned viewer
+# TASKPUMP_MONITOR_BIN=     # path to the monitor the pump hands off to
+#                           #   (default: <install>/libexec/tp-monitor)
+# TASKPUMP_MONITOR_REPO_ROOT=  # checkout whose worktrees to report on (default: the
+#                           #   caller's repo root)
+# TASKPUMP_MONITOR_MAIN_ROOT=  # primary checkout, used for cache keys and notes
+# TASKPUMP_MONITOR_INTERVAL=  # --watch refresh seconds; fractional ok (default: 1)
+# TASKPUMP_MONITOR_TITLE=   # title-line text (default: Arachne Task Pump)
+# TASKPUMP_MONITOR_COLS=    # terminal width override (default: the real width)
+# TASKPUMP_MONITOR_LINES=   # terminal height override (default: the real height)
+# TASKPUMP_MONITOR_LOG=     # redraw-instrumentation log (default: empty = off)
+# TASKPUMP_MONITOR_TAIL_LINES=  # agent-log lines per session in the compact feed
+#                           #   (default: 2)
+# TASKPUMP_AGENT_LOG_SCAN=  # log lines scanned per session to build that feed (default: 200)
+# TASKPUMP_AGENT_LOG_FILTER=  # jq program pulling feed lines out of an agent log
+#                           #   (default: empty = the built-in filter)
+# TASKPUMP_MONITOR_TERM=    # the GUI terminal BINARY the `o` key spawns to open a task
+#                           #   file — not a $TERM override (default: wezterm)
+# TASKPUMP_MONITOR_TERM_ARGS=  # its argv template; %CLASS% and %CWD% expand
+#                           #   (default: start --always-new-process --class %CLASS%
+#                           #   --cwd %CWD% --)
+# TASKPUMP_MONITOR_TASK_CLASS=  # window class for that spawned viewer, so a compositor
+#                           #   can rule on it (default: arachne-task)
+# TASKPUMP_MONITOR_OPEN_CMD=  # replaces the whole spawn; the file path is appended
+#                           #   (default: empty = use the terminal keys above)
+# TASKPUMP_MONITOR_USAGE_WINDOWS=  # comma-separated `label=datefmt` list of usage gauges
+#                           #   (default: 5h=+%H:%M,7d=+%a %H:%M)
+# TASKPUMP_MONITOR_DISK=    # 0 = hide the disk gauge (default: 1)
+# TASKPUMP_MONITOR_DISK_PAUSE_GB=  # the gauge's pause threshold (default: 10)
+# TASKPUMP_MONITOR_DISK_PANIC_GB=  # the gauge's panic threshold (default: 5)
+# TASKPUMP_MONITOR_NOTES_DIR=  # directory of session notes
+#                           #   (default: <main root>/<notes dirname>)
+# TASKPUMP_MONITOR_NOTES_DIRNAME=  # that directory's name
+#                           #   (default: .arachne-monitor-notes)
+# TASKPUMP_MONITOR_NOTES_FILE=  # a single notes file to tail, overriding the resolved
+#                           #   path (default: empty = resolve from the dir)
+# TASKPUMP_MONITOR_NOTES_TAIL=  # note lines shown in the panel (default: 6)
+# TASKPUMP_MONITOR_NOTES_COLW=  # max note width in the right column (default: 60)
+# The monitor redraws often and must not re-probe the world each frame, so every
+# probe is cached. Cache paths derive from the base unless set individually.
+# TASKPUMP_MONITOR_CACHE_BASE=  # cache path prefix (default: $TMPDIR/arachne-monitor)
+# TASKPUMP_MONITOR_SESS_CACHE=  # session probe cache file
+# TASKPUMP_MONITOR_SESS_TTL=  # session probe cache seconds (default: 2)
+# TASKPUMP_MONITOR_PUMP_CACHE=  # pump-state cache file
+# TASKPUMP_MONITOR_PUMP_TTL=  # pump-state cache seconds (default: 8)
+# TASKPUMP_MONITOR_DISK_CACHE=  # disk probe cache file
+# TASKPUMP_MONITOR_DISK_TTL=  # disk probe cache seconds (default: 60)
 
 # ── DAG rendering (tp dag-render) ────────────────────────────────────────────
-# TASKPUMP_DAG_BIN=            # (ARACHNE_DAG_BIN) path to the renderer the monitor invokes
-# TASKPUMP_DAG_REPO_ROOT=      # (ARACHNE_DAG_REPO_ROOT) repo root the renderer resolves against
+# TASKPUMP_DAG_BIN=         # path to the renderer the monitor invokes
+#                           #   (default: <install>/libexec/tp-dag-render)
+# TASKPUMP_DAG_REPO_ROOT=   # repo root the renderer resolves the ledger against
+# TASKPUMP_DAG_LAYOUT=      # the layout program (default: <install>/lib/dag-layout.awk)
+# TASKPUMP_AWK=             # the gawk binary; the layout engine needs GNU awk, not mawk
+#                           #   (default: gawk)
 
-# ── Cleanup and watchdogs (tp cleanup / disk-watchdog) ───────────────────────
-# TASKPUMP_CLEANUP_REPO_ROOT=  # (ARACHNE_CLEANUP_REPO_ROOT) repo whose worktrees get swept
-# TASKPUMP_DISK_REPO_ROOT=     # (ARACHNE_DISK_REPO_ROOT) repo the disk watchdog measures
-# TASKPUMP_DISK_WATCHDOG=      # (ARACHNE_DISK_WATCHDOG) path to the disk-watchdog binary
-# TASKPUMP_DISK_GATE=          # (ARACHNE_DISK_GATE) 0 = disable the low-disk feed gate
-# TASKPUMP_DISK_RECLAIM=       # (ARACHNE_DISK_RECLAIM) 1 = reclaim target dirs on pressure
+# ── Cleanup (tp cleanup) ─────────────────────────────────────────────────────
+# TASKPUMP_CLEANUP_REPO_ROOT=  # repo whose worktrees get swept (default: the caller's
+#                           #   repo root)
+# TASKPUMP_RECLAIM_PRIMARY= # 1 = same as --include-primary (default: 0)
+# TASKPUMP_EXTRA_BUSY_DIRS= # newline-separated workspace roots --targets must also
+#                           #   skip. A listed primary root is skipped even under
+#                           #   --include-primary. (default: empty)
+# TASKPUMP_STOP_GRACE_SEC=  # container stop grace period, seconds (default: 30)
+
+# ── Agent watchdog (tp agent-watchdog) ───────────────────────────────────────
+# TASKPUMP_WATCHDOG_POLL=   # seconds between sweeps (default: 120)
+# TASKPUMP_STUCK_THRESHOLD_MIN=  # agent-log staleness cutoff, minutes (default: 15)
+# TASKPUMP_STARTUP_GRACE_SEC=  # with --auto-exit, ignore a zero-agent state for this
+#                           #   many seconds after start (default: 120)
+# TASKPUMP_EMPTY_GRACE_CHECKS=  # with --auto-exit, exit after this many consecutive
+#                           #   zero-agent checks (default: 3)
+
+# ── Disk watchdog (tp disk-watchdog) ─────────────────────────────────────────
+# TASKPUMP_DISK_REPO_ROOT=  # repo the watchdog measures and reclaims within
+# TASKPUMP_DISK_MOUNT=      # mount to measure (default: /)
+# TASKPUMP_DISK_PROBE=      # command reporting free space
+#                           #   (default: df --output=avail -BG '<mount>')
+# TASKPUMP_DISK_POLL=       # seconds between checks (default: 30)
+# TASKPUMP_DISK_PAUSE_GB=   # free below this → pool cap 0; also the disk-low gate's
+#                           #   floor (default: 10)
+# TASKPUMP_DISK_PANIC_GB=   # free below this → reclaim build dirs and prune (default: 5)
+# TASKPUMP_DISK_RECOVER_GB= # free above this → restore the original cap (default: 20)
+# TASKPUMP_DISK_COOLDOWN=   # seconds to wait after a reclaim before another (default: 180)
+# TASKPUMP_PANIC_RECLAIM=   # 0 = prune only, never clean build dirs (default: 1)
+# TASKPUMP_DISK_WATCHDOG_LOG=  # its log path
+#                           #   (default: <state dir>/.arachne-disk-watchdog.log)
+
+# ── systemd unit (systemd/taskpump-pump.service) ─────────────────────────────
+# Read only by the unit file, which turns them into command-line flags. They are
+# set in the unit's environment, not usually in this file.
+# TASKPUMP_BIN=             # path to bin/tp
+# TASKPUMP_REPO=            # repo root the unit cds into and drives
+# TASKPUMP_PUMP_PHASES=     # phase range to drain, e.g. F55..F63  → --phases
+# TASKPUMP_PUMP_JOBS=       # concurrent pool cap                  → --jobs
+# TASKPUMP_PUMP_CEILING=    # usage ceiling                        → --usage-ceiling
+
+# ── Runtime contract — set by the pump/runner, not by config ─────────────────
+# These carry a decision the supervisor already made into the process that acts
+# on it. Setting one here does not configure anything; it is overwritten at
+# launch. They are listed so the contract is readable in one place.
+#
+#   TASKPUMP_WORKSPACE_PATH   the workspace this agent was assigned
+#   TASKPUMP_REPO_ROOT        the primary checkout, mounted read-only
+#   TASKPUMP_BRANCH           the branch the agent works on
+#   TASKPUMP_PHASE            the phase it drains
+#   TASKPUMP_TASK_ID          the lead task it is assigned
+#   TASKPUMP_BRIEF            host path of the RENDERED brief
+#                             (TASKPUMP_BRIEF_TEMPLATE is the configurable one)
+#   TASKPUMP_RESUME_NOTE      host path of the RENDERED resume preamble
+#                             (TASKPUMP_RESUME_TEMPLATE is the configurable one)
+#   TASKPUMP_ORIGINAL_CAP     the pool cap the disk watchdog must restore
+#   TASKPUMP_HOOK_MARK_FILE   dedup marker so a hook notifies once per condition
+#                             (TASKPUMP_FSGUARD_MARK_FILE is its older spelling)
+#   TASKPUMP_NOW_S            clock override; the test suites' seam
+#   TASKPUMP_ENTRYPOINT_TEST_MODE  entrypoint test seam: `plan` resolves and prints,
+#                             `preflight` also runs the hook — neither starts a session
