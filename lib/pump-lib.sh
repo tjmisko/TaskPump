@@ -9,6 +9,19 @@
 #
 # This file is sourced, never executed — no `set -e`, no top-level side effects.
 
+# apl_help <script> — print a script's leading header comment as its help text.
+# Bounded by an explicit `# HELP-END` marker rather than a hardcoded line range:
+# three tools used to extract their help with `sed -n '2,40p' "$0"`, which
+# silently truncated (or over-ran) the moment anyone edited the header, and
+# nothing tested it. Falls back to the end of the comment block when no marker
+# is present.
+apl_help() {
+  awk 'NR == 1 { next }
+       /^# HELP-END/ { exit }
+       /^#/ { sub(/^# ?/, ""); print; next }
+       { exit }' "$1"
+}
+
 # brcmfmac wedge signatures — the Apple-Silicon WiFi firmware hang that the
 # rotating-pool cap exists to avoid (see CLAUDE.md "Parallel runs").
 APL_WEDGE_SIGNATURES='Failed to alloc SKB|Firmware reported general error|Timeout on response for query command'
@@ -26,11 +39,20 @@ apl_network_unhealthy() {
   return 1
 }
 
+# The pool cap a caller that set no JOBS of its own falls back to. Three
+# different defaults for one number used to be spread across the pump (4), this
+# lib (6) and the disk watchdog (6), so which cap applied depended on whether
+# the cap file happened to exist. The pump still passes its own JOBS (4) down;
+# this is only for callers that don't — which is exactly what the 6 always
+# meant. One constant, two documented consumers.
+: "${TASKPUMP_JOBS_FALLBACK:=6}"
+
 # apl_read_cap — the live concurrency cap: CAP_FILE's contents if it holds a
-# positive integer (live-retunable mid-run), else JOBS. Lets an operator
-# `echo 3 > .arachne-pool-cap` without restarting the supervisor.
+# positive integer (live-retunable mid-run), else the caller's JOBS, else
+# TASKPUMP_JOBS_FALLBACK. Lets an operator `echo 3 > .arachne-pool-cap` without
+# restarting the supervisor.
 apl_read_cap() {
-  local c="${JOBS:-6}"
+  local c="${JOBS:-$TASKPUMP_JOBS_FALLBACK}"
   if [[ -n "${CAP_FILE:-}" && -f "$CAP_FILE" ]]; then
     local v; v="$(tr -dc '0-9' < "$CAP_FILE" 2>/dev/null || true)"
     [[ -n "$v" && "$v" -ge 1 ]] && c="$v"
@@ -47,18 +69,38 @@ apl_repair_worktree_gitignore() {
   fi
 }
 
-# apl_live_agent_slugs — echo the branch-slug of every live `arachne-agent-*`
-# container, one per line (slug = container name minus the `arachne-agent-`
-# prefix = branch with `/` → `-`). Liveness comes from `docker ps`, never from
-# task status (design D3). Honors a DOCKER override for testing.
-apl_live_agent_slugs() {
-  local docker_bin="${DOCKER:-docker}"
-  "$docker_bin" ps --filter 'name=arachne-agent' --format '{{.Names}}' 2>/dev/null \
-    | sed -n 's/^arachne-agent-//p'
+# ── Agent-container identity ──────────────────────────────────────────────────
+# The container-name prefix is this stack's join key: the pump derives a name
+# from a branch, both watchdogs count by it, cleanup maps a name back to a
+# worktree, and tooling outside this repo greps for it. So it is one knob, read
+# through one accessor, and its default must not drift.
+apl_agent_prefix() { printf '%s' "${TASKPUMP_AGENT_PREFIX:-arachne-agent-}"; }
+
+# apl_docker — the container-runtime binary. TASKPUMP_DOCKER is the canonical
+# spelling; DOCKER is the legacy one every existing harness sets.
+apl_docker() { printf '%s' "${TASKPUMP_DOCKER:-${DOCKER:-docker}}"; }
+
+# apl_live_agent_names — the full name of every live agent container, one per
+# line. This is THE enumeration: five near-copies of it used to live in the
+# pump's lib, cleanup, and both watchdogs, and three of them called `docker`
+# literally — so a harness that stubbed the runtime still reached the real
+# daemon. Liveness comes from the container runtime, never from task status
+# (design D3).
+apl_live_agent_names() {
+  local prefix; prefix="$(apl_agent_prefix)"
+  "$(apl_docker)" ps --filter "name=$prefix" --format '{{.Names}}' 2>/dev/null \
+    | grep "^$prefix" || true
 }
 
-# apl_count_live_agents — count of live arachne-agent containers (optionally
-# only those whose slug contains $1).
+# apl_live_agent_slugs — the same set, each name reduced to its branch slug
+# (name minus the prefix; the slug is the branch with `/` → `-`).
+apl_live_agent_slugs() {
+  local prefix; prefix="$(apl_agent_prefix)"
+  apl_live_agent_names | sed "s|^$prefix||"
+}
+
+# apl_count_live_agents — count of live agent containers (optionally only those
+# whose slug contains $1).
 apl_count_live_agents() {
   local filter="${1:-}" n=0 slug
   while IFS= read -r slug; do

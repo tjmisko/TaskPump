@@ -39,6 +39,7 @@
 #   handed to `arachne-monitor --watch` — quitting the monitor (q) leaves the
 #   pump running. --no-monitor (or ARACHNE_PUMP_MONITOR=0) keeps your shell;
 #   a non-tty skips it automatically.
+# HELP-END
 #
 # Stalled-claim auto-resume (on by default):
 #   A phase whose only blocker is its OWN orphaned claim — dead container, work
@@ -96,7 +97,7 @@ ARACHNE_TASK="${ARACHNE_TASK:-$TP_LIBEXEC_DIR/tp-task}"
 ARACHNE_USAGE="${ARACHNE_USAGE:-$TP_GATES_DIR/claude-usage}"
 ARACHNE_DISK_WATCHDOG="${ARACHNE_DISK_WATCHDOG:-$TP_LIBEXEC_DIR/tp-disk-watchdog}"
 MONITOR_BIN="${ARACHNE_MONITOR_BIN:-$TP_LIBEXEC_DIR/tp-monitor}"
-DOCKER="${DOCKER:-docker}"
+DOCKER="${TASKPUMP_DOCKER:-${DOCKER:-docker}}"
 ARACHNE_PHASE_BRIEF_TEMPLATE="${ARACHNE_PHASE_BRIEF_TEMPLATE:-$OPS_DIR/task-loop/briefs/_phase-drain-template.md}"
 # Worktrees base — overridable so the reclaim sweep / launcher can be unit-tested
 # against a fixture tree (single source for both launch_phase and reclaim).
@@ -104,7 +105,9 @@ WORKTREES_DIR="${ARACHNE_PUMP_WORKTREES_DIR:-$REPO_ROOT/.worktrees}"
 
 # Defaults (flags override).
 PHASES=""
-JOBS="${JOBS:-4}"
+# The supervisor's own default cap. Callers that set nothing at all fall back to
+# pump-lib's TASKPUMP_JOBS_FALLBACK instead; see the note there.
+JOBS="${TASKPUMP_JOBS:-${JOBS:-4}}"
 CEILING="${ARACHNE_USAGE_CEILING:-95}"
 GRAIN="phase"
 TICK="${POOL_TICK:-30}"
@@ -213,9 +216,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-usage() {
-  sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
-}
+usage() { apl_help "$0"; }
 [[ "$MODE" == "help" ]] && { usage; exit 0; }
 
 [[ -n "$PHASES" ]] || die "--phases is required (e.g. --phases F55..F63)"
@@ -253,7 +254,7 @@ pump_expand_phases() {
 
 phase_branch()    { printf '%s%s' "$BRANCH_PREFIX" "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"; }
 branch_slug()     { printf '%s' "${1//\//-}"; }
-phase_container() { printf 'arachne-agent-%s' "$(branch_slug "$(phase_branch "$1")")"; }
+phase_container() { printf '%s%s' "$(apl_agent_prefix)" "$(branch_slug "$(phase_branch "$1")")"; }
 # Host worktree the integration trunk is checked out into (A3): auto/trunk →
 # <worktrees>/auto-trunk, sharing the configurable worktrees base with phases.
 trunk_worktree()  { printf '%s/%s' "$WORKTREES_DIR" "$(branch_slug "$INTEGRATION_TRUNK")"; }
@@ -284,10 +285,10 @@ phase_open_count() {
 # Is a phase's worktree branch currently owned by a LIVE container? (D3)
 phase_live() {
   local want; want="$(phase_container "$1")"
-  local slug
-  while IFS= read -r slug; do
-    [[ "arachne-agent-$slug" == "$want" ]] && return 0
-  done < <(apl_live_agent_slugs)
+  local name
+  while IFS= read -r name; do
+    [[ "$name" == "$want" ]] && return 0
+  done < <(apl_live_agent_names)
   return 1
 }
 

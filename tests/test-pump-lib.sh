@@ -189,6 +189,77 @@ out=$(ARACHNE_NOW_S=$NOW apl_host_token_stale "$CRED" 900); rc=$?
 [[ "$rc" -eq 10 ]] && pass "custom margin (900s) widens the pause window" \
   || fail "custom margin should pause; rc=$rc out='$out'"
 
+echo "--- agent identity: one prefix, one runtime, one enumeration ---"
+# The container-name prefix is the stack's join key. Its default must not drift
+# (tooling outside this repo greps for it), and it must be overridable in one
+# place rather than re-hardcoded per tool.
+[[ "$(apl_agent_prefix)" == "arachne-agent-" ]] \
+  && pass "default agent prefix is arachne-agent-" \
+  || fail "default prefix drifted: '$(apl_agent_prefix)'"
+[[ "$(TASKPUMP_AGENT_PREFIX=tp-agent- apl_agent_prefix)" == "tp-agent-" ]] \
+  && pass "TASKPUMP_AGENT_PREFIX overrides the prefix" \
+  || fail "prefix override ignored"
+
+# The runtime override was the real defect: three of the five enumerations
+# called `docker` literally, so a harness that stubbed it still hit the daemon.
+cat >| "$BIN/fake-runtime" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == "ps" ]]; then printf '%s\n' "${STUB_NAMES:-}"; exit 0; fi
+exit 0
+EOF
+chmod +x "$BIN/fake-runtime"
+[[ "$(TASKPUMP_DOCKER="$BIN/fake-runtime" apl_docker)" == "$BIN/fake-runtime" ]] \
+  && pass "TASKPUMP_DOCKER selects the container runtime" \
+  || fail "TASKPUMP_DOCKER ignored"
+[[ "$(DOCKER="$BIN/fake-runtime" apl_docker)" == "$BIN/fake-runtime" ]] \
+  && pass "legacy DOCKER still selects the container runtime" \
+  || fail "legacy DOCKER ignored"
+
+mixed=$'arachne-agent-feat-a\nsome-other-container\narachne-agent-feat-b'
+got=$(DOCKER="$BIN/fake-runtime" STUB_NAMES="$mixed" apl_live_agent_names | tr '\n' ' ')
+[[ "$got" == "arachne-agent-feat-a arachne-agent-feat-b " ]] \
+  && pass "live enumeration keeps only prefixed containers" \
+  || fail "unexpected enumeration: '$got'"
+got=$(DOCKER="$BIN/fake-runtime" STUB_NAMES="$mixed" apl_live_agent_slugs | tr '\n' ' ')
+[[ "$got" == "feat-a feat-b " ]] \
+  && pass "slugs are names minus the prefix" \
+  || fail "unexpected slugs: '$got'"
+renamed=$'tp-agent-feat-a\narachne-agent-feat-b'
+got=$(TASKPUMP_AGENT_PREFIX=tp-agent- DOCKER="$BIN/fake-runtime" STUB_NAMES="$renamed" apl_live_agent_slugs | tr '\n' ' ')
+[[ "$got" == "feat-a " ]] \
+  && pass "a custom prefix selects and strips consistently" \
+  || fail "custom prefix enumeration: '$got'"
+
+echo "--- pool cap: one shared fallback, not three private ones ---"
+CAP_FILE="$TMP/absent-cap"
+[[ "$(JOBS=4 apl_read_cap)" == "4" ]] && pass "caller's JOBS wins when no cap file exists" \
+  || fail "expected 4 got '$(JOBS=4 apl_read_cap)'"
+got=$(unset JOBS; apl_read_cap)
+[[ "$got" == "6" ]] && pass "no JOBS at all falls back to TASKPUMP_JOBS_FALLBACK (6)" \
+  || fail "expected the shared fallback 6, got '$got'"
+got=$(unset JOBS; TASKPUMP_JOBS_FALLBACK=9 apl_read_cap)
+[[ "$got" == "9" ]] && pass "TASKPUMP_JOBS_FALLBACK is configurable" \
+  || fail "expected 9 got '$got'"
+
+echo "--- help extraction: a marker, not a line range ---"
+# `sed -n '2,40p' "$0"` truncated the moment anyone edited a header, silently.
+cat >| "$TMP/helpy" <<'EOF'
+#!/usr/bin/env bash
+# a tool that does something
+#   --flag   does the thing
+# HELP-END
+# this internal note must NOT reach --help
+set -e
+EOF
+got="$(apl_help "$TMP/helpy")"
+[[ "$got" == $'a tool that does something\n  --flag   does the thing' ]] \
+  && pass "help stops at HELP-END and strips the comment prefix" \
+  || fail "unexpected help text: '$got'"
+printf '#!/usr/bin/env bash\n# only line\nset -e\n' >| "$TMP/helpy2"
+[[ "$(apl_help "$TMP/helpy2")" == "only line" ]] \
+  && pass "help ends at the first non-comment line when unmarked" \
+  || fail "unmarked help extraction wrong"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"
