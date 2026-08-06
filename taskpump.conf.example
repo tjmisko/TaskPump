@@ -1,0 +1,126 @@
+# taskpump.conf — TaskPump configuration
+#
+# Copy to `taskpump.conf` at the root of the repo TaskPump drives.
+#
+# ── Discovery ────────────────────────────────────────────────────────────────
+# TaskPump walks up from $PWD looking for `taskpump.conf`, stopping at the
+# enclosing git worktree root. The search starts from the *caller's* directory,
+# never from where the tools are installed — so in a repo with worktrees, each
+# worktree gets its own configuration and its own ledger, and running the
+# primary checkout's copy of a tool from inside a worktree still operates on the
+# worktree. Set TASKPUMP_CONFIG to name a file explicitly and skip the walk.
+#
+# A missing config file is normal: every key below has a default baked into the
+# tool that reads it.
+#
+# ── Precedence ───────────────────────────────────────────────────────────────
+#   environment  >  taskpump.conf  >  tool default
+#
+# Legacy ARACHNE_* names are honored everywhere during the transition. An
+# ARACHNE_X in the environment sets TASKPUMP_X and still outranks this file;
+# every TASKPUMP_X set here is mirrored to ARACHNE_X, which is what the tools
+# currently read. Where both spellings are in the environment, TASKPUMP_X wins.
+#
+# ── Syntax ───────────────────────────────────────────────────────────────────
+# This file is sourced by bash with allexport on, so it is `KEY=value` per line.
+# Quote any value containing spaces: `TASKPUMP_NOTIFY_CMD='notify-send -u low'`.
+#
+# Defaults are filled in by the tools, not repeated here — the point of this
+# file is to document the key surface. Uncomment only what you need to change.
+
+# ── Ledger (tp task) ─────────────────────────────────────────────────────────
+# TASKPUMP_TASKS_DIR=          # (ARACHNE_TASKS_DIR) directory of task markdown files
+# TASKPUMP_TASK_OUT=           # (ARACHNE_TASK_OUT) JSON "next task" surface file
+# TASKPUMP_CODE_REPO=          # (ARACHNE_CODE_REPO) repo whose commits heartbeat measures
+# TASKPUMP_TASK_PUSH=          # (ARACHNE_TASK_PUSH) 1 = git push after each state commit
+# TASKPUMP_TASK_NOCOMMIT=      # (ARACHNE_TASK_NOCOMMIT) 1 = never commit state (fixture mode)
+# TASKPUMP_TASK_DEBUG=         # (ARACHNE_TASK_DEBUG) 1 = trace resolution to stderr
+# TASKPUMP_TASK=               # (ARACHNE_TASK) path to the task CLI other tools invoke
+# TASKPUMP_TASK_ID=            # (ARACHNE_TASK_ID) task a launched agent is assigned
+# TASKPUMP_CLAIM_STALE_HOURS=  # (ARACHNE_CLAIM_STALE_HOURS) age at which scrub relabels a claim
+# TASKPUMP_LOCK_WAIT=          # (ARACHNE_LOCK_WAIT) seconds to wait for the state lock
+# TASKPUMP_PHASE=              # (ARACHNE_PHASE) phase a launched agent drains
+# TASKPUMP_REPO=               # (ARACHNE_REPO) repo root for the systemd unit
+
+# ── Pump (tp pump) ───────────────────────────────────────────────────────────
+# TASKPUMP_PUMP_PHASES=        # (ARACHNE_PUMP_PHASES) phase range to drain, e.g. F55..F63
+# TASKPUMP_PUMP_JOBS=          # (ARACHNE_PUMP_JOBS) concurrent worktree pool cap
+# TASKPUMP_PUMP_BASE=          # (ARACHNE_PUMP_BASE) base ref new branches are cut from
+# TASKPUMP_PUMP_BRANCH_PREFIX= # (ARACHNE_PUMP_BRANCH_PREFIX) prefix for per-phase branches
+# TASKPUMP_PUMP_TASKS_DIR=     # (ARACHNE_PUMP_TASKS_DIR) tasks dir, independent of the ops dir
+# TASKPUMP_PUMP_OPS_DIR=       # (ARACHNE_PUMP_OPS_DIR) ledger checkout the pump pushes
+# TASKPUMP_PUMP_WORKTREES_DIR= # (ARACHNE_PUMP_WORKTREES_DIR) base dir holding agent worktrees
+# TASKPUMP_PUMP_STATE_FILE=    # (ARACHNE_PUMP_STATE_FILE) supervisor state across restarts
+# TASKPUMP_PUMP_QUARANTINE_FILE= # (ARACHNE_PUMP_QUARANTINE_FILE) phases held out of the frontier
+# TASKPUMP_PUMP_LOG=           # (ARACHNE_PUMP_LOG) supervisor log path
+# TASKPUMP_PUMP_CEILING=       # (ARACHNE_PUMP_CEILING) usage ceiling for the systemd unit
+# TASKPUMP_PUMP_RESUME_MAX=    # (ARACHNE_PUMP_RESUME_MAX) no-progress resumes before escalating
+# TASKPUMP_PUMP_STALL_EXIT_TICKS= # (ARACHNE_PUMP_STALL_EXIT_TICKS) idle ticks before deadlock exit
+# TASKPUMP_PUMP_BUILD_CMD=     # (ARACHNE_PUMP_BUILD_CMD) build gate for the merge queue
+# TASKPUMP_PUMP_MONITOR=       # (ARACHNE_PUMP_MONITOR) 0 = do not hand the terminal to the monitor
+# TASKPUMP_PUMP_NO_LAUNCH=     # (ARACHNE_PUMP_NO_LAUNCH) 1 = plan only, never start a container
+# TASKPUMP_PUMP_NO_GH=         # (ARACHNE_PUMP_NO_GH) 1 = skip all gh CLI calls
+# TASKPUMP_PUMP_DEBUG=         # (ARACHNE_PUMP_DEBUG) 1 = verbose supervisor tracing
+# TASKPUMP_PUMP_TRUNK=         # (ARACHNE_PUMP_TRUNK) integration trunk branch name
+# TASKPUMP_PUMP_TRUNK_PUSH=    # (ARACHNE_PUMP_TRUNK_PUSH) 1 = push the trunk after each merge
+# TASKPUMP_PUMP_TRUNK_LOCK_FILE= # (ARACHNE_PUMP_TRUNK_LOCK_FILE) flock guarding the merge queue
+# TASKPUMP_PUMP_INTEGRATION_BASE= # (ARACHNE_PUMP_INTEGRATION_BASE) base the trunk is cut from
+# TASKPUMP_PUMP_INTEGRATE_DRYRUN= # (ARACHNE_PUMP_INTEGRATE_DRYRUN) 1 = rehearse the merge queue
+# TASKPUMP_TRUNK_LOCK_WAIT=    # (ARACHNE_TRUNK_LOCK_WAIT) seconds to wait for the trunk lock
+# TASKPUMP_PUSH_RETRIES=       # (ARACHNE_PUSH_RETRIES) retries for a contended push
+# TASKPUMP_PHASE_BRIEF_TEMPLATE= # (ARACHNE_PHASE_BRIEF_TEMPLATE) phase-drain brief template
+# TASKPUMP_BRIEF=              # (ARACHNE_BRIEF) rendered brief handed to a launched agent
+# TASKPUMP_RESUME_NOTE=        # (ARACHNE_RESUME_NOTE) resume preamble for a stalled claim
+# TASKPUMP_POOL_CAP_FILE=      # (ARACHNE_POOL_CAP_FILE) live-editable pool cap
+# TASKPUMP_CREDENTIALS=        # (ARACHNE_CREDENTIALS) OAuth credentials file to copy from
+# TASKPUMP_TOKEN_GATE=         # (ARACHNE_TOKEN_GATE) 0 = disable the stale-token feed gate
+# TASKPUMP_TOKEN_MARGIN_S=     # (ARACHNE_TOKEN_MARGIN_S) seconds of TTL headroom the gate wants
+# TASKPUMP_NOW_S=              # (ARACHNE_NOW_S) clock override, for tests
+# TASKPUMP_NOTIFY_CMD=         # (ARACHNE_NOTIFY_CMD) command that delivers notifications
+
+# ── Usage gate (tp usage) ────────────────────────────────────────────────────
+# TASKPUMP_USAGE=              # (ARACHNE_USAGE) path to the usage-gate binary
+# TASKPUMP_USAGE_ENDPOINT=     # (ARACHNE_USAGE_ENDPOINT) OAuth usage endpoint URL
+# TASKPUMP_USAGE_CEILING=      # (ARACHNE_USAGE_CEILING) utilization percent at which to pause
+# TASKPUMP_USAGE_CACHE=        # (ARACHNE_USAGE_CACHE) cached usage payload path
+# TASKPUMP_USAGE_TTL=          # (ARACHNE_USAGE_TTL) cache freshness, seconds
+# TASKPUMP_USAGE_RESET_FILE=   # (ARACHNE_USAGE_RESET_FILE) reset-backstop file
+# TASKPUMP_USAGE_HTTP_TIMEOUT= # (ARACHNE_USAGE_HTTP_TIMEOUT) curl timeout, seconds
+# TASKPUMP_USAGE_DEBUG=        # (ARACHNE_USAGE_DEBUG) 1 = trace the probe to stderr
+
+# ── Monitor (tp monitor) ─────────────────────────────────────────────────────
+# TASKPUMP_MONITOR_BIN=        # (ARACHNE_MONITOR_BIN) path to the monitor the pump hands off to
+# TASKPUMP_MONITOR_REPO_ROOT=  # (ARACHNE_MONITOR_REPO_ROOT) checkout whose worktrees to report on
+# TASKPUMP_MONITOR_MAIN_ROOT=  # (ARACHNE_MONITOR_MAIN_ROOT) primary checkout, for cache keys
+# TASKPUMP_MONITOR_INTERVAL=   # (ARACHNE_MONITOR_INTERVAL) --watch refresh seconds
+# TASKPUMP_MONITOR_COLS=       # (ARACHNE_MONITOR_COLS) terminal width override
+# TASKPUMP_MONITOR_LINES=      # (ARACHNE_MONITOR_LINES) terminal height override
+# TASKPUMP_MONITOR_TERM=       # (ARACHNE_MONITOR_TERM) terminal type override
+# TASKPUMP_MONITOR_LOG=        # (ARACHNE_MONITOR_LOG) redraw-instrumentation log
+# TASKPUMP_MONITOR_TAIL_LINES= # (ARACHNE_MONITOR_TAIL_LINES) agent-log lines in the detail pane
+# TASKPUMP_MONITOR_DISK=       # (ARACHNE_MONITOR_DISK) 0 = hide the disk gauge
+# TASKPUMP_MONITOR_DISK_CACHE= # (ARACHNE_MONITOR_DISK_CACHE) disk probe cache file
+# TASKPUMP_MONITOR_DISK_TTL=   # (ARACHNE_MONITOR_DISK_TTL) disk probe cache seconds
+# TASKPUMP_MONITOR_DISK_PAUSE_GB= # (ARACHNE_MONITOR_DISK_PAUSE_GB) gauge's pause threshold
+# TASKPUMP_MONITOR_DISK_PANIC_GB= # (ARACHNE_MONITOR_DISK_PANIC_GB) gauge's panic threshold
+# TASKPUMP_MONITOR_SESS_CACHE= # (ARACHNE_MONITOR_SESS_CACHE) session probe cache file
+# TASKPUMP_MONITOR_SESS_TTL=   # (ARACHNE_MONITOR_SESS_TTL) session probe cache seconds
+# TASKPUMP_MONITOR_PUMP_CACHE= # (ARACHNE_MONITOR_PUMP_CACHE) pump-state cache file
+# TASKPUMP_MONITOR_PUMP_TTL=   # (ARACHNE_MONITOR_PUMP_TTL) pump-state cache seconds
+# TASKPUMP_MONITOR_NOTES_DIR=  # (ARACHNE_MONITOR_NOTES_DIR) directory of session notes
+# TASKPUMP_MONITOR_NOTES_FILE= # (ARACHNE_MONITOR_NOTES_FILE) single notes file to tail
+# TASKPUMP_MONITOR_NOTES_TAIL= # (ARACHNE_MONITOR_NOTES_TAIL) notes lines to show
+# TASKPUMP_MONITOR_NOTES_COLW= # (ARACHNE_MONITOR_NOTES_COLW) notes column width
+# TASKPUMP_MONITOR_OPEN_CMD=   # (ARACHNE_MONITOR_OPEN_CMD) command `o` runs on a task file
+# TASKPUMP_MONITOR_TASK_CLASS= # (ARACHNE_MONITOR_TASK_CLASS) window class for a spawned viewer
+
+# ── DAG rendering (tp dag-render) ────────────────────────────────────────────
+# TASKPUMP_DAG_BIN=            # (ARACHNE_DAG_BIN) path to the renderer the monitor invokes
+# TASKPUMP_DAG_REPO_ROOT=      # (ARACHNE_DAG_REPO_ROOT) repo root the renderer resolves against
+
+# ── Cleanup and watchdogs (tp cleanup / disk-watchdog) ───────────────────────
+# TASKPUMP_CLEANUP_REPO_ROOT=  # (ARACHNE_CLEANUP_REPO_ROOT) repo whose worktrees get swept
+# TASKPUMP_DISK_REPO_ROOT=     # (ARACHNE_DISK_REPO_ROOT) repo the disk watchdog measures
+# TASKPUMP_DISK_WATCHDOG=      # (ARACHNE_DISK_WATCHDOG) path to the disk-watchdog binary
+# TASKPUMP_DISK_GATE=          # (ARACHNE_DISK_GATE) 0 = disable the low-disk feed gate
+# TASKPUMP_DISK_RECLAIM=       # (ARACHNE_DISK_RECLAIM) 1 = reclaim target dirs on pressure
