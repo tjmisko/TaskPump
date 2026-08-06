@@ -656,12 +656,12 @@ RESUME_T="$TP_ROOT/templates/resume-note.md"
 placeholders_in() { grep -oE '\{\{[A-Z_]+\}\}' "$1" | sort -u | tr '\n' ' ' | sed 's/ $//'; }
 
 got=$(placeholders_in "$BRIEF_T")
-want='{{DEPENDS_ON}} {{PHASE}}'
+want='{{BASE}} {{DEPENDS_ON}} {{PHASE}} {{PROJECT_BRIEF}} {{TASK_CLI}} {{TASK_CLI_NAME}} {{TASK_DIR}} {{VERIFY_CMDS}}'
 [[ "$got" == "$want" ]] && pass "brief template uses exactly the placeholders the pump substitutes" \
   || fail "brief placeholder set drifted.\n  want: $want\n  got:  $got"
 
 got=$(placeholders_in "$RESUME_T")
-want='{{BRANCH}} {{COMMITS}} {{DIFF_STAT}} {{PHASE}} {{STATUS_SHORT}} {{TASK_CLI}} {{TASK_FILE}} {{TASK_ID}} {{VERIFY_CMDS}}'
+want='{{BRANCH}} {{COMMITS}} {{DIFF_STAT}} {{PHASE}} {{STATUS_SHORT}} {{TASK_CLI}} {{TASK_CLI_NAME}} {{TASK_FILE}} {{TASK_ID}} {{VERIFY_CMDS}}'
 [[ "$got" == "$want" ]] && pass "resume template uses exactly the documented placeholder set" \
   || fail "resume placeholder set drifted.\n  want: $want\n  got:  $got"
 # BUILD_GATE means the merge queue's gate (TASKPUMP_BUILD_GATE). Reusing the name
@@ -679,13 +679,25 @@ for ph in $(placeholders_in "$BRIEF_T") $(placeholders_in "$RESUME_T"); do
 done
 pass "every template placeholder is documented in templates/README.md"
 
-# Render the brief with the pump's own algorithm (sed for the scalar, whole-line
-# replacement for the block) and assert nothing is left unsubstituted.
+# Render the brief with the pump's own algorithm (sed for the scalars, whole-line
+# replacement for the blocks) and assert nothing is left unsubstituted. The
+# scalar set mirrors tp-pump's render map: PHASE, BASE, TASK_CLI, TASK_CLI_NAME,
+# TASK_DIR, and VERIFY_CMDS (a semicolon-joined single line via apl_join_commands);
+# DEPENDS_ON and PROJECT_BRIEF are whole-line blocks.
 DEPS_F="$WORK/deps.txt"
 printf 'Waits on F54.2 (another worktree).\nWaits on F56.1.\n' >| "$DEPS_F"
+PROJ_F="$WORK/project-brief.txt"
+printf 'Read the project docs before starting.\n' >| "$PROJ_F"
 RENDERED="$WORK/brief-rendered.md"
-sed 's/{{PHASE}}/F55/g' "$BRIEF_T" \
+sed -e 's/{{PHASE}}/F55/g' \
+    -e 's/{{BASE}}/main/g' \
+    -e 's|{{TASK_CLI}}|scripts/arachne-task|g' \
+    -e 's/{{TASK_CLI_NAME}}/arachne-task/g' \
+    -e 's|{{TASK_DIR}}|ops/task-loop/tasks|g' \
+    -e 's/{{VERIFY_CMDS}}/cargo fmt --check; cargo clippy/g' \
+    "$BRIEF_T" \
   | awk -v df="$DEPS_F" 'index($0, "{{DEPENDS_ON}}") { while ((getline line < df) > 0) print line; close(df); next } {print}' \
+  | awk -v pf="$PROJ_F" 'index($0, "{{PROJECT_BRIEF}}") { while ((getline line < pf) > 0) print line; close(pf); next } {print}' \
   >| "$RENDERED"
 if grep -q '{{' "$RENDERED"; then
   fail "brief left unsubstituted placeholders: $(grep -o '{{[A-Z_]*}}' "$RENDERED" | sort -u | tr '\n' ' ')"

@@ -37,6 +37,12 @@ the inserted lines.
 | Placeholder | Kind | Value |
 |---|---|---|
 | `{{PHASE}}` | scalar | The phase this worktree drains, e.g. `F55`. |
+| `{{BASE}}` | scalar | The integration base branch the worktree was cut from, e.g. `main`. |
+| `{{TASK_CLI}}` | scalar | How the agent invokes the task CLI in its workspace. |
+| `{{TASK_CLI_NAME}}` | scalar | The CLI's basename, for prose that names the tool. |
+| `{{TASK_DIR}}` | scalar | The tasks directory relative to the workspace, e.g. `ops/task-loop/tasks`. |
+| `{{VERIFY_CMDS}}` | scalar | The per-task verify commands, semicolon-joined onto one line. |
+| `{{PROJECT_BRIEF}}` | block | `TASKPUMP_PROJECT_BRIEF` — a paragraph pointing the agent at the project's own docs. |
 | `{{DEPENDS_ON}}` | block | Cross-phase dependency summary, or a line stating there are none. |
 
 ### `resume-note.md`
@@ -47,11 +53,12 @@ the inserted lines.
 | `{{PHASE}}` | scalar | Its phase, e.g. `F79`. |
 | `{{BRANCH}}` | scalar | The worktree's branch. |
 | `{{TASK_CLI}}` | scalar | How the agent invokes the task CLI in its workspace. |
+| `{{TASK_CLI_NAME}}` | scalar | The CLI's basename, for prose that names the tool. |
 | `{{TASK_FILE}}` | scalar | Path to the task file, so the prose need not hardcode the ledger layout. |
 | `{{COMMITS}}` | block | `git log --oneline <base>..<branch>` — what the dead session already landed. |
 | `{{STATUS_SHORT}}` | block | `git status --short`. |
 | `{{DIFF_STAT}}` | block | `git diff --stat`. |
-| `{{VERIFY_CMDS}}` | block | The project's format/lint/test commands, which must be clean before a task can be completed. |
+| `{{VERIFY_CMDS}}` | scalar | The project's format/lint/test commands, semicolon-joined onto one line; must be clean before a task can be completed. |
 
 `{{VERIFY_CMDS}}` is deliberately **not** called `BUILD_GATE`. `TASKPUMP_BUILD_GATE`
 already means something else — the merge queue's gate, which decides whether a
