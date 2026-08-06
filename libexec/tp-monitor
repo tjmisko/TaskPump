@@ -132,7 +132,9 @@ MANIFEST="${TASKPUMP_MANIFEST:-${MANIFEST:-$REPO_ROOT/$MANIFEST_SUBPATH}}"
 # Honours TASKPUMP_TASKS_DIR for the same reason tp-dag-render does: the two must
 # read the SAME ledger, or the GRAPH tab draws one set of tasks while `o` opens
 # files from another.
-TASKS_SUBDIR="${TASKPUMP_TASKS_SUBDIR:-ops/task-loop/tasks}"
+# TASKPUMP_LEDGER_PROBE is the shared spelling (tp-task resolves the ledger with
+# it); TASKS_SUBDIR is accepted as a monitor-local override for compatibility.
+TASKS_SUBDIR="${TASKPUMP_LEDGER_PROBE:-${TASKPUMP_TASKS_SUBDIR:-ops/task-loop/tasks}}"
 TASKS_DIR="${TASKPUMP_TASKS_DIR:-$REPO_ROOT/$TASKS_SUBDIR}"
 TASK_EXT="${TASKPUMP_TASK_EXT:-.md}"
 PHASE_SIGIL="${TASKPUMP_PHASE_SIGIL:-F}"
@@ -140,7 +142,11 @@ PHASE_SEP="${TASKPUMP_PHASE_SEPARATOR:-.}"
 
 # Agent workspace shape: what a container is called, what its log is called, and
 # how a feed line is pulled out of that log.
-AGENT_PREFIX="${TASKPUMP_AGENT_CONTAINER_PREFIX:-arachne-agent}"
+# TASKPUMP_AGENT_PREFIX is the shared spelling (the pump names containers with
+# it, dash included); the monitor works with the dashless form internally, so
+# strip a trailing dash from whichever spelling arrives.
+AGENT_PREFIX="${TASKPUMP_AGENT_PREFIX:-${TASKPUMP_AGENT_CONTAINER_PREFIX:-arachne-agent-}}"
+AGENT_PREFIX="${AGENT_PREFIX%-}"
 AGENT_LOG_NAME="${TASKPUMP_AGENT_LOG_NAME:-.arachne-agent.log}"
 AGENT_LOG_SCAN="${TASKPUMP_AGENT_LOG_SCAN:-200}"
 # Single-quoted: the jq program contains "\\s+", and a double-quoted assignment
@@ -268,7 +274,7 @@ task_status() {  # $1 = task id -> status word, or "-" / "null" / "?"
 # STATE — where a task or agent is in its life. The only family allowed green,
 # amber or red. Green is the progress axis and has exactly TWO steps, settled
 # and live; there is deliberately no third green anywhere in the monitor.
-# Keep in sync with hue() in scripts/arachne-dag-layout.awk — one vocabulary in
+# Keep in sync with hue() in lib/dag-layout.awk — one vocabulary in
 # two languages, and changing either alone is a bug.
 ST_DONE=$'\033[0;2;38;5;65m'      # ✓ done      — settled, behind you
 ST_LIVE=$'\033[0;38;5;71m'        # ▶ running   — an agent is on it right now

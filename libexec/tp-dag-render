@@ -78,7 +78,7 @@ _tp_repo_default() {
     printf '%s' "$TP_ROOT"
 }
 REPO_ROOT="${TASKPUMP_DAG_REPO_ROOT:-$(_tp_repo_default)}"
-TASKS_SUBDIR="${TASKPUMP_TASKS_SUBDIR:-ops/task-loop/tasks}"
+TASKS_SUBDIR="${TASKPUMP_LEDGER_PROBE:-${TASKPUMP_TASKS_SUBDIR:-ops/task-loop/tasks}}"
 TASKS_DIR="${TASKPUMP_TASKS_DIR:-$REPO_ROOT/$TASKS_SUBDIR}"
 TASK_EXT="${TASKPUMP_TASK_EXT:-.md}"
 PUMP_STATE_NAME="${TASKPUMP_PUMP_STATE_NAME:-.arachne-pump.state}"

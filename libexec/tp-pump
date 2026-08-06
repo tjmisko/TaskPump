@@ -199,7 +199,7 @@ DETACH=0
 # over by default. TASKPUMP_PUMP_MONITOR=0 or --no-monitor opts out; a non-tty
 # (cron, CI, a nested pump re-exec) opts out automatically.
 MONITOR="${TASKPUMP_PUMP_MONITOR:-1}"
-STATE_FILE="${TASKPUMP_PUMP_STATE_FILE:-$STATE_DIR/.arachne-pump.state}"
+STATE_FILE="${TASKPUMP_PUMP_STATE_FILE:-$STATE_DIR/${TASKPUMP_PUMP_STATE_NAME:-.arachne-pump.state}}"
 PUMP_LOG="${TASKPUMP_PUMP_LOG:-$STATE_DIR/.arachne-pump.log}"
 PUMP_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
@@ -1389,9 +1389,9 @@ pump_notify() {
 # ── Detach (E3) ────────────────────────────────────────────────────────────────
 # Re-exec the SAME command minus --detach, fully detached so a multi-day run
 # survives terminal close / SSH drop. Prefers a transient systemd --user unit
-# (clean `journalctl --user -u arachne-pump`, Restart not set for transient —
-# use scripts/arachne-pump.service for restart-on-failure); falls back to
-# setsid+nohup. The persistent unit template is scripts/arachne-pump.service.
+# (clean `journalctl --user -u taskpump-pump`, Restart not set for transient —
+# use systemd/taskpump-pump.service for restart-on-failure); falls back to
+# setsid+nohup. The persistent unit template is systemd/taskpump-pump.service.
 detach_and_exit() {
   local -a fwd=()
   local a
