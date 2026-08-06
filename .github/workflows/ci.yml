@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # mikefarah's yq (Go), NOT the Python `yq` — they share a name and share
+  # nothing else. The whole ledger is read and written through its
+  # `--front-matter=extract|process` modes, which the Python one does not have.
+  # Pinned to a v4 patch release: v4 is the API the tools are written against,
+  # and floating to `latest` means a future v5 silently breaks every read.
+  YQ_VERSION: v4.44.3
+
+jobs:
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends shellcheck
+          shellcheck --version
+
+      - name: Lint shell sources
+        run: |
+          # Severity is pinned to `error` deliberately.
+          #
+          # These tools came out of Arachne as ~2k lines apiece of working,
+          # heavily-exercised shell. At `error` the tree is clean today, so CI
+          # is green from day one and any NEW error is unambiguously a
+          # regression somebody just introduced. At `warning` there are 38
+          # pre-existing findings — a red CI that everybody learns to ignore,
+          # which is worse than no CI.
+          #
+          # The intended path is to ratchet: clear the warning-level findings,
+          # then change `-S error` to `-S warning` here and never let it back
+          # down. Widening the severity to make a change pass is the one thing
+          # this must not be used for.
+          files=$(find bin libexec lib gates runners hooks \
+                    -type f \( -name '*.sh' -o -perm -u+x \) 2>/dev/null | sort)
+          if [ -z "$files" ]; then
+            echo "no shell sources found — the layout moved?" >&2
+            exit 1
+          fi
+          echo "$files"
+          # -x follows `source`d files so the shared lib/ code is analysed in
+          # the context of each tool that sources it.
+          # shellcheck disable=SC2086
+          shellcheck -S error -x $files
+
+  tests:
+    name: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          # gawk: the DAG layout engine is a gawk program; ubuntu ships mawk by
+          # default, which lacks the array and printf behaviour it relies on.
+          # jq, git, util-linux (flock), coreutils (timeout) are already present
+          # on the runner; naming them here makes a change in the runner image
+          # fail at this step rather than deep inside a suite.
+          sudo apt-get install -y --no-install-recommends gawk jq git util-linux coreutils
+          gawk --version | head -1
+          jq --version
+
+      - name: Install yq ${{ env.YQ_VERSION }} (mikefarah)
+        run: |
+          url="https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
+          sudo curl -fsSL --retry 3 -o /usr/local/bin/yq "$url"
+          sudo chmod +x /usr/local/bin/yq
+          yq --version
+          # Fail loudly rather than 300 confusing assertion failures if the
+          # Python yq ever shadows this one.
+          yq --version 2>&1 | grep -q mikefarah \
+            || { echo "wrong yq on PATH — need mikefarah's Go implementation" >&2; exit 1; }
+
+      - name: Configure git identity
+        run: |
+          # The suites build throwaway repositories and commit in them.
+          git config --global user.name  "TaskPump CI"
+          git config --global user.email "ci@taskpump.invalid"
+          git config --global init.defaultBranch main
+
+      - name: Run the suites
+        run: ./tests/run-all.sh
+
+      - name: Generic-consumer smoke
+        run: |
+          # Drives the read-only verbs over tests/fixtures/generic-project — a
+          # project with a different tasks directory, a different id grammar,
+          # and no relationship to the repo TaskPump was extracted from. It is
+          # also the tree every example in README.md runs against, so this step
+          # is what keeps the quickstart from going stale.
+          cd tests/fixtures/generic-project
+          tp() { "$GITHUB_WORKSPACE/bin/tp" "$@"; }
+
+          assert_eq() {
+            if [ "$2" != "$3" ]; then
+              echo "FAIL: $1 — expected '$3', got '$2'" >&2
+              exit 1
+            fi
+            echo "ok: $1 = $2"
+          }
+
+          assert_eq "ready --count"          "$(tp task ready --count)"          "3"
+          assert_eq "ready --count-eligible" "$(tp task ready --count-eligible)" "1"
+          assert_eq "next"                   "$(tp task next --branch feat/t2 | jq -r .id)" "T2.1"
+
+          # scrub is the only verb that reports a task file invisible to the
+          # frontier, and exits 3 when it finds one. A clean fixture exits 0.
+          tp task scrub
+          echo "generic-consumer smoke passed"
