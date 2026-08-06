@@ -121,4 +121,55 @@ jobs:
           # scrub is the only verb that reports a task file invisible to the
           # frontier, and exits 3 when it finds one. A clean fixture exits 0.
           tp task scrub
+
+          # ── The create path ──────────────────────────────────────────────
+          # Everything above reads. `create` is the verb that writes a new task,
+          # and the only one that enforces TASKPUMP_ID_PATTERN — so it is where a
+          # consumer whose ids are not F-shaped finds out whether the grammar is
+          # really configurable, or whether the extraction left an F baked in.
+          #
+          # It runs against a COPY. The committed fixture is the tree every
+          # README example and every assertion above is written against; a step
+          # that grew a task in it would change those counts for the next run and
+          # leave the diff for someone else to explain.
+          tmproot="${RUNNER_TEMP:-/tmp}"
+          mkdir -p "$tmproot"
+          work="$(mktemp -d "$tmproot/tp-smoke.XXXXXX")/generic-project"
+          cp -r "$GITHUB_WORKSPACE/tests/fixtures/generic-project" "$work"
+          cd "$work"
+
+          tp task create T4.1 \
+            --title "smoke: the create path lands a task" \
+            --phase T4 \
+            --goal  "prove a consumer's own id grammar reaches the write path"
+
+          [ -f tasks/T4.1.md ] || { echo "FAIL: create wrote no task file" >&2; exit 1; }
+          echo "ok: create wrote tasks/T4.1.md"
+
+          # It has to reach the frontier, not just the filesystem. A file the
+          # ledger cannot parse is invisible rather than an error, so counting is
+          # the assertion that a written task is a real one.
+          assert_eq "ready --count after create" "$(tp task ready --count)" "4"
+          assert_eq "goal round-trips" \
+            "$(tp task goal T4.1)" \
+            "prove a consumer's own id grammar reaches the write path"
+
+          # The grammar has to reject as well as accept, or it is not enforcing
+          # anything. F45.23 is the shape TaskPump was extracted with, which is
+          # exactly the shape this consumer must not silently inherit.
+          if tp task create F45.23 --title "wrong grammar for this consumer" 2>/dev/null; then
+            echo "FAIL: create accepted an id the configured pattern rejects" >&2
+            exit 1
+          fi
+          echo "ok: create rejects an id outside TASKPUMP_ID_PATTERN"
+
+          # The committed fixture must be exactly as checked out.
+          cd "$GITHUB_WORKSPACE"
+          if ! git diff --quiet -- tests/fixtures/generic-project; then
+            echo "FAIL: the smoke mutated the committed fixture" >&2
+            git diff --stat -- tests/fixtures/generic-project >&2
+            exit 1
+          fi
+          echo "ok: committed fixture untouched"
+
           echo "generic-consumer smoke passed"
