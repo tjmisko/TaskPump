@@ -123,8 +123,12 @@ apl_read_cap() {
 # regression (2026-04-14 incident) so worktrees aren't silently gitignored.
 apl_repair_worktree_gitignore() {
   local repo_root="$1"
-  if grep -qE '^\.worktrees/$' "$repo_root/.gitignore" 2>/dev/null; then
-    sed -i '/^\.worktrees\/$/d' "$repo_root/.gitignore"
+  local line="${TASKPUMP_WORKTREES_IGNORE_LINE:-.worktrees/}"
+  # Anchor the whole line and escape it for both grep and sed, so a base
+  # containing dots or slashes matches itself and nothing else.
+  local esc; esc="$(printf '%s' "$line" | sed 's/[][\.*^$\/]/\\&/g')"
+  if grep -qE "^$esc\$" "$repo_root/.gitignore" 2>/dev/null; then
+    sed -i "/^$esc\$/d" "$repo_root/.gitignore"
   fi
 }
 

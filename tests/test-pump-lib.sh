@@ -277,6 +277,22 @@ printf 'edited\n' >| "$FSG/tracked.txt"
 [[ -n "$(apl_fs_guard "$FSG")" ]] && pass "a real source edit is still reported" \
   || fail "source edit went unreported"
 
+echo "--- gitignore repair: the ignore line is a knob, anchored and escaped ---"
+GI="$TMP/gi"; mkdir -p "$GI"
+printf '!.worktrees/\n!.worktrees/**\ntarget/\n.worktrees/\n' >| "$GI/.gitignore"
+apl_repair_worktree_gitignore "$GI"
+grep -qxF '.worktrees/' "$GI/.gitignore" && fail "the bare re-ignore line survived" \
+  || pass "the bare re-ignore line is stripped"
+grep -qxF '!.worktrees/' "$GI/.gitignore" && pass "the negations are left alone" \
+  || fail "a negation was stripped too"
+grep -qxF 'target/' "$GI/.gitignore" && pass "unrelated lines are left alone" \
+  || fail "an unrelated line was stripped"
+printf 'build/wt/\n!build/wt/**\n' >| "$GI/.gitignore"
+TASKPUMP_WORKTREES_IGNORE_LINE='build/wt/' apl_repair_worktree_gitignore "$GI"
+grep -qxF 'build/wt/' "$GI/.gitignore" && fail "a configured ignore line was not stripped" \
+  || pass "TASKPUMP_WORKTREES_IGNORE_LINE picks the line to strip"
+grep -qxF '!build/wt/**' "$GI/.gitignore" && pass "its negation survives" || fail "negation stripped"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"
