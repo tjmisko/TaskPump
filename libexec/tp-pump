@@ -127,9 +127,6 @@ _tp_default_verify=$'cargo fmt --all\ncargo clippy --workspace -- -D warnings'
 _tp_default_project_brief="Read the contributor documentation for this repository (CLAUDE.md, CONTRIBUTING.md, or equivalent) before writing code, then read the design note that phase {{PHASE}} is built against."
 VERIFY_CMDS="${TASKPUMP_VERIFY_CMDS:-$_tp_default_verify}"
 PROJECT_BRIEF="${TASKPUMP_PROJECT_BRIEF:-$_tp_default_project_brief}"
-# The resume note's own template; resolved like the brief but with no consumer
-# convention to honor, so it is simply the shipped one unless configured.
-RESUME_TEMPLATE="${TASKPUMP_RESUME_TEMPLATE:-$TP_ROOT/templates/resume-note.md}"
 
 # Where the run's dotfiles live. One knob moves them all out of the repo root;
 # each filename is still individually overridable.
@@ -648,6 +645,19 @@ resolve_brief_template() {
 }
 BRIEF_TEMPLATE="$(resolve_brief_template)"
 
+# The resume note resolves the same three ways, for the same reason: a consumer
+# whose agents depend on particular wording keeps it in its own ledger, while
+# the shipped default stays tool-agnostic. Symmetry matters here — the two
+# templates are read by the same agent in the same session.
+resolve_resume_template() {
+  local explicit="${TASKPUMP_RESUME_TEMPLATE:-}"
+  [[ -n "$explicit" ]] && { printf '%s' "$explicit"; return 0; }
+  local consumer="$OPS_DIR/task-loop/briefs/_resume-note-template.md"
+  [[ -f "$consumer" ]] && { printf '%s' "$consumer"; return 0; }
+  printf '%s' "$TP_ROOT/templates/resume-note.md"
+}
+RESUME_TEMPLATE="$(resolve_resume_template)"
+
 # Only reachable when the resolved template is genuinely absent — an explicit
 # TASKPUMP_BRIEF_TEMPLATE pointing nowhere, or a broken install.
 missing_brief_template_msg() {
@@ -675,6 +685,7 @@ render_brief_stream() {
     [TASK_CLI_NAME]="$TASK_CLI_NAME"
     [TASK_DIR]="$(tasks_dir_rel)"
     [VERIFY_CMDS]="$(apl_join_commands "$VERIFY_CMDS")"
+    [BUILD_GATE]="$(apl_join_commands "$VERIFY_CMDS")"
     [PROJECT_BRIEF]="${PROJECT_BRIEF//\{\{PHASE\}\}/$phase}"
   )
   TPL_BLOCKS=( [DEPENDS_ON]="$depfile" )
@@ -726,6 +737,11 @@ render_resume_note_stream() {
     [TASK_CLI]="$TASK_CLI"
     [TASK_CLI_NAME]="$TASK_CLI_NAME"
     [VERIFY_CMDS]="$(apl_join_commands "$VERIFY_CMDS")"
+    # The shipped templates call this {{BUILD_GATE}}. Both names resolve to the
+    # same value so either template file renders, but note that the pump's
+    # TASKPUMP_BUILD_GATE is a DIFFERENT thing — the merge queue's gate, not the
+    # per-task verification commands.
+    [BUILD_GATE]="$(apl_join_commands "$VERIFY_CMDS")"
   )
   TPL_BLOCKS=(
     [COMMITS]="$commits"
@@ -893,8 +909,8 @@ launch_phase() {
     TP_BRIEF="$brief"                  ARACHNE_BRIEF="$brief" \
     TP_RESUME_NOTE="$resume_note"      ARACHNE_RESUME_NOTE="$resume_note" \
     TP_LEDGER_REPO="$OPS_DIR" \
-    TP_AGENT_HOME="$CLAUDE_DIR" \
-    TP_AGENT_CONFIG="$CLAUDE_JSON" \
+    TP_CLAUDE_DIR="$CLAUDE_DIR"        CLAUDE_DIR="$CLAUDE_DIR" \
+    TP_CLAUDE_JSON="$CLAUDE_JSON"      CLAUDE_JSON="$CLAUDE_JSON" \
     TP_AGENT_LOG_NAME="$AGENT_LOG_NAME" \
     TP_GOAL_NOTE_NAME="$GOAL_NOTE_NAME" \
     TP_TASKS_DIR="$TASKS_DIR" \

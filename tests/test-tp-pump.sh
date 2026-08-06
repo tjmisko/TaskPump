@@ -266,18 +266,30 @@ echo "--- Test 11: the read-only-primary mount, now the runner's to keep ---"
 # write the primary checkout is how a past run silently corrupted the shared
 # tree. The mounts moved out of the pump and into the runner when launching
 # became a seam, so the guard follows them there.
-RUNNER_SH="$TP_ROOT/runners/claude-docker/runner.sh"
+# Overridable so this guard can be validated against the runner while it still
+# lives on another branch (git show gen/runner:runners/... > /tmp/runner.sh).
+RUNNER_SH="${TEST_RUNNER_SH:-$TP_ROOT/runners/claude-docker/runner.sh}"
+# The runner holds the repo root in a LOWER-CASE local: `local REPO_ROOT` would
+# blank the inherited value before the legacy fallback could read it. So each
+# pattern accepts either spelling rather than pinning one.
 assert_mounts() {  # <launcher-path> <label>
   local f="$1" label="$2"
-  grep -qE -- '-v +"?\$(TP_)?REPO_ROOT"?:"?\$(TP_)?REPO_ROOT"?:ro' "$f" \
+  local root='\$(TP_REPO_ROOT|REPO_ROOT|repo_root)'
+  local work='\$(TP_WORKSPACE|WORKSPACE_PATH|workspace|wt)'
+  local ledger='\$(TP_LEDGER_REPO|ledger_repo|(TP_REPO_ROOT|REPO_ROOT|repo_root)/ops)'
+  grep -qE -- "-v +\"?$root\"?:\"?$root\"?:ro" "$f" \
     && pass "$label: :ro primary mount present" || fail "$label: missing :ro primary mount"
-  grep -qE -- '-v +"?\$(TP_)?REPO_ROOT/\.git"?:' "$f" \
+  grep -qE -- "-v +\"?$root/\\.git\"?:" "$f" \
     && pass "$label: .git RW overlay present" || fail "$label: missing .git RW overlay"
-  grep -qE -- '-v +"?\$(TP_)?(WORKSPACE|wt)[A-Z_]*"?:' "$f" \
+  grep -qE -- "-v +\"?$work\"?:" "$f" \
     && pass "$label: worktree RW overlay present" || fail "$label: missing worktree RW overlay"
-  grep -qE -- '-v +"?\$(TP_LEDGER_REPO|TP_REPO_ROOT/ops|REPO_ROOT/ops)"?:' "$f" \
+  grep -qE -- "-v +\"?$ledger\"?:" "$f" \
     && pass "$label: ledger RW overlay present" || fail "$label: missing ledger RW overlay"
-  if grep -qE -- '-v +"?\$(TP_)?REPO_ROOT"?:"?\$(TP_)?REPO_ROOT"?( |$)' "$f"; then
+  # The terminator must be whitespace, a line continuation, or end of line.
+  # A bare [^:] backtracks: it lets the optional closing quote match empty and
+  # then matches the quote itself, so the legitimate `:"$root":ro` line reads as
+  # a blanket mount. Verified in both directions against the real runner.
+  if grep -qE -- "-v +\"?$root\"?:\"?$root\"?([[:space:]\\\\]|\$)" "$f"; then
     fail "$label: blanket RW primary mount re-introduced"
   else
     pass "$label: no blanket RW primary mount"
@@ -299,14 +311,14 @@ echo "--- Test 12b: the runner contract the pump exports ---"
 # environment. A name dropped here is a silent, launch-time-only failure.
 for v in TP_WORKSPACE TP_BRANCH TP_CONTAINER_NAME TP_IMAGE TP_ENTRYPOINT TP_TASK_ID \
          TP_PHASE TP_MODEL TP_MAX_TURNS TP_REPO_ROOT TP_BRIEF TP_RESUME_NOTE \
-         TP_LEDGER_REPO TP_AGENT_HOME TP_AGENT_CONFIG TP_MEMORY_MAX TP_MEMORY_SWAP \
+         TP_LEDGER_REPO TP_CLAUDE_DIR TP_CLAUDE_JSON TP_MEMORY_MAX TP_MEMORY_SWAP \
          TP_DOCKER TP_AGENT_LOG_NAME TP_GOAL_NOTE_NAME TP_TASKS_DIR; do
   grep -qF "$v=" "$PUMP" && pass "runner contract exports $v" || fail "runner contract missing $v"
 done
 # The legacy twins the in-container entrypoint still reads.
 for v in WORKSPACE_PATH REPO_ROOT ARACHNE_BRIEF ARACHNE_RESUME_NOTE ARACHNE_TASK_ID \
          ARACHNE_PHASE MAX_TURNS AGENT_MODEL AGENT_MEMORY_MAX AGENT_MEMORY_SWAP \
-         GITHUB_TOKEN; do
+         CLAUDE_DIR CLAUDE_JSON GITHUB_TOKEN; do
   grep -qF "$v=" "$PUMP" && pass "runner contract keeps the legacy $v" || fail "legacy twin missing: $v"
 done
 
@@ -997,6 +1009,45 @@ grep -q -- '--base release/2.0' "$GHLOG" \
 grep -qE -- '--base main( |$)' "$GHLOG" \
   && fail "a gh call still hardcodes main: $(cat "$GHLOG")" || pass "no gh call hardcodes main"
 rm -f "$BIN/gh"
+
+echo "--- Test 28: the resume note resolves like the brief does ---"
+RES2="$TMP/resolve2"; mkdir -p "$RES2/ops/task-loop/briefs"
+stall_fixture
+# `env` is needed, not a bare prefix: words that arrive through "$@" are not
+# parsed as assignments, so bash would try to execute the first one.
+rnote() { PATH="$BIN:$PATH" ARACHNE_POOL_CAP_FILE="$TMP/cap" \
+  ARACHNE_PUMP_STATE_FILE="$STATE19" ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+  STUB_LIVE="" STUB_AHEAD=3 STUB_HEAD=aaaa111 \
+  env "$@" "$PUMP" --no-health-gate --render-resume-note F97 2>&1; }
+
+# Shipped default, when a consumer supplies nothing.
+out=$(rnote ARACHNE_PUMP_OPS_DIR="$TMP/noops")
+have "$out" 'RESUME CONTEXT' && pass "the shipped resume template is the fallback" \
+  || fail "shipped resume template not used:\n$out"
+
+# A consumer's own copy, beside its brief template, wins over the shipped one.
+printf 'consumer resume note for {{TASK_ID}} on {{BRANCH}}\n' \
+  >| "$RES2/ops/task-loop/briefs/_resume-note-template.md"
+out=$(rnote ARACHNE_PUMP_OPS_DIR="$RES2/ops")
+[[ "$out" == "consumer resume note for F97.1 on feat/f97" ]] \
+  && pass "a consumer's resume template wins over the shipped one" \
+  || fail "consumer resume template not chosen: '$out'"
+
+# Explicit config outranks both.
+printf 'explicit resume note for {{TASK_ID}}\n' >| "$TMP/explicit-resume.md"
+out=$(rnote ARACHNE_PUMP_OPS_DIR="$RES2/ops" TASKPUMP_RESUME_TEMPLATE="$TMP/explicit-resume.md")
+[[ "$out" == "explicit resume note for F97.1" ]] \
+  && pass "explicit config outranks the consumer resume template" \
+  || fail "explicit resume template not chosen: '$out'"
+
+# {{BUILD_GATE}} is the shipped templates' name for the verification commands;
+# both names must resolve so either template file renders through this pump.
+printf 'gate: {{BUILD_GATE}} / cmds: {{VERIFY_CMDS}}\n' >| "$TMP/gate-resume.md"
+out=$(rnote ARACHNE_PUMP_OPS_DIR="$TMP/noops" TASKPUMP_RESUME_TEMPLATE="$TMP/gate-resume.md" \
+      TASKPUMP_VERIFY_CMDS="make check")
+[[ "$out" == 'gate: `make check` / cmds: `make check`' ]] \
+  && pass "{{BUILD_GATE}} and {{VERIFY_CMDS}} are the same value" \
+  || fail "placeholder alias wrong: '$out'"
 
 echo
 echo "=============================================="
