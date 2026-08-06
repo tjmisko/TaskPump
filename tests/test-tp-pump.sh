@@ -79,6 +79,8 @@ EOF
 }
 
 pump() { "$PUMP" --no-health-gate --dry-run --phases "$1" "${@:2}"; }
+# The default pre-tick chain, read out of the pump rather than re-listed here.
+default_hooks_of_pump() { sed -n '/^default_pre_tick_hooks()/,/^}/p' "$PUMP"; }
 
 # Contiguous range F55..F57 (no phase gaps), with a cross-phase blocker:
 #   F55.0 root → F55.1 (in-phase dep) ; F56.0 root ; F57.0 waits on F55.1 (cross-phase)
@@ -880,6 +882,71 @@ out=$(STUB_DISK_GATE_RC=10 pump F56)
 have "$out" 'GATE: PAUSED' && pass "the disk gate is in the default chain" || fail "disk gate missing:\n$out"
 out=$(STUB_DISK_GATE_RC=10 pump F56 --no-disk-gate)
 have "$out" 'GATE: feed-ok' && pass "--no-disk-gate drops the disk gate" || fail "--no-disk-gate ignored:\n$out"
+
+echo "--- Test 25: pre-tick hooks are a chain too ---"
+HBIN="$TMP/hooks"; mkdir -p "$HBIN"
+cat >| "$HBIN/quiet" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >| "$TMP_MARK"
+exit 0
+EOF
+cat >| "$HBIN/noisy" <<'EOF'
+#!/usr/bin/env bash
+echo "HOOK-SAYS: ${STUB_HOOK_MSG:-something is off}"
+exit 0
+EOF
+cat >| "$HBIN/broken" <<'EOF'
+#!/usr/bin/env bash
+echo "hook exploded"
+exit 4
+EOF
+chmod +x "$HBIN/quiet" "$HBIN/noisy" "$HBIN/broken"
+
+HOOKMARK="$TMP/hook.mark"
+NOTIFIED="$TMP/hook-notify.txt"
+hook_tick() {  # extra env from the caller
+  : >| "$NOTIFIED"
+  TASKPUMP_NOTIFY_CMD="tee -a $NOTIFIED" \
+  TASKPUMP_PUMP_NO_LAUNCH=1 \
+  ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
+  ARACHNE_PUMP_STATE_FILE="$TMP/hook.state" \
+  ARACHNE_POOL_CAP_FILE="$TMP/cap" \
+  TASKPUMP_HOOK_MARK_FILE="$HOOKMARK" \
+  ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+  "$PUMP" --no-health-gate --phases F56 --once 2>&1
+}
+
+mk F56.0 open
+# A hook runs with the repo root as its argument.
+TMP_MARK="$TMP/hook-arg.txt" out=$(TMP_MARK="$TMP/hook-arg.txt" TASKPUMP_PRE_TICK_HOOKS="$HBIN/quiet" hook_tick)
+[[ -s "$TMP/hook-arg.txt" ]] && pass "a hook is handed the repo root" || fail "hook got no argument:\n$out"
+[[ -s "$NOTIFIED" ]] && fail "a silent hook still notified" || pass "a silent hook says nothing"
+
+# Output is logged AND notified — but only when it changes.
+out=$(STUB_HOOK_MSG="the tree is dirty" TASKPUMP_PRE_TICK_HOOKS="$HBIN/noisy" hook_tick)
+have "$out" 'HOOK-SAYS: the tree is dirty' && pass "hook output is logged" || fail "hook output not logged:\n$out"
+grep -q 'the tree is dirty' "$NOTIFIED" && pass "hook output is notified the first time" \
+  || fail "no notification: $(cat "$NOTIFIED")"
+out=$(STUB_HOOK_MSG="the tree is dirty" TASKPUMP_PRE_TICK_HOOKS="$HBIN/noisy" hook_tick)
+grep -q 'the tree is dirty' "$NOTIFIED" && fail "an unchanged condition notified again" \
+  || pass "an unchanged condition is not re-notified"
+out=$(STUB_HOOK_MSG="now something else" TASKPUMP_PRE_TICK_HOOKS="$HBIN/noisy" hook_tick)
+grep -q 'now something else' "$NOTIFIED" && pass "a CHANGED condition notifies again" \
+  || fail "changed condition did not notify: $(cat "$NOTIFIED")"
+
+# A failing hook is a warning, never a reason to skip the tick.
+out=$(TASKPUMP_PRE_TICK_HOOKS="$(printf '%s\n%s\n' "$HBIN/broken" "$HBIN/noisy")" hook_tick)
+have "$out" "hook '.*broken' failed \\(rc=4\\)" && pass "a failing hook is reported" || fail "no warning for a failing hook:\n$out"
+have "$out" 'HOOK-SAYS' && pass "a failing hook does not stop the chain" || fail "chain stopped at the failure:\n$out"
+have "$out" 'GATE: feed-ok|tick:|PAUSED' && pass "the tick continues past a failing hook" || fail "tick aborted:\n$out"
+out=$(TASKPUMP_PRE_TICK_HOOKS="$HBIN/nope" hook_tick)
+have "$out" 'hook not executable' && pass "a missing hook is reported" || fail "missing hook silent:\n$out"
+
+# The default chain is still the two shipped hooks.
+have "$(default_hooks_of_pump)" 'gitignore-repair' && pass "gitignore-repair is in the default chain" \
+  || fail "gitignore-repair missing from the default chain"
+have "$(default_hooks_of_pump)" 'fs-guard' && pass "fs-guard is in the default chain" \
+  || fail "fs-guard missing from the default chain"
 
 echo
 echo "=============================================="

@@ -259,11 +259,12 @@ apl_phase_integrated() {
 # `$NF` tolerates `R old -> new` rename rows; the `ops` submodule-pointer line is
 # allowlisted (agents are told to leave it). Echoes a `FS-GUARD:` line when dirty,
 # nothing when clean. Graceful: silent when the repo can't be read.
+APL_FS_GUARD_ALLOWLIST="${TASKPUMP_FS_GUARD_ALLOWLIST:-^(\.worktrees/|ops$|ops/)}"
 apl_fs_guard() {
   local repo_root="$1" dirty
   dirty=$(git -C "$repo_root" status --porcelain 2>/dev/null \
           | awk '{print $NF}' \
-          | grep -Ev '^(\.worktrees/|ops$|ops/)' || true)
+          | grep -Ev "$APL_FS_GUARD_ALLOWLIST" || true)
   [[ -n "$dirty" ]] && printf 'FS-GUARD: primary checkout dirty outside allowlist:\n%s\n' "$dirty"
   # Always succeed: callers assign via $(...) under `set -e`, where a non-zero
   # return on the clean (no-dirt) path would abort the tick.

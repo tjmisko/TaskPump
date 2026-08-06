@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# hooks/fs-guard — flag edits that landed in the primary checkout.
+#
+# THE PRE-TICK HOOK CONTRACT
+#   $1        the repo root
+#   stdout    anything worth telling the operator; the pump logs it, and
+#             notifies when the text CHANGES (so a persistent condition does not
+#             fire a desktop notification every tick)
+#   exit 0    fine
+#   non-zero  the pump warns and carries on with the tick
+#
+# Agents work inside worktrees, and the primary checkout is mounted read-only in
+# their containers, so this should always be silent. It is the regression
+# detector for that arrangement: if a future mount change hands a container a
+# writable primary tree again, source edits start appearing where no agent
+# should be able to make them, and this is what says so.
+#
+# It reports any dirty path OUTSIDE the allowlist. The allowlist covers the
+# worktrees dir, the ledger checkout (agents commit task state there), and the
+# supervisor's own untracked run files.
+#
+# Configuration:
+#   TASKPUMP_FS_GUARD_ALLOWLIST   extended regex of paths that may be dirty
+# HELP-END
+set -uo pipefail
+
+_tp_self_root="$(CDPATH= cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+# shellcheck source=../lib/config.sh
+. "$_tp_self_root/lib/config.sh"
+tp_load_config
+# shellcheck source=../lib/pump-lib.sh
+. "$TP_LIB_DIR/pump-lib.sh"
+
+[[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { apl_help "$0"; exit 0; }
+
+repo_root="${1:-${TP_REPO_ROOT:-$PWD}}"
+apl_fs_guard "$repo_root"
+exit 0

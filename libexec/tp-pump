@@ -151,7 +151,9 @@ STATE_DIR="${TASKPUMP_STATE_DIR:-$REPO_ROOT}"
 AGENT_LOG_NAME="${TASKPUMP_AGENT_LOG_NAME:-.arachne-agent.log}"
 BRIEF_OUT_NAME="${TASKPUMP_BRIEF_OUT_NAME:-.arachne-phase-brief.md}"
 RESUME_NOTE_NAME="${TASKPUMP_RESUME_NOTE_NAME:-.arachne-resume.md}"
-FSGUARD_MARK_FILE="${TASKPUMP_FSGUARD_MARK_FILE:-$STATE_DIR/.arachne-fsguard.notified}"
+# Fingerprint of the last pre-tick hook output, so a persistent condition is
+# notified once rather than every tick. Survives a supervisor restart.
+HOOK_MARK_FILE="${TASKPUMP_HOOK_MARK_FILE:-${TASKPUMP_FSGUARD_MARK_FILE:-$STATE_DIR/.arachne-fsguard.notified}}"
 DISK_WATCHDOG_LOG="${TASKPUMP_DISK_WATCHDOG_LOG:-$STATE_DIR/.arachne-disk-watchdog.log}"
 
 # Defaults (flags override).
@@ -1180,6 +1182,54 @@ reclaim_done_targets() {
   done
 }
 
+# ── Pre-tick hooks ─────────────────────────────────────────────────────────────
+# Housekeeping the supervisor runs before it plans anything. Pulling the ledger
+# and scrubbing stale claims stay built in — the pump cannot function without
+# them — but the two that encode assumptions about one project's working
+# arrangement are files under hooks/ and can be replaced or dropped.
+#
+# Each hook is run with the repo root as $1. Its stdout is logged and, when the
+# text CHANGES since the last tick, sent to the notifier — a persistent
+# condition must not fire a desktop notification every TICK seconds. The
+# fingerprint lives in a marker file, so the dedup survives a supervisor
+# restart. A non-zero exit is a warning, never a reason to skip the tick.
+default_pre_tick_hooks() {
+  printf '%s\n' "$TP_ROOT/hooks/gitignore-repair"
+  printf '%s\n' "$TP_ROOT/hooks/fs-guard"
+}
+
+run_pre_tick_hooks() {
+  local hooks spec rc out all=""
+  hooks="${TASKPUMP_PRE_TICK_HOOKS:-$(default_pre_tick_hooks)}"
+  while IFS= read -r spec; do
+    [[ -z "${spec//[[:space:]]/}" ]] && continue
+    # A hook entry is a command line; splitting on whitespace is the point.
+    # shellcheck disable=SC2086
+    set -- $spec
+    if [[ ! -x "$1" ]]; then
+      warn "pre-tick hook not executable, skipping: $1"
+      continue
+    fi
+    rc=0
+    out="$(TP_REPO_ROOT="$REPO_ROOT" "$@" "$REPO_ROOT" 2>&1)" || rc=$?
+    (( rc != 0 )) && warn "pre-tick hook '$1' failed (rc=$rc)${out:+ — $out}"
+    [[ -n "$out" ]] && { log "$out"; all+="$out"$'\n'; }
+  done <<<"$hooks"
+
+  all="${all%$'\n'}"
+  if [[ -n "$all" ]]; then
+    # Compare against the trimmed form the marker holds; $(cat) strips trailing
+    # newlines, so an untrimmed comparison never matches and re-notifies forever.
+    if [[ "$all" != "$(cat "$HOOK_MARK_FILE" 2>/dev/null)" ]]; then
+      pump_notify "$all"
+      printf '%s' "$all" >"$HOOK_MARK_FILE" 2>/dev/null || true
+    fi
+  else
+    rm -f "$HOOK_MARK_FILE" 2>/dev/null || true   # quiet again → re-arm
+  fi
+  return 0
+}
+
 # ── One tick: scrub, plan, reclaim, gate, top up the pool to cap ───────────────
 do_tick() {
   git -C "$OPS_DIR" pull --ff-only >/dev/null 2>&1 || warn "ops pull --ff-only failed (continuing)"
@@ -1197,31 +1247,7 @@ do_tick() {
     warn "scrub failed (continuing)"
   fi
   reclaim_orphaned_claims   # D3: free tasks parked by dead containers before planning
-
-  # Strip any `.worktrees/` ignore line the `gh worktree` extension auto-appended
-  # since the last tick BEFORE the FS-GUARD reads the tree. The repair is also
-  # called inside launch_phase, but launches don't run while feeding is paused
-  # (usage ceiling, disk, WiFi) — so without this every-tick call a stray append
-  # would leave .gitignore dirty and the FS-GUARD would idle-loop on it (the
-  # 2026-06-24 incident). Idempotent: a no-op unless the bad line is present.
-  apl_repair_worktree_gitignore "$REPO_ROOT"
-
-  # RC-4 contamination guard (A8 / F65.5): flag any primary-source dirtiness an
-  # agent slipped past the read-only mount. Clean under normal operation. Always
-  # log it, but desktop-notify only when the contamination CHANGES — otherwise a
-  # persistent dirty tree spams a notification every tick (TICK seconds). The
-  # fingerprint persists in a gitignored marker so dedup survives restarts.
-  local fs_dirt fsg_mark="$FSGUARD_MARK_FILE"
-  fs_dirt="$(apl_fs_guard "$REPO_ROOT")"
-  if [[ -n "$fs_dirt" ]]; then
-    log "$fs_dirt"
-    if [[ "$fs_dirt" != "$(cat "$fsg_mark" 2>/dev/null)" ]]; then
-      pump_notify "$fs_dirt"
-      printf '%s' "$fs_dirt" >"$fsg_mark" 2>/dev/null || true
-    fi
-  else
-    rm -f "$fsg_mark" 2>/dev/null || true   # clean again → re-arm for next time
-  fi
+  run_pre_tick_hooks
 
   # Integrate finished phases into auto/trunk (A3). Runs after scrub and BEFORE
   # feed_gate: integration is local compute (no API tokens), so finished work
