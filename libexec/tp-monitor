@@ -218,10 +218,30 @@ fi
 
 task_file() { printf '%s/%s%s' "$TASKS_DIR" "$1" "$TASK_EXT"; }
 
-task_status() {  # $1 = task id -> status string or "-"
+# task_status -- one task's status word, read with the SAME hand-rolled
+# frontmatter reader lib/dag-layout.awk uses, rather than a second YAML parser.
+# There used to be two: a `yq --front-matter=extract` here, and the awk matcher
+# in the layout. Two parsers over one ledger is two chances to disagree about a
+# task, and the SESSIONS tab and the GRAPH canvas are meant to be incapable of
+# disagreeing -- the same reason --claims is delegated to the renderer rather
+# than re-derived here.
+#
+# The three answers are kept exactly as the yq call gave them, because callers
+# colourise them: "-" when there is no such file, "null" when the file has no
+# status field, "?" when the frontmatter block itself could not be read.
+task_status() {  # $1 = task id -> status word, or "-" / "null" / "?"
     local f; f="$(task_file "$1")"
     [[ -f "$f" ]] || { echo "-"; return; }
-    yq --front-matter=extract '.status' "$f" 2>/dev/null || echo "?"
+    awk -v want=status '
+        /^---[ \t]*$/ { fm++; if (fm == 2) exit; next }
+        fm != 1 { next }
+        index($0, want ":") == 1 {
+            v = substr($0, length(want) + 2)
+            gsub(/^[ \t]*/, "", v); gsub(/[ \t]*$/, "", v); gsub(/^"|"$/, "", v)
+            val = v; found = 1
+        }
+        END { if (fm < 2) print "?"; else print (found ? val : "null") }
+    ' "$f" 2>/dev/null || echo "?"
 }
 
 # ── Colour system ────────────────────────────────────────────────────────────
