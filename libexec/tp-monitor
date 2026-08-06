@@ -1,8 +1,8 @@
 #!/bin/bash
-# arachne-monitor -- at-a-glance status of parallel Arachne agents (btop-ish).
+# tp monitor -- at-a-glance status of parallel agents (btop-ish).
 #
-# Maps each running/recent arachne-agent container to its worktree, epic task
-# status (from the canonical ops/ task files), uptime, and last log lines.
+# Maps each running/recent agent container to its worktree, epic task status
+# (from the canonical task ledger), uptime, and last log lines.
 #
 # Layout (top is FIXED, sessions SCROLL):
 #   ┌ title + rule
@@ -28,28 +28,28 @@
 #
 # Notes: a free-text scratchpad scoped to the current pump run (keyed by the
 # pump's phase-range + start time, so a new run starts fresh). Persisted in
-# .arachne-monitor-notes/<run>.md (gitignored).
+# <notes dir>/<run>.md (gitignored).
 #
-# Refresh cadence: --watch defaults to 1s. Set ARACHNE_MONITOR_INTERVAL to change
-# it once in your shell/config; a positional --watch <N> still wins. Fractional
-# seconds are accepted, e.g. --watch 0.5.
+# Refresh cadence: --watch defaults to 1s. Set TASKPUMP_MONITOR_INTERVAL to
+# change it once in your shell/config; a positional --watch <N> still wins.
+# Fractional seconds are accepted, e.g. --watch 0.5.
 #
 # Usage:
-#   ./scripts/arachne-monitor             # one paint
-#   ./scripts/arachne-monitor --watch     # refresh every 1s (cached, scrollable)
-#   ./scripts/arachne-monitor --watch 5   # refresh every 5s
-#   ARACHNE_MONITOR_INTERVAL=3 ./scripts/arachne-monitor --watch   # every 3s (env)
-#   ./scripts/arachne-monitor --watch --log /tmp/mon.log   # log each redraw's timing
-#   ./scripts/arachne-monitor --no-disk   # hide the disk gauge
-#   ./scripts/arachne-monitor --demo      # synthetic sessions; no docker needed
-#   ./scripts/arachne-monitor --tab graph --cursor F79.5 --moves jj   # scripted focus
-#   ./scripts/arachne-monitor --decode-keys 5   # print the token each keypress
-#                                               # decodes to (q stops early);
-#                                               # run this when a key does
-#                                               # nothing in a new terminal
-#   ./scripts/arachne-monitor --show-help --tab graph  # print that tab's key
-#                                               # panel and exit (the headless
-#                                               # form of the ? overlay)
+#   tp monitor                  # one paint
+#   tp monitor --watch          # refresh every 1s (cached, scrollable)
+#   tp monitor --watch 5        # refresh every 5s
+#   TASKPUMP_MONITOR_INTERVAL=3 tp monitor --watch   # every 3s (env)
+#   tp monitor --watch --log /tmp/mon.log   # log each redraw's timing
+#   tp monitor --no-disk        # hide the disk gauge
+#   tp monitor --demo           # synthetic sessions; no docker needed
+#   tp monitor --tab graph --cursor F79.5 --moves jj   # scripted focus
+#   tp monitor --moves gt --show-help   # replay a tab switch, then print the
+#                                       # tab you landed on
+#   tp monitor --decode-keys 5  # print the token each keypress decodes to
+#                               # (q stops early); run this when a key does
+#                               # nothing in a new terminal
+#   tp monitor --show-help --tab graph  # print that tab's key panel and exit
+#                               # (the headless form of the ? overlay)
 #
 # Both tabs navigate a SELECTION with vim motions; the viewport follows it.
 #
@@ -65,11 +65,46 @@
 # the keys without launching the dashboard, run `--show-help --tab <t>`, which
 # prints the very same panel.
 #
-# Env: ARACHNE_MONITOR_OPEN_CMD  replace the `o` spawn entirely (path appended)
-#      ARACHNE_MONITOR_TERM      GUI terminal to spawn (default wezterm)
-#      ARACHNE_MONITOR_TASK_CLASS  window class for it (default arachne-task),
-#                                  so a Hyprland windowrule can float/place it
+# ── Configuration ────────────────────────────────────────────────────────────
+# Canonical names are TASKPUMP_*; the legacy ARACHNE_* spelling of every key is
+# still honoured (lib/config.sh promotes both directions), and taskpump.conf can
+# set either. Every default below reproduces the pre-extraction behaviour, so an
+# install with no config file renders exactly as it always did.
+#
+# Workspace           TASKPUMP_MONITOR_REPO_ROOT   checkout holding agent worktrees
+#                     TASKPUMP_MONITOR_MAIN_ROOT   primary checkout (caches, notes)
+#                     TASKPUMP_WORKTREES_DIR       worktree dir name (.worktrees)
+# Ledger              TASKPUMP_TASKS_DIR           the ledger
+#                     TASKPUMP_TASKS_SUBDIR        its path within the repo
+#                     TASKPUMP_TASK_EXT            task-file extension (.md)
+#                     TASKPUMP_MANIFEST            v1 parallel-run manifest
+#                     TASKPUMP_MANIFEST_SUBPATH    its path within the repo
+# Pump                TASKPUMP_PUMP_STATE_FILE     supervisor state file
+#                     TASKPUMP_PUMP_STATE_NAME     its filename
+# Agents              TASKPUMP_AGENT_CONTAINER_PREFIX  docker name filter/slug strip
+#                     TASKPUMP_AGENT_LOG_NAME      per-worktree agent log filename
+#                     TASKPUMP_AGENT_LOG_FILTER    jq program pulling feed lines
+#                     TASKPUMP_AGENT_LOG_SCAN      log lines scanned per session
+# Binaries            TASKPUMP_DAG_BIN  TASKPUMP_USAGE  TASKPUMP_TASK
+# Id grammar          TASKPUMP_PHASE_SIGIL  TASKPUMP_PHASE_SEPARATOR
+# Presentation        TASKPUMP_MONITOR_TITLE       title-line text
+#                     TASKPUMP_MONITOR_USAGE_WINDOWS  `label=datefmt` gauge list
+#                     TASKPUMP_MONITOR_CACHE_BASE  cache path prefix
+#                     TASKPUMP_MONITOR_NOTES_DIRNAME  notes dir name
+#                     TASKPUMP_MONITOR_OPEN_CMD    replace the `o` spawn entirely
+#                     TASKPUMP_MONITOR_TERM        GUI terminal to spawn (wezterm)
+#                     TASKPUMP_MONITOR_TERM_ARGS   its argv; %CLASS% / %CWD% expand
+#                     TASKPUMP_MONITOR_TASK_CLASS  window class, so a Hyprland
+#                                                  windowrule can float/place it
+#
+# Requires bash 4+ (namerefs, associative arrays) and, through tp-dag-render,
+# GNU awk. Both are checked rather than assumed.
 set -euo pipefail
+
+if (( ${BASH_VERSINFO[0]:-0} < 4 )); then
+    echo "ERROR: tp-monitor needs bash 4+ (found ${BASH_VERSION:-unknown})" >&2
+    exit 1
+fi
 
 # ── TaskPump config core ──────────────────────────────────────────────────────
 _tp_self_root="$(CDPATH= cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
@@ -77,15 +112,47 @@ _tp_self_root="$(CDPATH= cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/
 . "$_tp_self_root/lib/config.sh"
 tp_load_config
 
-# REPO_ROOT is the checkout whose .worktrees/ hold the agent workspaces — i.e.
-# the PRIMARY checkout. The override lets a worktree copy of this script report
-# on the primary's sessions instead of looking for a nested .worktrees/.
-REPO_ROOT="${ARACHNE_MONITOR_REPO_ROOT:-$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)}"
-MANIFEST="${MANIFEST:-$REPO_ROOT/ops/task-loop/parallel-manifest.tsv}"
-# Honours ARACHNE_TASKS_DIR for the same reason arachne-dag-render does: the two
-# must read the SAME ledger, or the GRAPH tab draws one set of tasks while `o`
-# opens files from another.
-TASKS_DIR="${ARACHNE_TASKS_DIR:-$REPO_ROOT/ops/task-loop/tasks}"
+# REPO_ROOT is the checkout whose worktrees hold the agent workspaces — i.e. the
+# PRIMARY checkout. Which repo that is, is a property of the CALLER's directory
+# rather than of which copy of this script is on PATH: the same rule config.sh
+# applies to config discovery, and the 2026-08-01 wrong-ledger lesson made
+# structural. Outside a repo there is nothing to infer, so the install root
+# stands in. The override lets a worktree copy report on the primary's sessions
+# instead of looking for a nested worktree dir.
+_tp_repo_default() {
+    local top
+    top="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+    [[ -n "$top" && -d "$top" ]] && { printf '%s' "$top"; return 0; }
+    printf '%s' "$TP_ROOT"
+}
+REPO_ROOT="${TASKPUMP_MONITOR_REPO_ROOT:-$(_tp_repo_default)}"
+WORKTREES_DIR="${TASKPUMP_WORKTREES_DIR:-.worktrees}"
+MANIFEST_SUBPATH="${TASKPUMP_MANIFEST_SUBPATH:-ops/task-loop/parallel-manifest.tsv}"
+MANIFEST="${TASKPUMP_MANIFEST:-${MANIFEST:-$REPO_ROOT/$MANIFEST_SUBPATH}}"
+# Honours TASKPUMP_TASKS_DIR for the same reason tp-dag-render does: the two must
+# read the SAME ledger, or the GRAPH tab draws one set of tasks while `o` opens
+# files from another.
+TASKS_SUBDIR="${TASKPUMP_TASKS_SUBDIR:-ops/task-loop/tasks}"
+TASKS_DIR="${TASKPUMP_TASKS_DIR:-$REPO_ROOT/$TASKS_SUBDIR}"
+TASK_EXT="${TASKPUMP_TASK_EXT:-.md}"
+PHASE_SIGIL="${TASKPUMP_PHASE_SIGIL:-F}"
+PHASE_SEP="${TASKPUMP_PHASE_SEPARATOR:-.}"
+
+# Agent workspace shape: what a container is called, what its log is called, and
+# how a feed line is pulled out of that log.
+AGENT_PREFIX="${TASKPUMP_AGENT_CONTAINER_PREFIX:-arachne-agent}"
+AGENT_LOG_NAME="${TASKPUMP_AGENT_LOG_NAME:-.arachne-agent.log}"
+AGENT_LOG_SCAN="${TASKPUMP_AGENT_LOG_SCAN:-200}"
+# Single-quoted: the jq program contains "\\s+", and a double-quoted assignment
+# would collapse that to "\s+", which jq rejects as a bad string escape.
+AGENT_LOG_FILTER="${TASKPUMP_AGENT_LOG_FILTER:-}"
+if [[ -z "$AGENT_LOG_FILTER" ]]; then
+    AGENT_LOG_FILTER='fromjson?
+            | (if .type=="assistant" then (.message.content[]? | (.text // ("⚙ "+(.name//"tool"))))
+               elif .type=="result"  then ("✓ "+(.subtype//"done"))
+               else empty end)
+            | gsub("\\s+";" ") | sub("^ ";"")'
+fi
 
 print_help() {
     # Print the leading comment block (minus the shebang), stripping "# ".
@@ -93,10 +160,10 @@ print_help() {
 }
 
 # Refresh interval precedence: positional --watch <N> (set in the arg loop below)
-#   >  ARACHNE_MONITOR_INTERVAL  >  built-in default (1s). Fractional ok.
-WATCH=0; INTERVAL="${ARACHNE_MONITOR_INTERVAL:-1}"; DEMO=0
-MONITOR_LOG="${ARACHNE_MONITOR_LOG:-}"        # redraw-instrumentation log (off if empty)
-SHOW_DISK="${ARACHNE_MONITOR_DISK:-1}"        # disk gauge on by default; --no-disk / =0 off
+#   >  TASKPUMP_MONITOR_INTERVAL  >  built-in default (1s). Fractional ok.
+WATCH=0; INTERVAL="${TASKPUMP_MONITOR_INTERVAL:-1}"; DEMO=0
+MONITOR_LOG="${TASKPUMP_MONITOR_LOG:-}"        # redraw-instrumentation log (off if empty)
+SHOW_DISK="${TASKPUMP_MONITOR_DISK:-1}"        # disk gauge on by default; --no-disk / =0 off
 # Tabs: 0 = SESSIONS (gauges + live sessions), 1 = GRAPH (layered task DAG).
 # On the GRAPH tab a cursor selects one task node; the viewport follows it.
 # GRAPH_TOPH seeds the first frame only — the watch loop recomputes it from the
@@ -104,9 +171,9 @@ SHOW_DISK="${ARACHNE_MONITOR_DISK:-1}"        # disk gauge on by default; --no-d
 TAB=0; PAN=0; CURSOR=""; MOVES=""; GRAPH_TOPH=8
 DECODE_KEYS=""                                # --decode-keys N: key-decoder probe
 SHOW_HELP=0                                   # --show-help: print the key panel, exit
-# Resolved next to this script, NOT under REPO_ROOT: the two differ whenever
-# ARACHNE_MONITOR_REPO_ROOT points a worktree copy at the primary checkout.
-DAG_BIN="${ARACHNE_DAG_BIN:-$TP_LIBEXEC_DIR/tp-dag-render}"
+# Resolved against the INSTALL, not REPO_ROOT: the two differ whenever
+# TASKPUMP_MONITOR_REPO_ROOT points a worktree copy at the primary checkout.
+DAG_BIN="${TASKPUMP_DAG_BIN:-$TP_LIBEXEC_DIR/tp-dag-render}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --watch)        WATCH=1 ;;
@@ -149,8 +216,10 @@ if [[ -f "$MANIFEST" ]]; then
     done < "$MANIFEST"
 fi
 
+task_file() { printf '%s/%s%s' "$TASKS_DIR" "$1" "$TASK_EXT"; }
+
 task_status() {  # $1 = task id -> status string or "-"
-    local f="$TASKS_DIR/$1.md"
+    local f; f="$(task_file "$1")"
     [[ -f "$f" ]] || { echo "-"; return; }
     yq --front-matter=extract '.status' "$f" 2>/dev/null || echo "?"
 }
@@ -287,26 +356,49 @@ render_bar() {
     return 0
 }
 
-# usage_bars -- render both window bars from an arachne-usage --json blob. Pass
-# the blob as $1 to reuse an already-fetched payload; omit to fetch fresh. Prints
-# nothing when the meter is unreachable (no windows). Never errors the caller.
+# usage_bars -- render one bar per configured window from a usage-meter --json
+# blob. Pass the blob as $1 to reuse an already-fetched payload; omit to fetch
+# fresh. Prints nothing when the meter is unreachable (no windows at all), so a
+# dead meter costs the frame nothing. Never errors the caller.
+#
+# TASKPUMP_MONITOR_USAGE_WINDOWS is a comma-separated list of `label=datefmt`,
+# naming which windows of the payload to draw, in order, and how each one's
+# reset time is spelled: a rolling five-hour window wants a clock, a seven-day
+# window wants a weekday too. A bare `label` takes the clock format.
 usage_bars() {
     [[ -x "$USAGE_BIN" ]] || return 0
     local usage_json="${1:-}"
     [[ -n "$usage_json" ]] || usage_json="$("$USAGE_BIN" --json 2>/dev/null || echo '{}')"
-    local fivep fiver sevenp sevenr
-    IFS=$'\t' read -r fivep fiver sevenp sevenr < <(jq -r '
-        ([.windows[]? | select(.label=="5h")] | .[0]) as $a
-      | ([.windows[]? | select(.label=="7d")] | .[0]) as $b
-      | [ ($a.percent // "-"), ($a.reset_at // "-"),
-          ($b.percent // "-"), ($b.reset_at // "-") ] | @tsv' \
+    # Every field is defaulted in jq, so no field can arrive empty — which is
+    # what makes `read` on a @tsv line safe here. (Tab is IFS whitespace, so an
+    # empty middle field would collapse and shift the rest; see the same trap
+    # documented in pump_summary_line, where the fields CAN be empty.)
+    local -A _pct=() _rst=()
+    local lbl pct rst
+    while IFS=$'\t' read -r lbl pct rst; do
+        [[ -n "$lbl" ]] || continue
+        _pct["$lbl"]="$pct"; _rst["$lbl"]="$rst"
+    done < <(jq -r '.windows[]?
+        | [ (.label // "-"), (.percent // "-"), (.reset_at // "-") ] | @tsv' \
         <<<"$usage_json" 2>/dev/null || true)
-    [[ "${fivep:-}" == "-" || "${fivep:-}" == "null" ]] && fivep=""
-    [[ "${sevenp:-}" == "-" || "${sevenp:-}" == "null" ]] && sevenp=""
-    if [[ -n "${fivep:-}" || -n "${sevenp:-}" ]]; then
-        render_bar "5h" "${fivep:-?}" "${fiver:-}" "+%H:%M"
-        render_bar "7d" "${sevenp:-?}" "${sevenr:-}" "+%a %H:%M"
-    fi
+
+    local -a specs=(); IFS=',' read -ra specs <<<"$USAGE_WINDOWS"
+    local spec fmt p any=0
+    for spec in "${specs[@]}"; do
+        p="${_pct[${spec%%=*}]:-}"
+        [[ -n "$p" && "$p" != "-" && "$p" != "null" ]] && any=1
+    done
+    (( any )) || return 0
+    for spec in "${specs[@]}"; do
+        lbl="${spec%%=*}"
+        fmt="+%H:%M"; [[ "$spec" == *=* ]] && fmt="${spec#*=}"
+        p="${_pct[$lbl]:-}"
+        [[ "$p" == "-" || "$p" == "null" ]] && p=""
+        # A window the payload does not carry still gets its row, as "?" — which
+        # render_bar reports as unavailable. Silently dropping the row would
+        # move the ones below it and make the gauge block change height.
+        render_bar "$lbl" "${p:-?}" "${_rst[$lbl]:-}" "$fmt"
+    done
     return 0
 }
 
@@ -366,12 +458,14 @@ cache_age() {  # $1 cache -> seconds since mtime, or empty if absent
     printf '%d' "$(( $(date +%s) - $(stat -c %Y "$1" 2>/dev/null || echo 0) ))"
 }
 
-USAGE_BIN="${ARACHNE_USAGE:-$TP_GATES_DIR/claude-usage}"
-TASK_BIN="${ARACHNE_TASK:-$TP_LIBEXEC_DIR/tp-task}"
+USAGE_BIN="${TASKPUMP_USAGE:-$TP_GATES_DIR/claude-usage}"
+TASK_BIN="${TASKPUMP_TASK:-$TP_LIBEXEC_DIR/tp-task}"
+USAGE_WINDOWS="${TASKPUMP_MONITOR_USAGE_WINDOWS:-5h=+%H:%M,7d=+%a %H:%M}"
 
-# MAIN_ROOT is the PRIMARY checkout (where .worktrees/ lives), resolved from git
-# so caches/keys are correct even when the monitor runs from inside a worktree.
-MAIN_ROOT="${ARACHNE_MONITOR_MAIN_ROOT:-}"
+# MAIN_ROOT is the PRIMARY checkout (where the worktree dir lives), resolved from
+# git so caches/keys are correct even when the monitor runs from inside a
+# worktree.
+MAIN_ROOT="${TASKPUMP_MONITOR_MAIN_ROOT:-}"
 if [[ -z "$MAIN_ROOT" ]]; then
     MAIN_ROOT="$(git -C "$REPO_ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
     MAIN_ROOT="${MAIN_ROOT%/.git}"; MAIN_ROOT="${MAIN_ROOT%/.git/}"
@@ -379,37 +473,41 @@ if [[ -z "$MAIN_ROOT" ]]; then
 fi
 
 # The pump state + run notes live in the PRIMARY checkout (the pump always runs
-# from main), so resolve against MAIN_ROOT — the monitor then shows the live
-# pump even when run from a worktree. Override wins.
-PUMP_STATE="${ARACHNE_PUMP_STATE_FILE:-$MAIN_ROOT/.arachne-pump.state}"
+# from the main line), so resolve against MAIN_ROOT — the monitor then shows the
+# live pump even when run from a worktree. Override wins.
+PUMP_STATE_NAME="${TASKPUMP_PUMP_STATE_NAME:-.arachne-pump.state}"
+PUMP_STATE="${TASKPUMP_PUMP_STATE_FILE:-$MAIN_ROOT/$PUMP_STATE_NAME}"
+# Caches are keyed by a cksum of the main root so parallel checkouts, each with
+# their own pump, cannot read each other's frames.
 CACHE_KEY="$(printf '%s' "$MAIN_ROOT" | cksum | cut -d' ' -f1)"
-CACHE_BASE="${TMPDIR:-/tmp}/arachne-monitor"
+CACHE_BASE="${TASKPUMP_MONITOR_CACHE_BASE:-${TMPDIR:-/tmp}/arachne-monitor}"
 
-# Disk gauge config (free-space colour thresholds mirror arachne-disk-watchdog).
-DISK_TTL="${ARACHNE_MONITOR_DISK_TTL:-60}"          # heavy-sizing cache freshness (s)
-DISK_PANIC_GB="${ARACHNE_MONITOR_DISK_PANIC_GB:-5}"
-DISK_PAUSE_GB="${ARACHNE_MONITOR_DISK_PAUSE_GB:-10}"
-DISK_CACHE="${ARACHNE_MONITOR_DISK_CACHE:-$CACHE_BASE-disk.$CACHE_KEY.tsv}"
+# Disk gauge config (free-space colour thresholds mirror tp disk-watchdog).
+DISK_TTL="${TASKPUMP_MONITOR_DISK_TTL:-60}"          # heavy-sizing cache freshness (s)
+DISK_PANIC_GB="${TASKPUMP_MONITOR_DISK_PANIC_GB:-5}"
+DISK_PAUSE_GB="${TASKPUMP_MONITOR_DISK_PAUSE_GB:-10}"
+DISK_CACHE="${TASKPUMP_MONITOR_DISK_CACHE:-$CACHE_BASE-disk.$CACHE_KEY.tsv}"
 
 # Pump queue-count cache (the eligible-frontier scan is ~3s — far too slow to run
 # every 1s paint, so it is backgrounded on its own TTL).
-PUMP_TTL="${ARACHNE_MONITOR_PUMP_TTL:-8}"
-PUMP_CACHE="${ARACHNE_MONITOR_PUMP_CACHE:-$CACHE_BASE-pump.$CACHE_KEY.tsv}"
+PUMP_TTL="${TASKPUMP_MONITOR_PUMP_TTL:-8}"
+PUMP_CACHE="${TASKPUMP_MONITOR_PUMP_CACHE:-$CACHE_BASE-pump.$CACHE_KEY.tsv}"
 
 # Docker session-table cache (docker ps + per-container log tails) — refreshed a
 # bit faster than the queue/disk since log freshness matters more.
-SESS_TTL="${ARACHNE_MONITOR_SESS_TTL:-2}"
-SESS_CACHE="${ARACHNE_MONITOR_SESS_CACHE:-$CACHE_BASE-sess.$CACHE_KEY.tsv}"
+SESS_TTL="${TASKPUMP_MONITOR_SESS_TTL:-2}"
+SESS_CACHE="${TASKPUMP_MONITOR_SESS_CACHE:-$CACHE_BASE-sess.$CACHE_KEY.tsv}"
 
-TAIL_LINES="${ARACHNE_MONITOR_TAIL_LINES:-2}"   # feed lines per session (compact)
+TAIL_LINES="${TASKPUMP_MONITOR_TAIL_LINES:-2}"   # feed lines per session (compact)
 
 # ── Notes field ──────────────────────────────────────────────────────────────
 # Scratchpad scoped to the current pump RUN (phases + started_at), so a new run
-# starts fresh. ARACHNE_MONITOR_NOTES_FILE overrides the resolved path (tests).
-NOTES_DIR="${ARACHNE_MONITOR_NOTES_DIR:-$MAIN_ROOT/.arachne-monitor-notes}"
-NOTES_TAIL="${ARACHNE_MONITOR_NOTES_TAIL:-6}"    # note lines shown in the panel
-NOTES_COLW="${ARACHNE_MONITOR_NOTES_COLW:-60}"   # max note width in the right column
-EDITOR_BIN="${VISUAL:-${EDITOR:-nvim}}"          # Ctrl-G / e popout target
+# starts fresh. TASKPUMP_MONITOR_NOTES_FILE overrides the resolved path (tests).
+NOTES_DIRNAME="${TASKPUMP_MONITOR_NOTES_DIRNAME:-.arachne-monitor-notes}"
+NOTES_DIR="${TASKPUMP_MONITOR_NOTES_DIR:-$MAIN_ROOT/$NOTES_DIRNAME}"
+NOTES_TAIL="${TASKPUMP_MONITOR_NOTES_TAIL:-6}"    # note lines shown in the panel
+NOTES_COLW="${TASKPUMP_MONITOR_NOTES_COLW:-60}"   # max note width in the right column
+EDITOR_BIN="${VISUAL:-${EDITOR:-nvim}}"           # Ctrl-G / e popout target
 
 notes_run_key() {
     [[ -f "$PUMP_STATE" ]] || { printf 'session'; return 0; }
@@ -423,7 +521,7 @@ notes_run_key() {
 }
 
 notes_file() {
-    [[ -n "${ARACHNE_MONITOR_NOTES_FILE:-}" ]] && { printf '%s' "$ARACHNE_MONITOR_NOTES_FILE"; return 0; }
+    [[ -n "${TASKPUMP_MONITOR_NOTES_FILE:-}" ]] && { printf '%s' "$TASKPUMP_MONITOR_NOTES_FILE"; return 0; }
     printf '%s/%s.md' "$NOTES_DIR" "$(notes_run_key)"
 }
 
@@ -576,7 +674,7 @@ pump_summary_line() {
 # docker's disk breakdown. One TSV record per line (MAIN/DKR/WT).
 disk_compute() {
     local main_b
-    main_b="$(du -sb --exclude="$MAIN_ROOT/.worktrees" "$MAIN_ROOT" 2>/dev/null | awk '{print $1}')"
+    main_b="$(du -sb --exclude="$MAIN_ROOT/$WORKTREES_DIR" "$MAIN_ROOT" 2>/dev/null | awk '{print $1}')"
     printf 'MAIN\t%s\n' "${main_b:-0}"
     if command -v docker >/dev/null 2>&1; then
         docker system df --format '{{.Type}}\t{{.Size}}\t{{.Reclaimable}}' 2>/dev/null \
@@ -589,7 +687,7 @@ disk_compute() {
         | while IFS= read -r wt; do
               [[ -d "$wt" ]] || continue
               wb="$(du -sb "$wt" 2>/dev/null | awk '{print $1}')"
-              printf 'WT\t%s\t%s\n' "${wt#"$MAIN_ROOT/.worktrees/"}" "${wb:-0}"
+              printf 'WT\t%s\t%s\n' "${wt#"$MAIN_ROOT/$WORKTREES_DIR/"}" "${wb:-0}"
           done
 }
 
@@ -662,12 +760,8 @@ disk_subinfo_line() {
 # stream-json log. Best-effort; never errors the caller.
 log_events() {  # $1 = log file
     local logf="$1" out
-    out="$(tail -200 "$logf" 2>/dev/null \
-        | jq -rR 'fromjson?
-            | (if .type=="assistant" then (.message.content[]? | (.text // ("⚙ "+(.name//"tool"))))
-               elif .type=="result"  then ("✓ "+(.subtype//"done"))
-               else empty end)
-            | gsub("\\s+";" ") | sub("^ ";"")' 2>/dev/null \
+    out="$(tail -"$AGENT_LOG_SCAN" "$logf" 2>/dev/null \
+        | jq -rR "$AGENT_LOG_FILTER" 2>/dev/null \
         | grep -v '^$' | tail -"$TAIL_LINES" || true)"
     [[ -z "$out" ]] && out="$(tail -"$TAIL_LINES" "$logf" 2>/dev/null || true)"
     # Terminate the last line. Callers consume this with `while IFS= read -r`,
@@ -686,13 +780,13 @@ slug_branch() {  # $1 = slug
     local slug="$1" cand d
     [[ -n "${SLUG_BRANCH[$slug]:-}" ]] && { printf '%s' "${SLUG_BRANCH[$slug]}"; return 0; }
     while IFS= read -r cand; do
-        d="${cand#"$REPO_ROOT/.worktrees/"}"; d="${d%/}"
+        d="${cand#"$REPO_ROOT/$WORKTREES_DIR/"}"; d="${d%/}"
         [[ "${d//\//-}" == "$slug" ]] && { printf '%s' "$d"; return 0; }
     # Match on either marker: .git identifies a real worktree, and the agent log
     # identifies a workspace whose checkout is not visible from here (and is the
     # only marker the fixtures carry).
-    done < <(find "$REPO_ROOT/.worktrees" -mindepth 1 -maxdepth 4 \
-                  \( -name .git -o -name .arachne-agent.log \) -printf '%h\n' 2>/dev/null)
+    done < <(find "$REPO_ROOT/$WORKTREES_DIR" -mindepth 1 -maxdepth 4 \
+                  \( -name .git -o -name "$AGENT_LOG_NAME" \) -printf '%h\n' 2>/dev/null)
     printf ''
 }
 
@@ -704,7 +798,21 @@ slug_branch() {  # $1 = slug
 # sessions worker, never on the paint path.
 ledger_claims() {
     [[ -x "$DAG_BIN" ]] || return 0
-    ARACHNE_TASKS_DIR="$TASKS_DIR" "$DAG_BIN" --claims 2>/dev/null || true
+    dag_env "$DAG_BIN" --claims 2>/dev/null || true
+}
+
+# dag_env -- run the renderer configured EXACTLY as this monitor is. Both tools
+# resolve their own config, but the monitor may have been pointed at another
+# checkout's ledger, so the ledger and the id grammar are handed over rather than
+# re-derived: the graph must never draw one ledger's tasks while `o` opens files
+# from another. Both spellings are set so the child cannot pick up a stale
+# legacy value from the surrounding environment.
+dag_env() {
+    TASKPUMP_TASKS_DIR="$TASKS_DIR" ARACHNE_TASKS_DIR="$TASKS_DIR" \
+    TASKPUMP_TASK_EXT="$TASK_EXT" ARACHNE_TASK_EXT="$TASK_EXT" \
+    TASKPUMP_PHASE_SIGIL="$PHASE_SIGIL" ARACHNE_PHASE_SIGIL="$PHASE_SIGIL" \
+    TASKPUMP_PHASE_SEPARATOR="$PHASE_SEP" ARACHNE_PHASE_SEPARATOR="$PHASE_SEP" \
+    "$@"
 }
 
 # sessions_compute -- BACKGROUND worker: docker ps + per-container metadata + log
@@ -724,9 +832,9 @@ sessions_compute() {
         CLAIM_TASK[$cb]="$ct"; CLAIM_TURNS[$cb]="$cn"; CLAIM_GOAL[$cb]="$cg"
     done < <(ledger_claims)
     while IFS='|' read -r cname state status; do
-        [[ -z "$cname" || "$cname" != arachne-agent* ]] && continue
+        [[ -z "$cname" || "$cname" != "$AGENT_PREFIX"* ]] && continue
         found=1
-        local slug="${cname#arachne-agent-}"
+        local slug="${cname#"$AGENT_PREFIX"-}"
         local name="${SLUG_NAME[$slug]:-$slug}"
         local branch; branch="$(slug_branch "$slug")"
         # The manifest's epic anchor is a launch-time constant and goes stale the
@@ -739,7 +847,7 @@ sessions_compute() {
         local cstate="running"; [[ "$state" != "running" ]] && cstate="exited"
         local up; up="$(printf '%s' "$status" | sed -E 's/^(Up|Exited[^ ]*) //; s/ ago$//' | cut -c1-11)"
         local logf=""
-        [[ -n "$branch" ]] && logf="$REPO_ROOT/.worktrees/$branch/.arachne-agent.log"
+        [[ -n "$branch" ]] && logf="$REPO_ROOT/$WORKTREES_DIR/$branch/$AGENT_LOG_NAME"
         local age="-" stale=0
         if [[ -n "$logf" && -f "$logf" ]]; then
             local mtime; mtime="$(stat -c %Y "$logf" 2>/dev/null || echo 0)"
@@ -762,7 +870,7 @@ sessions_compute() {
         case "$tstat" in
             blocked|stuck|needs-review) flagged+=$'F\t'"$task"$'\t'"$name"$'\t'"$tstat"$'\n' ;;
         esac
-    done < <(docker ps -a --filter 'name=arachne-agent' --format '{{.Names}}|{{.State}}|{{.Status}}' 2>/dev/null)
+    done < <(docker ps -a --filter "name=$AGENT_PREFIX" --format '{{.Names}}|{{.State}}|{{.Status}}' 2>/dev/null)
     [[ "$found" -eq 0 ]] && printf 'N\t1\n'
     printf '%s' "$flagged"
     return 0
@@ -917,7 +1025,7 @@ sessions_lines() {  # $1 = width
             # least legible thing in it: basic bright-black is ~2.5:1 nominal and
             # under 2:1 through a translucent terminal over a photo.
             L) printf '    %s%s%s\n' "$C_MUTED" "${a:0:$((width - 4))}" "$ST_RST" ;;
-            N) printf '%s(no arachne-agent containers running or recently exited)%s\n' "$C_FAINT" "$ST_RST" ;;
+            N) printf '%s(no %s containers running or recently exited)%s\n' "$C_FAINT" "$AGENT_PREFIX" "$ST_RST" ;;
             F) flagged+="  $C_MUTED$a ($b)$ST_RST: $(colorize "$c")"$'\n' ;;
         esac
     done < "$SESS_CACHE"
@@ -931,15 +1039,17 @@ sessions_lines() {  # $1 = width
 }
 
 # ── Layout ───────────────────────────────────────────────────────────────────
-# Geometry: ARACHNE_MONITOR_COLS / _LINES pin the width/height (tests, or forcing
-# a layout); otherwise read the real terminal via tput, with sane fallbacks.
+# Geometry: TASKPUMP_MONITOR_COLS / _LINES pin the width/height (tests, or
+# forcing a layout); otherwise read the real terminal via tput, with sane
+# fallbacks. Read fresh on EVERY paint, which is how a resize is picked up
+# without a SIGWINCH handler.
 term_width()  {
-    local w="${ARACHNE_MONITOR_COLS:-}"
+    local w="${TASKPUMP_MONITOR_COLS:-}"
     [[ -z "$w" ]] && w="$(tput cols 2>/dev/null || echo 100)"
     [[ "$w" =~ ^[0-9]+$ && "$w" -ge 40 ]] || w=100; echo "$w"
 }
 term_height() {
-    local h="${ARACHNE_MONITOR_LINES:-}"
+    local h="${TASKPUMP_MONITOR_LINES:-}"
     [[ -z "$h" ]] && h="$(tput lines 2>/dev/null || echo 40)"
     [[ "$h" =~ ^[0-9]+$ && "$h" -ge 6 ]] || h=40; echo "$h"
 }
@@ -949,9 +1059,14 @@ term_height() {
 # mangle the 3-byte '─' into garbage.
 hbar() { local w="$1" s; printf -v s '%*s' "$w" ''; printf '%s' "${s// /─}"; }
 
+# The title names the run this dashboard is watching, so it is deployment copy
+# rather than the tool's own name. It keeps its historical default so an existing
+# install's frame is unchanged; set TASKPUMP_MONITOR_TITLE to retitle it.
+MONITOR_TITLE="${TASKPUMP_MONITOR_TITLE:-Arachne Task Pump}"
+
 header() {  # $1 = optional suffix tag
-    printf '%sArachne Task Pump%s %s— %s%s%s\n' \
-        "$C_STRONG" "$ST_RST" "$C_MUTED" "$(date '+%Y-%m-%d %H:%M:%S')" "${1:-}" "$ST_RST"
+    printf '%s%s%s %s— %s%s%s\n' \
+        "$C_STRONG" "$MONITOR_TITLE" "$ST_RST" "$C_MUTED" "$(date '+%Y-%m-%d %H:%M:%S')" "${1:-}" "$ST_RST"
     rule
 }
 
@@ -1083,9 +1198,9 @@ graph_live_branches() {
     local out="" cname b
     while IFS= read -r cname; do
         [[ -z "$cname" ]] && continue
-        b="$(slug_branch "${cname#arachne-agent-}")"
+        b="$(slug_branch "${cname#"$AGENT_PREFIX"-}")"
         [[ -n "$b" ]] && out+="$b,"
-    done < <(docker ps --filter 'name=arachne-agent' --format '{{.Names}}' 2>/dev/null)
+    done < <(docker ps --filter "name=$AGENT_PREFIX" --format '{{.Names}}' 2>/dev/null)
     printf '%s' "${out%,}"
 }
 
@@ -1281,19 +1396,14 @@ graph_follow() {
 # rather than through a cache: one gawk pass over the whole task corpus is
 # ~50ms, comfortably inside the paint budget, and it keeps panning instant.
 render_graph() {
-    [[ -x "$DAG_BIN" ]] || { printf '(arachne-dag-render not found)\n'; return 0; }
+    [[ -x "$DAG_BIN" ]] || { printf '(dag renderer not found: %s)\n' "$DAG_BIN"; return 0; }
     local phases; phases="$(graph_phases)"
     if [[ -z "$phases" ]]; then
         printf '%s(no pump running — nothing scoped to graph)%s\n' "$C_FAINT" "$ST_RST"
-        printf '%s start a pump, or: scripts/arachne-dag-render --phases F79%s\n' "$C_FAINT" "$ST_RST"
+        printf '%s start a pump, or: tp dag-render --phases <range>%s\n' "$C_FAINT" "$ST_RST"
         return 0
     fi
-    # Hand the renderer the monitor's own TASKS_DIR rather than letting it
-    # re-derive one: with ARACHNE_MONITOR_REPO_ROOT pointing a worktree copy at
-    # the primary checkout the two resolve differently, and the graph would then
-    # draw one ledger's tasks while `o` opened files from another.
-    ARACHNE_TASKS_DIR="$TASKS_DIR" \
-    "$DAG_BIN" --phases "$phases" --pan "$PAN" --cols "$(term_width)" \
+    dag_env "$DAG_BIN" --phases "$phases" --pan "$PAN" --cols "$(term_width)" \
                --cursor "$CURSOR" --index-file "$(graph_index_file)" \
                --live-branches "$(graph_live_branches)" 2>/dev/null \
         || printf '(dag render failed)\n'
@@ -1521,11 +1631,13 @@ edit_in_nvim() {  # file
 # outlives it if you quit. With no display (a plain tty, ssh) there is no window
 # to open, so it falls back to handing THIS terminal to the editor, which the
 # notes popout already knows how to do and undo.
-TASK_TERM="${ARACHNE_MONITOR_TERM:-wezterm}"          # GUI terminal to spawn
-TASK_WIN_CLASS="${ARACHNE_MONITOR_TASK_CLASS:-arachne-task}"   # for Hyprland windowrules
-# ARACHNE_MONITOR_OPEN_CMD replaces the whole spawn; the file path is appended.
-
-task_file() { printf '%s/%s.md' "$TASKS_DIR" "$1"; }
+TASK_TERM="${TASKPUMP_MONITOR_TERM:-wezterm}"                   # GUI terminal to spawn
+TASK_WIN_CLASS="${TASKPUMP_MONITOR_TASK_CLASS:-arachne-task}"   # for Hyprland windowrules
+# The terminal's argv, up to but not including the editor and the file, which are
+# always appended. %CLASS% and %CWD% expand. The default is wezterm's spelling;
+# a different terminal is a config change rather than a code change.
+TASK_TERM_ARGS="${TASKPUMP_MONITOR_TERM_ARGS:-start --always-new-process --class %CLASS% --cwd %CWD% --}"
+# TASKPUMP_MONITOR_OPEN_CMD replaces the whole spawn; the file path is appended.
 
 # spawn_detached -- run "$@" out of the monitor's session and controlling
 # terminal, so it neither draws on the dashboard nor dies with it.
@@ -1543,17 +1655,22 @@ open_task_file() {  # $1 = task id
     [[ -n "$id" ]] || return 0
     f="$(task_file "$id")"
     [[ -f "$f" ]] || return 0
-    if [[ -n "${ARACHNE_MONITOR_OPEN_CMD:-}" ]]; then
-        local -a cmd; read -r -a cmd <<< "$ARACHNE_MONITOR_OPEN_CMD"
+    if [[ -n "${TASKPUMP_MONITOR_OPEN_CMD:-}" ]]; then
+        local -a cmd; read -r -a cmd <<< "$TASKPUMP_MONITOR_OPEN_CMD"
         (( ${#cmd[@]} )) && { spawn_detached "${cmd[@]}" "$f"; return 0; }
     fi
     if [[ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]] && command -v "$TASK_TERM" >/dev/null 2>&1; then
-        # --always-new-process so the window gets its own class: wezterm sets the
-        # Wayland app_id per GUI process, and without it the window joins an
-        # existing instance under the default class, where a windowrule can't
-        # reach it.
-        spawn_detached "$TASK_TERM" start --always-new-process --class "$TASK_WIN_CLASS" \
-                       --cwd "$REPO_ROOT" -- "$EDITOR_BIN" "$f" && return 0
+        # The default argv carries --always-new-process so the window gets its
+        # own class: wezterm sets the Wayland app_id per GUI process, and without
+        # it the window joins an existing instance under the default class, where
+        # a windowrule can't reach it.
+        local -a targs=(); read -r -a targs <<< "$TASK_TERM_ARGS"
+        local ti
+        for ti in "${!targs[@]}"; do
+            targs[ti]="${targs[ti]//%CLASS%/$TASK_WIN_CLASS}"
+            targs[ti]="${targs[ti]//%CWD%/$REPO_ROOT}"
+        done
+        spawn_detached "$TASK_TERM" "${targs[@]}" "$EDITOR_BIN" "$f" && return 0
     fi
     edit_in_nvim "$f"
     return 0
