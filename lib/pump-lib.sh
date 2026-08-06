@@ -259,7 +259,14 @@ apl_phase_integrated() {
 # `$NF` tolerates `R old -> new` rename rows; the `ops` submodule-pointer line is
 # allowlisted (agents are told to leave it). Echoes a `FS-GUARD:` line when dirty,
 # nothing when clean. Graceful: silent when the repo can't be read.
-APL_FS_GUARD_ALLOWLIST="${TASKPUMP_FS_GUARD_ALLOWLIST:-^(\.worktrees/|ops$|ops/)}"
+# Paths that are allowed to be dirty in the primary checkout: the worktrees the
+# agents actually work in, the ledger checkout they commit task state to, and
+# the supervisor's own untracked run files. The last two entries are the
+# integration trunk's lock and quarantine files — they are created in the repo
+# root by the first --integration-trunk run, are not tracked, and without them
+# here the contamination guard fires on every single tick for the rest of the
+# drain.
+APL_FS_GUARD_ALLOWLIST="${TASKPUMP_FS_GUARD_ALLOWLIST:-^(\.worktrees/|ops$|ops/|\.auto-trunk\.lock$|\.auto-trunk-quarantine$)}"
 apl_fs_guard() {
   local repo_root="$1" dirty
   dirty=$(git -C "$repo_root" status --porcelain 2>/dev/null \

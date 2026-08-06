@@ -260,6 +260,23 @@ printf '#!/usr/bin/env bash\n# only line\nset -e\n' >| "$TMP/helpy2"
   && pass "help ends at the first non-comment line when unmarked" \
   || fail "unmarked help extraction wrong"
 
+echo "--- Test 27: the integration trunk's own run files are not contamination ---"
+# The first --integration-trunk run creates two untracked files in the repo
+# root. They were in neither .gitignore nor the guard's allowlist, so every tick
+# for the rest of the drain reported a dirty primary checkout.
+FSG="$TMP/fsg"; mkdir -p "$FSG"
+git -C "$FSG" init -q -b main
+git -C "$FSG" config user.name t; git -C "$FSG" config user.email t@t
+printf 'x\n' >| "$FSG/tracked.txt"; git -C "$FSG" add -A; git -C "$FSG" -c commit.gpgsign=false commit -qm seed
+[[ -z "$(apl_fs_guard "$FSG")" ]] && pass "a clean checkout is silent" || fail "clean checkout reported dirty"
+: >| "$FSG/.auto-trunk.lock"
+: >| "$FSG/.auto-trunk-quarantine"
+[[ -z "$(apl_fs_guard "$FSG")" ]] && pass "the trunk lock and quarantine file are allowlisted" \
+  || fail "trunk run files reported as contamination: $(apl_fs_guard "$FSG")"
+printf 'edited\n' >| "$FSG/tracked.txt"
+[[ -n "$(apl_fs_guard "$FSG")" ]] && pass "a real source edit is still reported" \
+  || fail "source edit went unreported"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"
