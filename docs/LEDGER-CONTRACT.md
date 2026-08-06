@@ -124,7 +124,7 @@ is already there.
 
 ## 3. Frontmatter schema
 
-Every field below is written by `tp task create`, except the four marked
+Every field below is written by `tp task create`, except the three marked
 *(verb-added)*, which appear the first time a verb needs them. A reader must
 treat an absent field as its documented default; a writer should emit the full
 set.
