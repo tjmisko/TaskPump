@@ -21,8 +21,8 @@ fail() { printf 'FAIL: %s\n' "$*" >&2; FAIL=$((FAIL + 1)); }
 
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 TD="$TMP/tasks"; mkdir -p "$TD"
-export ARACHNE_TASKS_DIR="$TD"
-export ARACHNE_PUMP_STATE_FILE="$TMP/no-such.state"
+export TASKPUMP_TASKS_DIR="$TD"
+export TASKPUMP_PUMP_STATE_FILE="$TMP/no-such.state"
 
 # mktask <id> <phase> <status> <claimed_by> [blocker ...]
 mktask() {
@@ -299,6 +299,207 @@ wide=$("$CLI" --phases F90 --no-color 2>/dev/null | strip | awk '{ if (length($0
 clip=$("$CLI" --phases F90 --no-color --cols 12 2>/dev/null | strip | awk '{ if (length($0) > m) m = length($0) } END { print m }')
 [[ "$clip" -le 12 && "$wide" -gt "$clip" ]] \
     && pass "--cols clips long lines ($wide → $clip)" || fail "--cols did not clip: $wide vs $clip"
+
+# ── Test 19: the alarm statuses ─────────────────────────────────────────────
+# blocked / needs-review / stuck had NO fixture in either suite: three of the
+# six statuses the ledger can hold were drawn by code nothing exercised. They
+# are also the three a reader most needs to see, so a silent regression here
+# would hide exactly the tasks that need a human.
+echo "--- Test 19: blocked / needs-review / stuck ---"
+mktask F86.1 F86 done         ""
+mktask F86.2 F86 blocked      ""  F86.1
+mktask F86.3 F86 needs-review ""  F86.1
+mktask F86.4 F86 stuck        ""  F86.1
+alarm=$("$CLI" --phases F86 --no-color 2>/dev/null | strip)
+grep -qE "│ F86\.2 +⊘ │" <<<"$alarm" && pass "blocked renders ⊘" || fail "blocked glyph wrong:\n$alarm"
+grep -qE "│ F86\.3 +! │" <<<"$alarm" && pass "needs-review renders !" || fail "needs-review glyph wrong:\n$alarm"
+grep -qE "│ F86\.4 +! │" <<<"$alarm" && pass "stuck renders !" || fail "stuck glyph wrong:\n$alarm"
+# ...and their hues, which are the STATE palette's ⊘ muted red and ! coral. R5:
+# hue() here and the ST_* constants in tp-monitor are one vocabulary in two
+# languages, so a change to either alone is the bug this pins.
+alarmc=$("$CLI" --phases F86 2>/dev/null)
+grep -q $'\033\[0;38;5;131m' <<<"$alarmc" && pass "blocked wears the muted red" \
+    || fail "no muted red for blocked"
+grep -q $'\033\[0;1;38;5;203m' <<<"$alarmc" && pass "needs-review / stuck wear the alert coral" \
+    || fail "no coral for the review statuses"
+# Every sequence still absolute, on the statuses that were never rendered before.
+leaky19=$(printf '%s' "$alarmc" | grep -oE $'\033\\[[0-9;]*m' | grep -vE $'\033\\[0(;|m)' || true)
+[[ -z "$leaky19" ]] && pass "the alarm statuses emit no attribute-leaking sequence" \
+    || fail "non-absolute sequence in an alarm hue: $(tr -d '\033' <<<"$leaky19" | sort -u | tr '\n' ' ')"
+rm -f "$TD"/F86.*.md
+
+# ── Test 20: --full-ids ─────────────────────────────────────────────────────
+# Full ids are the default in every range, so --full-ids only does visible work
+# when it OVERRIDES a --compact earlier on the same line. That is the whole
+# reason the flag exists, and it had no test at all.
+echo "--- Test 20: --full-ids ---"
+full=$("$CLI" --phases F90 --no-color --full-ids 2>/dev/null | strip)
+grep -qE "│ F90\.1 " <<<"$full" && pass "--full-ids keeps the phase prefix" \
+    || fail "--full-ids dropped the phase:\n$full"
+over=$("$CLI" --phases F90 --no-color --compact --full-ids 2>/dev/null | strip)
+grep -qE "│ F90\.1 " <<<"$over" && pass "--full-ids after --compact wins (last flag wins)" \
+    || fail "--full-ids did not override --compact:\n$over"
+rev=$("$CLI" --phases F90 --no-color --full-ids --compact 2>/dev/null | strip)
+grep -qE "│ \.1 " <<<"$rev" && pass "--compact after --full-ids wins too" \
+    || fail "flag order not honoured in reverse:\n$rev"
+
+# ── Test 21: out-of-range blockers enter as stub nodes ──────────────────────
+# select() pulls an out-of-range blocker in when it is UNFINISHED, so the reader
+# can see what the range is waiting on; a done one is history and would just
+# widen the graph. Neither half had a fixture.
+echo "--- Test 21: out-of-range blocker stubs ---"
+mktask F87.9 F87 open  ""              # out of range, unfinished → pulled in
+mktask F88.9 F88 done  ""              # out of range, finished  → left out
+mktask F89.1 F89 open  ""  F87.9
+mktask F89.2 F89 open  ""  F88.9
+stub=$("$CLI" --phases F89 --no-color 2>/dev/null | strip)
+grep -qE "│ F87\.9 " <<<"$stub" && pass "an unfinished out-of-range blocker is drawn as a stub" \
+    || fail "out-of-range blocker missing:\n$stub"
+grep -q 'F88.9' <<<"$stub" && fail "a DONE out-of-range blocker widened the graph:\n$stub" \
+    || pass "a done out-of-range blocker is left out"
+# The stub is a real node with a real edge, not a floating box: its dependent
+# must sit strictly below it (I3).
+sy=$(grep -n "│ F87.9 " <<<"$stub" | head -1 | cut -d: -f1)
+dy=$(grep -n "│ F89.1 " <<<"$stub" | head -1 | cut -d: -f1)
+[[ -n "$sy" && -n "$dy" && "$sy" -lt "$dy" ]] \
+    && pass "the stub layers above its in-range dependent ($sy < $dy)" \
+    || fail "stub not layered above its dependent: stub=$sy dep=$dy"
+# ...and the dependent is WAITING on it, which is the point of pulling it in.
+grep -qE "│ F89\.1 +◌ │" <<<"$stub" && pass "the dependent reads ◌ waiting behind the stub" \
+    || fail "dependent not waiting:\n$stub"
+rm -f "$TD"/F87.*.md "$TD"/F88.*.md "$TD"/F89.*.md
+
+# ── Test 22: mglyph's junction cases (├ ┤ ┼) ────────────────────────────────
+# The bitmask rewrite exists BECAUSE merging glyphs incrementally drew a column
+# of ┬ stubs where a trunk collected several parents. Until now ┼ was only ever
+# asserted ABSENT (Test 15) and ├ / ┤ never appeared in a fixture at all — the
+# glyphs that motivated the rewrite had no positive test.
+#
+# Two mirrored fan-in trunks: each of .5 and .6 depends on the whole chain, so
+# one trunk runs down each side of it and the chain's parents join one from the
+# left (┤) and one from the right (├), crossing the other trunk's rails (┼).
+echo "--- Test 22: junction glyphs ---"
+mktask F82.1 F82 done ""
+mktask F82.2 F82 done ""  F82.1
+mktask F82.3 F82 done ""  F82.2
+mktask F82.4 F82 done ""  F82.3
+mktask F82.5 F82 open ""  F82.1 F82.2 F82.3 F82.4
+mktask F82.6 F82 open ""  F82.1 F82.2 F82.3 F82.4
+junc=$("$CLI" --phases F82 --no-color 2>/dev/null | strip)
+for pair in '├:a trunk joined from the right' '┤:a trunk joined from the left' '┼:a genuine crossing'; do
+    gl="${pair%%:*}"; what="${pair#*:}"
+    n=$(grep -o "$gl" <<<"$junc" | wc -l)
+    [[ "$n" -ge 1 ]] && pass "$gl renders for $what ($n)" || fail "$gl never drawn:\n$junc"
+done
+# The failure mode this replaced: merging glyphs incrementally cannot express
+# "a vertical passes THROUGH a join", so a trunk collecting four parents drew
+# four disconnected ┬ stubs. The property that fixes is exactly this — every
+# junction cell has ink directly above AND below it, because the vertical it
+# sits on continues past the join. (A ┬ on a rail row is legal and expected: it
+# is mask 14, an edge fanning downward, which is a different cell entirely.)
+broken=$(awk '
+    { row[NR] = $0 }
+    END {
+        for (y = 1; y <= NR; y++) {
+            n = split(row[y], ch, "")
+            for (x = 1; x <= n; x++) {
+                if (ch[x] != "├" && ch[x] != "┤" && ch[x] != "┼") continue
+                split(row[y-1], up, ""); split(row[y+1], dn, "")
+                a = (y > 1)  ? up[x] : ""
+                b = (y < NR) ? dn[x] : ""
+                if (a == "" || a == " " || b == "" || b == " ")
+                    printf "row %d col %d: %s above=[%s] below=[%s]\n", y, x, ch[x], a, b
+            }
+        }
+    }' <<<"$junc")
+[[ -z "$broken" ]] && pass "every junction cell carries the vertical through it" \
+    || fail "a junction is not on a continuous vertical:\n$broken\n$junc"
+rm -f "$TD"/F82.*.md
+
+# ── Test 23: the ledger-shaped early exits ──────────────────────────────────
+# Both are exit-0 paths, so a caller that lost them would render an empty frame
+# and look merely idle rather than misconfigured.
+echo "--- Test 23: missing / empty ledger ---"
+nodir=$(TASKPUMP_TASKS_DIR="$TMP/no-such-ledger" "$CLI" --phases F90 2>/dev/null); rc=$?
+grep -q "no tasks dir: $TMP/no-such-ledger" <<<"$nodir" && [[ "$rc" -eq 0 ]] \
+    && pass "a missing tasks dir names the path it looked for, exit 0" \
+    || fail "missing-dir message wrong (rc=$rc): $nodir"
+mkdir -p "$TMP/empty-ledger"
+notasks=$(TASKPUMP_TASKS_DIR="$TMP/empty-ledger" "$CLI" --phases F90 2>/dev/null); rc=$?
+[[ "$notasks" == "(no tasks found)" && "$rc" -eq 0 ]] \
+    && pass "an empty tasks dir reports cleanly, exit 0" \
+    || fail "empty-dir message wrong (rc=$rc): $notasks"
+
+# ── Test 24: --claims edge cases ────────────────────────────────────────────
+# The SESSIONS tab reads this. A branch with no claim must produce no row (not
+# an empty one), and a claim with no turn budget must say so in a way the
+# monitor's `!= null` test can act on.
+echo "--- Test 24: --claims edges ---"
+# A ledger with tasks but no in_progress claim. (An EMPTY dir takes the
+# "(no tasks found)" early exit instead, which Test 23 covers.)
+UNCLAIMED="$TMP/unclaimed"; mkdir -p "$UNCLAIMED"
+printf -- '---\nid: "F84.1"\nphase: "F84"\nstatus: open\nclaimed_by: ""\nblockers: []\n---\nbody\n' \
+    >| "$UNCLAIMED/F84.1.md"
+noclaim=$(TASKPUMP_TASKS_DIR="$UNCLAIMED" "$CLI" --claims 2>/dev/null)
+[[ -z "$noclaim" ]] && pass "a ledger with no claims emits no rows" || fail "spurious claim rows: $noclaim"
+# F90.3 is in_progress on feat/f90 and was made without a turn_budget_remaining.
+cl24=$("$CLI" --claims 2>/dev/null)
+[[ "$(awk -F'\t' '$1=="feat/f90"{print NF}' <<<"$cl24")" == "4" ]] \
+    && pass "a claim row has all four fields" || fail "claim row is not 4 fields: $cl24"
+[[ "$(awk -F'\t' '$1=="feat/f90"{print $3}' <<<"$cl24")" == "null" ]] \
+    && pass "an absent turn budget renders the literal null" \
+    || fail "turn budget not null: $(awk -F'\t' '$1=="feat/f90"' <<<"$cl24")"
+# Only in_progress claims count — a done task's branch is not holding anything.
+mktask F85.1 F85 done "feat/f85"
+[[ -z "$("$CLI" --claims 2>/dev/null | awk -F'\t' '$1=="feat/f85"')" ]] \
+    && pass "a done task's branch holds no claim" || fail "a done task produced a claim row"
+rm -f "$TD"/F85.*.md
+
+# ── Test 25: the interpreter is named when it is wrong ──────────────────────
+# and()/or() are gawk extensions; mawk would mis-render every junction rather
+# than stopping. The check must name the dependency, not fail obscurely.
+echo "--- Test 25: gawk requirement ---"
+notgawk=$(TASKPUMP_AWK=/nonexistent-awk "$CLI" --phases F90 2>&1); rc=$?
+[[ "$rc" -ne 0 ]] && grep -q 'gawk' <<<"$notgawk" \
+    && pass "a missing awk fails loudly and names gawk" \
+    || fail "missing awk not reported clearly (rc=$rc): $notgawk"
+cat >| "$TMP/fake-awk" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+chmod +x "$TMP/fake-awk"
+badawk=$(TASKPUMP_AWK="$TMP/fake-awk" "$CLI" --phases F90 2>&1); rc=$?
+[[ "$rc" -ne 0 ]] && grep -q 'GNU awk' <<<"$badawk" \
+    && pass "a non-GNU awk is rejected before anything is drawn" \
+    || fail "non-gawk not rejected (rc=$rc): $badawk"
+
+# ── Test 26: the id grammar is configurable ─────────────────────────────────
+# Phase = <sigil><digits> up to the separator. Both halves are hooks now, and a
+# sigil is a literal prefix rather than a pattern.
+echo "--- Test 26: configurable id grammar ---"
+PTD="$TMP/ptasks"; mkdir -p "$PTD"
+pmk() {  # <id> <status> [blocker ...]
+    local id="$1" st="$2"; shift 2
+    { echo '---'; echo "id: \"$id\""; echo "status: $st"; echo 'claimed_by: ""'
+      if (( $# )); then echo 'blockers:'; for b in "$@"; do echo "  - \"$b\""; done
+      else echo 'blockers: []'; fi
+      echo '---'; echo body; } >| "$PTD/$id.md"
+}
+pmk P12-1 done; pmk P12-2 open P12-1; pmk P13-1 open
+pg=$(TASKPUMP_TASKS_DIR="$PTD" TASKPUMP_PHASE_SIGIL=P TASKPUMP_PHASE_SEPARATOR=- \
+     "$CLI" --phases P12 --no-color 2>/dev/null | strip)
+grep -qE "│ P12-1 +✓ │" <<<"$pg" && pass "a P<n>-<m> id grammar layers and draws" \
+    || fail "custom grammar did not render:\n$pg"
+grep -q 'P13-1' <<<"$pg" && fail "the P13 phase leaked into a P12 graph:\n$pg" \
+    || pass "phase scoping honours the configured sigil"
+pc=$(TASKPUMP_TASKS_DIR="$PTD" TASKPUMP_PHASE_SIGIL=P TASKPUMP_PHASE_SEPARATOR=- \
+     "$CLI" --phases P12 --no-color --compact 2>/dev/null | strip)
+grep -qE "│ -1 " <<<"$pc" && pass "--compact shortens at the configured separator" \
+    || fail "--compact used the wrong separator:\n$pc"
+prng=$(TASKPUMP_TASKS_DIR="$PTD" TASKPUMP_PHASE_SIGIL=P TASKPUMP_PHASE_SEPARATOR=- \
+       "$CLI" --phases P12..P13 --no-color 2>/dev/null | strip)
+grep -q 'P13-1' <<<"$prng" && pass "A..B ranges work on the configured sigil" \
+    || fail "range scoping missed P13:\n$prng"
 
 echo
 echo "=============================================="

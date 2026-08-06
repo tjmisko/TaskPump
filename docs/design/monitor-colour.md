@@ -1,4 +1,13 @@
-# arachne-monitor — colour system
+# tp monitor — colour system
+
+> **Naming note (TaskPump extraction).** Written when these files lived in
+> Arachne's `scripts/`. Read `arachne-monitor` → `libexec/tp-monitor`,
+> `arachne-dag-layout.awk` → `lib/dag-layout.awk`, `test-arachne-monitor.sh` →
+> `tests/test-tp-monitor.sh`. R1 and R3 are still enforced by Test 23 of that
+> suite; R5's two palettes are still `hue()` in the layout and the `ST_*`
+> constants in the monitor, and the three statuses that had never been rendered
+> by a fixture — `blocked`, `needs-review`, `stuck` — are now pinned by Test 19
+> of `tests/test-tp-dag-render.sh`.
 
 Written 2026-08-05, after the monitor's two tabs were found disagreeing about
 what green means.

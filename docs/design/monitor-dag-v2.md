@@ -1,6 +1,23 @@
 # GRAPH tab v2 — placement algorithm restructure
 
-Supersedes the layout section of `DESIGN-monitor-dag.md`. Written 2026-08-05
+> **Naming note (TaskPump extraction).** This document predates the extraction
+> and names files as they were in Arachne's `scripts/`. The bodies are left
+> as written — they are a dated record, not a manual. Read them with:
+> `arachne-monitor` → `libexec/tp-monitor`, `arachne-dag-render` →
+> `libexec/tp-dag-render`, `arachne-dag-layout.awk` → `lib/dag-layout.awk`,
+> `arachne-task` → `libexec/tp-task`, `test-arachne-*.sh` → `tests/test-tp-*.sh`.
+>
+> Two things the algorithm now takes as configuration rather than as given:
+> the id grammar (`TASKPUMP_PHASE_SIGIL`, `TASKPUMP_PHASE_SEPARATOR` — a phase
+> is `<sigil><digits>` up to the separator, so `F79.4` is the default reading
+> and `P12-1` is equally valid), and the awk binary (`TASKPUMP_AWK`). The
+> layout's edge junctions are built from `and()`/`or()` on a direction bitmask,
+> which are GNU extensions, so the interpreter is now probed before drawing
+> rather than assumed — under mawk every junction would mis-render silently.
+> The status vocabulary and the frontmatter field names are deliberately NOT
+> configurable: they are the ledger's schema, owned by `tp task`.
+
+Supersedes the layout section of `monitor-dag.md`. Written 2026-08-05
 after reviewing v1 against the live F79 graph.
 
 **Status: built.** Two deviations from this document were made during

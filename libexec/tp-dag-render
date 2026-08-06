@@ -1,13 +1,13 @@
 #!/bin/bash
-# arachne-dag-render -- render the task DAG for a phase range as a layered ASCII
-# graph, for the arachne-monitor GRAPH tab.
+# tp dag-render -- render the task DAG for a phase range as a layered ASCII
+# graph, for the tp-monitor GRAPH tab.
 #
 # Nodes are boxes, one row of boxes per dependency layer, edges routed through
 # horizontal rail bands between layers. Reads task frontmatter directly (the
-# whole graph in one gawk pass) rather than shelling out to yq per task, so it
-# is cheap enough to sit behind the monitor's normal cache TTL.
+# whole graph in one gawk pass) rather than shelling out to a YAML parser per
+# task, so it is cheap enough to sit behind the monitor's normal cache TTL.
 #
-# Layout passes (v2 -- see scripts/DESIGN-monitor-dag-v2.md):
+# Layout passes (v2 -- see docs/design/monitor-dag-v2.md):
 #   layer()     longest-path layering over `blockers:`
 #   dummies()   one trunk of dummy nodes per target with far blockers, so a
 #               multi-layer edge is actually drawn instead of silently dropped
@@ -20,21 +20,46 @@
 #               overlap horizontally share one rail row, so a wide fan-out band
 #               stays a few rows tall instead of one row per parent
 #
+# Requires GNU awk (gawk) and bash 4+. The layout uses and()/or() bit operations
+# on the edge mask, which are gawk extensions: under mawk or BWK awk every edge
+# junction would render wrong rather than failing loudly, so the interpreter is
+# checked up front. See TASKPUMP_AWK below to point at a differently-named gawk.
+#
 # Usage:
-#   ./scripts/arachne-dag-render                     # phases from .arachne-pump.state
-#   ./scripts/arachne-dag-render --phases F79
-#   ./scripts/arachne-dag-render --phases F55..F63
-#   ./scripts/arachne-dag-render --running F79.4     # mark these as live (▶)
-#   ./scripts/arachne-dag-render --cursor F79.5      # heavy border on one node
-#   ./scripts/arachne-dag-render --index-file /tmp/i # TSV node table for the monitor
-#   ./scripts/arachne-dag-render --cols 200          # clip output to a viewport
-#   ./scripts/arachne-dag-render --no-color          # for tests
-#   ./scripts/arachne-dag-render --claims            # no picture: one row per
-#       branch holding an in_progress claim, naming the single task an agent is
-#       actually on (branch/task/turns/goal, tab separated). Shares this file's
-#       parser and election with the canvas, so the monitor's two tabs cannot
-#       disagree about which claim is live.
+#   tp dag-render                       # phases from the pump state file
+#   tp dag-render --phases F79
+#   tp dag-render --phases F55..F63
+#   tp dag-render --running F79.4       # mark these as live (▶)
+#   tp dag-render --cursor F79.5        # heavy border on one node
+#   tp dag-render --index-file /tmp/i   # TSV node table for the monitor
+#   tp dag-render --cols 200            # clip output to a viewport
+#   tp dag-render --no-color            # for tests
+#   tp dag-render --claims              # no picture: one row per branch holding
+#       an in_progress claim, naming the single task an agent is actually on
+#       (branch/task/turns/goal, tab separated). Shares this file's parser and
+#       election with the canvas, so the monitor's two tabs cannot disagree
+#       about which claim is live.
+#
+# Config (canonical TASKPUMP_* names; the legacy ARACHNE_* spelling of each is
+# still honoured, and taskpump.conf sets either):
+#   TASKPUMP_DAG_REPO_ROOT     repo the ledger is resolved against
+#                              (default: $PWD's git worktree, else the install)
+#   TASKPUMP_TASKS_DIR         the ledger itself (default: <root>/<subdir>)
+#   TASKPUMP_TASKS_SUBDIR      ledger path within the repo
+#                              (default: ops/task-loop/tasks)
+#   TASKPUMP_TASK_EXT          task-file extension (default: .md)
+#   TASKPUMP_PUMP_STATE_FILE   pump state, for the implicit phase range
+#   TASKPUMP_PUMP_STATE_NAME   its filename (default: .arachne-pump.state)
+#   TASKPUMP_PHASE_SIGIL       letter a phase token starts with (default: F)
+#   TASKPUMP_PHASE_SEPARATOR   what ends the phase within an id (default: .)
+#   TASKPUMP_DAG_LAYOUT        the layout program (default: lib/dag-layout.awk)
+#   TASKPUMP_AWK               the gawk binary (default: gawk)
 set -euo pipefail
+
+if (( ${BASH_VERSINFO[0]:-0} < 4 )); then
+    echo "ERROR: tp-dag-render needs bash 4+ (found ${BASH_VERSION:-unknown})" >&2
+    exit 1
+fi
 
 # ── TaskPump config core ──────────────────────────────────────────────────────
 _tp_self_root="$(CDPATH= cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
@@ -42,9 +67,26 @@ _tp_self_root="$(CDPATH= cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/
 . "$_tp_self_root/lib/config.sh"
 tp_load_config
 
-REPO_ROOT="${ARACHNE_DAG_REPO_ROOT:-$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)}"
-TASKS_DIR="${ARACHNE_TASKS_DIR:-$REPO_ROOT/ops/task-loop/tasks}"
-PUMP_STATE="${ARACHNE_PUMP_STATE_FILE:-$REPO_ROOT/.arachne-pump.state}"
+# The repo whose ledger this renders is a property of the CALLER's directory,
+# not of which copy of the script is on PATH -- the same rule config.sh applies
+# to config discovery, and the 2026-08-01 wrong-ledger lesson made structural.
+# Outside a repo there is nothing to infer, so the install root stands in.
+_tp_repo_default() {
+    local top
+    top="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+    [[ -n "$top" && -d "$top" ]] && { printf '%s' "$top"; return 0; }
+    printf '%s' "$TP_ROOT"
+}
+REPO_ROOT="${TASKPUMP_DAG_REPO_ROOT:-$(_tp_repo_default)}"
+TASKS_SUBDIR="${TASKPUMP_TASKS_SUBDIR:-ops/task-loop/tasks}"
+TASKS_DIR="${TASKPUMP_TASKS_DIR:-$REPO_ROOT/$TASKS_SUBDIR}"
+TASK_EXT="${TASKPUMP_TASK_EXT:-.md}"
+PUMP_STATE_NAME="${TASKPUMP_PUMP_STATE_NAME:-.arachne-pump.state}"
+PUMP_STATE="${TASKPUMP_PUMP_STATE_FILE:-$REPO_ROOT/$PUMP_STATE_NAME}"
+PHASE_SIGIL="${TASKPUMP_PHASE_SIGIL:-F}"
+PHASE_SEP="${TASKPUMP_PHASE_SEPARATOR:-.}"
+LAYOUT_AWK="${TASKPUMP_DAG_LAYOUT:-$TP_LIB_DIR/dag-layout.awk}"
+AWK_BIN="${TASKPUMP_AWK:-gawk}"
 
 PHASES=""; RUNNING=""; LIVEBRANCHES=""; COLOR=1; COMPACT=-1; PANX=0
 CURSOR=""; INDEXFILE=""; COLS=0; MODE=""
@@ -85,10 +127,19 @@ fi
 [[ -d "$TASKS_DIR" ]] || { echo "(no tasks dir: $TASKS_DIR)"; exit 0; }
 
 shopt -s nullglob
-files=("$TASKS_DIR"/*.md)
+files=("$TASKS_DIR"/*"$TASK_EXT")
 (( ${#files[@]} )) || { echo "(no tasks found)"; exit 0; }
 
-gawk -v phases="$PHASES" -v running="$RUNNING" -v livebranches="$LIVEBRANCHES" \
+# The layout's edge-junction glyphs come from and()/or() on a direction bitmask.
+# mawk and BWK awk do not have them, and would mis-render every join rather than
+# stopping -- so say which dependency is missing, by name, before drawing.
+command -v "$AWK_BIN" >/dev/null 2>&1 \
+    || { echo "ERROR: $AWK_BIN not found — tp dag-render needs GNU awk (gawk); set TASKPUMP_AWK to override" >&2; exit 1; }
+"$AWK_BIN" 'BEGIN { exit (and(3, 1) == 1) ? 0 : 1 }' </dev/null >/dev/null 2>&1 \
+    || { echo "ERROR: $AWK_BIN is not GNU awk (gawk) — the DAG layout needs its and()/or() bit operations" >&2; exit 1; }
+
+"$AWK_BIN" -v phases="$PHASES" -v running="$RUNNING" -v livebranches="$LIVEBRANCHES" \
      -v color="$COLOR" -v compact="$COMPACT" -v panx="$PANX" \
      -v cursor="$CURSOR" -v indexfile="$INDEXFILE" -v cols="$COLS" -v mode="$MODE" \
-     -f "$TP_LIB_DIR/dag-layout.awk" "${files[@]}"
+     -v sigil="$PHASE_SIGIL" -v phasesep="$PHASE_SEP" \
+     -f "$LAYOUT_AWK" "${files[@]}"
