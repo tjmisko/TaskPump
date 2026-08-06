@@ -8,8 +8,9 @@
 set -uo pipefail
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
-PUMP="$SCRIPT_DIR/arachne-pump"
-REAL_TASK="$SCRIPT_DIR/arachne-task"
+TP_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+PUMP="$TP_ROOT/libexec/tp-pump"
+REAL_TASK="$TP_ROOT/libexec/tp-task"
 PASS=0; FAIL=0
 pass() { printf 'PASS: %s\n' "$*"; PASS=$((PASS + 1)); }
 fail() { printf 'FAIL: %s\n' "$*" >&2; FAIL=$((FAIL + 1)); }
@@ -281,11 +282,14 @@ assert_mounts() {  # <launcher-path> <label>
   fi
 }
 assert_mounts "$PUMP" "arachne-pump"
-assert_mounts "$SCRIPT_DIR/run-parallel.sh" "run-parallel.sh"
+# The matching run-parallel.sh assertions are deliberately gone: run-parallel.sh
+# is Arachne's bounded manifest launcher, stays in Arachne, and is slated for
+# deletion there — the pump's own --phases/--jobs covers what it did. The pump
+# is the only launcher TaskPump ships, so it is the only one to guard.
 
 echo "--- Test 12: apl_fs_guard flags primary-source dirt, ignores allowlist (F65.5) ---"
-# shellcheck source=scripts/arachne-pump-lib.sh
-source "$SCRIPT_DIR/arachne-pump-lib.sh"
+# shellcheck source=../lib/pump-lib.sh
+source "$TP_ROOT/lib/pump-lib.sh"
 GR="$TMP/guardrepo"; mkdir -p "$GR"
 git -C "$GR" init -q
 git -C "$GR" config user.email t@t.t

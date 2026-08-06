@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# test-entrypoint-parallel.sh — INSPECTION-only guard for entrypoint-parallel.sh.
+# test-entrypoint.sh — INSPECTION-only guard for the claude-docker runner's
+# entrypoint.
 #
-# entrypoint-parallel.sh configures an iptables sandbox and launches a real
+# The entrypoint configures an iptables sandbox and launches a real
 # `claude -p` Auto Mode session, so it is never executed here. This harness is a
 # static regression guard for the F45.14.6 invariants:
 #   * the session runs under `--permission-mode auto`;
@@ -10,19 +11,20 @@
 #   * the pre-seeded Auto Mode allow rules (claude-settings-auto.json) are read
 #     and merged into the dev user's settings.json.
 #
-# Run: ./scripts/test-entrypoint-parallel.sh   (offline; no container launched)
+# Run: ./tests/test-entrypoint.sh   (offline; no container launched)
 set -uo pipefail
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
-ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
-EP="$ROOT/entrypoint-parallel.sh"
-AUTO_JSON="$ROOT/claude-settings-auto.json"
+TP_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+EP="$TP_ROOT/runners/claude-docker/entrypoint.sh"
+
+WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
 
 PASS=0; FAIL=0
 pass() { printf 'PASS: %s\n' "$*"; PASS=$((PASS + 1)); }
 fail() { printf 'FAIL: %s\n' "$*" >&2; FAIL=$((FAIL + 1)); }
 
-[[ -f "$EP" ]] || { echo "FAIL: entrypoint-parallel.sh not found at $EP" >&2; exit 1; }
+[[ -f "$EP" ]] || { echo "FAIL: entrypoint not found at $EP" >&2; exit 1; }
 
 # ── Permission posture ─────────────────────────────────────────────────────────
 echo "--- permission posture ---"
@@ -54,22 +56,76 @@ else
   fail "entrypoint-parallel.sh never writes settings.json"
 fi
 
-# ── The allow file itself is well-formed Auto Mode config ──────────────────────
-echo "--- claude-settings-auto.json shape ---"
-if [[ -f "$AUTO_JSON" ]]; then
-  pass "claude-settings-auto.json exists"
-  if command -v jq >/dev/null 2>&1; then
-    mode=$(jq -r '.permissions.defaultMode // empty' "$AUTO_JSON" 2>/dev/null)
-    [[ "$mode" == "auto" ]] && pass "permissions.defaultMode == auto" \
-      || fail "permissions.defaultMode is '$mode' (expected auto)"
-    n=$(jq -r '.permissions.allow | length' "$AUTO_JSON" 2>/dev/null)
-    [[ "$n" =~ ^[0-9]+$ && "$n" -gt 0 ]] && pass "permissions.allow has $n pre-approved rules" \
-      || fail "permissions.allow is empty or missing"
-  else
-    echo "  (jq unavailable — skipping JSON shape assertions)"
-  fi
+# ── The merge itself, against a fixture allow file ─────────────────────────────
+# The real claude-settings-auto.json is an Arachne-side artifact and does not
+# ship with TaskPump, so there is nothing at the repo root to inspect. What is
+# TaskPump's to guarantee is the *merge semantics* the entrypoint applies, so
+# that is what gets exercised: a fixture MCP config and a fixture Auto Mode
+# config, combined by the entrypoint's own jq expression, must yield a
+# settings.json that keeps the MCP servers and lets the Auto settings win every
+# conflicting key.
+echo "--- Auto Mode settings merge ---"
+MERGE_EXPR='.[0] * .[1]'
+if grep -qF -- "jq -s '$MERGE_EXPR'" "$EP"; then
+  pass "entrypoint merges MCP + Auto settings with jq -s '$MERGE_EXPR'"
 else
-  fail "claude-settings-auto.json missing at $AUTO_JSON"
+  fail "entrypoint no longer merges with jq -s '$MERGE_EXPR' (update this test with it)"
+fi
+
+FIX_MCP="$WORK/claude-mcp.json"
+FIX_AUTO="$WORK/claude-settings-auto.json"
+cat >| "$FIX_MCP" <<'EOF'
+{
+  "mcpServers": { "context7": { "command": "npx", "args": ["-y", "@upstash/context7-mcp"] } },
+  "permissions": { "defaultMode": "default", "allow": ["Bash(ls:*)"] }
+}
+EOF
+cat >| "$FIX_AUTO" <<'EOF'
+{
+  "permissions": {
+    "defaultMode": "auto",
+    "allow": ["Bash(cargo test:*)", "Bash(git commit:*)"]
+  }
+}
+EOF
+
+if command -v jq >/dev/null 2>&1; then
+  mode=$(jq -r '.permissions.defaultMode // empty' "$FIX_AUTO" 2>/dev/null)
+  [[ "$mode" == "auto" ]] && pass "fixture allow file declares permissions.defaultMode == auto" \
+    || fail "fixture permissions.defaultMode is '$mode' (expected auto)"
+  n=$(jq -r '.permissions.allow | length' "$FIX_AUTO" 2>/dev/null)
+  [[ "$n" =~ ^[0-9]+$ && "$n" -gt 0 ]] && pass "fixture permissions.allow has $n pre-approved rules" \
+    || fail "fixture permissions.allow is empty or missing"
+
+  MERGED="$WORK/settings.json"
+  jq -s "$MERGE_EXPR" "$FIX_MCP" "$FIX_AUTO" >| "$MERGED" 2>/dev/null
+
+  got=$(jq -r '.mcpServers.context7.command // empty' "$MERGED" 2>/dev/null)
+  [[ "$got" == "npx" ]] && pass "merge keeps the MCP servers from claude-mcp.json" \
+    || fail "merge lost mcpServers (context7.command = '$got')"
+
+  got=$(jq -r '.permissions.defaultMode // empty' "$MERGED" 2>/dev/null)
+  [[ "$got" == "auto" ]] && pass "merge lets Auto Mode win defaultMode over the MCP config" \
+    || fail "merged defaultMode is '$got' (expected auto to win)"
+
+  got=$(jq -r '.permissions.allow | index("Bash(cargo test:*)") // empty' "$MERGED" 2>/dev/null)
+  [[ -n "$got" ]] && pass "merge carries the Auto Mode allow rules into settings.json" \
+    || fail "merged permissions.allow lost the Auto Mode rules"
+
+  got=$(jq -r '.permissions.allow | index("Bash(ls:*)") // empty' "$MERGED" 2>/dev/null)
+  [[ -z "$got" ]] && pass "Auto Mode's allow list replaces the MCP config's, not appends" \
+    || fail "merged permissions.allow still carries the MCP config's rules"
+else
+  echo "  (jq unavailable — skipping the merge assertions)"
+fi
+
+# Both single-sided fallbacks must exist, or a run with only one of the two files
+# silently launches with no settings.json at all.
+if grep -qF 'cp "$AUTO_JSON" /home/dev/.claude/settings.json' "$EP" \
+   && grep -qF 'cp "$MCP_JSON" /home/dev/.claude/settings.json' "$EP"; then
+  pass "entrypoint falls back to whichever config exists when only one is present"
+else
+  fail "entrypoint is missing a single-sided fallback for MCP-only / Auto-only"
 fi
 
 # ── Smoke test is run before the session ───────────────────────────────────────

@@ -13,7 +13,8 @@
 set -uo pipefail
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
-CLI="$SCRIPT_DIR/arachne-dag-render"
+TP_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+CLI="$TP_ROOT/libexec/tp-dag-render"
 PASS=0; FAIL=0
 pass() { printf 'PASS: %s\n' "$*"; PASS=$((PASS + 1)); }
 fail() { printf 'FAIL: %s\n' "$*" >&2; FAIL=$((FAIL + 1)); }

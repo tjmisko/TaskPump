@@ -13,7 +13,8 @@
 set -uo pipefail
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
-CLI="$SCRIPT_DIR/arachne-monitor"
+TP_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+CLI="$TP_ROOT/libexec/tp-monitor"
 PASS=0; FAIL=0
 pass() { printf 'PASS: %s\n' "$*"; PASS=$((PASS + 1)); }
 fail() { printf 'FAIL: %s\n' "$*" >&2; FAIL=$((FAIL + 1)); }
@@ -469,7 +470,7 @@ claim F97.2 in_progress feat/f97  "2026-08-05T10:00:00Z" '"2026-08-05T10:30:00Z"
 claim F97.3 in_progress feat/f97  "2026-08-05T11:00:00Z" '"2026-08-05T11:30:00Z"' F97.1
 CPS="$TMP/claim-pump.state"
 printf '%s' '{"phases":"F97","started_at":"2026-08-05T09:00:00Z","status":"running"}' >| "$CPS"
-cgraph=$(ARACHNE_TASKS_DIR="$CTD" "$SCRIPT_DIR/arachne-dag-render" \
+cgraph=$(ARACHNE_TASKS_DIR="$CTD" "$TP_ROOT/libexec/tp-dag-render" \
              --phases F97 --no-color --live-branches feat/f97 2>/dev/null)
 runners=$(grep -o '▶' <<<"$cgraph" | wc -l)
 [[ "$runners" == "1" ]] && pass "exactly one node renders ▶ ($runners)" \
@@ -480,12 +481,12 @@ grep -qE "│ F97\.2 +⧗ │" <<<"$cgraph" && pass "the stale claim falls back 
     || fail "F97.2 should be parked:\n$cgraph"
 # A claim that never heartbeated still competes, on claimed_at.
 claim F97.4 in_progress feat/f97b "2026-08-05T12:00:00Z" null F97.1
-nohb=$(ARACHNE_TASKS_DIR="$CTD" "$SCRIPT_DIR/arachne-dag-render" \
+nohb=$(ARACHNE_TASKS_DIR="$CTD" "$TP_ROOT/libexec/tp-dag-render" \
            --phases F97 --no-color --live-branches feat/f97b 2>/dev/null)
 grep -qE "│ F97\.4 +▶ │" <<<"$nohb" && pass "a never-heartbeated claim falls back to claimed_at" \
     || fail "F97.4 should be running:\n$nohb"
 # --claims is the same election, and is what the SESSIONS tab reads.
-cl=$(ARACHNE_TASKS_DIR="$CTD" "$SCRIPT_DIR/arachne-dag-render" --claims 2>/dev/null)
+cl=$(ARACHNE_TASKS_DIR="$CTD" "$TP_ROOT/libexec/tp-dag-render" --claims 2>/dev/null)
 [[ "$(awk -F'\t' '$1=="feat/f97"{print $2}' <<<"$cl")" == "F97.3" ]] \
     && pass "--claims names the same task the canvas paints ▶" \
     || fail "--claims disagrees with the canvas:\n$cl"

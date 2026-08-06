@@ -12,7 +12,8 @@ set -euo pipefail
 # CDPATH= guards against a caller's exported CDPATH making `cd` to the relative
 # dirname echo the target dir into the command substitution (corrupts SCRIPT_DIR).
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
-CLI="$SCRIPT_DIR/arachne-task"
+TP_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+CLI="$TP_ROOT/libexec/tp-task"
 
 PASS=0
 FAIL=0
@@ -731,7 +732,7 @@ else
 fi
 
 # ── Workspace resolution ──────────────────────────────────────────────────────
-# Every worktree carries its own scripts/arachne-task AND its own ops/ checkout.
+# Every worktree carries its own copy of the CLI AND its own ops/ checkout.
 # Invoking one workspace's copy of the CLI while standing in another must write
 # to the workspace the caller is standing in, not the one the script lives in —
 # otherwise a claim made from a worktree lands in the primary's ledger and both
@@ -745,18 +746,23 @@ resolution_root_of() {
 
 WS_A="$TMPDIR_TEST/ws-a"
 WS_B="$TMPDIR_TEST/ws-b"
+# Each fake workspace is a self-contained TaskPump install, so the CLI's own root
+# ($ws/libexec/..) really is $ws — the condition these cases are written against.
+# Copies, not symlinks: the root comes from `readlink -f`, which would follow a
+# symlink back to the real installation and defeat the whole fixture.
 for ws in "$WS_A" "$WS_B"; do
-  mkdir -p "$ws/scripts" "$ws/ops/task-loop/tasks"
+  mkdir -p "$ws/libexec" "$ws/lib" "$ws/ops/task-loop/tasks"
   git -C "$ws" init -q
-  cp "$CLI" "$ws/scripts/arachne-task"
-  chmod +x "$ws/scripts/arachne-task"
+  cp "$CLI" "$ws/libexec/tp-task"
+  cp "$TP_ROOT/lib/config.sh" "$ws/lib/config.sh"
+  chmod +x "$ws/libexec/tp-task"
   git -C "$ws" -c user.name=test -c user.email=t@e add -A
   git -C "$ws" -c user.name=test -c user.email=t@e commit -q -m "init $ws"
 done
 
 # Standing in workspace B but invoking workspace A's copy of the CLI: the
 # ledger written must be B's. This is the regression — it used to resolve to A.
-got=$(resolution_root_of "$WS_B" "$WS_A/scripts/arachne-task")
+got=$(resolution_root_of "$WS_B" "$WS_A/libexec/tp-task")
 if [[ "$got" == "$WS_B/ops/task-loop/tasks" ]]; then
   pass "cross-workspace invocation resolves to the caller's workspace"
 else
@@ -764,7 +770,7 @@ else
 fi
 
 # Standing in its own workspace still resolves to itself.
-got=$(resolution_root_of "$WS_A" "$WS_A/scripts/arachne-task")
+got=$(resolution_root_of "$WS_A" "$WS_A/libexec/tp-task")
 if [[ "$got" == "$WS_A/ops/task-loop/tasks" ]]; then
   pass "same-workspace invocation resolves to that workspace"
 else
@@ -777,14 +783,14 @@ fi
 NO_OPS="$TMPDIR_TEST/no-ops"
 mkdir -p "$NO_OPS"
 git -C "$NO_OPS" init -q
-got=$(resolution_root_of "$NO_OPS" "$WS_A/scripts/arachne-task")
+got=$(resolution_root_of "$NO_OPS" "$WS_A/libexec/tp-task")
 if [[ "$got" == "$WS_A/ops/task-loop/tasks" ]]; then
   pass "git repo without an ops/ checkout falls back to the script's workspace"
 else
   fail "no-ops fallback resolved to '$got', expected '$WS_A/ops/task-loop/tasks'"
 fi
 
-got=$(resolution_root_of "$TMPDIR_TEST" "$WS_A/scripts/arachne-task")
+got=$(resolution_root_of "$TMPDIR_TEST" "$WS_A/libexec/tp-task")
 if [[ "$got" == "$WS_A/ops/task-loop/tasks" ]]; then
   pass "outside any git repo falls back to the script's workspace"
 else
@@ -793,7 +799,7 @@ fi
 
 # An explicit ARACHNE_TASKS_DIR still wins over both.
 got=$( cd "$WS_B" && ARACHNE_TASKS_DIR="$TASKS" ARACHNE_TASK_NOCOMMIT=1 \
-        "$WS_A/scripts/arachne-task" resolve --tasks-dir )
+        "$WS_A/libexec/tp-task" resolve --tasks-dir )
 if [[ "$got" == "$TASKS" ]]; then
   pass "ARACHNE_TASKS_DIR overrides workspace resolution"
 else

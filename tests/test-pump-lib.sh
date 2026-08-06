@@ -13,7 +13,8 @@
 set -uo pipefail
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
-LIB="$SCRIPT_DIR/arachne-pump-lib.sh"
+TP_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+LIB="$TP_ROOT/lib/pump-lib.sh"
 
 PASS=0; FAIL=0
 pass() { printf 'PASS: %s\n' "$*"; PASS=$((PASS + 1)); }

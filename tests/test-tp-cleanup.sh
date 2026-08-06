@@ -10,8 +10,9 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
-CLEANUP="$SCRIPT_DIR/arachne-cleanup"
-WATCHDOG="$SCRIPT_DIR/arachne-disk-watchdog"
+TP_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
+CLEANUP="$TP_ROOT/libexec/tp-cleanup"
+WATCHDOG="$TP_ROOT/libexec/tp-disk-watchdog"
 
 PASS=0; FAIL=0
 pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
@@ -70,14 +71,22 @@ assert_no  "feat/a not acted on while live"  "$out" "worktree: $FIX/.worktrees/f
 assert_has "feat/b still reclaimed"          "$out" "worktree: $FIX/.worktrees/feat/b/target"
 
 echo "--- Test 4: watchdog PANIC invokes target reclaim before docker prune ---"
-# Stub arachne-cleanup so the watchdog's reclaim/docker calls are observable and
-# fast (no scan of the real worktrees). The watchdog resolves it via REPO_ROOT.
-mkdir -p "$FIX/scripts"
-cat > "$FIX/scripts/arachne-cleanup" <<'EOF'
+# Stub tp-cleanup so the watchdog's reclaim/docker calls are observable and fast
+# (no scan of the real worktrees). The watchdog resolves its siblings against its
+# own install root, so the stub only takes effect inside a throwaway copy of that
+# install — hence a fixture tree holding the watchdog, config.sh, and the stub.
+# A copy, not a symlink: TP_ROOT comes from `readlink -f`, which would follow a
+# symlink straight back to the real installation.
+TPFIX="$FIX/taskpump"
+mkdir -p "$TPFIX/libexec" "$TPFIX/lib"
+cp "$WATCHDOG" "$TPFIX/libexec/tp-disk-watchdog"
+cp "$TP_ROOT/lib/config.sh" "$TPFIX/lib/config.sh"
+cat > "$TPFIX/libexec/tp-cleanup" <<'EOF'
 #!/bin/bash
 echo "STUB-CLEANUP-CALLED args: $*"
 EOF
-chmod +x "$FIX/scripts/arachne-cleanup"
+chmod +x "$TPFIX/libexec/tp-disk-watchdog" "$TPFIX/libexec/tp-cleanup"
+WATCHDOG="$TPFIX/libexec/tp-disk-watchdog"
 
 out="$(ARACHNE_DISK_REPO_ROOT="$FIX" FREE_GB_OVERRIDE=3 PANIC_THRESHOLD_GB=5 PAUSE_THRESHOLD_GB=10 \
        "$WATCHDOG" --once --dry-run 2>&1)"
