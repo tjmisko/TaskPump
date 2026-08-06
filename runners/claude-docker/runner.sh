@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+# runners/claude-docker/runner.sh — the claude-docker runner. RUNNER CONTRACT v1.
+#
+# A runner is the seam between the supervisor (libexec/tp-pump) and whatever
+# actually executes an agent. The pump decides *what* should run — which phase,
+# which worktree, which task is the lead, whether this is a resume — and then
+# hands that decision to a runner, which knows *how* to start it. This runner
+# starts a detached Docker container running the Claude Code CLI.
+#
+# Everything in here was lifted verbatim out of the pump's own launch block so
+# that container behaviour is byte-identical for an existing consumer: same
+# mounts, same capabilities, same memory caps, same environment. The pump keeps
+# the parts that are its own business — worktree materialisation, brief
+# rendering, resume notes, liveness — and calls this file for the last step.
+#
+# ── The contract ─────────────────────────────────────────────────────────────
+#
+#   runner.sh launch    Start the agent container detached. Prints the container
+#                       id on stdout. Non-zero exit with a reason on stderr when
+#                       the launch fails.
+#   runner.sh stop      Stop the named container. Idempotent: stopping something
+#                       that is not running succeeds.
+#
+# Inputs arrive as environment variables, never as arguments, so the set can grow
+# without breaking a caller. Each one is read as TP_<NAME> first and falls back
+# to the legacy spelling a pre-TaskPump Arachne deployment already exports. Note
+# that lib/config.sh promotes TASKPUMP_X to ARACHNE_X, so a key set in
+# taskpump.conf reaches this script through the legacy column below.
+#
+#   TP_WORKSPACE        WORKSPACE_PATH      required — the agent's workspace
+#                                           (a git worktree), mounted RW and used
+#                                           as the container workdir
+#   TP_REPO_ROOT        REPO_ROOT           required — the primary checkout,
+#                                           mounted READ-ONLY
+#   TP_CONTAINER_NAME   ARACHNE_CONTAINER_NAME  required — `docker run --name`
+#   TP_IMAGE            ARACHNE_IMAGE       required — image to run
+#   TP_ENTRYPOINT       ARACHNE_ENTRYPOINT  in-container entrypoint path
+#                                           (default /entrypoint-parallel.sh)
+#   TP_LEDGER_REPO      ARACHNE_PUMP_OPS_DIR  ledger checkout, mounted RW
+#                                           (default $TP_REPO_ROOT/ops)
+#   TP_BRANCH           ARACHNE_BRANCH      informational; forwarded to the agent
+#   TP_TASK_ID          ARACHNE_TASK_ID     lead task the agent is assigned
+#   TP_PHASE            ARACHNE_PHASE       phase the agent drains
+#   TP_BRIEF            ARACHNE_BRIEF       rendered kickoff brief (host path)
+#   TP_RESUME_NOTE      ARACHNE_RESUME_NOTE resume preamble, or empty
+#   TP_MODEL            AGENT_MODEL         model alias (default opus)
+#   TP_MAX_TURNS        MAX_TURNS           turn cap for the session (default 600)
+#   TP_CLAUDE_DIR       CLAUDE_DIR          host agent home (default ~/.claude)
+#   TP_CLAUDE_JSON      CLAUDE_JSON         host agent config (default ~/.claude.json)
+#   TP_MEMORY_MAX       AGENT_MEMORY_MAX    --memory (default 3g)
+#   TP_MEMORY_SWAP      AGENT_MEMORY_SWAP   --memory-swap (default 5g)
+#   TP_CONTAINER_RUN_USER  —                optional `--user`; unset by default,
+#                                           see "Why root" below
+#   TP_ENV_PASSTHROUGH  —                   extra variable names to forward when
+#                                           set (see DEFAULT_PASSTHROUGH)
+#   GITHUB_TOKEN        —                   forwarded for ops fetch + gh
+#   DOCKER              —                   container binary override (test seam)
+#
+# ── Deliberately NOT in v1: liveness ─────────────────────────────────────────
+#
+# "Is this phase still running?" stays in lib/pump-lib.sh (`apl_live_branches`),
+# which asks `docker ps` directly. Liveness is a *fleet* question — the pump asks
+# it once per tick about every phase at once — while launch and stop are asked
+# about one container at a time. Routing the fleet query through a per-container
+# CLI would mean N subprocesses per tick to answer a question one `docker ps`
+# already answers, and the pump's most important safety property (never
+# double-launch a live container) would then depend on a fan-out loop rather than
+# a single atomic snapshot. A second runner will need a liveness verb; v1 is
+# honest that it does not have one yet.
+#
+# ── Why root, and why no --user ──────────────────────────────────────────────
+#
+# The launch deliberately does not pass `--user`. The container starts as root
+# because the entrypoint installs an iptables egress allowlist (hence
+# --cap-add NET_ADMIN) and writes into the agent user's home; it drops to the
+# unprivileged container user with `su` for the session itself. Setting
+# TP_CONTAINER_RUN_USER emits a `--user` flag for a consumer whose image needs
+# one, but doing so will break any pre-flight that configures the firewall.
+
+set -euo pipefail
+
+PROG="runner.sh"
+CONTRACT_VERSION=1
+
+die()  { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+warn() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+
+DOCKER="${DOCKER:-docker}"
+
+# Variables forwarded into the container when — and only when — they are set in
+# the runner's own environment. Keeping this list opt-in keeps the launch line
+# deterministic: an unset key produces no flag at all.
+#
+# Both spellings of each key are listed. The entrypoint resolves TASKPUMP_X then
+# TP_X, so forwarding only one of them would make the other silently inert in the
+# caller's hands — which is exactly what happened: the pump exported TP_TASKS_DIR,
+# TP_AGENT_LOG_NAME and TP_GOAL_NOTE_NAME, and nothing carried them across.
+DEFAULT_PASSTHROUGH="\
+TASKPUMP_PRE_FLIGHT TP_PRE_FLIGHT \
+TASKPUMP_WORKSPACE_TASK_CLI TP_WORKSPACE_TASK_CLI \
+TASKPUMP_CONTAINER_USER TP_CONTAINER_USER \
+TASKPUMP_CONTAINER_HOME TP_CONTAINER_HOME \
+TASKPUMP_SAFETY_TURNS TP_SAFETY_TURNS \
+TASKPUMP_TASKS_DIR TP_TASKS_DIR \
+TASKPUMP_TASK_OUT TP_TASK_OUT \
+TASKPUMP_TASK_FILE_EXT TP_TASK_FILE_EXT \
+TASKPUMP_AGENT_LOG_NAME TP_AGENT_LOG_NAME \
+TASKPUMP_GOAL_NOTE_NAME TP_GOAL_NOTE_NAME \
+TASKPUMP_RESUME_NOTE_NAME TP_RESUME_NOTE_NAME \
+TASKPUMP_RO_PROBE_FILE TP_RO_PROBE_FILE \
+TASKPUMP_HOST_CRED_MOUNT TP_HOST_CRED_MOUNT \
+TASKPUMP_HOST_CONFIG_MOUNT TP_HOST_CONFIG_MOUNT \
+TASKPUMP_CRED_REFRESH_INTERVAL_S TP_CRED_REFRESH_INTERVAL_S \
+TASKPUMP_AGENT_WALL_TIMEOUT_S TP_AGENT_WALL_TIMEOUT_S \
+CRED_REFRESH_INTERVAL_S \
+AGENT_WALL_TIMEOUT_S"
+
+# first_set <name>... — print the value of the first variable that is set and
+# non-empty. Indirect expansion, never eval, so a value containing shell
+# metacharacters is not re-parsed.
+first_set() {
+  local name
+  for name in "$@"; do
+    if [[ -n "${!name-}" ]]; then
+      printf '%s' "${!name}"
+      return 0
+    fi
+  done
+  printf ''
+}
+
+usage() {
+  cat <<EOF
+$PROG — claude-docker runner (contract v$CONTRACT_VERSION)
+
+  $PROG launch    start the agent container detached; prints its id
+  $PROG stop      stop the container named by TP_CONTAINER_NAME
+  $PROG contract  print the contract version
+
+All inputs are environment variables; see the header of this file for the table.
+EOF
+}
+
+do_launch() {
+  # Locals are deliberately lower-case. A `local REPO_ROOT` would blank the
+  # inherited REPO_ROOT before first_set ever got to read it — the legacy
+  # fallback would then silently never fire.
+  local wt repo_root ledger_repo cname image entrypoint
+  wt="$(first_set TP_WORKSPACE WORKSPACE_PATH)"
+  repo_root="$(first_set TP_REPO_ROOT REPO_ROOT)"
+  cname="$(first_set TP_CONTAINER_NAME ARACHNE_CONTAINER_NAME)"
+  image="$(first_set TP_IMAGE ARACHNE_IMAGE)"
+  entrypoint="$(first_set TP_ENTRYPOINT ARACHNE_ENTRYPOINT)"
+  : "${entrypoint:=/entrypoint-parallel.sh}"
+
+  [[ -n "$wt" ]]        || die "TP_WORKSPACE (or WORKSPACE_PATH) is required"
+  [[ -n "$repo_root" ]] || die "TP_REPO_ROOT (or REPO_ROOT) is required"
+  [[ -n "$cname" ]]     || die "TP_CONTAINER_NAME is required"
+  # No default image on purpose. A wrong-but-plausible default would launch the
+  # wrong agent silently; a missing name should be loud.
+  [[ -n "$image" ]]     || die "TP_IMAGE is required (no default: an implicit image is a silent wrong launch)"
+
+  ledger_repo="$(first_set TP_LEDGER_REPO ARACHNE_PUMP_OPS_DIR)"
+  : "${ledger_repo:=$repo_root/ops}"
+
+  local branch task_id phase brief resume_note model max_turns
+  branch="$(first_set TP_BRANCH ARACHNE_BRANCH)"
+  task_id="$(first_set TP_TASK_ID ARACHNE_TASK_ID)"
+  phase="$(first_set TP_PHASE ARACHNE_PHASE)"
+  brief="$(first_set TP_BRIEF ARACHNE_BRIEF)"
+  resume_note="$(first_set TP_RESUME_NOTE ARACHNE_RESUME_NOTE)"
+  model="$(first_set TP_MODEL AGENT_MODEL)";       : "${model:=opus}"
+  max_turns="$(first_set TP_MAX_TURNS MAX_TURNS)"; : "${max_turns:=600}"
+
+  local claude_dir claude_json mem_max mem_swap
+  claude_dir="$(first_set TP_CLAUDE_DIR CLAUDE_DIR)";    : "${claude_dir:=$HOME/.claude}"
+  claude_json="$(first_set TP_CLAUDE_JSON CLAUDE_JSON)"; : "${claude_json:=$HOME/.claude.json}"
+  mem_max="$(first_set TP_MEMORY_MAX AGENT_MEMORY_MAX)"; : "${mem_max:=3g}"
+  mem_swap="$(first_set TP_MEMORY_SWAP AGENT_MEMORY_SWAP)"; : "${mem_swap:=5g}"
+
+  # Optional --user. Absent by default; see "Why root" in the header.
+  local run_user_args=()
+  local run_user; run_user="$(first_set TP_CONTAINER_RUN_USER)"
+  [[ -n "$run_user" ]] && run_user_args=(--user "$run_user")
+
+  # Opt-in extra environment, appended in list order so the launch line is stable.
+  local passthrough_args=() name
+  for name in ${TP_ENV_PASSTHROUGH-$DEFAULT_PASSTHROUGH}; do
+    [[ -n "${!name-}" ]] && passthrough_args+=(-e "$name=${!name}")
+  done
+
+  # A stale container of the same name blocks `--name`. Removing it is the same
+  # idempotency the pump had inline; failure here is never fatal because the
+  # usual cause is that there is nothing to remove.
+  "$DOCKER" rm -f "$cname" >/dev/null 2>&1 || true
+
+  local cid rc=0
+  cid=$("$DOCKER" run --rm -d \
+    --name "$cname" \
+    --cap-add NET_ADMIN \
+    --memory "$mem_max" \
+    --memory-swap "$mem_swap" \
+    ${run_user_args[@]+"${run_user_args[@]}"} \
+    -e GITHUB_TOKEN="${GITHUB_TOKEN:-}" \
+    -e WORKSPACE_PATH="$wt" \
+    -e REPO_ROOT="$repo_root" \
+    -e ARACHNE_BRIEF="$brief" \
+    -e ARACHNE_RESUME_NOTE="$resume_note" \
+    -e ARACHNE_TASK_ID="$task_id" \
+    -e ARACHNE_PHASE="$phase" \
+    -e MAX_TURNS="$max_turns" \
+    -e AGENT_MODEL="$model" \
+    -e TASKPUMP_WORKSPACE_PATH="$wt" \
+    -e TASKPUMP_REPO_ROOT="$repo_root" \
+    -e TASKPUMP_LEDGER_REPO="$ledger_repo" \
+    -e TASKPUMP_BRIEF="$brief" \
+    -e TASKPUMP_RESUME_NOTE="$resume_note" \
+    -e TASKPUMP_TASK_ID="$task_id" \
+    -e TASKPUMP_PHASE="$phase" \
+    -e TASKPUMP_BRANCH="$branch" \
+    -e TASKPUMP_MAX_TURNS="$max_turns" \
+    -e TASKPUMP_AGENT_MODEL="$model" \
+    ${passthrough_args[@]+"${passthrough_args[@]}"} \
+    -v "$claude_dir":/tmp/claude-home:ro \
+    -v "$claude_json":/tmp/claude-home-json/.claude.json:ro \
+    -v "$repo_root":"$repo_root":ro \
+    -v "$repo_root/.git":"$repo_root/.git" \
+    -v "$wt":"$wt" \
+    -v "$ledger_repo":"$ledger_repo" \
+    -w "$wt" \
+    "$image" "$entrypoint") || rc=$?
+
+  if [[ $rc -ne 0 ]]; then
+    die "docker run failed (rc=$rc) for container $cname from image $image"
+  fi
+  [[ -n "$cid" ]] || die "docker run produced no container id for $cname"
+
+  printf '%s\n' "$cid"
+}
+
+do_stop() {
+  local cname; cname="$(first_set TP_CONTAINER_NAME ARACHNE_CONTAINER_NAME)"
+  [[ -n "$cname" ]] || die "TP_CONTAINER_NAME is required"
+
+  local out rc=0
+  out=$("$DOCKER" stop "$cname" 2>&1) || rc=$?
+  if [[ $rc -eq 0 ]]; then
+    printf '%s\n' "$cname"
+    return 0
+  fi
+  # Stop is idempotent by contract: a supervisor tearing down should not have to
+  # race `docker ps` to find out whether it still has something to stop.
+  if grep -qiE 'no such container|is not running' <<<"$out"; then
+    warn "container $cname is not running"
+    return 0
+  fi
+  printf '%s\n' "$out" >&2
+  die "docker stop failed (rc=$rc) for container $cname"
+}
+
+verb="${1:-}"
+case "$verb" in
+  launch)         shift; do_launch "$@" ;;
+  stop)           shift; do_stop "$@" ;;
+  contract)       printf '%s\n' "$CONTRACT_VERSION" ;;
+  -h|--help|help) usage ;;
+  '')             usage >&2; exit 2 ;;
+  *)              printf '%s: unknown verb: %s\n' "$PROG" "$verb" >&2; usage >&2; exit 2 ;;
+esac

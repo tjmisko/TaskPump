@@ -1,40 +1,65 @@
-# arachne-pump.service — systemd --user unit for a multi-day usage-governed run.
+# taskpump-pump.service — systemd --user unit for a multi-day usage-governed run.
 #
-# This is the PERSISTENT-unit path for E3 (restart-on-failure). For a quick
-# throwaway run, `arachne-pump --detach` uses a transient `systemd-run --user`
-# unit instead and needs none of this.
+# This is the PERSISTENT-unit path (restart-on-failure). For a quick throwaway
+# run, `tp pump --detach` uses a transient `systemd-run --user` unit and needs
+# none of this.
 #
-# Install (edit the phases/flags first, and the repo path if it isn't
-# ~/Projects/Arachne):
+# Nothing project-specific is baked in. Everything the unit needs comes from
+# %h/.config/taskpump/pump.env, so this file can be installed once and reused
+# for any repo the pump drives.
 #
-#   mkdir -p ~/.config/systemd/user
-#   cp scripts/arachne-pump.service ~/.config/systemd/user/arachne-pump.service
-#   $EDITOR ~/.config/systemd/user/arachne-pump.service   # set ARACHNE_PUMP_PHASES
+# ── Install ──────────────────────────────────────────────────────────────────
+#
+#   mkdir -p ~/.config/systemd/user ~/.config/taskpump
+#   cp systemd/taskpump-pump.service ~/.config/systemd/user/
+#   $EDITOR ~/.config/taskpump/pump.env          # see the template below
 #   systemctl --user daemon-reload
-#   systemctl --user start arachne-pump          # (or: enable --now to survive logout w/ linger)
-#   journalctl --user -u arachne-pump -f         # watch
-#   systemctl --user stop arachne-pump           # stop FEEDING (running agents keep going)
+#   systemctl --user start taskpump-pump         # (or: enable --now, with linger)
+#   journalctl --user -u taskpump-pump -f        # watch
+#   systemctl --user stop taskpump-pump          # stop FEEDING (agents keep going)
 #
 # To survive a full logout, enable linger once: `loginctl enable-linger "$USER"`.
+#
+# ── ~/.config/taskpump/pump.env ──────────────────────────────────────────────
+#
+#   # Required: where the pump binary is, and which repo it drives.
+#   TASKPUMP_BIN=%h/Projects/TaskPump/bin/tp
+#   TASKPUMP_REPO=%h/Projects/Arachne
+#
+#   # Required: what to drain, and how hard.
+#   TASKPUMP_PUMP_PHASES=F55..F63
+#   TASKPUMP_PUMP_JOBS=4
+#   TASKPUMP_PUMP_CEILING=95
+#
+#   # Optional: anything else the pump reads. The file is sourced by systemd, so
+#   # one KEY=value per line, no quoting, no expansion.
+#   # TASKPUMP_IMAGE=arachne
+#   # TASKPUMP_PRE_FLIGHT=/preflight.sh
+#   # GITHUB_TOKEN=ghp_...
+#
+# systemd expands %h in the unit, not in the env file — write a literal absolute
+# path there (/home/you/...), not %h.
+#
+# TASKPUMP_REPO is used twice on purpose: ExecStart cds into it (for a pump that
+# resolves its repo from $PWD) and it is also in the environment (for a pump that
+# reads the key). Setting it once satisfies both.
 
 [Unit]
-Description=Arachne usage-governed DAG pump
+Description=TaskPump usage-governed DAG pump
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-# ── Edit these ───────────────────────────────────────────────────────────────
-Environment=ARACHNE_REPO=%h/Projects/Arachne
-Environment=ARACHNE_PUMP_PHASES=F55..F63
-Environment=ARACHNE_PUMP_JOBS=4
-Environment=ARACHNE_PUMP_CEILING=95
-# ─────────────────────────────────────────────────────────────────────────────
-WorkingDirectory=%h/Projects/Arachne
-ExecStart=/usr/bin/env bash -lc '"$ARACHNE_REPO/libexec/tp-pump" --phases "$ARACHNE_PUMP_PHASES" --jobs "$ARACHNE_PUMP_JOBS" --usage-ceiling "$ARACHNE_PUMP_CEILING"'
+EnvironmentFile=%h/.config/taskpump/pump.env
+WorkingDirectory=%h
+ExecStart=/usr/bin/env bash -lc 'cd "$TASKPUMP_REPO" && exec "$TASKPUMP_BIN" pump --phases "$TASKPUMP_PUMP_PHASES" --jobs "$TASKPUMP_PUMP_JOBS" --usage-ceiling "$TASKPUMP_PUMP_CEILING"'
 # A drained pump exits 0 (success) and should NOT be restarted; only restart on
-# an actual crash. The pump never kills running agents, so a restart re-derives
-# in-flight work from task files + docker ps (design D3/E2) without disruption.
+# an actual failure. Note that the deadlock exit is 3, deliberately non-zero, so
+# a pump that can no longer make progress is restarted here and pages the
+# operator rather than idling green forever. The pump never kills running
+# agents, so a restart re-derives in-flight work from task files + `docker ps`
+# without disruption.
 Restart=on-failure
 RestartSec=30
 # Stopping the unit stops FEEDING; detached agent containers keep running.
