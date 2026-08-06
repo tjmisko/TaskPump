@@ -13,8 +13,8 @@
 #
 # The fixture is a throwaway git repo shaped like Arachne: an `ops/` ledger at
 # ops/task-loop/tasks, an ops-side brief template at
-# ops/task-loop/briefs/_phase-drain-template.md (a verbatim copy of Arachne's,
-# checked in beside this script), phase branches named `feat/fNN`, and worktrees
+# ops/task-loop/briefs/ holding both consumer-side templates (checked in beside
+# this script), phase branches named `feat/fNN`, and worktrees
 # under .worktrees/. The TaskPump tools are COPIED into it rather than symlinked,
 # because both TP_ROOT and the pump's REPO_ROOT are derived through
 # `readlink -f` — a symlink would resolve straight back out of the fixture.
@@ -74,6 +74,13 @@ TASKS="$REPO/ops/task-loop/tasks"
 BRIEFS="$REPO/ops/task-loop/briefs"
 mkdir -p "$TASKS" "$BRIEFS"
 cp "$GOLDEN/consumer-brief-template.md" "$BRIEFS/_phase-drain-template.md"
+# The resume note the same way. Both templates resolve consumer-side-first, so
+# what this pins is the CONSUMER's wording, not whichever generic default
+# TaskPump happens to ship — which is the point: the byte-identity promise is
+# Arachne's to keep, in its own ledger, and the shipped default stays something
+# a second consumer can actually use. These two files are also the migration:
+# they are what Arachne drops into ops/task-loop/briefs/ to keep its prose.
+cp "$GOLDEN/consumer-resume-template.md" "$BRIEFS/_resume-note-template.md"
 
 mk() {  # mk <id> <status> [blockers_csv] [claimed_by]
   local id=$1 status=$2 blockers=${3:-} claimed=${4:-null}
