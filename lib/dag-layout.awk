@@ -1,11 +1,28 @@
-# arachne-dag-layout.awk -- frontmatter extraction + layered DAG layout (v2).
-# Driven by scripts/arachne-dag-render; see scripts/DESIGN-monitor-dag-v2.md for
-# the algorithm and the invariants/objectives it is held to.
+# dag-layout.awk -- frontmatter extraction + layered DAG layout (v2).
+# Driven by libexec/tp-dag-render; see docs/design/monitor-dag-v2.md for the
+# algorithm and the invariants/objectives it is held to.
+#
+# REQUIRES GNU awk. addm() and box() use and()/or() on a direction bitmask,
+# which are gawk extensions -- under mawk or BWK awk every edge junction would
+# render wrong rather than failing loudly. tp-dag-render checks the interpreter
+# before handing over.
 #
 # vars: phases ("F79" | "F55..F63" | "") running (csv of ids) color (0|1)
 #       compact (-1 auto | 0 | 1) panx (columns to skip on the left)
 #       cursor (task id to draw with a heavy border) indexfile (path or "")
 #       cols (viewport width in columns, 0 = unclipped)
+#       sigil (letter a phase token starts with, default "F")
+#       phasesep (what ends the phase inside an id, default ".")
+#
+# The ID GRAMMAR is exactly two hooks, both above: an id is <sigil><digits>
+# <phasesep> <rest>, so F79.4 groups under phase F79. Everything else about a
+# task -- the status vocabulary (done / in_progress / open / blocked /
+# needs-review / stuck) and the frontmatter field names -- is the LEDGER's
+# schema, owned by tp-task, and is deliberately not re-declarable here: three
+# copies of a vocabulary that must agree is how they come to disagree.
+#
+# The phase RANGE operator is always "..", independent of phasesep, matching
+# `tp task ready --phases A..B`.
 #
 # Pipeline: select -> layer -> dummies -> order -> xassign -> route -> flush.
 #
@@ -18,6 +35,10 @@ BEGIN {
     N = 0; n = 0; NT = 0; maxl = 0; MAXX = 0; MAXY = 0
     BASE_GAP = 2            # gap between siblings that share a parent
     UNREL_GAP = 6           # gap between neighbours that share none (O3 gutter)
+    # Defaults, so the layout still runs when driven by hand rather than by
+    # tp-dag-render. num() and store() are the only readers.
+    if (sigil == "") sigil = "F"
+    if (phasesep == "") phasesep = "."
     lo_ph = -1; hi_ph = -1
     if (phases ~ /\.\./) {
         split(phases, PR, /\.\./); lo_ph = num(PR[1]); hi_ph = num(PR[2])
@@ -64,7 +85,20 @@ function resolve_live(   i, b, k) {
         if (!(b in liveKey) || k > liveKey[b]) { liveKey[b] = k; liveOf[b] = i + 1 }
     }
 }
-function num(s) { gsub(/[^0-9]/, "", s); return s + 0 }
+# num -- a phase token's ordinal, for range comparison: "F79" -> 79. The sigil is
+# stripped by LENGTH rather than by regex, so a sigil containing a metacharacter
+# is a literal prefix and not a pattern.
+function num(s) {
+    if (sigil != "" && toupper(substr(s, 1, length(sigil))) == toupper(sigil))
+        s = substr(s, length(sigil) + 1)
+    gsub(/[^0-9]/, "", s)
+    return s + 0
+}
+# phase_of -- the phase an id belongs to: everything before the first separator.
+function phase_of(s,   k) {
+    k = index(s, phasesep)
+    return (k > 0) ? substr(s, 1, k - 1) : s
+}
 function unq(s) {
     gsub(/^[ \t]*/, "", s); gsub(/[ \t]*$/, "", s); gsub(/^"|"$/, "", s)
     gsub(/\t/, " ", s)
@@ -105,8 +139,7 @@ fm != 1 { next }
 }
 function store(   p) {
     if (cid == "") return
-    p = (cph != "") ? cph : cid
-    sub(/\..*$/, "", p)
+    p = phase_of((cph != "") ? cph : cid)
     aId[N] = cid; aSt[N] = cst; aBl[N] = cbl; aPh[N] = num(p); aBy[N] = cby
     aGo[N] = cgo; aTi[N] = cti; aTb[N] = ctb; aRa[N] = cra
     aHb[N] = chb; aCa[N] = cca
@@ -166,11 +199,12 @@ function layer(   pass, i, j, m, B, p, L, cand, changed) {
 # the pump's log without mentally re-attaching the phase every time. The four
 # columns are the cheaper thing to spend. `--compact` still asks for the short
 # form when the width actually matters.
-function labels(   i, lbl) {
+function labels(   i, lbl, k) {
     if (compact < 0) compact = 0
     BOXW = 0
     for (i = 0; i < n; i++) {
-        lbl = (compact && index(id[i], ".")) ? substr(id[i], index(id[i], ".")) : id[i]
+        k = index(id[i], phasesep)
+        lbl = (compact && k) ? substr(id[i], k) : id[i]
         label[i] = lbl
         if (length(lbl) > BOXW) BOXW = length(lbl)
     }
@@ -736,7 +770,7 @@ function eligible(i,   m, B, j, p) {
 # and loud is not the same as legible. Colour still only reinforces the glyph
 # (see glyph() above), never replaces it.
 #
-# Keep in sync with the ST_* palette in scripts/arachne-monitor.
+# Keep in sync with the ST_* palette in libexec/tp-monitor.
 function hue(i,   s) {
     if (!color) return ""
     s = st[i]
