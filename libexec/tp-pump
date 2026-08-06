@@ -121,6 +121,15 @@ RUNNER="${TASKPUMP_RUNNER:-$TP_ROOT/runners/claude-docker/runner.sh}"
 DOCKER="${TASKPUMP_DOCKER:-${DOCKER:-docker}}"
 IMAGE="${TASKPUMP_IMAGE:-arachne}"
 ENTRYPOINT="${TASKPUMP_ENTRYPOINT:-/entrypoint-parallel.sh}"
+# Building the agent image once before the drain. Unset ⇒ the default docker
+# build of the repo root; set to the empty string ⇒ skip it entirely, which is
+# what a runner that pulls a prebuilt image wants. (Building really belongs to
+# the runner; moving it there is a second round of the launch seam.)
+if [[ -n "${TASKPUMP_IMAGE_BUILD+set}" ]]; then
+  IMAGE_BUILD_CMD="$TASKPUMP_IMAGE_BUILD"
+else
+  IMAGE_BUILD_CMD="\"$DOCKER\" build -t \"$IMAGE\" \"$REPO_ROOT\""
+fi
 
 # Worktrees base — overridable so the reclaim sweep / launcher can be unit-tested
 # against a fixture tree (single source for both launch_phase and reclaim).
@@ -872,31 +881,48 @@ launch_phase() {
     rm -f "$wt/$RESUME_NOTE_NAME" 2>/dev/null || true
   fi
 
-  "$DOCKER" rm -f "$cname" >/dev/null 2>&1 || true
-  local cid
-  cid=$("$DOCKER" run --rm -d \
-    --name "$cname" \
-    --cap-add NET_ADMIN \
-    --memory "${AGENT_MEMORY_MAX:-3g}" \
-    --memory-swap "${AGENT_MEMORY_SWAP:-5g}" \
-    -e GITHUB_TOKEN="${GITHUB_TOKEN:-}" \
-    -e WORKSPACE_PATH="$wt" \
-    -e REPO_ROOT="$REPO_ROOT" \
-    -e ARACHNE_BRIEF="$brief" \
-    -e ARACHNE_RESUME_NOTE="$resume_note" \
-    -e ARACHNE_TASK_ID="$lead" \
-    -e ARACHNE_PHASE="$phase" \
-    -e MAX_TURNS="$MAX_TURNS" \
-    -e AGENT_MODEL="$AGENT_MODEL" \
-    -v "$CLAUDE_DIR":/tmp/claude-home:ro \
-    -v "$CLAUDE_JSON":/tmp/claude-home-json/.claude.json:ro \
-    -v "$REPO_ROOT":"$REPO_ROOT":ro \
-    -v "$REPO_ROOT/.git":"$REPO_ROOT/.git" \
-    -v "$wt":"$wt" \
-    -v "$REPO_ROOT/ops":"$REPO_ROOT/ops" \
-    -w "$wt" \
-    arachne /entrypoint-parallel.sh)
-  log "launched $phase -> $cname ($(printf '%s' "$cid" | cut -c1-12))  lead=$lead${RESUME_TASK_ID:+ (RESUME)}  log: $wt/.arachne-agent.log"
+  # ── Hand off to the runner ──────────────────────────────────────────────────
+  # The pump decides WHAT to run and WHERE; the runner owns HOW — the sandbox,
+  # the mounts, the credential handling, the image. Everything it needs arrives
+  # in the environment, in two spellings: the canonical TP_* names, and the
+  # legacy ones the in-container entrypoint reads today. The container-side
+  # reader prefers canonical and falls back to legacy, so either half can be
+  # migrated on its own.
+  #
+  # Stopping a container and checking liveness are still the pump's, by
+  # container name through the runtime directly. Folding those into the runner
+  # contract is v2: liveness is read on every tick from every phase, and routing
+  # it through a process spawn per phase per tick is a cost worth measuring
+  # first.
+  local cid rc=0
+  cid=$(
+    TP_WORKSPACE="$wt"                 WORKSPACE_PATH="$wt" \
+    TP_BRANCH="$branch" \
+    TP_CONTAINER_NAME="$cname" \
+    TP_IMAGE="$IMAGE" \
+    TP_ENTRYPOINT="$ENTRYPOINT" \
+    TP_TASK_ID="$lead"                 ARACHNE_TASK_ID="$lead" \
+    TP_PHASE="$phase"                  ARACHNE_PHASE="$phase" \
+    TP_MODEL="$AGENT_MODEL"            AGENT_MODEL="$AGENT_MODEL" \
+    TP_MAX_TURNS="$MAX_TURNS"          MAX_TURNS="$MAX_TURNS" \
+    TP_REPO_ROOT="$REPO_ROOT"          REPO_ROOT="$REPO_ROOT" \
+    TP_BRIEF="$brief"                  ARACHNE_BRIEF="$brief" \
+    TP_RESUME_NOTE="$resume_note"      ARACHNE_RESUME_NOTE="$resume_note" \
+    TP_LEDGER_REPO="$OPS_DIR" \
+    TP_AGENT_HOME="$CLAUDE_DIR" \
+    TP_AGENT_CONFIG="$CLAUDE_JSON" \
+    TP_AGENT_LOG_NAME="$AGENT_LOG_NAME" \
+    TP_MEMORY_MAX="${AGENT_MEMORY_MAX:-3g}"   AGENT_MEMORY_MAX="${AGENT_MEMORY_MAX:-3g}" \
+    TP_MEMORY_SWAP="${AGENT_MEMORY_SWAP:-5g}" AGENT_MEMORY_SWAP="${AGENT_MEMORY_SWAP:-5g}" \
+    TP_DOCKER="$DOCKER"                DOCKER="$DOCKER" \
+    GITHUB_TOKEN="${GITHUB_TOKEN:-}" \
+    "$RUNNER" launch
+  ) || rc=$?
+  if (( rc != 0 )); then
+    warn "runner failed to launch $phase (rc=$rc): $RUNNER"
+    return 1
+  fi
+  log "launched $phase -> $cname ($(printf '%s' "$cid" | cut -c1-12))  lead=$lead${RESUME_TASK_ID:+ (RESUME)}  log: $wt/$AGENT_LOG_NAME"
   return 0
 }
 
@@ -1455,8 +1481,11 @@ fi
 # Skip the (~9 GB) image build when we will not launch containers — keeps the
 # NO_LAUNCH tick (tests / live read-only validation) side-effect-free.
 if [[ "${TASKPUMP_PUMP_NO_LAUNCH:-0}" -ne 1 ]]; then
-  log "Building $IMAGE image ..."
-  "$DOCKER" build -t "$IMAGE" "$REPO_ROOT" >/dev/null || die "image build failed"
+  [[ -x "$RUNNER" ]] || die "no agent runner at $RUNNER (set TASKPUMP_RUNNER)"
+  if [[ -n "$IMAGE_BUILD_CMD" ]]; then
+    log "Building the $IMAGE image ..."
+    ( cd "$REPO_ROOT" && eval "$IMAGE_BUILD_CMD" ) >/dev/null || die "image build failed"
+  fi
 fi
 
 # Materialise auto/trunk + its worktree once, before the loop (A3). Real run

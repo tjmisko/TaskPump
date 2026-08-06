@@ -261,33 +261,54 @@ plant_target
 STUB_GATE_RC=0 ARACHNE_DISK_RECLAIM=1 STUB_LIVE="arachne-agent-feat-f56" reclaim_tick --phases F56 --once >/dev/null 2>&1
 [[ -d "$WT/feat/f56/target" ]] && pass "live-phase target/ never reclaimed (phase_live guard)" || fail "live phase target/ was reclaimed"
 
-echo "--- Test 11: A8 read-only-primary mount set in both launchers (F65.5) ---"
-# Static guard against a future blanket-RW $REPO_ROOT regression (RC-4). Each
-# launcher must carry the :ro parent plus the three RW overlays, and must NOT
-# carry an un-suffixed `-v "$REPO_ROOT":"$REPO_ROOT"` (blanket read-write).
+echo "--- Test 11: the read-only-primary mount, now the runner's to keep ---"
+# Static guard against a blanket-RW $REPO_ROOT regression: a container that can
+# write the primary checkout is how a past run silently corrupted the shared
+# tree. The mounts moved out of the pump and into the runner when launching
+# became a seam, so the guard follows them there.
+RUNNER_SH="$TP_ROOT/runners/claude-docker/runner.sh"
 assert_mounts() {  # <launcher-path> <label>
   local f="$1" label="$2"
-  grep -qF -- '-v "$REPO_ROOT":"$REPO_ROOT":ro' "$f" \
+  grep -qE -- '-v +"?\$(TP_)?REPO_ROOT"?:"?\$(TP_)?REPO_ROOT"?:ro' "$f" \
     && pass "$label: :ro primary mount present" || fail "$label: missing :ro primary mount"
-  grep -qF -- '-v "$REPO_ROOT/.git":"$REPO_ROOT/.git"' "$f" \
+  grep -qE -- '-v +"?\$(TP_)?REPO_ROOT/\.git"?:' "$f" \
     && pass "$label: .git RW overlay present" || fail "$label: missing .git RW overlay"
-  grep -qF -- '-v "$wt":"$wt"' "$f" \
+  grep -qE -- '-v +"?\$(TP_)?(WORKSPACE|wt)[A-Z_]*"?:' "$f" \
     && pass "$label: worktree RW overlay present" || fail "$label: missing worktree RW overlay"
-  grep -qF -- '-v "$REPO_ROOT/ops":"$REPO_ROOT/ops"' "$f" \
-    && pass "$label: ops RW overlay present" || fail "$label: missing ops RW overlay"
-  # Regression: a blanket `-v "$REPO_ROOT":"$REPO_ROOT"` not followed by `:` (so
-  # not the `:ro` line, and distinct from the /.git and /ops overlays).
-  if grep -Eq -- '-v "\$REPO_ROOT":"\$REPO_ROOT"[^:]' "$f"; then
-    fail "$label: blanket RW \$REPO_ROOT mount re-introduced (A8 regression)"
+  grep -qE -- '-v +"?\$(TP_LEDGER_REPO|TP_REPO_ROOT/ops|REPO_ROOT/ops)"?:' "$f" \
+    && pass "$label: ledger RW overlay present" || fail "$label: missing ledger RW overlay"
+  if grep -qE -- '-v +"?\$(TP_)?REPO_ROOT"?:"?\$(TP_)?REPO_ROOT"?( |$)' "$f"; then
+    fail "$label: blanket RW primary mount re-introduced"
   else
-    pass "$label: no blanket RW \$REPO_ROOT mount"
+    pass "$label: no blanket RW primary mount"
   fi
 }
-assert_mounts "$PUMP" "arachne-pump"
-# The matching run-parallel.sh assertions are deliberately gone: run-parallel.sh
-# is Arachne's bounded manifest launcher, stays in Arachne, and is slated for
-# deletion there — the pump's own --phases/--jobs covers what it did. The pump
-# is the only launcher TaskPump ships, so it is the only one to guard.
+if [[ -f "$RUNNER_SH" ]]; then
+  assert_mounts "$RUNNER_SH" "claude-docker runner"
+else
+  # The runner is built alongside this change on its own branch; until the two
+  # are integrated there is nothing here to read.
+  printf 'SKIP: mount guard — no runner at %s yet (lands on integration)\n' "$RUNNER_SH"
+fi
+# The pump must no longer carry mounts of its own: launching is the runner's.
+grep -qE -- '-v +"' "$PUMP" && fail "the pump still mounts things itself" \
+  || pass "the pump carries no container mounts"
+
+echo "--- Test 12b: the runner contract the pump exports ---"
+# The runner is a separate process, so every one of these has to be in the
+# environment. A name dropped here is a silent, launch-time-only failure.
+for v in TP_WORKSPACE TP_BRANCH TP_CONTAINER_NAME TP_IMAGE TP_ENTRYPOINT TP_TASK_ID \
+         TP_PHASE TP_MODEL TP_MAX_TURNS TP_REPO_ROOT TP_BRIEF TP_RESUME_NOTE \
+         TP_LEDGER_REPO TP_AGENT_HOME TP_AGENT_CONFIG TP_MEMORY_MAX TP_MEMORY_SWAP \
+         TP_DOCKER; do
+  grep -qF "$v=" "$PUMP" && pass "runner contract exports $v" || fail "runner contract missing $v"
+done
+# The legacy twins the in-container entrypoint still reads.
+for v in WORKSPACE_PATH REPO_ROOT ARACHNE_BRIEF ARACHNE_RESUME_NOTE ARACHNE_TASK_ID \
+         ARACHNE_PHASE MAX_TURNS AGENT_MODEL AGENT_MEMORY_MAX AGENT_MEMORY_SWAP \
+         GITHUB_TOKEN; do
+  grep -qF "$v=" "$PUMP" && pass "runner contract keeps the legacy $v" || fail "legacy twin missing: $v"
+done
 
 echo "--- Test 12: apl_fs_guard flags primary-source dirt, ignores allowlist (F65.5) ---"
 # shellcheck source=../lib/pump-lib.sh
