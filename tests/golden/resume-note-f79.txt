@@ -1,0 +1,58 @@
+# RESUME CONTEXT — read this before the kickoff brief below
+
+You are **resuming `F79.4`** on this worktree (`feat/f79`). A previous agent
+session claimed this task, committed real work, and then died without
+finishing it. Your job is to carry it to a conclusion.
+
+## Do NOT start by running `arachne-task next`
+
+`F79.4` is already claimed to this branch, so it is **invisible** to
+`next` and `ready` — both surface only `status: open` tasks. Calling
+`arachne-task next --phase F79` returns `null`, and reading that as
+"frontier drained" is precisely the stall that stranded this task.
+Read the task file directly instead:
+
+```
+cat ops/task-loop/tasks/F79.4.md
+```
+
+## Work already committed on this branch
+
+```
+<sha> feat(f79): sweep the mechanical lints
+<sha> feat(f79): the ratchet baseline
+```
+
+## Uncommitted state (`git status --short`, then `git diff --stat`)
+
+```
+?? c.txt
+```
+
+```
+```
+
+## How to finish
+
+Re-read the task's Spec / Scope / Acceptance, work out what the commits above
+already satisfy, and do the rest. Then pick exactly one of these three endings.
+**All three release the tasks blocked behind this one; leaving it claimed and
+unfinished does not** — that is what stalled the pump.
+
+1. **Finish it.** `scripts/arachne-task complete <id> --commits <shas>`, once
+   `cargo fmt --all` and `cargo clippy --workspace -- -D warnings` are clean and
+   the affected crates' tests pass.
+2. **Split it.** If part of the work is genuinely done and the remainder needs
+   judgement, a decision, or scope you cannot settle alone: `complete` the
+   finished portion — stating precisely what you did and did NOT do in the
+   completion notes — and file the remainder as a new task with
+   `scripts/arachne-task create <phase>.<n> --title "..." --goal "..."`, setting
+   its `blockers` if it depends on anything. If only the production wiring is
+   outstanding, `complete --defer-wiring "..."` instead.
+3. **Block it.** If it truly cannot proceed:
+   `scripts/arachne-task block <id> --reason "..."`.
+
+Do not hand-edit task frontmatter; the CLI is its only writer. Commit early and
+often — another interruption must not lose your work.
+
+---
