@@ -1,4 +1,11 @@
-# arachne-monitor — tabbed UI + layered task-DAG view
+# tp monitor — tabbed UI + layered task-DAG view
+
+> **Naming note (TaskPump extraction).** Written when these files lived in
+> Arachne's `scripts/`. Read `arachne-monitor` → `libexec/tp-monitor`,
+> `arachne-dag-render` → `libexec/tp-dag-render`, `test-arachne-monitor.sh` →
+> `tests/test-tp-monitor.sh`, and `.arachne-pump.state` → whatever
+> `TASKPUMP_PUMP_STATE_FILE` resolves to (that filename is still the default).
+> **The layout section here is superseded by `monitor-dag-v2.md`.**
 
 Design note for the `feat/monitor-dag-view` branch. Validated against the live
 F79 ledger (24 tasks, 7 layers, widest layer 12) on 2026-08-05.

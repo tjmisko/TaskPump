@@ -1219,6 +1219,56 @@ grep -q '▐' <<<"$(TASKPUMP_MONITOR_USAGE_WINDOWS='5h,7d' "$CLI" 2>/dev/null)" 
     && fail "drew a bar with no window data" || pass "an unreachable meter still draws no bars"
 make_usage_stub 30 40
 
+# ── Test 35: the GUI spawn argv, and the renderer's absence ─────────────────
+# Both were untested and both changed in the port: the terminal's argv is a
+# config key now, and the not-found message names the path it looked for. The
+# spawn is the one the ARACHNE_MONITOR_OPEN_CMD override BYPASSES, so Test 19
+# never reached it — a wrong argv here is invisible until someone presses o on
+# a real desktop.
+echo "--- Test 35: GUI spawn argv + missing renderer ---"
+cat >| "$BIN/faketerm" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$TMP/argv.txt"
+EOF
+chmod +x "$BIN/faketerm"
+spawn_argv() {  # $@ = extra env assignments → the argv faketerm was handed
+    : >| "$TMP/argv.txt"
+    env DISPLAY=:0 EDITOR=fake-ed TASKPUMP_MONITOR_TERM=faketerm \
+        TASKPUMP_PUMP_STATE_FILE="$GPS" TASKPUMP_TASKS_DIR="$GTD" \
+        TASKPUMP_MONITOR_REPO_ROOT="$TMP/spawnrepo" TASKPUMP_MONITOR_COLS=100 \
+        "$@" "$CLI" --tab graph --cursor F96.5 --moves o >/dev/null 2>&1
+    local i; for i in 1 2 3 4 5 6 7 8 9 10; do [[ -s "$TMP/argv.txt" ]] && break; sleep 0.2; done
+    cat "$TMP/argv.txt" 2>/dev/null
+}
+want="start --always-new-process --class arachne-task --cwd $TMP/spawnrepo -- fake-ed $GTD/F96.5.md"
+[[ "$(spawn_argv env)" == "$want" ]] \
+    && pass "the default GUI spawn argv is unchanged" \
+    || fail "spawn argv drifted:\n  got  $(spawn_argv env)\n  want $want"
+# --always-new-process is load-bearing: without it wezterm joins an existing
+# instance under the default class, where a windowrule cannot reach the window.
+grep -q -- '--always-new-process' <<<"$(spawn_argv env)" \
+    && pass "the default argv keeps --always-new-process" || fail "--always-new-process dropped"
+# A different terminal is a config change, not a code change.
+kitty_want="--app-id mytask --working-directory $TMP/spawnrepo -e fake-ed $GTD/F96.5.md"
+got=$(spawn_argv env TASKPUMP_MONITOR_TERM_ARGS='--app-id %CLASS% --working-directory %CWD% -e' \
+                     TASKPUMP_MONITOR_TASK_CLASS=mytask)
+[[ "$got" == "$kitty_want" ]] \
+    && pass "a custom terminal argv expands %CLASS% and %CWD%" \
+    || fail "custom argv wrong:\n  got  $got\n  want $kitty_want"
+
+# The renderer's two failure modes both degrade to a line rather than an abort.
+gmiss=$(TASKPUMP_DAG_BIN="$TMP/no-such-renderer" TASKPUMP_PUMP_STATE_FILE="$GPS" \
+        TASKPUMP_TASKS_DIR="$GTD" TASKPUMP_MONITOR_COLS=100 "$CLI" --tab graph 2>/dev/null | strip_ansi)
+grep -q "dag renderer not found: $TMP/no-such-renderer" <<<"$gmiss" \
+    && pass "a missing renderer names the path it looked for" || fail "missing-renderer line wrong:\n$gmiss"
+grep -q 'SESSIONS' <<<"$gmiss" && pass "...and the rest of the frame still renders" \
+    || fail "a missing renderer took the frame down"
+printf '#!/usr/bin/env bash\nexit 3\n' >| "$TMP/badrender"; chmod +x "$TMP/badrender"
+gfail=$(TASKPUMP_DAG_BIN="$TMP/badrender" TASKPUMP_PUMP_STATE_FILE="$GPS" \
+        TASKPUMP_TASKS_DIR="$GTD" TASKPUMP_MONITOR_COLS=100 "$CLI" --tab graph 2>/dev/null | strip_ansi)
+grep -q '(dag render failed)' <<<"$gfail" \
+    && pass "a failing renderer degrades to one line" || fail "render failure not reported:\n$gfail"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"
