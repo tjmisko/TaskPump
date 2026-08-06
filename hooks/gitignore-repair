@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# hooks/gitignore-repair — undo a tool's habit of re-ignoring the worktrees dir.
+#
+# THE PRE-TICK HOOK CONTRACT
+#   $1        the repo root
+#   stdout    anything worth telling the operator; the pump logs it, and
+#             notifies when the text CHANGES (so a persistent condition does not
+#             fire a desktop notification every tick)
+#   exit 0    fine
+#   non-zero  the pump warns and carries on with the tick
+#
+# What this repairs: the `gh worktree` extension appends a bare `.worktrees/`
+# line to .gitignore on every `worktree create`. Sitting after the intentional
+# `!.worktrees/` negations, it silently re-ignores every worktree — which hides
+# their files from ripgrep and from an agent's file search, and leaves the
+# primary checkout permanently dirty, which in turn makes the contamination
+# guard fire on every tick. A live run stalled on exactly that in 2026-06-24.
+#
+# Idempotent: a no-op unless the bad line is present. Says nothing when there is
+# nothing to repair, so it does not add a line to every tick's log.
+#
+# Configuration:
+#   TASKPUMP_WORKTREES_IGNORE_LINE   the line to strip (default `.worktrees/`)
+# HELP-END
+set -uo pipefail
+
+_tp_self_root="$(CDPATH= cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+# shellcheck source=../lib/config.sh
+. "$_tp_self_root/lib/config.sh"
+tp_load_config
+# shellcheck source=../lib/pump-lib.sh
+. "$TP_LIB_DIR/pump-lib.sh"
+
+[[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { apl_help "$0"; exit 0; }
+
+repo_root="${1:-${TP_REPO_ROOT:-$PWD}}"
+apl_repair_worktree_gitignore "$repo_root"
+exit 0

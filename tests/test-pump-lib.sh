@@ -189,6 +189,110 @@ out=$(ARACHNE_NOW_S=$NOW apl_host_token_stale "$CRED" 900); rc=$?
 [[ "$rc" -eq 10 ]] && pass "custom margin (900s) widens the pause window" \
   || fail "custom margin should pause; rc=$rc out='$out'"
 
+echo "--- agent identity: one prefix, one runtime, one enumeration ---"
+# The container-name prefix is the stack's join key. Its default must not drift
+# (tooling outside this repo greps for it), and it must be overridable in one
+# place rather than re-hardcoded per tool.
+[[ "$(apl_agent_prefix)" == "arachne-agent-" ]] \
+  && pass "default agent prefix is arachne-agent-" \
+  || fail "default prefix drifted: '$(apl_agent_prefix)'"
+[[ "$(TASKPUMP_AGENT_PREFIX=tp-agent- apl_agent_prefix)" == "tp-agent-" ]] \
+  && pass "TASKPUMP_AGENT_PREFIX overrides the prefix" \
+  || fail "prefix override ignored"
+
+# The runtime override was the real defect: three of the five enumerations
+# called `docker` literally, so a harness that stubbed it still hit the daemon.
+cat >| "$BIN/fake-runtime" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == "ps" ]]; then printf '%s\n' "${STUB_NAMES:-}"; exit 0; fi
+exit 0
+EOF
+chmod +x "$BIN/fake-runtime"
+[[ "$(TASKPUMP_DOCKER="$BIN/fake-runtime" apl_docker)" == "$BIN/fake-runtime" ]] \
+  && pass "TASKPUMP_DOCKER selects the container runtime" \
+  || fail "TASKPUMP_DOCKER ignored"
+[[ "$(DOCKER="$BIN/fake-runtime" apl_docker)" == "$BIN/fake-runtime" ]] \
+  && pass "legacy DOCKER still selects the container runtime" \
+  || fail "legacy DOCKER ignored"
+
+mixed=$'arachne-agent-feat-a\nsome-other-container\narachne-agent-feat-b'
+got=$(DOCKER="$BIN/fake-runtime" STUB_NAMES="$mixed" apl_live_agent_names | tr '\n' ' ')
+[[ "$got" == "arachne-agent-feat-a arachne-agent-feat-b " ]] \
+  && pass "live enumeration keeps only prefixed containers" \
+  || fail "unexpected enumeration: '$got'"
+got=$(DOCKER="$BIN/fake-runtime" STUB_NAMES="$mixed" apl_live_agent_slugs | tr '\n' ' ')
+[[ "$got" == "feat-a feat-b " ]] \
+  && pass "slugs are names minus the prefix" \
+  || fail "unexpected slugs: '$got'"
+renamed=$'tp-agent-feat-a\narachne-agent-feat-b'
+got=$(TASKPUMP_AGENT_PREFIX=tp-agent- DOCKER="$BIN/fake-runtime" STUB_NAMES="$renamed" apl_live_agent_slugs | tr '\n' ' ')
+[[ "$got" == "feat-a " ]] \
+  && pass "a custom prefix selects and strips consistently" \
+  || fail "custom prefix enumeration: '$got'"
+
+echo "--- pool cap: one shared fallback, not three private ones ---"
+CAP_FILE="$TMP/absent-cap"
+[[ "$(JOBS=4 apl_read_cap)" == "4" ]] && pass "caller's JOBS wins when no cap file exists" \
+  || fail "expected 4 got '$(JOBS=4 apl_read_cap)'"
+got=$(unset JOBS; apl_read_cap)
+[[ "$got" == "6" ]] && pass "no JOBS at all falls back to TASKPUMP_JOBS_FALLBACK (6)" \
+  || fail "expected the shared fallback 6, got '$got'"
+got=$(unset JOBS; TASKPUMP_JOBS_FALLBACK=9 apl_read_cap)
+[[ "$got" == "9" ]] && pass "TASKPUMP_JOBS_FALLBACK is configurable" \
+  || fail "expected 9 got '$got'"
+
+echo "--- help extraction: a marker, not a line range ---"
+# `sed -n '2,40p' "$0"` truncated the moment anyone edited a header, silently.
+cat >| "$TMP/helpy" <<'EOF'
+#!/usr/bin/env bash
+# a tool that does something
+#   --flag   does the thing
+# HELP-END
+# this internal note must NOT reach --help
+set -e
+EOF
+got="$(apl_help "$TMP/helpy")"
+[[ "$got" == $'a tool that does something\n  --flag   does the thing' ]] \
+  && pass "help stops at HELP-END and strips the comment prefix" \
+  || fail "unexpected help text: '$got'"
+printf '#!/usr/bin/env bash\n# only line\nset -e\n' >| "$TMP/helpy2"
+[[ "$(apl_help "$TMP/helpy2")" == "only line" ]] \
+  && pass "help ends at the first non-comment line when unmarked" \
+  || fail "unmarked help extraction wrong"
+
+echo "--- Test 27: the integration trunk's own run files are not contamination ---"
+# The first --integration-trunk run creates two untracked files in the repo
+# root. They were in neither .gitignore nor the guard's allowlist, so every tick
+# for the rest of the drain reported a dirty primary checkout.
+FSG="$TMP/fsg"; mkdir -p "$FSG"
+git -C "$FSG" init -q -b main
+git -C "$FSG" config user.name t; git -C "$FSG" config user.email t@t
+printf 'x\n' >| "$FSG/tracked.txt"; git -C "$FSG" add -A; git -C "$FSG" -c commit.gpgsign=false commit -qm seed
+[[ -z "$(apl_fs_guard "$FSG")" ]] && pass "a clean checkout is silent" || fail "clean checkout reported dirty"
+: >| "$FSG/.auto-trunk.lock"
+: >| "$FSG/.auto-trunk-quarantine"
+[[ -z "$(apl_fs_guard "$FSG")" ]] && pass "the trunk lock and quarantine file are allowlisted" \
+  || fail "trunk run files reported as contamination: $(apl_fs_guard "$FSG")"
+printf 'edited\n' >| "$FSG/tracked.txt"
+[[ -n "$(apl_fs_guard "$FSG")" ]] && pass "a real source edit is still reported" \
+  || fail "source edit went unreported"
+
+echo "--- gitignore repair: the ignore line is a knob, anchored and escaped ---"
+GI="$TMP/gi"; mkdir -p "$GI"
+printf '!.worktrees/\n!.worktrees/**\ntarget/\n.worktrees/\n' >| "$GI/.gitignore"
+apl_repair_worktree_gitignore "$GI"
+grep -qxF '.worktrees/' "$GI/.gitignore" && fail "the bare re-ignore line survived" \
+  || pass "the bare re-ignore line is stripped"
+grep -qxF '!.worktrees/' "$GI/.gitignore" && pass "the negations are left alone" \
+  || fail "a negation was stripped too"
+grep -qxF 'target/' "$GI/.gitignore" && pass "unrelated lines are left alone" \
+  || fail "an unrelated line was stripped"
+printf 'build/wt/\n!build/wt/**\n' >| "$GI/.gitignore"
+TASKPUMP_WORKTREES_IGNORE_LINE='build/wt/' apl_repair_worktree_gitignore "$GI"
+grep -qxF 'build/wt/' "$GI/.gitignore" && fail "a configured ignore line was not stripped" \
+  || pass "TASKPUMP_WORKTREES_IGNORE_LINE picks the line to strip"
+grep -qxF '!build/wt/**' "$GI/.gitignore" && pass "its negation survives" || fail "negation stripped"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"

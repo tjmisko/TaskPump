@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# gates/claude-token-fresh — pause launching when the HOST's OAuth access token
+# is about to expire.
+#
+# THE GATE CONTRACT
+#   stdout   a one-line reason, when pausing
+#   exit 0   feed OK
+#   exit 10  pause launching (running agents are never touched)
+#   other    treated as a broken gate: the pump warns and feeds anyway
+#
+# Why this exists: launched containers are given the host's ACCESS token with
+# the refresh token stripped out, so they cannot rotate it. That is deliberate —
+# the refresh token rotates on use and the host's copy is mounted read-only, so
+# a container-side refresh would log the host out. The consequence is that the
+# host owns rotation, and a container launched against an already-expired token
+# just 401s and burns a relaunch cycle. So: pause launching while the token is
+# within a margin of expiry, and resume once a host-side session writes a fresh
+# one back.
+#
+# Configuration:
+#   TASKPUMP_TOKEN_GATE       0 disables the gate (default 1)
+#   TASKPUMP_TOKEN_MARGIN_S   seconds of headroom before expiry (default 600)
+#   TASKPUMP_CREDENTIALS      credentials file (default ~/.claude/.credentials.json)
+#   TASKPUMP_NOW_S            clock override, for tests
+#
+# Fails open everywhere: a missing file, absent jq, or an unreadable expiry all
+# feed. A meter we cannot read must never wedge the pump.
+# HELP-END
+set -uo pipefail
+
+_tp_self_root="$(CDPATH= cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+# shellcheck source=../lib/config.sh
+. "$_tp_self_root/lib/config.sh"
+tp_load_config
+# shellcheck source=../lib/pump-lib.sh
+. "$TP_LIB_DIR/pump-lib.sh"
+
+[[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { apl_help "$0"; exit 0; }
+
+CRED="${TASKPUMP_CREDENTIALS:-$HOME/.claude/.credentials.json}"
+
+reason="$(apl_host_token_stale "$CRED")" || rc=$?
+rc="${rc:-0}"
+if [[ "$rc" -eq 10 ]]; then
+  printf '%s\n' "$reason"
+  exit 10
+fi
+exit 0

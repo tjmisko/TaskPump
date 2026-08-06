@@ -1,0 +1,14 @@
+# TaskPump's own run state. These are created in the root of whatever repo the
+# pump drives; they are listed here too because TaskPump is itself a repo a pump
+# can be pointed at, and because the contamination guard's allowlist and this
+# file have to agree — a run file that is tracked here but allowlisted there is
+# a dirty tree nobody notices, and one that is neither is a warning every tick.
+.arachne-pump.state
+.arachne-pump.log
+.arachne-pool-cap
+.arachne-usage-reset
+.arachne-fsguard.notified
+.arachne-disk-watchdog.log
+.arachne-agent-watchdog.log
+.auto-trunk.lock
+.auto-trunk-quarantine

@@ -79,6 +79,8 @@ EOF
 }
 
 pump() { "$PUMP" --no-health-gate --dry-run --phases "$1" "${@:2}"; }
+# The default pre-tick chain, read out of the pump rather than re-listed here.
+default_hooks_of_pump() { sed -n '/^default_pre_tick_hooks()/,/^}/p' "$PUMP"; }
 
 # Contiguous range F55..F57 (no phase gaps), with a cross-phase blocker:
 #   F55.0 root → F55.1 (in-phase dep) ; F56.0 root ; F57.0 waits on F55.1 (cross-phase)
@@ -151,8 +153,8 @@ NOTIFY="$TMP/notify.txt"; : >| "$NOTIFY"
 pump_tick() {  # $1=phases ; extra env via caller
   # Suppress real desktop notifications by default (the fs-guard now runs in
   # do_tick and would notify-send against this dirty worktree); a caller can
-  # still override ARACHNE_NOTIFY_CMD to capture, as the drain test does.
-  ARACHNE_NOTIFY_CMD="${ARACHNE_NOTIFY_CMD:-true}" \
+  # still override TASKPUMP_NOTIFY_CMD to capture, as the drain test does.
+  TASKPUMP_NOTIFY_CMD="${TASKPUMP_NOTIFY_CMD:-true}" \
   ARACHNE_PUMP_NO_LAUNCH=1 \
   ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
   ARACHNE_PUMP_STATE_FILE="$STATE" \
@@ -175,9 +177,9 @@ STUB_GATE_RC=10 pump_tick F55..F57 --once >/dev/null 2>&1
 
 # 8c: a fully-drained range exits → status=drained + one notification.
 mk F55.0 done; mk F55.1 done; mk F56.0 done; mk F57.0 done
-STUB_GATE_RC=0 ARACHNE_NOTIFY_CMD="tee -a $NOTIFY" pump_tick F55..F57 >/dev/null 2>&1
+STUB_GATE_RC=0 TASKPUMP_NOTIFY_CMD="tee -a $NOTIFY" pump_tick F55..F57 >/dev/null 2>&1
 [[ "$(jq -r '.status' "$STATE" 2>/dev/null)" == "drained" ]] && pass "state.status = drained when range empties" || fail "state.status not drained: $(cat "$STATE" 2>/dev/null)"
-grep -qi 'drained' "$NOTIFY" && pass "drain notification fired via ARACHNE_NOTIFY_CMD" || fail "no drain notification: $(cat "$NOTIFY" 2>/dev/null)"
+grep -qi 'drained' "$NOTIFY" && pass "drain notification fired via TASKPUMP_NOTIFY_CMD" || fail "no drain notification: $(cat "$NOTIFY" 2>/dev/null)"
 
 # 8d: restart detection logs a resume for the same range.
 out=$(STUB_GATE_RC=0 pump_tick F55..F57 --once 2>&1 >/dev/null; STUB_GATE_RC=0 pump_tick F55..F57 --once 2>&1)
@@ -232,7 +234,7 @@ plant_target() {  # fake done-phase worktree with a target/ dir + sentinel
 }
 reclaim_tick() {  # one real tick with the reclaim sweep active, fixture-wired
   PATH="$BIN:$PATH" \
-  ARACHNE_NOTIFY_CMD="${ARACHNE_NOTIFY_CMD:-true}" \
+  TASKPUMP_NOTIFY_CMD="${TASKPUMP_NOTIFY_CMD:-true}" \
   ARACHNE_PUMP_WORKTREES_DIR="$WT" \
   ARACHNE_PUMP_NO_LAUNCH=1 \
   ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
@@ -259,33 +261,66 @@ plant_target
 STUB_GATE_RC=0 ARACHNE_DISK_RECLAIM=1 STUB_LIVE="arachne-agent-feat-f56" reclaim_tick --phases F56 --once >/dev/null 2>&1
 [[ -d "$WT/feat/f56/target" ]] && pass "live-phase target/ never reclaimed (phase_live guard)" || fail "live phase target/ was reclaimed"
 
-echo "--- Test 11: A8 read-only-primary mount set in both launchers (F65.5) ---"
-# Static guard against a future blanket-RW $REPO_ROOT regression (RC-4). Each
-# launcher must carry the :ro parent plus the three RW overlays, and must NOT
-# carry an un-suffixed `-v "$REPO_ROOT":"$REPO_ROOT"` (blanket read-write).
+echo "--- Test 11: the read-only-primary mount, now the runner's to keep ---"
+# Static guard against a blanket-RW $REPO_ROOT regression: a container that can
+# write the primary checkout is how a past run silently corrupted the shared
+# tree. The mounts moved out of the pump and into the runner when launching
+# became a seam, so the guard follows them there.
+# Overridable so this guard can be validated against the runner while it still
+# lives on another branch (git show gen/runner:runners/... > /tmp/runner.sh).
+RUNNER_SH="${TEST_RUNNER_SH:-$TP_ROOT/runners/claude-docker/runner.sh}"
+# The runner holds the repo root in a LOWER-CASE local: `local REPO_ROOT` would
+# blank the inherited value before the legacy fallback could read it. So each
+# pattern accepts either spelling rather than pinning one.
 assert_mounts() {  # <launcher-path> <label>
   local f="$1" label="$2"
-  grep -qF -- '-v "$REPO_ROOT":"$REPO_ROOT":ro' "$f" \
+  local root='\$(TP_REPO_ROOT|REPO_ROOT|repo_root)'
+  local work='\$(TP_WORKSPACE|WORKSPACE_PATH|workspace|wt)'
+  local ledger='\$(TP_LEDGER_REPO|ledger_repo|(TP_REPO_ROOT|REPO_ROOT|repo_root)/ops)'
+  grep -qE -- "-v +\"?$root\"?:\"?$root\"?:ro" "$f" \
     && pass "$label: :ro primary mount present" || fail "$label: missing :ro primary mount"
-  grep -qF -- '-v "$REPO_ROOT/.git":"$REPO_ROOT/.git"' "$f" \
+  grep -qE -- "-v +\"?$root/\\.git\"?:" "$f" \
     && pass "$label: .git RW overlay present" || fail "$label: missing .git RW overlay"
-  grep -qF -- '-v "$wt":"$wt"' "$f" \
+  grep -qE -- "-v +\"?$work\"?:" "$f" \
     && pass "$label: worktree RW overlay present" || fail "$label: missing worktree RW overlay"
-  grep -qF -- '-v "$REPO_ROOT/ops":"$REPO_ROOT/ops"' "$f" \
-    && pass "$label: ops RW overlay present" || fail "$label: missing ops RW overlay"
-  # Regression: a blanket `-v "$REPO_ROOT":"$REPO_ROOT"` not followed by `:` (so
-  # not the `:ro` line, and distinct from the /.git and /ops overlays).
-  if grep -Eq -- '-v "\$REPO_ROOT":"\$REPO_ROOT"[^:]' "$f"; then
-    fail "$label: blanket RW \$REPO_ROOT mount re-introduced (A8 regression)"
+  grep -qE -- "-v +\"?$ledger\"?:" "$f" \
+    && pass "$label: ledger RW overlay present" || fail "$label: missing ledger RW overlay"
+  # The terminator must be whitespace, a line continuation, or end of line.
+  # A bare [^:] backtracks: it lets the optional closing quote match empty and
+  # then matches the quote itself, so the legitimate `:"$root":ro` line reads as
+  # a blanket mount. Verified in both directions against the real runner.
+  if grep -qE -- "-v +\"?$root\"?:\"?$root\"?([[:space:]\\\\]|\$)" "$f"; then
+    fail "$label: blanket RW primary mount re-introduced"
   else
-    pass "$label: no blanket RW \$REPO_ROOT mount"
+    pass "$label: no blanket RW primary mount"
   fi
 }
-assert_mounts "$PUMP" "arachne-pump"
-# The matching run-parallel.sh assertions are deliberately gone: run-parallel.sh
-# is Arachne's bounded manifest launcher, stays in Arachne, and is slated for
-# deletion there — the pump's own --phases/--jobs covers what it did. The pump
-# is the only launcher TaskPump ships, so it is the only one to guard.
+if [[ -f "$RUNNER_SH" ]]; then
+  assert_mounts "$RUNNER_SH" "claude-docker runner"
+else
+  # The runner is built alongside this change on its own branch; until the two
+  # are integrated there is nothing here to read.
+  printf 'SKIP: mount guard — no runner at %s yet (lands on integration)\n' "$RUNNER_SH"
+fi
+# The pump must no longer carry mounts of its own: launching is the runner's.
+grep -qE -- '-v +"' "$PUMP" && fail "the pump still mounts things itself" \
+  || pass "the pump carries no container mounts"
+
+echo "--- Test 12b: the runner contract the pump exports ---"
+# The runner is a separate process, so every one of these has to be in the
+# environment. A name dropped here is a silent, launch-time-only failure.
+for v in TP_WORKSPACE TP_BRANCH TP_CONTAINER_NAME TP_IMAGE TP_ENTRYPOINT TP_TASK_ID \
+         TP_PHASE TP_MODEL TP_MAX_TURNS TP_REPO_ROOT TP_BRIEF TP_RESUME_NOTE \
+         TP_LEDGER_REPO TP_CLAUDE_DIR TP_CLAUDE_JSON TP_MEMORY_MAX TP_MEMORY_SWAP \
+         TP_DOCKER TP_AGENT_LOG_NAME TP_GOAL_NOTE_NAME TP_TASKS_DIR; do
+  grep -qF "$v=" "$PUMP" && pass "runner contract exports $v" || fail "runner contract missing $v"
+done
+# The legacy twins the in-container entrypoint still reads.
+for v in WORKSPACE_PATH REPO_ROOT ARACHNE_BRIEF ARACHNE_RESUME_NOTE ARACHNE_TASK_ID \
+         ARACHNE_PHASE MAX_TURNS AGENT_MODEL AGENT_MEMORY_MAX AGENT_MEMORY_SWAP \
+         CLAUDE_DIR CLAUDE_JSON GITHUB_TOKEN; do
+  grep -qF "$v=" "$PUMP" && pass "runner contract keeps the legacy $v" || fail "legacy twin missing: $v"
+done
 
 echo "--- Test 12: apl_fs_guard flags primary-source dirt, ignores allowlist (F65.5) ---"
 # shellcheck source=../lib/pump-lib.sh
@@ -319,7 +354,7 @@ echo "--- Test 13: integration trunk — selection, build-gate, conflict (A3 v0)
 # drive branch-exists / already-integrated / conflict / build-red.
 QFILE="$TMP/quarantine"; ISTATE="$TMP/ipump.state"
 itick() {  # integration dry-run --once tick: $1=phases ; extra env via caller
-  ARACHNE_NOTIFY_CMD="${ARACHNE_NOTIFY_CMD:-true}" \
+  TASKPUMP_NOTIFY_CMD="${TASKPUMP_NOTIFY_CMD:-true}" \
   ARACHNE_PUMP_NO_LAUNCH=1 \
   ARACHNE_PUMP_INTEGRATE_DRYRUN=1 \
   ARACHNE_PUMP_QUARANTINE_FILE="$QFILE" \
@@ -365,7 +400,7 @@ grep -qE '^F55 .*conflict$' "$QFILE" && pass "quarantine marker written for conf
 # 13f: --integration-trunk OFF ⇒ no integration whatsoever (opt-out regression).
 : >| "$QFILE"
 out=$(STUB_GATE_RC=0 ARACHNE_PUMP_BUILD_CMD='false' \
-  ARACHNE_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 ARACHNE_PUMP_INTEGRATE_DRYRUN=1 \
+  TASKPUMP_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 ARACHNE_PUMP_INTEGRATE_DRYRUN=1 \
   ARACHNE_PUMP_QUARANTINE_FILE="$QFILE" ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
   ARACHNE_PUMP_STATE_FILE="$ISTATE" ARACHNE_POOL_CAP_FILE="$TMP/cap" \
   ARACHNE_PUMP_LOG="$TMP/pump.log" ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
@@ -470,7 +505,7 @@ EOF
 }
 status_of() { sed -n 's/^status: *//p' "$TASKS/$1.md" | head -1; }
 claim_tick() {  # $1 = phases ; STUB_LIVE/STUB_AHEAD supplied by caller
-  PATH="$BIN:$PATH" ARACHNE_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 \
+  PATH="$BIN:$PATH" TASKPUMP_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 \
   ARACHNE_CLAIM_STALE_HOURS=99999 ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
   ARACHNE_PUMP_STATE_FILE="$STATE17" ARACHNE_POOL_CAP_FILE="$TMP/cap" \
   ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
@@ -505,7 +540,7 @@ echo "--- Test 18: scrub integrity findings reach the pump log with their paths 
 # could not tell a corrupt ledger from scrub itself crashing.
 STATE18="$TMP/pump18.state"
 tick18() {
-  ARACHNE_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 \
+  TASKPUMP_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 \
   ARACHNE_PUMP_OPS_DIR="$TMP/noops" ARACHNE_PUMP_STATE_FILE="$STATE18" \
   ARACHNE_POOL_CAP_FILE="$TMP/cap" ARACHNE_PUMP_LOG="$TMP/pump18.log" \
   ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
@@ -568,7 +603,7 @@ EOF
 chmod +x "$BIN/git"
 STATE19="$TMP/pump19.state"
 rtick() {  # one --once tick over F97; extra flags forwarded
-  PATH="$BIN:$PATH" ARACHNE_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 \
+  PATH="$BIN:$PATH" TASKPUMP_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 \
   ARACHNE_CLAIM_STALE_HOURS=99999 ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
   ARACHNE_PUMP_STATE_FILE="$STATE19" ARACHNE_POOL_CAP_FILE="$TMP/cap" \
   ARACHNE_PUMP_LOG="$TMP/pump19.log" ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
@@ -624,7 +659,7 @@ have "$out" 'resuming F97' && fail "resumed a foreign-branch claim:\n$out" || pa
 # the RESUME arm was tested ahead of `oc`, this phase was classified DONE and
 # is_drained declared the range finished over committed, unfinished work.
 rm -f "$TASKS"/*.md; mk F97.0 done; mkclaim F97.1 feat/f97
-out=$(PATH="$BIN:$PATH" ARACHNE_NOTIFY_CMD=true ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
+out=$(PATH="$BIN:$PATH" TASKPUMP_NOTIFY_CMD=true ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
       ARACHNE_PUMP_STATE_FILE="$STATE19" ARACHNE_POOL_CAP_FILE="$TMP/cap" \
       ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" STUB_LIVE="" STUB_AHEAD=3 STUB_HEAD=aaaa111 \
       "$PUMP" --no-health-gate --dry-run --phases F97 2>&1)
@@ -666,7 +701,7 @@ have "$note" 'Split it' && pass "note authorises split-and-unblock" || fail "not
 stall_fixture
 for _ in 1 2 3; do STUB_LIVE="" STUB_AHEAD=3 STUB_HEAD=9999aaa rtick >/dev/null 2>&1; done
 rc=0
-out=$(PATH="$BIN:$PATH" ARACHNE_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 \
+out=$(PATH="$BIN:$PATH" TASKPUMP_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 \
       ARACHNE_CLAIM_STALE_HOURS=99999 ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
       ARACHNE_PUMP_STATE_FILE="$STATE19" ARACHNE_POOL_CAP_FILE="$TMP/cap" \
       ARACHNE_PUMP_LOG="$TMP/pump19.log" ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
@@ -726,8 +761,293 @@ out=$(PATH="$BIN:$PATH" ARACHNE_PUMP_MONITOR=0 ARACHNE_MONITOR_BIN="$BIN/fake-mo
       ARACHNE_TASKS_DIR="$TASKS" timeout 60 "$PUMP" --phases F98 --detach 2>&1) || true
 have "$out" 'not a tty' && fail "ARACHNE_PUMP_MONITOR=0 ignored:\n$out" \
                         || pass "ARACHNE_PUMP_MONITOR=0 opts out"
-have "$(sed -n '2,60p' "$PUMP")" 'no-monitor' && pass "--no-monitor is documented in --help" \
-                                              || fail "--no-monitor missing from the help block"
+have "$("$PUMP" --help)" 'no-monitor' && pass "--no-monitor is documented in --help" \
+                                      || fail "--no-monitor missing from the help block"
+
+echo "--- Test 20: naming and layout knobs, all defaulting to today's values ---"
+mk F55.0 open; mk F55.1 open F55.0; mk F56.0 open; mk F57.0 open F55.1
+# Branch and container naming are what join the ledger, the worktrees, and the
+# live-container check. They used to be literals in five places each.
+out=$(pump F56)
+have "$out" 'LAUNCH +F56 +-> feat/f56' && pass "default branch prefix is feat/" \
+  || fail "default branch naming changed:\n$out"
+out=$(TASKPUMP_BRANCH_PREFIX="epic/" pump F56)
+have "$out" 'LAUNCH +F56 +-> epic/f56' && pass "TASKPUMP_BRANCH_PREFIX renames the branch" \
+  || fail "branch prefix override ignored:\n$out"
+# A live container is matched through the same prefix, so renaming one without
+# the other must not silently mark a running phase launchable.
+out=$(STUB_LIVE="tp-agent-feat-f56" TASKPUMP_AGENT_PREFIX="tp-agent-" pump F56)
+have "$out" 'RUNNING +F56' && pass "TASKPUMP_AGENT_PREFIX drives the liveness join" \
+  || fail "agent prefix override ignored:\n$out"
+out=$(STUB_LIVE="tp-agent-feat-f56" pump F56)
+have "$out" 'LAUNCH +F56' && pass "a container under another prefix is not ours" \
+  || fail "foreign container claimed as ours:\n$out"
+
+echo "--- Test 21: brief-template resolution — explicit, consumer, shipped ---"
+# The consumer's own template lives in its ledger. Absent an explicit override
+# it wins, which is how an existing project keeps rendering exactly what it did.
+RES="$TMP/resolve"; mkdir -p "$RES/ops/task-loop/briefs"
+printf 'consumer template for {{PHASE}}\n' >| "$RES/ops/task-loop/briefs/_phase-drain-template.md"
+out=$(ARACHNE_PUMP_OPS_DIR="$RES/ops" "$PUMP" --render-brief F55 2>&1)
+[[ "$out" == "consumer template for F55" ]] && pass "consumer's ops-side template is used when present" \
+  || fail "consumer template not chosen: '$out'"
+printf 'explicit template for {{PHASE}}\n' >| "$TMP/explicit.md"
+out=$(ARACHNE_PUMP_OPS_DIR="$RES/ops" TASKPUMP_BRIEF_TEMPLATE="$TMP/explicit.md" \
+      "$PUMP" --render-brief F55 2>&1)
+[[ "$out" == "explicit template for F55" ]] && pass "explicit config outranks the consumer template" \
+  || fail "explicit template not chosen: '$out'"
+# No consumer template at all used to be a hard die, which left a fresh project
+# unable to run until it wrote one. It now falls through to the shipped default.
+out=$(ARACHNE_PUMP_OPS_DIR="$TMP/no-such-ops" "$PUMP" --render-brief F55 2>&1)
+grep -qF 'F55' <<<"$out" && pass "a project with no template falls back to the shipped one" \
+  || fail "shipped fallback did not render:\n$out"
+grep -qiF 'not found' <<<"$out" && fail "still dying on a missing consumer template:\n$out" \
+  || pass "no hard die on a missing consumer template"
+
+echo "--- Test 22: TASKPUMP_STATE_DIR relocates the run's dotfiles ---"
+SD="$TMP/state-dir"; mkdir -p "$SD"
+mk F55.0 done; mk F55.1 done; mk F56.0 done; mk F57.0 done
+TASKPUMP_NOTIFY_CMD=true TASKPUMP_PUMP_NO_LAUNCH=1 ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
+  TASKPUMP_STATE_DIR="$SD" ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+  "$PUMP" --no-health-gate --phases F55..F57 --once >/dev/null 2>&1
+[[ -f "$SD/.arachne-pump.state" ]] && pass "state file follows TASKPUMP_STATE_DIR" \
+  || fail "state file not written under $SD"
+[[ -f "$SD/.arachne-pool-cap" ]] && pass "pool-cap file follows TASKPUMP_STATE_DIR" \
+  || fail "cap file not written under $SD"
+# An individual filename still overrides the directory.
+TASKPUMP_NOTIFY_CMD=true TASKPUMP_PUMP_NO_LAUNCH=1 ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
+  TASKPUMP_STATE_DIR="$SD" TASKPUMP_PUMP_STATE_FILE="$TMP/named.state" \
+  ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+  "$PUMP" --no-health-gate --phases F55..F57 --once >/dev/null 2>&1
+[[ -f "$TMP/named.state" ]] && pass "an explicit state filename outranks the state dir" \
+  || fail "TASKPUMP_PUMP_STATE_FILE ignored"
+mk F55.0 open; mk F55.1 open F55.0; mk F56.0 open; mk F57.0 open F55.1
+
+echo "--- Test 23: templates carry the prose, and every project word is a key ---"
+# The shipped brief must not smuggle one project's vocabulary into another's.
+out=$(ARACHNE_PUMP_OPS_DIR="$TMP/no-such-ops" \
+      TASKPUMP_TASK_CLI="bin/tp task" \
+      TASKPUMP_VERIFY_CMDS=$'make lint\nmake test' \
+      TASKPUMP_PROJECT_BRIEF="Read HACKING.md first." \
+      "$PUMP" --render-brief F55 2>&1)
+grep -qF 'bin/tp task next' <<<"$out" && pass "TASKPUMP_TASK_CLI reaches the brief" \
+  || fail "task CLI not substituted:\n$out"
+grep -qF '`make lint` and `make test`' <<<"$out" && pass "verify commands render as an inline phrase" \
+  || fail "verify commands not joined:\n$out"
+grep -qF 'Read HACKING.md first.' <<<"$out" && pass "TASKPUMP_PROJECT_BRIEF reaches the brief" \
+  || fail "project brief not substituted:\n$out"
+grep -qiE 'cargo|arachne|CLAUDE\.md' <<<"$out" \
+  && fail "the shipped brief still names one project:\n$out" \
+  || pass "the shipped brief names no particular project"
+grep -qF '{{' <<<"$out" && fail "unsubstituted placeholder left in the brief:\n$out" \
+  || pass "no placeholder survives rendering"
+
+# Same for the resume note, which is what a stalled agent reads first.
+stall_fixture
+note=$(PATH="$BIN:$PATH" ARACHNE_PUMP_OPS_DIR="$TMP/noops" ARACHNE_POOL_CAP_FILE="$TMP/cap" \
+       ARACHNE_PUMP_STATE_FILE="$STATE19" ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+       TASKPUMP_TASK_CLI="bin/tp task" TASKPUMP_VERIFY_CMDS="make check" \
+       STUB_LIVE="" STUB_AHEAD=3 STUB_HEAD=aaaa111 \
+       "$PUMP" --no-health-gate --render-resume-note F97 2>/dev/null)
+grep -qF 'bin/tp task complete' <<<"$note" && pass "resume note uses the configured task CLI" \
+  || fail "resume note kept the default CLI:\n$note"
+grep -qF '`bin/tp task` next' <<<"$note" && fail "bare CLI name should be the basename:\n$note" \
+  || pass "prose uses the CLI basename, invocations use the full path"
+grep -qF '`make check` are clean' <<<"$note" && pass "resume note uses the configured verify commands" \
+  || fail "resume note kept cargo:\n$note"
+grep -qF '{{' <<<"$note" && fail "unsubstituted placeholder left in the resume note:\n$note" \
+  || pass "no placeholder survives the resume note"
+
+echo "--- Test 24: the feed gate is a pluggable, fail-open chain ---"
+GBIN="$TMP/gates"; mkdir -p "$GBIN"
+mkgate() {  # mkgate <name> <exit> <message>
+  cat >| "$GBIN/$1" <<EOF
+#!/usr/bin/env bash
+echo "$3"
+exit $2
+EOF
+  chmod +x "$GBIN/$1"
+}
+mkgate feed-ok      0  "nothing to say"
+mkgate pause-quota 10  "quota exhausted, retrying after reset"
+mkgate pause-second 10 "the second gate would also pause"
+mkgate broken       7  "the meter is on fire"
+mkgate prefixed    10  "prefixed: reason after the tool name"
+
+gate_plan() { TASKPUMP_GATES="$1" pump F56; }
+
+out=$(gate_plan "$GBIN/feed-ok")
+have "$out" 'GATE: feed-ok' && pass "a chain of one passing gate feeds" || fail "custom chain blocked:\n$out"
+out=$(gate_plan "$GBIN/pause-quota")
+have "$out" 'GATE: PAUSED — quota exhausted' && pass "a custom gate's reason reaches the plan" \
+  || fail "custom gate reason missing:\n$out"
+
+# Order decides which reason the operator reads, so it has to be honored.
+out=$(gate_plan "$(printf '%s\n%s\n' "$GBIN/pause-quota" "$GBIN/pause-second")")
+have "$out" 'quota exhausted' && pass "the first pausing gate wins" || fail "chain order ignored:\n$out"
+out=$(gate_plan "$(printf '%s\n%s\n' "$GBIN/pause-second" "$GBIN/pause-quota")")
+have "$out" 'the second gate would also pause' && pass "reordering changes which reason wins" \
+  || fail "chain order ignored on reverse:\n$out"
+
+# Fail-open is the whole safety story: a broken gate must not halt a multi-day
+# drain, and it must say so rather than failing silently.
+out=$(gate_plan "$(printf '%s\n%s\n' "$GBIN/broken" "$GBIN/feed-ok")" 2>&1)
+have "$out" 'GATE: feed-ok' && pass "a gate that errors fails OPEN" || fail "broken gate halted feeding:\n$out"
+have "$out" 'failed \(rc=7\)' && pass "a broken gate is reported, not swallowed" || fail "no warning for a broken gate:\n$out"
+out=$(gate_plan "$GBIN/not-a-real-gate" 2>&1)
+have "$out" 'gate not executable' && pass "a missing gate is reported" || fail "missing gate silent:\n$out"
+have "$out" 'GATE: feed-ok' && pass "a missing gate fails OPEN" || fail "missing gate halted feeding:\n$out"
+
+# A tool that prefixes every diagnostic with its own name should not have to
+# special-case this path.
+out=$(gate_plan "$GBIN/prefixed")
+have "$out" 'GATE: PAUSED — reason after the tool name' && pass "a leading tool-name prefix is stripped" \
+  || fail "prefix not stripped:\n$out"
+
+# The shipped example is a working no-op, so copying it cannot break a chain.
+out=$(gate_plan "$TP_ROOT/gates/example-gate")
+have "$out" 'GATE: feed-ok' && pass "the shipped example gate is a no-op" || fail "example gate paused:\n$out"
+
+# The three --no-*-gate flags still drop their entry from the DEFAULT chain.
+out=$(STUB_GATE_RC=10 pump F56 --no-usage-gate)
+have "$out" 'GATE: feed-ok' && pass "--no-usage-gate drops the usage gate" || fail "--no-usage-gate ignored:\n$out"
+out=$(STUB_DISK_GATE_RC=10 pump F56)
+have "$out" 'GATE: PAUSED' && pass "the disk gate is in the default chain" || fail "disk gate missing:\n$out"
+out=$(STUB_DISK_GATE_RC=10 pump F56 --no-disk-gate)
+have "$out" 'GATE: feed-ok' && pass "--no-disk-gate drops the disk gate" || fail "--no-disk-gate ignored:\n$out"
+
+echo "--- Test 25: pre-tick hooks are a chain too ---"
+HBIN="$TMP/hooks"; mkdir -p "$HBIN"
+cat >| "$HBIN/quiet" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >| "$TMP_MARK"
+exit 0
+EOF
+cat >| "$HBIN/noisy" <<'EOF'
+#!/usr/bin/env bash
+echo "HOOK-SAYS: ${STUB_HOOK_MSG:-something is off}"
+exit 0
+EOF
+cat >| "$HBIN/broken" <<'EOF'
+#!/usr/bin/env bash
+echo "hook exploded"
+exit 4
+EOF
+chmod +x "$HBIN/quiet" "$HBIN/noisy" "$HBIN/broken"
+
+HOOKMARK="$TMP/hook.mark"
+NOTIFIED="$TMP/hook-notify.txt"
+hook_tick() {  # extra env from the caller
+  : >| "$NOTIFIED"
+  TASKPUMP_NOTIFY_CMD="tee -a $NOTIFIED" \
+  TASKPUMP_PUMP_NO_LAUNCH=1 \
+  ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
+  ARACHNE_PUMP_STATE_FILE="$TMP/hook.state" \
+  ARACHNE_POOL_CAP_FILE="$TMP/cap" \
+  TASKPUMP_HOOK_MARK_FILE="$HOOKMARK" \
+  ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+  "$PUMP" --no-health-gate --phases F56 --once 2>&1
+}
+
+mk F56.0 open
+# A hook runs with the repo root as its argument.
+TMP_MARK="$TMP/hook-arg.txt" out=$(TMP_MARK="$TMP/hook-arg.txt" TASKPUMP_PRE_TICK_HOOKS="$HBIN/quiet" hook_tick)
+[[ -s "$TMP/hook-arg.txt" ]] && pass "a hook is handed the repo root" || fail "hook got no argument:\n$out"
+[[ -s "$NOTIFIED" ]] && fail "a silent hook still notified" || pass "a silent hook says nothing"
+
+# Output is logged AND notified — but only when it changes.
+out=$(STUB_HOOK_MSG="the tree is dirty" TASKPUMP_PRE_TICK_HOOKS="$HBIN/noisy" hook_tick)
+have "$out" 'HOOK-SAYS: the tree is dirty' && pass "hook output is logged" || fail "hook output not logged:\n$out"
+grep -q 'the tree is dirty' "$NOTIFIED" && pass "hook output is notified the first time" \
+  || fail "no notification: $(cat "$NOTIFIED")"
+out=$(STUB_HOOK_MSG="the tree is dirty" TASKPUMP_PRE_TICK_HOOKS="$HBIN/noisy" hook_tick)
+grep -q 'the tree is dirty' "$NOTIFIED" && fail "an unchanged condition notified again" \
+  || pass "an unchanged condition is not re-notified"
+out=$(STUB_HOOK_MSG="now something else" TASKPUMP_PRE_TICK_HOOKS="$HBIN/noisy" hook_tick)
+grep -q 'now something else' "$NOTIFIED" && pass "a CHANGED condition notifies again" \
+  || fail "changed condition did not notify: $(cat "$NOTIFIED")"
+
+# A failing hook is a warning, never a reason to skip the tick.
+out=$(TASKPUMP_PRE_TICK_HOOKS="$(printf '%s\n%s\n' "$HBIN/broken" "$HBIN/noisy")" hook_tick)
+have "$out" "hook '.*broken' failed \\(rc=4\\)" && pass "a failing hook is reported" || fail "no warning for a failing hook:\n$out"
+have "$out" 'HOOK-SAYS' && pass "a failing hook does not stop the chain" || fail "chain stopped at the failure:\n$out"
+have "$out" 'GATE: feed-ok|tick:|PAUSED' && pass "the tick continues past a failing hook" || fail "tick aborted:\n$out"
+out=$(TASKPUMP_PRE_TICK_HOOKS="$HBIN/nope" hook_tick)
+have "$out" 'hook not executable' && pass "a missing hook is reported" || fail "missing hook silent:\n$out"
+
+# The default chain is still the two shipped hooks.
+have "$(default_hooks_of_pump)" 'gitignore-repair' && pass "gitignore-repair is in the default chain" \
+  || fail "gitignore-repair missing from the default chain"
+have "$(default_hooks_of_pump)" 'fs-guard' && pass "fs-guard is in the default chain" \
+  || fail "fs-guard missing from the default chain"
+
+echo "--- Test 26: --integration-base reaches every gh call ---"
+# All three gh invocations used to hardcode `main`, so a run pointed at a
+# release branch silently opened its PRs against main instead. Assert on the
+# argv a gh stub records.
+GHLOG="$TMP/gh.log"
+cat >| "$BIN/gh" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$GHLOG"
+# \`pr list\` must answer empty so graduate_trunk goes on to create one.
+exit 0
+EOF
+chmod +x "$BIN/gh"
+
+: >| "$GHLOG"
+GTMP="$TMP/grad"; mkdir -p "$GTMP"
+git -C "$GTMP" init -q -b main 2>/dev/null || true
+mk F58.0 done
+PATH="$BIN:$PATH" TASKPUMP_NOTIFY_CMD=true TASKPUMP_PUMP_NO_LAUNCH=1 \
+  ARACHNE_PUMP_OPS_DIR="$TMP/noops" ARACHNE_PUMP_STATE_FILE="$TMP/gh.state" \
+  ARACHNE_POOL_CAP_FILE="$TMP/cap" ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+  ARACHNE_PUMP_WORKTREES_DIR="$TMP/ghwt" \
+  "$PUMP" --no-health-gate --phases F58 --integration-trunk \
+          --integration-base release/2.0 >/dev/null 2>&1 || true
+grep -q -- '--base release/2.0' "$GHLOG" \
+  && pass "gh targets the configured integration base" || fail "gh calls: $(cat "$GHLOG")"
+grep -qE -- '--base main( |$)' "$GHLOG" \
+  && fail "a gh call still hardcodes main: $(cat "$GHLOG")" || pass "no gh call hardcodes main"
+rm -f "$BIN/gh"
+
+echo "--- Test 28: the resume note resolves like the brief does ---"
+RES2="$TMP/resolve2"; mkdir -p "$RES2/ops/task-loop/briefs"
+stall_fixture
+# `env` is needed, not a bare prefix: words that arrive through "$@" are not
+# parsed as assignments, so bash would try to execute the first one.
+rnote() { PATH="$BIN:$PATH" ARACHNE_POOL_CAP_FILE="$TMP/cap" \
+  ARACHNE_PUMP_STATE_FILE="$STATE19" ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+  STUB_LIVE="" STUB_AHEAD=3 STUB_HEAD=aaaa111 \
+  env "$@" "$PUMP" --no-health-gate --render-resume-note F97 2>&1; }
+
+# Shipped default, when a consumer supplies nothing.
+out=$(rnote ARACHNE_PUMP_OPS_DIR="$TMP/noops")
+have "$out" 'RESUME CONTEXT' && pass "the shipped resume template is the fallback" \
+  || fail "shipped resume template not used:\n$out"
+
+# A consumer's own copy, beside its brief template, wins over the shipped one.
+printf 'consumer resume note for {{TASK_ID}} on {{BRANCH}}\n' \
+  >| "$RES2/ops/task-loop/briefs/_resume-note-template.md"
+out=$(rnote ARACHNE_PUMP_OPS_DIR="$RES2/ops")
+[[ "$out" == "consumer resume note for F97.1 on feat/f97" ]] \
+  && pass "a consumer's resume template wins over the shipped one" \
+  || fail "consumer resume template not chosen: '$out'"
+
+# Explicit config outranks both.
+printf 'explicit resume note for {{TASK_ID}}\n' >| "$TMP/explicit-resume.md"
+out=$(rnote ARACHNE_PUMP_OPS_DIR="$RES2/ops" TASKPUMP_RESUME_TEMPLATE="$TMP/explicit-resume.md")
+[[ "$out" == "explicit resume note for F97.1" ]] \
+  && pass "explicit config outranks the consumer resume template" \
+  || fail "explicit resume template not chosen: '$out'"
+
+# {{BUILD_GATE}} is the shipped templates' name for the verification commands;
+# both names must resolve so either template file renders through this pump.
+printf 'gate: {{BUILD_GATE}} / cmds: {{VERIFY_CMDS}}\n' >| "$TMP/gate-resume.md"
+out=$(rnote ARACHNE_PUMP_OPS_DIR="$TMP/noops" TASKPUMP_RESUME_TEMPLATE="$TMP/gate-resume.md" \
+      TASKPUMP_VERIFY_CMDS="make check")
+[[ "$out" == 'gate: `make check` / cmds: `make check`' ]] \
+  && pass "{{BUILD_GATE}} and {{VERIFY_CMDS}} are the same value" \
+  || fail "placeholder alias wrong: '$out'"
 
 echo
 echo "=============================================="

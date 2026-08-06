@@ -1,44 +1,40 @@
 #!/usr/bin/env bash
-# arachne-pump — usage-governed, DAG-aware, keep-acquiring task-loop supervisor.
+# tp-pump — usage-governed, DAG-aware, keep-acquiring task-loop supervisor.
 #
-# A singular HOST-level loop (so there is no cross-agent claim race — design D1)
-# that points the parallel substrate at a RANGE of phases and drains it for days:
+# A singular HOST-level loop (so there is no cross-agent claim race) that points
+# a sandboxed-agent substrate at a RANGE of phases and drains it for days:
 #
 #   * Queue = the live eligible frontier, recomputed every tick from `blockers:`
-#     via `arachne-task ready --phases A..B` (design D2). Newly-unblocked tasks
-#     enter automatically — this is "keep acquiring".
-#   * Dispatch grain = phase (D4): each phase FN with eligible work gets a
-#     worktree that drains its own sub-tree serially via the in-context
-#     `arachne-task next --phase FN` loop; phases fan out in parallel.
-#   * Liveness from `docker ps`, never task status (D3): a parked epic
-#     (in_progress, dead container) auto-resumes; a live one is never double-launched.
-#   * Feed gate: pause LAUNCHING new work (running agents are never killed) when
-#     `arachne-usage --gate` says we're at/over the ceiling, when free disk drops
-#     below PAUSE_THRESHOLD_GB (`arachne-disk-watchdog --gate`), when a reset-backstop
-#     window is open, or when the brcmfmac WiFi firmware looks wedged. Resume
-#     automatically when the window slides / disk frees / journal goes quiet.
-#   * Disk discipline (A4): a completed phase's worktree target/ is reclaimed
-#     (`cargo clean`) each tick once its container has exited, so a multi-day
-#     drain's disk footprint stays bounded (ARACHNE_DISK_RECLAIM=0 disables).
+#     via `tp task ready --phases A..B`. Newly-unblocked tasks enter
+#     automatically — this is "keep acquiring".
+#   * Dispatch grain = phase: each phase with eligible work gets a worktree that
+#     drains its own sub-tree serially via the in-context `tp task next --phase`
+#     loop; phases fan out in parallel.
+#   * Liveness from the container runtime, never task status: a parked epic
+#     (in_progress, dead container) auto-resumes; a live one is never
+#     double-launched.
+#   * Feed gate: pause LAUNCHING new work — running agents are never killed —
+#     when any gate in TASKPUMP_GATES says so. The default chain is network
+#     health, host token freshness, the plan's usage ceiling, and free disk.
+#     Feeding resumes by itself when the gate clears.
+#   * Disk discipline: a completed phase's worktree build dir is reclaimed each
+#     tick once its container has exited, so a multi-day drain's disk footprint
+#     stays bounded (TASKPUMP_DISK_RECLAIM=0 disables).
 #   * Drains: exits only when no open task remains in range AND no live agent
-#     container remains, then pushes ops/ and emits a summary.
-#
-# Design: ops/planning/2026-06-22 - Autonomous Task Loop v2 — Usage-Governed DAG Pump.md
-# Generalizes run-parallel.sh's pool scheduler; shared helpers live in
-# scripts/arachne-pump-lib.sh (sourced by both). run-parallel.sh stays the
-# manifest path.
+#     container remains, then pushes the ledger and emits a summary.
 #
 # Usage:
-#   arachne-pump --phases F55..F63 --jobs 4 --usage-ceiling 95 --grain phase
-#   arachne-pump --phases F55..F63 --dry-run     # print the plan, launch nothing
-#   arachne-pump --phases F64 --list             # one planning pass, then exit
-#   arachne-pump --phases F64 --once             # one REAL tick (scrub+gate+launch), exit
+#   tp pump --phases F55..F63 --jobs 4 --usage-ceiling 95 --grain phase
+#   tp pump --phases F55..F63 --dry-run     # print the plan, launch nothing
+#   tp pump --phases F64 --list             # one planning pass, then exit
+#   tp pump --phases F64 --once             # one REAL tick (scrub+gate+launch), exit
 #
 # Monitor handoff:
 #   With --detach, the supervisor goes to systemd and this terminal is then
-#   handed to `arachne-monitor --watch` — quitting the monitor (q) leaves the
-#   pump running. --no-monitor (or ARACHNE_PUMP_MONITOR=0) keeps your shell;
-#   a non-tty skips it automatically.
+#   handed to the monitor — quitting it (q) leaves the pump running.
+#   --no-monitor (or TASKPUMP_PUMP_MONITOR=0) keeps your shell; a non-tty skips
+#   it automatically.
+# HELP-END
 #
 # Stalled-claim auto-resume (on by default):
 #   A phase whose only blocker is its OWN orphaned claim — dead container, work
@@ -50,28 +46,10 @@
 #   --resume-max N          attempts before escalating to a human (default 3)
 #   --no-resume-stalled     disable; revert to parking orphans for review
 #
-# Env overrides (mostly for testing / advanced use):
-#   ARACHNE_PUMP_RESUME_MAX        default for --resume-max (3)
-#   ARACHNE_PUMP_STALL_EXIT_TICKS  consecutive deadlocked ticks before exit (3)
-#   ARACHNE_PUMP_MONITOR           0 = never open the monitor after --detach
-#   ARACHNE_MONITOR_BIN            path to arachne-monitor (default: alongside)
-#   ARACHNE_TASK    path to arachne-task   (default: alongside this script)
-#   ARACHNE_USAGE   path to arachne-usage  (default: alongside this script)
-#   ARACHNE_DISK_WATCHDOG  path to arachne-disk-watchdog (default: alongside this script)
-#   ARACHNE_DISK_RECLAIM   1/0 — cargo-clean a phase's target/ once done (default 1)
-#   ARACHNE_TOKEN_GATE     1/0 — pause LAUNCHING when the HOST OAuth access token is
-#                   stale (default 1). Containers are access-token-only (they cannot
-#                   rotate the shared refresh token — that would log the host out;
-#                   see entrypoint-parallel.sh), so they cannot self-refresh: the
-#                   host must keep its token fresh (a live host `claude` session, or
-#                   a manual refresh). Running agents are never killed.
-#   ARACHNE_TOKEN_MARGIN_S  seconds before host-token expiry to start pausing (600)
-#   ARACHNE_PUMP_WORKTREES_DIR  worktrees base (default: <repo>/.worktrees; tests)
-#   DOCKER          docker binary          (default: docker)
-#   ARACHNE_PHASE_BRIEF_TEMPLATE  phase-drain brief template (default:
-#                   ops/task-loop/briefs/_phase-drain-template.md — built by F64.4)
-#   MAX_TURNS, AGENT_MODEL, AGENT_MEMORY_MAX, AGENT_MEMORY_SWAP — forwarded to
-#                   launched containers (same meaning as run-parallel.sh).
+# Configuration lives in taskpump.conf (see taskpump.conf.example for the full
+# key surface) or the environment; the configuration block below names every key
+# this tool reads, with the default each one falls back to. The legacy ARACHNE_*
+# spellings still arrive here through lib/config.sh.
 set -euo pipefail
 
 # ── TaskPump config core ──────────────────────────────────────────────────────
@@ -85,36 +63,100 @@ REPO_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=../lib/pump-lib.sh
 source "$TP_LIB_DIR/pump-lib.sh"
 
-CLAUDE_DIR="$HOME/.claude"
-CLAUDE_JSON="$HOME/.claude.json"
-OPS_DIR="${ARACHNE_PUMP_OPS_DIR:-$REPO_ROOT/ops}"
-# Tasks dir — overridable (independent of OPS_DIR) so phase_dependencies / brief
-# rendering can be unit-tested against a flat fixture dir.
-TASKS_DIR="${ARACHNE_PUMP_TASKS_DIR:-$OPS_DIR/task-loop/tasks}"
+# ── Configuration ─────────────────────────────────────────────────────────────
+# Every value here has a default that reproduces what the pump did before any of
+# it was configurable, so a project with no taskpump.conf sees no change. Where a
+# key exists in both a shared and a pump-scoped spelling, the pump-scoped one
+# wins: TASKPUMP_TASKS_DIR is what every tool reads, TASKPUMP_PUMP_TASKS_DIR
+# points this supervisor somewhere else. The legacy ARACHNE_* names still arrive
+# here through the config core.
 
-ARACHNE_TASK="${ARACHNE_TASK:-$TP_LIBEXEC_DIR/tp-task}"
-ARACHNE_USAGE="${ARACHNE_USAGE:-$TP_GATES_DIR/claude-usage}"
-ARACHNE_DISK_WATCHDOG="${ARACHNE_DISK_WATCHDOG:-$TP_LIBEXEC_DIR/tp-disk-watchdog}"
-MONITOR_BIN="${ARACHNE_MONITOR_BIN:-$TP_LIBEXEC_DIR/tp-monitor}"
-DOCKER="${DOCKER:-docker}"
-ARACHNE_PHASE_BRIEF_TEMPLATE="${ARACHNE_PHASE_BRIEF_TEMPLATE:-$OPS_DIR/task-loop/briefs/_phase-drain-template.md}"
+# The agent's home and config on the host. Mounted read-only into a launched
+# container, and the credentials file the token gate reads.
+CLAUDE_DIR="${TASKPUMP_AGENT_HOME:-$HOME/.claude}"
+CLAUDE_JSON="${TASKPUMP_AGENT_CONFIG:-$HOME/.claude.json}"
+
+# The ledger: a git checkout the pump pulls at the top of every tick and pushes
+# when the range drains, holding the task files.
+OPS_DIR="${TASKPUMP_PUMP_OPS_DIR:-${TASKPUMP_LEDGER_REPO:-$REPO_ROOT/ops}}"
+# Tasks dir — overridable independently of OPS_DIR so phase_dependencies / brief
+# rendering can be unit-tested against a flat fixture dir.
+TASKS_DIR="${TASKPUMP_PUMP_TASKS_DIR:-${TASKPUMP_TASKS_DIR:-$OPS_DIR/task-loop/tasks}}"
+# The file that tells us a submodule ledger has actually been checked out. Any
+# path inside the ledger that only exists once `submodule update` has run.
+SUBMODULE_PROBE="${TASKPUMP_SUBMODULE_PROBE:-ops/planning/STATUS.md}"
+
+# Sibling tools.
+TASK_BIN="${TASKPUMP_TASK:-$TP_LIBEXEC_DIR/tp-task}"
+USAGE_BIN="${TASKPUMP_USAGE:-$TP_GATES_DIR/claude-usage}"
+DISK_WATCHDOG_BIN="${TASKPUMP_DISK_WATCHDOG:-$TP_LIBEXEC_DIR/tp-disk-watchdog}"
+MONITOR_BIN="${TASKPUMP_MONITOR_BIN:-$TP_LIBEXEC_DIR/tp-monitor}"
+
+# The agent runner. The pump decides WHAT to launch and WHERE; the runner owns
+# HOW — the sandbox, the mounts, the credentials. See runners/claude-docker.
+RUNNER="${TASKPUMP_RUNNER:-$TP_ROOT/runners/claude-docker/runner.sh}"
+DOCKER="${TASKPUMP_DOCKER:-${DOCKER:-docker}}"
+IMAGE="${TASKPUMP_IMAGE:-arachne}"
+ENTRYPOINT="${TASKPUMP_ENTRYPOINT:-/entrypoint-parallel.sh}"
+# Building the agent image once before the drain. Unset ⇒ the default docker
+# build of the repo root; set to the empty string ⇒ skip it entirely, which is
+# what a runner that pulls a prebuilt image wants. (Building really belongs to
+# the runner; moving it there is a second round of the launch seam.)
+if [[ -n "${TASKPUMP_IMAGE_BUILD+set}" ]]; then
+  IMAGE_BUILD_CMD="$TASKPUMP_IMAGE_BUILD"
+else
+  IMAGE_BUILD_CMD="\"$DOCKER\" build -t \"$IMAGE\" \"$REPO_ROOT\""
+fi
+
 # Worktrees base — overridable so the reclaim sweep / launcher can be unit-tested
 # against a fixture tree (single source for both launch_phase and reclaim).
-WORKTREES_DIR="${ARACHNE_PUMP_WORKTREES_DIR:-$REPO_ROOT/.worktrees}"
+WORKTREES_DIR="${TASKPUMP_PUMP_WORKTREES_DIR:-${TASKPUMP_WORKTREES_DIR:-$REPO_ROOT/.worktrees}}"
+
+# What the templates say about this project. The defaults reproduce Arachne's
+# wording exactly, so a rendered brief or resume note is unchanged for it.
+#   TASKPUMP_TASK_CLI     how an agent invokes the ledger CLI from its worktree
+#   TASKPUMP_VERIFY_CMDS  newline-separated commands a task must leave green;
+#                         rendered mid-sentence as `a` and `b`
+#   TASKPUMP_PROJECT_BRIEF  one paragraph pointing an agent at the project's own
+#                         contributor documentation
+TASK_CLI="${TASKPUMP_TASK_CLI:-scripts/arachne-task}"
+TASK_CLI_NAME="$(basename "$TASK_CLI")"
+# Built outside the expansions: an apostrophe inside a ${x:-word} default is a
+# real quote to bash, and would swallow the rest of the file.
+_tp_default_verify=$'cargo fmt --all\ncargo clippy --workspace -- -D warnings'
+_tp_default_project_brief="Read the contributor documentation for this repository (CLAUDE.md, CONTRIBUTING.md, or equivalent) before writing code, then read the design note that phase {{PHASE}} is built against."
+VERIFY_CMDS="${TASKPUMP_VERIFY_CMDS:-$_tp_default_verify}"
+PROJECT_BRIEF="${TASKPUMP_PROJECT_BRIEF:-$_tp_default_project_brief}"
+
+# Where the run's dotfiles live. One knob moves them all out of the repo root;
+# each filename is still individually overridable.
+STATE_DIR="${TASKPUMP_STATE_DIR:-$REPO_ROOT}"
+AGENT_LOG_NAME="${TASKPUMP_AGENT_LOG_NAME:-.arachne-agent.log}"
+BRIEF_OUT_NAME="${TASKPUMP_BRIEF_OUT_NAME:-.arachne-phase-brief.md}"
+RESUME_NOTE_NAME="${TASKPUMP_RESUME_NOTE_NAME:-.arachne-resume.md}"
+# Written inside the container rather than here, but named here so one place
+# owns every filename the run drops into a worktree.
+GOAL_NOTE_NAME="${TASKPUMP_GOAL_NOTE_NAME:-.arachne-goal.md}"
+# Fingerprint of the last pre-tick hook output, so a persistent condition is
+# notified once rather than every tick. Survives a supervisor restart.
+HOOK_MARK_FILE="${TASKPUMP_HOOK_MARK_FILE:-${TASKPUMP_FSGUARD_MARK_FILE:-$STATE_DIR/.arachne-fsguard.notified}}"
+DISK_WATCHDOG_LOG="${TASKPUMP_DISK_WATCHDOG_LOG:-$STATE_DIR/.arachne-disk-watchdog.log}"
 
 # Defaults (flags override).
 PHASES=""
-JOBS="${JOBS:-4}"
-CEILING="${ARACHNE_USAGE_CEILING:-95}"
+# The supervisor's own default cap. Callers that set nothing at all fall back to
+# pump-lib's TASKPUMP_JOBS_FALLBACK instead; see the note there.
+JOBS="${TASKPUMP_JOBS:-${JOBS:-4}}"
+CEILING="${TASKPUMP_USAGE_CEILING:-95}"
 GRAIN="phase"
-TICK="${POOL_TICK:-30}"
-STAGGER="${POOL_STAGGER:-3}"
-HEALTH_WINDOW="${HEALTH_WINDOW:-120}"
+TICK="${TASKPUMP_TICK:-${POOL_TICK:-30}}"
+STAGGER="${TASKPUMP_STAGGER:-${POOL_STAGGER:-3}}"
+HEALTH_WINDOW="${TASKPUMP_HEALTH_WINDOW:-${HEALTH_WINDOW:-120}}"
 HEALTH_GATE=1
 USAGE_GATE=1
 DISK_GATE=1
-BRANCH_PREFIX="${ARACHNE_PUMP_BRANCH_PREFIX:-feat/}"
-BASE_REF="${ARACHNE_PUMP_BASE:-main}"
+BRANCH_PREFIX="${TASKPUMP_PUMP_BRANCH_PREFIX:-${TASKPUMP_BRANCH_PREFIX:-feat/}}"
+BASE_REF="${TASKPUMP_PUMP_BASE:-${TASKPUMP_BASE:-main}}"
 BASE_GIVEN=0      # set when --base is passed explicitly (gates the trunk override)
 # ── Autonomous integration trunk (A3 / F65.6) ────────────────────────────────
 # Opt-in behind --integration-trunk (default OFF): when on, the run cuts every
@@ -123,46 +165,50 @@ BASE_GIVEN=0      # set when --base is passed explicitly (gates the trunk overri
 # graduates the whole drain as one auto/trunk → main PR. Flag off ⇒ byte-for-byte
 # the prior pump.
 INTEGRATION=0
-INTEGRATION_TRUNK="${ARACHNE_PUMP_TRUNK:-auto/trunk}"
-INTEGRATION_BASE="${ARACHNE_PUMP_INTEGRATION_BASE:-main}"
+INTEGRATION_TRUNK="${TASKPUMP_PUMP_TRUNK:-${TASKPUMP_TRUNK:-auto/trunk}}"
+INTEGRATION_BASE="${TASKPUMP_PUMP_INTEGRATION_BASE:-${TASKPUMP_INTEGRATION:-main}}"
 # Build gate run on each merge into the trunk (empty ⇒ default cargo check +
-# smoke). Overridable for tests (ARACHNE_PUMP_BUILD_CMD='false' forces red).
-BUILD_GATE_CMD="${ARACHNE_PUMP_BUILD_CMD:-}"
-TRUNK_LOCK_FILE="${ARACHNE_PUMP_TRUNK_LOCK_FILE:-$REPO_ROOT/.auto-trunk.lock}"
-QUARANTINE_FILE="${ARACHNE_PUMP_QUARANTINE_FILE:-$REPO_ROOT/.auto-trunk-quarantine}"
-MAX_TURNS="${MAX_TURNS:-600}"
-AGENT_MODEL="${AGENT_MODEL:-opus}"
+# smoke). Overridable for tests (TASKPUMP_BUILD_GATE='false' forces red).
+BUILD_GATE_CMD="${TASKPUMP_PUMP_BUILD_CMD:-${TASKPUMP_BUILD_GATE:-}}"
+TRUNK_LOCK_FILE="${TASKPUMP_PUMP_TRUNK_LOCK_FILE:-$STATE_DIR/.auto-trunk.lock}"
+QUARANTINE_FILE="${TASKPUMP_PUMP_QUARANTINE_FILE:-$STATE_DIR/.auto-trunk-quarantine}"
+# Reclaim of a finished phase's build artifacts. Empty ⇒ the default cargo
+# clean / rm -rf of <worktree>/target; a configured command is run with the
+# worktree as $1 and its cwd.
+RECLAIM_CMD="${TASKPUMP_RECLAIM_CMD:-}"
+MAX_TURNS="${TASKPUMP_MAX_TURNS:-${MAX_TURNS:-600}}"
+AGENT_MODEL="${TASKPUMP_AGENT_MODEL:-${AGENT_MODEL:-opus}}"
 # ── Stalled-claim auto-resume (2026-08-05) ───────────────────────────────────
 # A phase starved solely by its own orphaned-but-committed claim is relaunched
 # to *continue* that task, bounded by RESUME_MAX no-progress attempts. Default
 # ON: the behaviour it replaces is a permanent, silent idle loop.
 RESUME_STALLED=1
-RESUME_MAX="${ARACHNE_PUMP_RESUME_MAX:-3}"
+RESUME_MAX="${TASKPUMP_PUMP_RESUME_MAX:-${TASKPUMP_RESUME_MAX:-3}}"
 # Consecutive fully-deadlocked ticks before the pump gives up and pages a human.
 # >1 so a container dying mid-tick cannot trip it.
-STALL_EXIT_TICKS="${ARACHNE_PUMP_STALL_EXIT_TICKS:-3}"
+STALL_EXIT_TICKS="${TASKPUMP_PUMP_STALL_EXIT_TICKS:-${TASKPUMP_STALL_EXIT_TICKS:-3}}"
 STALL_TICKS=0
 RESUME_TASK_ID=""
 LAST_PARKED_FP=""
-CAP_FILE="${ARACHNE_POOL_CAP_FILE:-$REPO_ROOT/.arachne-pool-cap}"
-RESET_FILE="${ARACHNE_USAGE_RESET_FILE:-$REPO_ROOT/.arachne-usage-reset}"
+CAP_FILE="${TASKPUMP_POOL_CAP_FILE:-$STATE_DIR/.arachne-pool-cap}"
+RESET_FILE="${TASKPUMP_USAGE_RESET_FILE:-$STATE_DIR/.arachne-usage-reset}"
 MODE="run"        # run | dry | list | once | render | resume-note | help
 DETACH=0
 # After --detach hands the supervisor to systemd, the launching terminal is free
 # — and watching the monitor is what you almost always want next, so take it
-# over by default. ARACHNE_PUMP_MONITOR=0 or --no-monitor opts out; a non-tty
+# over by default. TASKPUMP_PUMP_MONITOR=0 or --no-monitor opts out; a non-tty
 # (cron, CI, a nested pump re-exec) opts out automatically.
-MONITOR="${ARACHNE_PUMP_MONITOR:-1}"
-STATE_FILE="${ARACHNE_PUMP_STATE_FILE:-$REPO_ROOT/.arachne-pump.state}"
-PUMP_LOG="${ARACHNE_PUMP_LOG:-$REPO_ROOT/.arachne-pump.log}"
+MONITOR="${TASKPUMP_PUMP_MONITOR:-1}"
+STATE_FILE="${TASKPUMP_PUMP_STATE_FILE:-$STATE_DIR/.arachne-pump.state}"
+PUMP_LOG="${TASKPUMP_PUMP_LOG:-$STATE_DIR/.arachne-pump.log}"
 PUMP_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 warn() { printf 'arachne-pump: %s\n' "$*" >&2; }
 die()  { warn "$*"; exit 1; }
 log()  { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
 # Quiet per-tick skip traces (e.g. "already integrated") — off unless
-# ARACHNE_PUMP_DEBUG=1, so reconcile doesn't spam the log every TICK seconds.
-dbg_log() { [[ "${ARACHNE_PUMP_DEBUG:-0}" -eq 1 ]] && log "$*"; return 0; }
+# TASKPUMP_PUMP_DEBUG=1, so reconcile doesn't spam the log every TICK seconds.
+dbg_log() { [[ "${TASKPUMP_PUMP_DEBUG:-0}" -eq 1 ]] && log "$*"; return 0; }
 
 # Keep the verbatim argv so --detach can re-exec the same command minus --detach.
 ORIG_ARGS=("$@")
@@ -213,9 +259,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-usage() {
-  sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
-}
+usage() { apl_help "$0"; }
 [[ "$MODE" == "help" ]] && { usage; exit 0; }
 
 [[ -n "$PHASES" ]] || die "--phases is required (e.g. --phases F55..F63)"
@@ -251,9 +295,18 @@ pump_expand_phases() {
   done
 }
 
+# The tasks dir as an agent inside the worktree would name it. Absolute when the
+# ledger sits outside the code repo, which is also how an agent would reach it.
+tasks_dir_rel() {
+  case "$TASKS_DIR" in
+    "$REPO_ROOT"/*) printf '%s' "${TASKS_DIR#"$REPO_ROOT"/}" ;;
+    *)              printf '%s' "$TASKS_DIR" ;;
+  esac
+}
+
 phase_branch()    { printf '%s%s' "$BRANCH_PREFIX" "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"; }
 branch_slug()     { printf '%s' "${1//\//-}"; }
-phase_container() { printf 'arachne-agent-%s' "$(branch_slug "$(phase_branch "$1")")"; }
+phase_container() { printf '%s%s' "$(apl_agent_prefix)" "$(branch_slug "$(phase_branch "$1")")"; }
 # Host worktree the integration trunk is checked out into (A3): auto/trunk →
 # <worktrees>/auto-trunk, sharing the configurable worktrees base with phases.
 trunk_worktree()  { printf '%s/%s' "$WORKTREES_DIR" "$(branch_slug "$INTEGRATION_TRUNK")"; }
@@ -267,33 +320,33 @@ pump_in_list() {
 
 # Distinct phases present in the live eligible frontier (have ≥1 launchable task).
 frontier_phases() {
-  "$ARACHNE_TASK" ready --phases "$PHASES" --json 2>/dev/null \
+  "$TASK_BIN" ready --phases "$PHASES" --json 2>/dev/null \
     | jq -r '.[].phase' 2>/dev/null | sort -u
 }
 
 # Open-task count across the range (the drain test). 0 ⇒ no open work remains.
 open_count() {
-  "$ARACHNE_TASK" ready --phases "$PHASES" --count 2>/dev/null || echo 0
+  "$TASK_BIN" ready --phases "$PHASES" --count 2>/dev/null || echo 0
 }
 
 # Open-task count within a single phase (regardless of blocker state).
 phase_open_count() {
-  "$ARACHNE_TASK" ready --phase "$1" --count 2>/dev/null || echo 0
+  "$TASK_BIN" ready --phase "$1" --count 2>/dev/null || echo 0
 }
 
 # Is a phase's worktree branch currently owned by a LIVE container? (D3)
 phase_live() {
   local want; want="$(phase_container "$1")"
-  local slug
-  while IFS= read -r slug; do
-    [[ "arachne-agent-$slug" == "$want" ]] && return 0
-  done < <(apl_live_agent_slugs)
+  local name
+  while IFS= read -r name; do
+    [[ "$name" == "$want" ]] && return 0
+  done < <(apl_live_agent_names)
   return 1
 }
 
 # Lowest eligible task id in a phase (the epic/safety-net task for the container).
 phase_lead_task() {
-  "$ARACHNE_TASK" ready --phase "$1" --json 2>/dev/null | jq -r '.[0].id // empty' 2>/dev/null
+  "$TASK_BIN" ready --phase "$1" --json 2>/dev/null | jq -r '.[0].id // empty' 2>/dev/null
 }
 
 # ── Liveness-based reclaim (D3 applied to the eligibility path) ─────────────────
@@ -332,13 +385,13 @@ reclaim_orphaned_claims() {
       parked=$((parked + 1))
       continue
     fi
-    if "$ARACHNE_TASK" release "$id" \
+    if "$TASK_BIN" release "$id" \
         --reason "Auto-reclaimed by pump: container for $branch is dead and the branch has 0 commits (D3 liveness reclaim)." \
         >/dev/null 2>&1; then
       log "reclaimed orphaned claim $id ($branch — container dead, 0 commits) → open"
       reclaimed=$((reclaimed + 1))
     fi
-  done < <("$ARACHNE_TASK" list --status in_progress 2>/dev/null)
+  done < <("$TASK_BIN" list --status in_progress 2>/dev/null)
   [[ "$reclaimed" -gt 0 ]] && log "liveness reclaim: $reclaimed task(s) released to open"
   # Report parked orphans only when the SET changes. This used to warn twice per
   # tick unconditionally: one 2026-08-05 F79 stall produced 563 identical pairs
@@ -402,57 +455,97 @@ detect_stalled_orphans() {
     [[ "$ahead" -gt 0 ]] || continue
     STALL_TASK["$phase"]="$id"
     STALL_STATUS["$phase"]="$status"
-  done < <("$ARACHNE_TASK" list 2>/dev/null)
+  done < <("$TASK_BIN" list 2>/dev/null)
   return 0
 }
 
 # ── Feed gate ──────────────────────────────────────────────────────────────────
-# Echoes a one-line reason and returns 10 to pause feeding, or returns 0 to feed.
+# A gate answers one question before the pump launches anything: is it a good
+# idea to start MORE work right now? It never stops work already running.
+#
+# The chain is an ordered list of command lines, one per line. Each is run with
+# stdout and stderr captured together (the tools that predate this contract
+# write their reason to stderr) and judged by exit status:
+#
+#   0    feed OK
+#   10   pause launching; its output is the reason the operator sees
+#   else a broken gate — warn and FEED ANYWAY
+#
+# That last rule is deliberate: a gate that cannot reach its meter must never
+# silently halt a multi-day drain. Every gate shipped here fails open too.
+#
+# The default chain is exactly what was hardcoded before — network health, host
+# token freshness, the usage ceiling, free disk — with the three --no-*-gate
+# flags dropping their entry. A configured TASKPUMP_GATES replaces the whole
+# chain and is used verbatim; the flags still export their disable switches, so
+# a gate that honors them keeps working either way.
+default_gates() {
+  [[ "$HEALTH_GATE" -eq 1 ]] && printf '%s\n' "$TP_GATES_DIR/net-health"
+  printf '%s\n' "$TP_GATES_DIR/claude-token-fresh"
+  [[ "$USAGE_GATE" -eq 1 ]] && printf '%s\n' "$USAGE_BIN --gate"
+  [[ "$DISK_GATE"  -eq 1 ]] && printf '%s\n' "$TP_GATES_DIR/disk-low"
+  return 0
+}
+
+# Everything a gate might need, since a gate is a separate process.
+export_gate_env() {
+  export TASKPUMP_HEALTH_GATE="$HEALTH_GATE"
+  export TASKPUMP_USAGE_GATE="$USAGE_GATE"
+  export TASKPUMP_DISK_GATE="$DISK_GATE"
+  export TASKPUMP_HEALTH_WINDOW="$HEALTH_WINDOW"
+  export TASKPUMP_USAGE_CEILING="$CEILING"
+  export TASKPUMP_USAGE_RESET_FILE="$RESET_FILE"
+  export TASKPUMP_CREDENTIALS="$CLAUDE_DIR/.credentials.json"
+  export TASKPUMP_DISK_WATCHDOG="$DISK_WATCHDOG_BIN"
+  # The legacy spellings the un-migrated tools still read.
+  export HEALTH_GATE HEALTH_WINDOW
+  export ARACHNE_USAGE_RESET_FILE="$RESET_FILE"
+}
+
+# Strip a leading "<toolname>: " so a tool that prefixes all its diagnostics
+# does not have to special-case the gate path. Only a bare token counts, so a
+# reason that merely contains a colon is left alone.
+strip_gate_prefix() {
+  local r="$1"
+  [[ "$r" =~ ^[A-Za-z0-9._-]+:\ (.*)$ ]] && r="${BASH_REMATCH[1]}"
+  printf '%s' "$r"
+}
+
 GATE_REASON=""
 feed_gate() {
   GATE_REASON=""
-  if apl_network_unhealthy; then
-    GATE_REASON="brcmfmac wedge signature in last ${HEALTH_WINDOW}s"
-    return 10
-  fi
-  # Host OAuth token freshness (access-token-only container model): containers can
-  # no longer self-refresh, so launching one with an already-expired host token
-  # just 401s and dies. Pause launching until the host token is refreshed. Cheap
-  # local check; self-contained (honors ARACHNE_TOKEN_GATE); fail-open.
-  local treason trc
-  treason="$(apl_host_token_stale "$CLAUDE_DIR/.credentials.json")"; trc=$?
-  if [[ "$trc" -eq 10 ]]; then
-    GATE_REASON="$treason"
-    return 10
-  fi
-  if [[ "$USAGE_GATE" -eq 1 ]]; then
-    local reason rc
-    reason="$(ARACHNE_USAGE_RESET_FILE="$RESET_FILE" "$ARACHNE_USAGE" --gate --ceiling "$CEILING" 2>&1)"; rc=$?
-    if [[ "$rc" -eq 10 ]]; then
-      GATE_REASON="${reason#arachne-usage: }"
-      return 10
+  export_gate_env
+  local gates spec rc reason
+  gates="${TASKPUMP_GATES:-$(default_gates)}"
+  while IFS= read -r spec; do
+    [[ -z "${spec//[[:space:]]/}" ]] && continue
+    # A gate entry is a command line; splitting on whitespace is the point.
+    # shellcheck disable=SC2086
+    set -- $spec
+    if [[ ! -x "$1" ]]; then
+      warn "gate not executable, skipping: $1"
+      continue
     fi
-  fi
-  if [[ "$DISK_GATE" -eq 1 ]]; then
-    local dreason drc
-    dreason="$(apl_disk_low)"; drc=$?
-    if [[ "$drc" -eq 10 ]]; then
-      GATE_REASON="$dreason"
-      return 10
-    fi
-  fi
+    rc=0
+    reason="$("$@" 2>&1)" || rc=$?
+    case "$rc" in
+      0) ;;
+      10) GATE_REASON="$(strip_gate_prefix "$reason")"; return 10 ;;
+      *) warn "gate '$1' failed (rc=$rc); feeding anyway${reason:+ — $reason}" ;;
+    esac
+  done <<<"$gates"
   return 0
 }
 
 # ── Dependency-aware briefs (A3 v1 / F65.6) ────────────────────────────────────
 # dep_pr_number <branch> — the open draft-PR number for a dependency branch, or
-# empty. Fail-open: empty when gh is absent / disabled (ARACHNE_PUMP_NO_GH=1, for
+# empty. Fail-open: empty when gh is absent / disabled (TASKPUMP_PUMP_NO_GH=1, for
 # hermetic tests) / errors.
 dep_pr_number() {
   local branch="$1"
-  [[ "${ARACHNE_PUMP_NO_GH:-0}" -eq 1 ]] && return 0
+  [[ "${TASKPUMP_PUMP_NO_GH:-0}" -eq 1 ]] && return 0
   command -v gh >/dev/null 2>&1 || return 0
-  gh pr list --head "$branch" --base main --json number -q '.[0].number // empty' 2>/dev/null || true
+  gh pr list --head "$branch" --base "$INTEGRATION_BASE" --json number -q '.[0].number // empty' 2>/dev/null || true
 }
 
 # phase_cross_blockers <FN> — the unique set of OTHER phases this phase's tasks
@@ -463,6 +556,12 @@ phase_cross_blockers() {
   local phase="$1"
   local -A seen=()
   local f blk bphase
+  # DEFERRED (documented, not fixed): this reads task frontmatter directly with
+  # yq, bypassing the "the CLI is the ledger's only reader and writer"
+  # invariant, and re-hardcodes both the task-file naming convention and the
+  # `.md` extension. Routing it through the CLI needs a subcommand that reports
+  # blockers for a whole phase in one call; doing it per-file through the CLI
+  # would add a process spawn per task per tick.
   shopt -s nullglob
   for f in "$TASKS_DIR/$phase."*.md; do
     while IFS= read -r blk; do
@@ -531,6 +630,42 @@ phase_dependencies() {
   done
 }
 
+# ── Brief-template resolution ─────────────────────────────────────────────────
+# Three places to look, in order: what the operator configured, the consumer's
+# own template inside its ledger (Arachne's path — so an existing project keeps
+# rendering exactly what it did), and finally the generic one shipped with
+# TaskPump. Previously a missing consumer template was a hard die, which made a
+# fresh project unable to run at all until it wrote one.
+resolve_brief_template() {
+  local explicit="${TASKPUMP_PHASE_BRIEF_TEMPLATE:-${TASKPUMP_BRIEF_TEMPLATE:-}}"
+  [[ -n "$explicit" ]] && { printf '%s' "$explicit"; return 0; }
+  local consumer="$OPS_DIR/task-loop/briefs/_phase-drain-template.md"
+  [[ -f "$consumer" ]] && { printf '%s' "$consumer"; return 0; }
+  printf '%s' "$TP_ROOT/templates/phase-drain-brief.md"
+}
+BRIEF_TEMPLATE="$(resolve_brief_template)"
+
+# The resume note resolves the same three ways, for the same reason: a consumer
+# whose agents depend on particular wording keeps it in its own ledger, while
+# the shipped default stays tool-agnostic. Symmetry matters here — the two
+# templates are read by the same agent in the same session.
+resolve_resume_template() {
+  local explicit="${TASKPUMP_RESUME_TEMPLATE:-}"
+  [[ -n "$explicit" ]] && { printf '%s' "$explicit"; return 0; }
+  local consumer="$OPS_DIR/task-loop/briefs/_resume-note-template.md"
+  [[ -f "$consumer" ]] && { printf '%s' "$consumer"; return 0; }
+  printf '%s' "$TP_ROOT/templates/resume-note.md"
+}
+RESUME_TEMPLATE="$(resolve_resume_template)"
+
+# Only reachable when the resolved template is genuinely absent — an explicit
+# TASKPUMP_BRIEF_TEMPLATE pointing nowhere, or a broken install.
+missing_brief_template_msg() {
+  printf 'phase-drain brief template not found: %s\n' "$BRIEF_TEMPLATE"
+  printf '  looked at: $TASKPUMP_BRIEF_TEMPLATE, then %s/task-loop/briefs/_phase-drain-template.md,\n' "$OPS_DIR"
+  printf '  then the one shipped at %s/templates/phase-drain-brief.md\n' "$TP_ROOT"
+}
+
 # ── Brief rendering (D6 / F64.4; deps A3 v1) ───────────────────────────────────
 # render_brief_stream <phase> — render the parameterized phase-drain template to
 # stdout: substitute {{PHASE}} (plain sed — no envsubst, no clash with the
@@ -542,11 +677,19 @@ render_brief_stream() {
   local phase="$1"
   local depfile; depfile="$(mktemp)"
   phase_dependencies "$phase" >| "$depfile"
-  sed "s/{{PHASE}}/$phase/g" "$ARACHNE_PHASE_BRIEF_TEMPLATE" \
-    | awk -v df="$depfile" '
-        index($0, "{{DEPENDS_ON}}") { while ((getline line < df) > 0) print line; close(df); next }
-        { print }
-      '
+  local -A TPL_VARS TPL_BLOCKS
+  TPL_VARS=(
+    [PHASE]="$phase"
+    [BASE]="$BASE_REF"
+    [TASK_CLI]="$TASK_CLI"
+    [TASK_CLI_NAME]="$TASK_CLI_NAME"
+    [TASK_DIR]="$(tasks_dir_rel)"
+    [VERIFY_CMDS]="$(apl_join_commands "$VERIFY_CMDS")"
+    [BUILD_GATE]="$(apl_join_commands "$VERIFY_CMDS")"
+    [PROJECT_BRIEF]="${PROJECT_BRIEF//\{\{PHASE\}\}/$phase}"
+  )
+  TPL_BLOCKS=( [DEPENDS_ON]="$depfile" )
+  apl_render_template "$BRIEF_TEMPLATE"
   rm -f "$depfile" 2>/dev/null || true
 }
 
@@ -554,9 +697,8 @@ render_brief_stream() {
 # and echo its path (the launcher passes the path to the container).
 render_brief() {
   local phase="$1"
-  [[ -f "$ARACHNE_PHASE_BRIEF_TEMPLATE" ]] \
-    || die "phase-drain brief template not found: $ARACHNE_PHASE_BRIEF_TEMPLATE (built by F64.4)"
-  local out="$WORKTREES_DIR/$(phase_branch "$phase")/.arachne-phase-brief.md"
+  [[ -f "$BRIEF_TEMPLATE" ]] || die "$(missing_brief_template_msg)"
+  local out="$WORKTREES_DIR/$(phase_branch "$phase")/$BRIEF_OUT_NAME"
   mkdir -p "$(dirname "$out")" 2>/dev/null || true
   render_brief_stream "$phase" >| "$out"
   printf '%s' "$out"
@@ -564,7 +706,7 @@ render_brief() {
 
 # ── Launch one phase's worktree + container ────────────────────────────────────
 # Write the resume preamble the container prepends ahead of the kickoff brief.
-# `entrypoint-parallel.sh` already resolves ARACHNE_RESUME_NOTE and cats it
+# The in-container entrypoint already resolves the resume-note path and cats it
 # between the goal preamble and the brief — that plumbing was built for
 # run-parallel.sh's interrupted-session path and the pump simply never used it,
 # so nothing in the container needs to change.
@@ -572,67 +714,49 @@ render_brief() {
 # The one thing run-parallel.sh's version cannot say is what a *dead* agent
 # already landed: it only reports uncommitted state. A resumed task's whole
 # context is its commits, so those lead here.
+#
+# The prose lives in templates/resume-note.md (TASKPUMP_RESUME_TEMPLATE). It was
+# ~55 lines of heredoc naming one project's CLI path, task-file layout, and
+# verification commands; this function now only gathers the git state the
+# template splices in.
 render_resume_note_stream() {
   local wt="$1" branch="$2" id="$3"
   local phase="${id%%.*}"
-  {
-    cat <<'EOF'
-# RESUME CONTEXT — read this before the kickoff brief below
-EOF
-    printf '\nYou are **resuming `%s`** on this worktree (`%s`). A previous agent\n' "$id" "$branch"
-    printf 'session claimed this task, committed real work, and then died without\n'
-    printf 'finishing it. Your job is to carry it to a conclusion.\n\n'
-    cat <<'EOF'
-## Do NOT start by running `arachne-task next`
-EOF
-    printf '\n`%s` is already claimed to this branch, so it is **invisible** to\n' "$id"
-    printf '`next` and `ready` — both surface only `status: open` tasks. Calling\n'
-    printf '`arachne-task next --phase %s` returns `null`, and reading that as\n' "$phase"
-    printf '"frontier drained" is precisely the stall that stranded this task.\n'
-    printf 'Read the task file directly instead:\n\n'
-    printf '```\ncat ops/task-loop/tasks/%s.md\n```\n\n' "$id"
-    printf '## Work already committed on this branch\n\n```\n'
-    git -C "$wt" log --oneline "$BASE_REF..$branch" 2>/dev/null | head -40 || true
-    printf '```\n\n## Uncommitted state (`git status --short`, then `git diff --stat`)\n\n```\n'
-    git -C "$wt" status --short 2>/dev/null | head -40 || true
-    printf '```\n\n```\n'
-    git -C "$wt" diff --stat 2>/dev/null | tail -20 || true
-    printf '```\n\n'
-    cat <<'EOF'
-## How to finish
+  local commits status_short diff_stat
+  commits="$(mktemp)"; status_short="$(mktemp)"; diff_stat="$(mktemp)"
+  git -C "$wt" log --oneline "$BASE_REF..$branch" 2>/dev/null | head -40 >| "$commits" || true
+  git -C "$wt" status --short 2>/dev/null | head -40 >| "$status_short" || true
+  git -C "$wt" diff --stat 2>/dev/null | tail -20 >| "$diff_stat" || true
 
-Re-read the task's Spec / Scope / Acceptance, work out what the commits above
-already satisfy, and do the rest. Then pick exactly one of these three endings.
-**All three release the tasks blocked behind this one; leaving it claimed and
-unfinished does not** — that is what stalled the pump.
-
-1. **Finish it.** `scripts/arachne-task complete <id> --commits <shas>`, once
-   `cargo fmt --all` and `cargo clippy --workspace -- -D warnings` are clean and
-   the affected crates' tests pass.
-2. **Split it.** If part of the work is genuinely done and the remainder needs
-   judgement, a decision, or scope you cannot settle alone: `complete` the
-   finished portion — stating precisely what you did and did NOT do in the
-   completion notes — and file the remainder as a new task with
-   `scripts/arachne-task create <phase>.<n> --title "..." --goal "..."`, setting
-   its `blockers` if it depends on anything. If only the production wiring is
-   outstanding, `complete --defer-wiring "..."` instead.
-3. **Block it.** If it truly cannot proceed:
-   `scripts/arachne-task block <id> --reason "..."`.
-
-Do not hand-edit task frontmatter; the CLI is its only writer. Commit early and
-often — another interruption must not lose your work.
-
----
-
-EOF
-  }
+  local -A TPL_VARS TPL_BLOCKS
+  TPL_VARS=(
+    [TASK_ID]="$id"
+    [PHASE]="$phase"
+    [BRANCH]="$branch"
+    [TASK_FILE]="$(tasks_dir_rel)/$id.md"
+    [TASK_CLI]="$TASK_CLI"
+    [TASK_CLI_NAME]="$TASK_CLI_NAME"
+    [VERIFY_CMDS]="$(apl_join_commands "$VERIFY_CMDS")"
+    # The shipped templates call this {{BUILD_GATE}}. Both names resolve to the
+    # same value so either template file renders, but note that the pump's
+    # TASKPUMP_BUILD_GATE is a DIFFERENT thing — the merge queue's gate, not the
+    # per-task verification commands.
+    [BUILD_GATE]="$(apl_join_commands "$VERIFY_CMDS")"
+  )
+  TPL_BLOCKS=(
+    [COMMITS]="$commits"
+    [STATUS_SHORT]="$status_short"
+    [DIFF_STAT]="$diff_stat"
+  )
+  apl_render_template "$RESUME_TEMPLATE"
+  rm -f "$commits" "$status_short" "$diff_stat" 2>/dev/null || true
 }
 
 # write_resume_note <wt> <branch> <id> — render to the worktree and echo the path
-# (the launcher passes the path to the container via ARACHNE_RESUME_NOTE).
+# (the launcher passes the path on to the runner).
 write_resume_note() {
   local wt="$1" branch="$2" id="$3"
-  local out="$wt/.arachne-resume.md"
+  local out="$wt/$RESUME_NOTE_NAME"
   render_resume_note_stream "$wt" "$branch" "$id" >| "$out"
   printf '%s' "$out"
 }
@@ -644,7 +768,7 @@ write_resume_note() {
 escalate_stalled() {
   local phase="$1" id="$2" verdict="$3"
   ESCALATED["$phase"]=1
-  "$ARACHNE_TASK" needs-review "$id" \
+  "$TASK_BIN" needs-review "$id" \
     --reason "Pump auto-resume exhausted: $RESUME_MAX resume attempts made no new commits on $(phase_branch "$phase"). Needs a human to finish, split, or block it." \
     >/dev/null 2>&1 \
     || warn "escalate $id: needs-review failed"
@@ -664,7 +788,7 @@ resume_phase() {
   # detected but not launched — pool cap reached, feed gate shut — must not burn
   # an attempt it never got to use.
   local verdict rc=0
-  verdict="$("$ARACHNE_TASK" resume-attempt "$id" --head "$head" --max "$RESUME_MAX" 2>/dev/null)" || rc=$?
+  verdict="$("$TASK_BIN" resume-attempt "$id" --head "$head" --max "$RESUME_MAX" 2>/dev/null)" || rc=$?
   if (( rc == 10 )); then
     escalate_stalled "$phase" "$id" "$verdict"
     return 1
@@ -676,7 +800,7 @@ resume_phase() {
   # branch — never needs-review/stuck).
   local status="${STALL_STATUS[$phase]:-}"
   if [[ "$status" == "needs-review" || "$status" == "stuck" ]]; then
-    "$ARACHNE_TASK" reopen "$id" \
+    "$TASK_BIN" reopen "$id" \
       --reason "Pump auto-resume ($verdict): committed work on $branch, container dead; relaunching to continue." \
       >/dev/null 2>&1 || { warn "resume $phase: reopen $id failed"; return 1; }
   fi
@@ -693,7 +817,7 @@ launch_phase() {
   local phase="$1"
   # Test/maintenance hook: tick through the gate + plan + state logic without
   # materialising worktrees or containers.
-  if [[ "${ARACHNE_PUMP_NO_LAUNCH:-0}" -eq 1 ]]; then
+  if [[ "${TASKPUMP_PUMP_NO_LAUNCH:-0}" -eq 1 ]]; then
     if [[ -n "$RESUME_TASK_ID" ]]; then
       log "would launch $phase -> $(phase_branch "$phase") (NO_LAUNCH, resume $RESUME_TASK_ID)"
     else
@@ -725,7 +849,7 @@ launch_phase() {
       git -C "$REPO_ROOT" worktree add "$wt" -b "$branch" "$BASE_REF" >/dev/null
     fi
   fi
-  [[ -f "$wt/ops/planning/STATUS.md" ]] || git -C "$wt" submodule update --init --recursive 2>&1 | tail -1 || true
+  [[ -f "$wt/$SUBMODULE_PROBE" ]] || git -C "$wt" submodule update --init --recursive 2>&1 | tail -1 || true
   apl_repair_worktree_gitignore "$REPO_ROOT"
   if (cd "$REPO_ROOT" && git check-ignore -q "$wt" 2>/dev/null); then
     warn "worktree still gitignored: $wt — fix .gitignore; skipping $phase"; return 1
@@ -754,34 +878,53 @@ launch_phase() {
   if [[ -n "$RESUME_TASK_ID" ]]; then
     resume_note="$(write_resume_note "$wt" "$branch" "$RESUME_TASK_ID")"
   else
-    rm -f "$wt/.arachne-resume.md" 2>/dev/null || true
+    rm -f "$wt/$RESUME_NOTE_NAME" 2>/dev/null || true
   fi
 
-  "$DOCKER" rm -f "$cname" >/dev/null 2>&1 || true
-  local cid
-  cid=$("$DOCKER" run --rm -d \
-    --name "$cname" \
-    --cap-add NET_ADMIN \
-    --memory "${AGENT_MEMORY_MAX:-3g}" \
-    --memory-swap "${AGENT_MEMORY_SWAP:-5g}" \
-    -e GITHUB_TOKEN="${GITHUB_TOKEN:-}" \
-    -e WORKSPACE_PATH="$wt" \
-    -e REPO_ROOT="$REPO_ROOT" \
-    -e ARACHNE_BRIEF="$brief" \
-    -e ARACHNE_RESUME_NOTE="$resume_note" \
-    -e ARACHNE_TASK_ID="$lead" \
-    -e ARACHNE_PHASE="$phase" \
-    -e MAX_TURNS="$MAX_TURNS" \
-    -e AGENT_MODEL="$AGENT_MODEL" \
-    -v "$CLAUDE_DIR":/tmp/claude-home:ro \
-    -v "$CLAUDE_JSON":/tmp/claude-home-json/.claude.json:ro \
-    -v "$REPO_ROOT":"$REPO_ROOT":ro \
-    -v "$REPO_ROOT/.git":"$REPO_ROOT/.git" \
-    -v "$wt":"$wt" \
-    -v "$REPO_ROOT/ops":"$REPO_ROOT/ops" \
-    -w "$wt" \
-    arachne /entrypoint-parallel.sh)
-  log "launched $phase -> $cname ($(printf '%s' "$cid" | cut -c1-12))  lead=$lead${RESUME_TASK_ID:+ (RESUME)}  log: $wt/.arachne-agent.log"
+  # ── Hand off to the runner ──────────────────────────────────────────────────
+  # The pump decides WHAT to run and WHERE; the runner owns HOW — the sandbox,
+  # the mounts, the credential handling, the image. Everything it needs arrives
+  # in the environment, in two spellings: the canonical TP_* names, and the
+  # legacy ones the in-container entrypoint reads today. The container-side
+  # reader prefers canonical and falls back to legacy, so either half can be
+  # migrated on its own.
+  #
+  # Stopping a container and checking liveness are still the pump's, by
+  # container name through the runtime directly. Folding those into the runner
+  # contract is v2: liveness is read on every tick from every phase, and routing
+  # it through a process spawn per phase per tick is a cost worth measuring
+  # first.
+  local cid rc=0
+  cid=$(
+    TP_WORKSPACE="$wt"                 WORKSPACE_PATH="$wt" \
+    TP_BRANCH="$branch" \
+    TP_CONTAINER_NAME="$cname" \
+    TP_IMAGE="$IMAGE" \
+    TP_ENTRYPOINT="$ENTRYPOINT" \
+    TP_TASK_ID="$lead"                 ARACHNE_TASK_ID="$lead" \
+    TP_PHASE="$phase"                  ARACHNE_PHASE="$phase" \
+    TP_MODEL="$AGENT_MODEL"            AGENT_MODEL="$AGENT_MODEL" \
+    TP_MAX_TURNS="$MAX_TURNS"          MAX_TURNS="$MAX_TURNS" \
+    TP_REPO_ROOT="$REPO_ROOT"          REPO_ROOT="$REPO_ROOT" \
+    TP_BRIEF="$brief"                  ARACHNE_BRIEF="$brief" \
+    TP_RESUME_NOTE="$resume_note"      ARACHNE_RESUME_NOTE="$resume_note" \
+    TP_LEDGER_REPO="$OPS_DIR" \
+    TP_CLAUDE_DIR="$CLAUDE_DIR"        CLAUDE_DIR="$CLAUDE_DIR" \
+    TP_CLAUDE_JSON="$CLAUDE_JSON"      CLAUDE_JSON="$CLAUDE_JSON" \
+    TP_AGENT_LOG_NAME="$AGENT_LOG_NAME" \
+    TP_GOAL_NOTE_NAME="$GOAL_NOTE_NAME" \
+    TP_TASKS_DIR="$TASKS_DIR" \
+    TP_MEMORY_MAX="${AGENT_MEMORY_MAX:-3g}"   AGENT_MEMORY_MAX="${AGENT_MEMORY_MAX:-3g}" \
+    TP_MEMORY_SWAP="${AGENT_MEMORY_SWAP:-5g}" AGENT_MEMORY_SWAP="${AGENT_MEMORY_SWAP:-5g}" \
+    TP_DOCKER="$DOCKER"                DOCKER="$DOCKER" \
+    GITHUB_TOKEN="${GITHUB_TOKEN:-}" \
+    "$RUNNER" launch
+  ) || rc=$?
+  if (( rc != 0 )); then
+    warn "runner failed to launch $phase (rc=$rc): $RUNNER"
+    return 1
+  fi
+  log "launched $phase -> $cname ($(printf '%s' "$cid" | cut -c1-12))  lead=$lead${RESUME_TASK_ID:+ (RESUME)}  log: $wt/$AGENT_LOG_NAME"
   return 0
 }
 
@@ -803,7 +946,7 @@ ensure_trunk() {
       || die "cannot add trunk worktree $twt"
     log "integration trunk worktree at $twt"
   fi
-  [[ -f "$twt/ops/planning/STATUS.md" ]] || git -C "$twt" submodule update --init --recursive 2>&1 | tail -1 || true
+  [[ -f "$twt/$SUBMODULE_PROBE" ]] || git -C "$twt" submodule update --init --recursive 2>&1 | tail -1 || true
   apl_repair_worktree_gitignore "$REPO_ROOT"
 }
 
@@ -840,12 +983,12 @@ quarantine_phase() {
   local phase="$1" sha="$2" reason="$3"
   local lead; lead="$(phase_lead_task "$phase")"
   [[ -z "$lead" ]] && lead="$phase.0"
-  if [[ "${ARACHNE_PUMP_INTEGRATE_DRYRUN:-0}" -eq 1 ]]; then
+  if [[ "${TASKPUMP_PUMP_INTEGRATE_DRYRUN:-0}" -eq 1 ]]; then
     log "would quarantine $phase: $reason"
     log "would needs-review $lead: $reason"
   else
     log "quarantine $phase: $reason — not advancing $INTEGRATION_TRUNK; $lead → needs-review"
-    "$ARACHNE_TASK" needs-review "$lead" --reason "auto/trunk integration $reason ($phase)" >/dev/null 2>&1 \
+    "$TASK_BIN" needs-review "$lead" --reason "auto/trunk integration $reason ($phase)" >/dev/null 2>&1 \
       || warn "needs-review $lead failed"
     pump_notify "auto/trunk: quarantined $phase ($reason); $lead flagged needs-review"
   fi
@@ -861,7 +1004,7 @@ integrate_one_phase() {
     dbg_log "skip integrate $phase: live container (not quiescent)"
     return 0
   fi
-  if [[ "${ARACHNE_PUMP_INTEGRATE_DRYRUN:-0}" -eq 1 ]]; then
+  if [[ "${TASKPUMP_PUMP_INTEGRATE_DRYRUN:-0}" -eq 1 ]]; then
     integrate_one_phase_dryrun "$phase" "$branch"
   else
     integrate_one_phase_real "$phase" "$branch"
@@ -917,7 +1060,7 @@ integrate_one_phase_real() {
     fi
     local post; post="$(git -C "$twt" rev-parse HEAD 2>/dev/null)"
     log "integrated $phase @ $(printf '%s' "$post" | cut -c1-12)"
-    [[ "${ARACHNE_PUMP_TRUNK_PUSH:-0}" -eq 1 ]] && git -C "$twt" push >/dev/null 2>&1 || true
+    [[ "${TASKPUMP_PUMP_TRUNK_PUSH:-0}" -eq 1 ]] && git -C "$twt" push >/dev/null 2>&1 || true
     exit 0
   ) || true
 }
@@ -938,15 +1081,18 @@ reconcile_trunk() {
   return 0
 }
 
-# graduate_trunk — drain tail (real run only): open exactly one auto/trunk → main
-# PR (idempotent: refresh if it exists). main receives no direct commits — the
-# separate trunk buffer keeps integration continuous while review stays batched.
+# graduate_trunk — drain tail (real run only): open exactly one trunk →
+# integration-base PR (idempotent: refresh if it exists). The base receives no
+# direct commits — the separate trunk buffer keeps integration continuous while
+# review stays batched. Every gh call here targets $INTEGRATION_BASE; all three
+# used to hardcode `main` while --integration-base pretended to be configurable,
+# so pointing a run at a release branch silently opened PRs against main.
 graduate_trunk() {
   [[ "$INTEGRATION" -eq 1 ]] || return 0
-  command -v gh >/dev/null 2>&1 || { warn "gh absent; cannot graduate $INTEGRATION_TRUNK → main"; return 0; }
+  command -v gh >/dev/null 2>&1 || { warn "gh absent; cannot graduate $INTEGRATION_TRUNK → $INTEGRATION_BASE"; return 0; }
   local twt; twt="$(trunk_worktree)"
   local existing
-  existing="$(gh pr list --head "$INTEGRATION_TRUNK" --base main --json number -q '.[0].number // empty' 2>/dev/null || true)"
+  existing="$(gh pr list --head "$INTEGRATION_TRUNK" --base "$INTEGRATION_BASE" --json number -q '.[0].number // empty' 2>/dev/null || true)"
   if [[ -n "$existing" ]]; then
     log "graduation PR #$existing already open for $INTEGRATION_TRUNK; left as-is"
     return 0
@@ -960,11 +1106,11 @@ graduate_trunk() {
   if [[ -n "$quarantined" ]]; then
     body="$(printf '%s\nQuarantined (needs human reconciliation):\n%s\n' "$body" "$quarantined")"
   fi
-  if gh pr create --base main --head "$INTEGRATION_TRUNK" \
+  if gh pr create --base "$INTEGRATION_BASE" --head "$INTEGRATION_TRUNK" \
       --title "auto: integrate $PHASES" --body "$body" >/dev/null 2>&1; then
-    log "opened graduation PR $INTEGRATION_TRUNK → main"
+    log "opened graduation PR $INTEGRATION_TRUNK → $INTEGRATION_BASE"
   else
-    warn "gh pr create for $INTEGRATION_TRUNK → main failed"
+    warn "gh pr create for $INTEGRATION_TRUNK → $INTEGRATION_BASE failed"
   fi
 }
 
@@ -1041,7 +1187,7 @@ print_plan() {
 # disk-pressure pause can self-heal as completed phases free their target/ dirs.
 # Disabled with ARACHNE_DISK_RECLAIM=0.
 reclaim_done_targets() {
-  [[ "${ARACHNE_DISK_RECLAIM:-1}" -eq 1 ]] || return 0
+  [[ "${TASKPUMP_DISK_RECLAIM:-1}" -eq 1 ]] || return 0
   local p wt sz
   for p in "${PLAN_DONE[@]:-}"; do
     [[ -z "$p" ]] && continue
@@ -1049,16 +1195,70 @@ reclaim_done_targets() {
     [[ -d "$wt/target" ]] || continue
     phase_live "$p" && continue
     sz="$(du -sh "$wt/target" 2>/dev/null | cut -f1)"
-    if command -v cargo >/dev/null 2>&1; then
+    if [[ -n "$RECLAIM_CMD" ]]; then
+      if ( cd "$wt" && eval "$RECLAIM_CMD" ) >/dev/null 2>&1; then
+        log "reclaimed $p target/ (${sz:-?}) via TASKPUMP_RECLAIM_CMD"
+      else
+        warn "TASKPUMP_RECLAIM_CMD failed for $p ($wt)"
+      fi
+    elif command -v cargo >/dev/null 2>&1; then
       if cargo clean --manifest-path "$wt/Cargo.toml" >/dev/null 2>&1; then
         log "reclaimed $p target/ (${sz:-?}) via cargo clean"
       else
-        warn "cargo clean failed for $p ($wt); run scripts/arachne-cleanup --targets to reclaim"
+        warn "cargo clean failed for $p ($wt); run '\''tp cleanup --targets'\'' to reclaim"
       fi
     elif rm -rf "$wt/target"; then
       log "reclaimed $p target/ (${sz:-?}) via rm -rf (no cargo)"
     fi
   done
+}
+
+# ── Pre-tick hooks ─────────────────────────────────────────────────────────────
+# Housekeeping the supervisor runs before it plans anything. Pulling the ledger
+# and scrubbing stale claims stay built in — the pump cannot function without
+# them — but the two that encode assumptions about one project's working
+# arrangement are files under hooks/ and can be replaced or dropped.
+#
+# Each hook is run with the repo root as $1. Its stdout is logged and, when the
+# text CHANGES since the last tick, sent to the notifier — a persistent
+# condition must not fire a desktop notification every TICK seconds. The
+# fingerprint lives in a marker file, so the dedup survives a supervisor
+# restart. A non-zero exit is a warning, never a reason to skip the tick.
+default_pre_tick_hooks() {
+  printf '%s\n' "$TP_ROOT/hooks/gitignore-repair"
+  printf '%s\n' "$TP_ROOT/hooks/fs-guard"
+}
+
+run_pre_tick_hooks() {
+  local hooks spec rc out all=""
+  hooks="${TASKPUMP_PRE_TICK_HOOKS:-$(default_pre_tick_hooks)}"
+  while IFS= read -r spec; do
+    [[ -z "${spec//[[:space:]]/}" ]] && continue
+    # A hook entry is a command line; splitting on whitespace is the point.
+    # shellcheck disable=SC2086
+    set -- $spec
+    if [[ ! -x "$1" ]]; then
+      warn "pre-tick hook not executable, skipping: $1"
+      continue
+    fi
+    rc=0
+    out="$(TP_REPO_ROOT="$REPO_ROOT" "$@" "$REPO_ROOT" 2>&1)" || rc=$?
+    (( rc != 0 )) && warn "pre-tick hook '$1' failed (rc=$rc)${out:+ — $out}"
+    [[ -n "$out" ]] && { log "$out"; all+="$out"$'\n'; }
+  done <<<"$hooks"
+
+  all="${all%$'\n'}"
+  if [[ -n "$all" ]]; then
+    # Compare against the trimmed form the marker holds; $(cat) strips trailing
+    # newlines, so an untrimmed comparison never matches and re-notifies forever.
+    if [[ "$all" != "$(cat "$HOOK_MARK_FILE" 2>/dev/null)" ]]; then
+      pump_notify "$all"
+      printf '%s' "$all" >"$HOOK_MARK_FILE" 2>/dev/null || true
+    fi
+  else
+    rm -f "$HOOK_MARK_FILE" 2>/dev/null || true   # quiet again → re-arm
+  fi
+  return 0
 }
 
 # ── One tick: scrub, plan, reclaim, gate, top up the pool to cap ───────────────
@@ -1069,7 +1269,7 @@ do_tick() {
   # operator a generic "scrub failed" every tick for days with nothing to go on,
   # and conflated a corrupt ledger with scrub itself crashing.
   local scrub_out scrub_line scrub_rc=0
-  scrub_out=$("$ARACHNE_TASK" scrub 2>&1) || scrub_rc=$?
+  scrub_out=$("$TASK_BIN" scrub 2>&1) || scrub_rc=$?
   if (( scrub_rc == 3 )); then
     while IFS= read -r scrub_line; do
       [[ -n "$scrub_line" ]] && warn "ledger integrity: $scrub_line"
@@ -1078,31 +1278,7 @@ do_tick() {
     warn "scrub failed (continuing)"
   fi
   reclaim_orphaned_claims   # D3: free tasks parked by dead containers before planning
-
-  # Strip any `.worktrees/` ignore line the `gh worktree` extension auto-appended
-  # since the last tick BEFORE the FS-GUARD reads the tree. The repair is also
-  # called inside launch_phase, but launches don't run while feeding is paused
-  # (usage ceiling, disk, WiFi) — so without this every-tick call a stray append
-  # would leave .gitignore dirty and the FS-GUARD would idle-loop on it (the
-  # 2026-06-24 incident). Idempotent: a no-op unless the bad line is present.
-  apl_repair_worktree_gitignore "$REPO_ROOT"
-
-  # RC-4 contamination guard (A8 / F65.5): flag any primary-source dirtiness an
-  # agent slipped past the read-only mount. Clean under normal operation. Always
-  # log it, but desktop-notify only when the contamination CHANGES — otherwise a
-  # persistent dirty tree spams a notification every tick (TICK seconds). The
-  # fingerprint persists in a gitignored marker so dedup survives restarts.
-  local fs_dirt fsg_mark="$REPO_ROOT/.arachne-fsguard.notified"
-  fs_dirt="$(apl_fs_guard "$REPO_ROOT")"
-  if [[ -n "$fs_dirt" ]]; then
-    log "$fs_dirt"
-    if [[ "$fs_dirt" != "$(cat "$fsg_mark" 2>/dev/null)" ]]; then
-      pump_notify "$fs_dirt"
-      printf '%s' "$fs_dirt" >"$fsg_mark" 2>/dev/null || true
-    fi
-  else
-    rm -f "$fsg_mark" 2>/dev/null || true   # clean again → re-arm for next time
-  fi
+  run_pre_tick_hooks
 
   # Integrate finished phases into auto/trunk (A3). Runs after scrub and BEFORE
   # feed_gate: integration is local compute (no API tokens), so finished work
@@ -1163,7 +1339,7 @@ do_tick() {
 # unit reports `failed` rather than sitting green while making no progress.
 stall_exit() {
   local attention
-  attention=$("$ARACHNE_TASK" list 2>/dev/null \
+  attention=$("$TASK_BIN" list 2>/dev/null \
     | awk '$2=="blocked"||$2=="stuck"||$2=="needs-review"{n++} END{print n+0}')
   write_state stalled "no live agents, nothing launchable, nothing resumable"
   git -C "$OPS_DIR" push >/dev/null 2>&1 || warn "ops push on stall exit failed"
@@ -1203,8 +1379,8 @@ write_state() {  # $1=status(running|paused|drained) $2=paused_reason
 pump_notify() {
   local msg="$1"
   log "$msg"
-  if [[ -n "${ARACHNE_NOTIFY_CMD:-}" ]]; then
-    printf '%s\n' "$msg" | ${ARACHNE_NOTIFY_CMD} >/dev/null 2>&1 || true
+  if [[ -n "${TASKPUMP_NOTIFY_CMD:-}" ]]; then
+    printf '%s\n' "$msg" | ${TASKPUMP_NOTIFY_CMD} >/dev/null 2>&1 || true
   elif command -v notify-send >/dev/null 2>&1; then
     notify-send "arachne-pump" "$msg" >/dev/null 2>&1 || true
   fi
@@ -1247,7 +1423,7 @@ detach_and_exit() {
 exec_monitor() {
   [[ "$MONITOR" -eq 1 ]] || return 0
   [[ -t 0 && -t 1 ]] || { log "not a tty — skipping the monitor (run: $MONITOR_BIN --watch)"; return 0; }
-  [[ -x "$MONITOR_BIN" ]] || { log "no arachne-monitor at $MONITOR_BIN — skipping"; return 0; }
+  [[ -x "$MONITOR_BIN" ]] || { log "no monitor at $MONITOR_BIN — skipping"; return 0; }
   # The supervisor writes .arachne-pump.state on its first tick; give it a beat
   # so the monitor's opening frame shows the run instead of "no pump".
   sleep 2
@@ -1260,8 +1436,7 @@ case "$MODE" in
   render)
     # Print the phase-drain brief rendered for $PHASES to stdout (debug / test).
     # Goes through render_brief_stream so {{DEPENDS_ON}} is expanded too (v1).
-    [[ -f "$ARACHNE_PHASE_BRIEF_TEMPLATE" ]] \
-      || die "phase-drain brief template not found: $ARACHNE_PHASE_BRIEF_TEMPLATE (built by F64.4)"
+    [[ -f "$BRIEF_TEMPLATE" ]] || die "$(missing_brief_template_msg)"
     render_brief_stream "$PHASES"
     exit 0
     ;;
@@ -1303,23 +1478,25 @@ fi
 if [[ -z "${GITHUB_TOKEN:-}" ]] && command -v gh >/dev/null 2>&1; then
   GITHUB_TOKEN="$(gh auth token 2>/dev/null || true)"; export GITHUB_TOKEN
 fi
-[[ -f "$ARACHNE_PHASE_BRIEF_TEMPLATE" ]] \
-  || die "phase-drain brief template missing: $ARACHNE_PHASE_BRIEF_TEMPLATE (build F64.4 first)"
+[[ -f "$BRIEF_TEMPLATE" ]] || die "$(missing_brief_template_msg)"
 
 # Seed the live cap file for discoverability / retuning.
 [[ -f "$CAP_FILE" ]] || echo "$JOBS" >| "$CAP_FILE" 2>/dev/null || true
 
 # Skip the (~9 GB) image build when we will not launch containers — keeps the
 # NO_LAUNCH tick (tests / live read-only validation) side-effect-free.
-if [[ "${ARACHNE_PUMP_NO_LAUNCH:-0}" -ne 1 ]]; then
-  log "Building arachne image ..."
-  "$DOCKER" build -t arachne "$REPO_ROOT" >/dev/null || die "image build failed"
+if [[ "${TASKPUMP_PUMP_NO_LAUNCH:-0}" -ne 1 ]]; then
+  [[ -x "$RUNNER" ]] || die "no agent runner at $RUNNER (set TASKPUMP_RUNNER)"
+  if [[ -n "$IMAGE_BUILD_CMD" ]]; then
+    log "Building the $IMAGE image ..."
+    ( cd "$REPO_ROOT" && eval "$IMAGE_BUILD_CMD" ) >/dev/null || die "image build failed"
+  fi
 fi
 
 # Materialise auto/trunk + its worktree once, before the loop (A3). Real run
 # only — skipped under NO_LAUNCH (tests / read-only validation) and a no-op when
 # --integration-trunk is off.
-if [[ "${ARACHNE_PUMP_NO_LAUNCH:-0}" -ne 1 ]]; then
+if [[ "${TASKPUMP_PUMP_NO_LAUNCH:-0}" -ne 1 ]]; then
   ensure_trunk
 fi
 
@@ -1327,15 +1504,15 @@ fi
 # run-parallel.sh does, so disk pressure also drops the live pool cap (cap-file
 # path) on top of the feed gate. --auto-exit retires it once no agents remain.
 # Skipped for --once / NO_LAUNCH ticks and when the disk gate is disabled.
-if [[ "$MODE" == "run" && "$DISK_GATE" -eq 1 && "${ARACHNE_PUMP_NO_LAUNCH:-0}" -ne 1 ]]; then
-  nohup "$ARACHNE_DISK_WATCHDOG" --auto-exit \
-    >>"$REPO_ROOT/.arachne-disk-watchdog.log" 2>&1 </dev/null &
+if [[ "$MODE" == "run" && "$DISK_GATE" -eq 1 && "${TASKPUMP_PUMP_NO_LAUNCH:-0}" -ne 1 ]]; then
+  nohup "$DISK_WATCHDOG_BIN" --auto-exit \
+    >>"$DISK_WATCHDOG_LOG" 2>&1 </dev/null &
   disown "$!" 2>/dev/null || true
-  log "disk watchdog started (cap-file path; log: .arachne-disk-watchdog.log)"
+  log "disk watchdog started (cap-file path; log: $DISK_WATCHDOG_LOG)"
 fi
 
 log "Pump: phases=$PHASES grain=$GRAIN cap=$JOBS (live via $CAP_FILE) ceiling=${CEILING}% tick=${TICK}s"
-log "Singular supervisor; Ctrl-C stops feeding but leaves running agents. Monitor: scripts/arachne-monitor --watch"
+log "Singular supervisor; Ctrl-C stops feeding but leaves running agents. Monitor: $MONITOR_BIN --watch"
 
 if [[ "$MODE" == "once" ]]; then
   do_tick
@@ -1362,7 +1539,7 @@ graduate_trunk
 git -C "$OPS_DIR" push >/dev/null 2>&1 || warn "final ops push failed"
 write_state drained ""
 # Tally non-done terminal states that need a human (blocked / stuck / needs-review).
-attention=$("$ARACHNE_TASK" list 2>/dev/null \
+attention=$("$TASK_BIN" list 2>/dev/null \
   | awk '$2=="blocked"||$2=="stuck"||$2=="needs-review"{n++} END{print n+0}')
 pump_notify "$PHASES drained: 0 open should remain ($(open_count) open), $attention task(s) need human review (blocked/stuck/needs-review)."
 exit 0
