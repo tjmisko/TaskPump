@@ -823,40 +823,66 @@ TASKPUMP_NOTIFY_CMD=true TASKPUMP_PUMP_NO_LAUNCH=1 ARACHNE_PUMP_OPS_DIR="$TMP/no
   || fail "TASKPUMP_PUMP_STATE_FILE ignored"
 mk F55.0 open; mk F55.1 open F55.0; mk F56.0 open; mk F57.0 open F55.1
 
-echo "--- Test 23: templates carry the prose, and every project word is a key ---"
-# The shipped brief must not smuggle one project's vocabulary into another's.
-out=$(ARACHNE_PUMP_OPS_DIR="$TMP/no-such-ops" \
+# `env` is needed, not a bare prefix: words that arrive through "$@" are not
+# parsed as assignments, so bash would try to execute the first one.
+rnote() { PATH="$BIN:$PATH" ARACHNE_POOL_CAP_FILE="$TMP/cap" \
+  ARACHNE_PUMP_STATE_FILE="$STATE19" ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+  STUB_LIVE="" STUB_AHEAD=3 STUB_HEAD=aaaa111 \
+  env "$@" "$PUMP" --no-health-gate --render-resume-note F97 2>&1; }
+
+echo "--- Test 23a: the renderer substitutes every placeholder it documents ---"
+# Drive this from a fixture template, NOT from whichever file templates/ ships.
+# Asserting that the shipped brief uses {{TASK_CLI}} couples this suite to a
+# file another branch owns, and it broke the moment a differently-worded — but
+# perfectly valid — default arrived. What has to hold is that the RENDERER
+# resolves a placeholder, not that some particular template chose to use it.
+ALLTPL="$TMP/all-placeholders.md"
+cat >| "$ALLTPL" <<'EOF'
+phase={{PHASE}} base={{BASE}} cli={{TASK_CLI}} name={{TASK_CLI_NAME}}
+dir={{TASK_DIR}} verify={{VERIFY_CMDS}} gate={{BUILD_GATE}}
+brief={{PROJECT_BRIEF}}
+{{DEPENDS_ON}}
+EOF
+out=$(ARACHNE_PUMP_NO_GH=1 TASKPUMP_BRIEF_TEMPLATE="$ALLTPL" \
       TASKPUMP_TASK_CLI="bin/tp task" \
       TASKPUMP_VERIFY_CMDS=$'make lint\nmake test' \
       TASKPUMP_PROJECT_BRIEF="Read HACKING.md first." \
       "$PUMP" --render-brief F55 2>&1)
-grep -qF 'bin/tp task next' <<<"$out" && pass "TASKPUMP_TASK_CLI reaches the brief" \
-  || fail "task CLI not substituted:\n$out"
-grep -qF '`make lint` and `make test`' <<<"$out" && pass "verify commands render as an inline phrase" \
-  || fail "verify commands not joined:\n$out"
-grep -qF 'Read HACKING.md first.' <<<"$out" && pass "TASKPUMP_PROJECT_BRIEF reaches the brief" \
-  || fail "project brief not substituted:\n$out"
-grep -qiE 'cargo|arachne|CLAUDE\.md' <<<"$out" \
-  && fail "the shipped brief still names one project:\n$out" \
-  || pass "the shipped brief names no particular project"
-grep -qF '{{' <<<"$out" && fail "unsubstituted placeholder left in the brief:\n$out" \
-  || pass "no placeholder survives rendering"
+grep -qF 'phase=F55' <<<"$out"            && pass "{{PHASE}} substitutes"      || fail "PHASE:\n$out"
+grep -qF 'base=main' <<<"$out"            && pass "{{BASE}} substitutes"       || fail "BASE:\n$out"
+grep -qF 'cli=bin/tp task' <<<"$out"      && pass "{{TASK_CLI}} substitutes"   || fail "TASK_CLI:\n$out"
+# basename strips the directory, not the subcommand: `bin/tp task` → `tp task`,
+# which is what prose should call it. (Arachne's default gives `arachne-task`.)
+grep -qF 'name=tp task' <<<"$out"         && pass "{{TASK_CLI_NAME}} drops the directory, keeps the subcommand" || fail "TASK_CLI_NAME:\n$out"
+grep -qF '`make lint` and `make test`' <<<"$out" && pass "{{VERIFY_CMDS}} renders as an inline phrase" || fail "VERIFY_CMDS:\n$out"
+grep -qF 'gate=`make lint` and `make test`' <<<"$out" && pass "{{BUILD_GATE}} is an alias of {{VERIFY_CMDS}}" || fail "BUILD_GATE:\n$out"
+grep -qF 'brief=Read HACKING.md first.' <<<"$out" && pass "{{PROJECT_BRIEF}} substitutes" || fail "PROJECT_BRIEF:\n$out"
+grep -qF 'No cross-phase dependencies.' <<<"$out" && pass "{{DEPENDS_ON}} expands as a block" || fail "DEPENDS_ON:\n$out"
 
-# Same for the resume note, which is what a stalled agent reads first.
+echo "--- Test 23b: whatever ships must render clean and name no project ---"
+# These two properties hold for ANY shipped default, so they survive a template
+# arriving from another branch. Anything more specific belongs in 23a.
+assert_shipped() {  # <label> <rendered>
+  local label="$1" out="$2"
+  grep -qF '{{' <<<"$out" && fail "$label: an unsubstituted placeholder survived:\n$out" \
+    || pass "$label: no placeholder survives rendering"
+  grep -qiE 'cargo|arachne|CLAUDE\.md' <<<"$out" \
+    && fail "$label: the shipped default names one project:\n$out" \
+    || pass "$label: names no particular project"
+}
+assert_shipped "shipped brief" "$(ARACHNE_PUMP_OPS_DIR="$TMP/no-such-ops" ARACHNE_PUMP_NO_GH=1 \
+  TASKPUMP_TASK_CLI="bin/tp task" TASKPUMP_VERIFY_CMDS="make check" \
+  TASKPUMP_PROJECT_BRIEF="Read HACKING.md first." "$PUMP" --render-brief F55 2>&1)"
+
 stall_fixture
-note=$(PATH="$BIN:$PATH" ARACHNE_PUMP_OPS_DIR="$TMP/noops" ARACHNE_POOL_CAP_FILE="$TMP/cap" \
-       ARACHNE_PUMP_STATE_FILE="$STATE19" ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
-       TASKPUMP_TASK_CLI="bin/tp task" TASKPUMP_VERIFY_CMDS="make check" \
-       STUB_LIVE="" STUB_AHEAD=3 STUB_HEAD=aaaa111 \
-       "$PUMP" --no-health-gate --render-resume-note F97 2>/dev/null)
-grep -qF 'bin/tp task complete' <<<"$note" && pass "resume note uses the configured task CLI" \
-  || fail "resume note kept the default CLI:\n$note"
-grep -qF '`bin/tp task` next' <<<"$note" && fail "bare CLI name should be the basename:\n$note" \
-  || pass "prose uses the CLI basename, invocations use the full path"
-grep -qF '`make check` are clean' <<<"$note" && pass "resume note uses the configured verify commands" \
-  || fail "resume note kept cargo:\n$note"
-grep -qF '{{' <<<"$note" && fail "unsubstituted placeholder left in the resume note:\n$note" \
-  || pass "no placeholder survives the resume note"
+assert_shipped "shipped resume note" "$(rnote ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
+  TASKPUMP_TASK_CLI="bin/tp task" TASKPUMP_VERIFY_CMDS="make check")"
+
+# And the resume note must still carry the one sentence it exists for.
+note=$(rnote ARACHNE_PUMP_OPS_DIR="$TMP/noops")
+have "$note" 'RESUME CONTEXT' && pass "the resume note keeps its heading" || fail "no heading:\n$note"
+have "$note" 'Do NOT start by running' && pass "the resume note keeps the next-returns-null warning" \
+  || fail "the load-bearing warning is gone:\n$note"
 
 echo "--- Test 24: the feed gate is a pluggable, fail-open chain ---"
 GBIN="$TMP/gates"; mkdir -p "$GBIN"
@@ -1013,12 +1039,6 @@ rm -f "$BIN/gh"
 echo "--- Test 28: the resume note resolves like the brief does ---"
 RES2="$TMP/resolve2"; mkdir -p "$RES2/ops/task-loop/briefs"
 stall_fixture
-# `env` is needed, not a bare prefix: words that arrive through "$@" are not
-# parsed as assignments, so bash would try to execute the first one.
-rnote() { PATH="$BIN:$PATH" ARACHNE_POOL_CAP_FILE="$TMP/cap" \
-  ARACHNE_PUMP_STATE_FILE="$STATE19" ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
-  STUB_LIVE="" STUB_AHEAD=3 STUB_HEAD=aaaa111 \
-  env "$@" "$PUMP" --no-health-gate --render-resume-note F97 2>&1; }
 
 # Shipped default, when a consumer supplies nothing.
 out=$(rnote ARACHNE_PUMP_OPS_DIR="$TMP/noops")
