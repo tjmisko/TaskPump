@@ -1144,6 +1144,29 @@ both=$(env -u TASKPUMP_PUMP_STATE_FILE \
        "$CLI" --tab graph 2>/dev/null | strip_ansi)
 grep -q '┃ F96.4 ' <<<"$both" \
     && pass "TASKPUMP_TASKS_DIR outranks ARACHNE_TASKS_DIR" || fail "legacy name won over canonical:\n$both"
+# MANIFEST is the one legacy name with no ARACHNE_ prefix, so the config core
+# cannot promote it — the monitor has to honour the bare spelling itself.
+BM="$TMP/bare-manifest.tsv"; printf 'displayname\tfeat/f97\tbrief.md\tF97.3\n' >| "$BM"
+BMC="$TMP/bare-sess.tsv"
+cat >| "$BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+for a in "$@"; do
+  case "$a" in
+    '{{.Names}}|{{.State}}|{{.Status}}') echo 'arachne-agent-feat-f97|running|Up 3 minutes'; exit 0 ;;
+    '{{.Names}}') echo 'arachne-agent-feat-f97'; exit 0 ;;
+  esac
+done
+exit 0
+EOF
+chmod +x "$BIN/docker"
+bmrun() { env -u TASKPUMP_MANIFEST MANIFEST="$BM" TASKPUMP_TASKS_DIR="$CTD" \
+          TASKPUMP_MONITOR_REPO_ROOT="$SFR" TASKPUMP_MONITOR_SESS_CACHE="$BMC" \
+          TASKPUMP_MONITOR_COLS=140 "$CLI" 2>/dev/null | strip_ansi; }
+bmrun >/dev/null; sleep 2; bm=$(bmrun)
+grep -q 'displayname' <<<"$bm" \
+    && pass "the bare MANIFEST spelling still supplies the session display name" \
+    || fail "bare MANIFEST ignored:\n$bm"
+printf '#!/usr/bin/env bash\nexit 0\n' >| "$BIN/docker"; chmod +x "$BIN/docker"
 
 # ── Test 33: the deployment-shaped constants are configurable ───────────────
 # The container prefix, the agent log name and the worktree dir were literals in
