@@ -51,7 +51,10 @@ EOF
 cat >| "$BIN/claude-usage" <<'EOF'
 #!/usr/bin/env bash
 if [[ "${1:-}" == "--gate" ]]; then
-  [[ "${STUB_GATE_RC:-0}" -eq 10 ]] && { echo "claude-usage: 97% of the 5-hour window used (ceiling 95%)" >&2; exit 10; }
+  # The real meter prefixes its own name; the pump strips that prefix before
+  # showing the reason, so the stub has to speak the same way for the golden to
+  # pin the stripping.
+  [[ "${STUB_GATE_RC:-0}" -eq 10 ]] && { echo "arachne-usage: 97% of the 5-hour window used (ceiling 95%)" >&2; exit 10; }
   exit 0
 fi
 exit 0
