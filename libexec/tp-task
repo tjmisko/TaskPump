@@ -1,66 +1,108 @@
 #!/usr/bin/env bash
-# arachne-task — task-management CLI for the Arachne task-loop.
+# tp-task — TaskPump's ledger CLI: the sole reader/writer of a task DAG kept as
+# one markdown file per task, state in YAML frontmatter.
 #
-# Task state lives as per-file markdown with YAML frontmatter. This CLI is the
-# single writer / reader to that state. See /home/tjmisko/.claude/plans/
-# check-the-logs-from-floofy-tarjan.md Layer 3 for the contract.
+# Nothing here is project-specific. Every literal that used to name Arachne — the
+# ledger's location, the id grammar, the committer identity, the tripwire
+# constants — is a TASKPUMP_* config key whose baked default reproduces Arachne's
+# behaviour exactly, so a checkout with no taskpump.conf behaves as it always did.
+# See `tp-task --help` for the key list and lib/config.sh for how they resolve.
 #
-# Env vars:
-#   ARACHNE_TASKS_DIR      Path to tasks directory. Default: <workspace>/ops/task-loop/tasks,
-#                          where <workspace> is $PWD's git worktree when that
-#                          worktree has an ops/ checkout, else the directory
-#                          above this script.
-#   ARACHNE_TASK_OUT       Path to the JSON "next task" surface file.
-#                          Default: $(dirname $ARACHNE_TASKS_DIR)/.next-task
-#   ARACHNE_TASK_PUSH      If "1", `git push` after each state-mutating commit.
-#                          Default: unset (local commits only).
-#   ARACHNE_TASK_NOCOMMIT  If "1", skip git commit entirely (fixture mode).
-#   ARACHNE_TASK_DEBUG     If "1", print debug traces to stderr.
+# ── The id grammar contract ──────────────────────────────────────────────────
+#
+# Two knobs describe a consumer's id scheme, and they do different jobs:
+#
+#   TASKPUMP_ID_PATTERN  VALIDATES. A regex `create` tests a new id against.
+#   TASKPUMP_PHASE_SIGIL DERIVES. The alphabetic prefix on a phase token, which
+#                        phase ranges strip and re-apply (`F55..F63` → F55…F63).
+#
+# What is NOT configurable is the shape: an id is `PHASE` or `PHASE.N`, and the
+# phase is everything before the first `.`. Phase grouping, range expansion, and
+# ordering are all built on that split, so a consumer choosing a different
+# separator would silently lose all three. Pick a sigil and a pattern; keep the
+# dot.
 
 set -euo pipefail
 
 # ── TaskPump config core ──────────────────────────────────────────────────────
 # Loaded before any default below, so a taskpump.conf key reaches the `: "${X:=}"`
-# defaults through the legacy-alias promotion in lib/config.sh.
+# defaults, and so a legacy ARACHNE_* export still arrives under its canonical
+# TASKPUMP_* spelling.
 _tp_self_root="$(CDPATH= cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 # shellcheck source=../lib/config.sh
 . "$_tp_self_root/lib/config.sh"
 tp_load_config
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# ── Workspace resolution ──────────────────────────────────────────────────────
 # Resolve the workspace whose ledger we operate on. Env vars still override.
 #
 # The caller's workspace wins over the script's own location. Both the primary
-# checkout and every worktree carry their own `scripts/arachne-task` and their
-# own `ops/` checkout, so deriving the root from the script alone means
-# `/primary/scripts/arachne-task claim F78.8` run while standing in a worktree
-# writes the claim into the *primary's* ledger — the worktree's own ops never
-# learns about it, and the primary's silently drifts. Preferring $PWD's
-# worktree makes task state follow the workspace the work is happening in,
-# which is what every caller means.
-_arachne_script_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
-_arachne_script_root="$(cd "$_arachne_script_dir/.." && pwd)"
+# checkout and every worktree carry their own copy of this CLI and their own
+# ledger checkout, so deriving the root from the script alone means
+# `/primary/libexec/tp-task claim F78.8` run while standing in a worktree writes
+# the claim into the *primary's* ledger — the worktree's own ledger never learns
+# about it, and the primary's silently drifts. Preferring $PWD's worktree makes
+# task state follow the workspace the work is happening in, which is what every
+# caller means.
+#
+# TASKPUMP_LEDGER_PROBE is the ledger's path relative to a candidate workspace
+# root. It answers "does this worktree carry a ledger of its own?" and, when no
+# explicit tasks dir is given, it *is* the ledger's location — one key rather
+# than two spellings of the same path that can drift apart.
+: "${TASKPUMP_LEDGER_PROBE:=ops/task-loop/tasks}"
 
-_arachne_repo_root="$_arachne_script_root"
-_arachne_cwd_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
-if [[ -n "$_arachne_cwd_root" && -d "$_arachne_cwd_root/ops/task-loop/tasks" ]]; then
-  _arachne_repo_root="$_arachne_cwd_root"
+_tp_script_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+_tp_script_root="$(cd "$_tp_script_dir/.." && pwd)"
+
+_tp_repo_root="$_tp_script_root"
+_tp_cwd_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [[ -n "$_tp_cwd_root" && -d "$_tp_cwd_root/$TASKPUMP_LEDGER_PROBE" ]]; then
+  _tp_repo_root="$_tp_cwd_root"
 fi
 
-: "${ARACHNE_TASKS_DIR:=$_arachne_repo_root/ops/task-loop/tasks}"
-: "${ARACHNE_TASK_OUT:=$(dirname "$ARACHNE_TASKS_DIR")/.next-task}"
-: "${ARACHNE_CODE_REPO:=$_arachne_repo_root}"
-: "${ARACHNE_TASK_PUSH:=0}"
-: "${ARACHNE_TASK_NOCOMMIT:=0}"
-: "${ARACHNE_TASK_DEBUG:=0}"
+# ── Config ────────────────────────────────────────────────────────────────────
+: "${TASKPUMP_TASKS_DIR:=$_tp_repo_root/$TASKPUMP_LEDGER_PROBE}"
+: "${TASKPUMP_TASK_OUT:=$(dirname "$TASKPUMP_TASKS_DIR")/.next-task}"
+: "${TASKPUMP_CODE_REPO:=$_tp_repo_root}"
+# TASKPUMP_PUSH is the design's name for the same switch; TASKPUMP_TASK_PUSH is
+# where a legacy ARACHNE_TASK_PUSH lands, so it has to win to keep the promotion
+# faithful.
+: "${TASKPUMP_TASK_PUSH:=${TASKPUMP_PUSH:-0}}"
+: "${TASKPUMP_TASK_NOCOMMIT:=0}"
+: "${TASKPUMP_TASK_DEBUG:=0}"
+
+# Ledger commit identity. Distinct from the operator's own git identity so a
+# ledger's history separates bookkeeping from authored work.
+: "${TASKPUMP_COMMITTER_NAME:=arachne-task}"
+: "${TASKPUMP_COMMITTER_EMAIL:=task@arachne.local}"
+
+# Id grammar. See the contract at the top of this file.
+: "${TASKPUMP_ID_PATTERN:=^F[0-9]+(\.[0-9]+)?$}"
+: "${TASKPUMP_PHASE_SIGIL:=F}"
+
+# Tripwire + concurrency constants.
+: "${TASKPUMP_TURN_BUDGET_DEFAULT:=50}"
+: "${TASKPUMP_FAILURE_LIMIT:=3}"
+: "${TASKPUMP_CLAIM_STALE_HOURS:=24}"
+: "${TASKPUMP_LOCK_WAIT:=120}"
+: "${TASKPUMP_PUSH_RETRIES:=6}"
+
+# Name this tool answers to in its own diagnostics. Left as the historical value
+# so existing output is byte-identical; a consumer rebranding the install sets it.
+: "${TASKPUMP_PROG_NAME:=arachne-task}"
 
 dbg() {
-  [[ "$ARACHNE_TASK_DEBUG" == "1" ]] && printf '[arachne-task] %s\n' "$*" >&2
+  [[ "$TASKPUMP_TASK_DEBUG" == "1" ]] && printf '[%s] %s\n' "$TASKPUMP_PROG_NAME" "$*" >&2
+  return 0
+}
+
+warn() {
+  printf '%s: %s\n' "$TASKPUMP_PROG_NAME" "$*" >&2
   return 0
 }
 
 die() {
-  printf 'arachne-task: %s\n' "$*" >&2
+  printf '%s: %s\n' "$TASKPUMP_PROG_NAME" "$*" >&2
   exit 1
 }
 
@@ -112,7 +154,7 @@ fm_id_status() {
 # Path to a task file by id. Returns empty if not found.
 task_file() {
   local id=$1 file
-  file="$ARACHNE_TASKS_DIR/$id.md"
+  file="$TASKPUMP_TASKS_DIR/$id.md"
   [[ -f "$file" ]] && printf '%s' "$file"
 }
 
@@ -120,19 +162,34 @@ task_file() {
 task_file_required() {
   local id=$1 file
   file=$(task_file "$id")
-  [[ -z "$file" ]] && die "no task file for id='$id' in $ARACHNE_TASKS_DIR"
+  [[ -z "$file" ]] && die "no task file for id='$id' in $TASKPUMP_TASKS_DIR"
   printf '%s' "$file"
+}
+
+# ── Phase sigil ───────────────────────────────────────────────────────────────
+# Drop a leading TASKPUMP_PHASE_SIGIL from a phase token, case-insensitively, so
+# "F55", "f55" and "55" all reduce to "55". Any other input is returned as-is —
+# callers distinguish "had a sigil" from "did not" by comparing to the input.
+strip_phase_sigil() {
+  local value=$1 sigil=$TASKPUMP_PHASE_SIGIL
+  if [[ -n "$sigil" && "${value,,}" == "${sigil,,}"* ]]; then
+    value=${value:${#sigil}}
+  fi
+  printf '%s' "$value"
 }
 
 # ── Sort key for phase-anchored ids ───────────────────────────────────────────
 # "F17.10" → "17 10" so `sort -n -k1,1 -k2,2` orders F9 < F10 < F17.2 < F17.10.
 # "F-MERGE.2" → "999999 2" (special phase sorted last within its bucket).
 phase_sort_key() {
-  local id=$1 phase_part num_part phase_num
+  local id=$1 phase_part num_part phase_num bare
   phase_part=${id%%.*}         # F17 from F17.10
   num_part=${id##*.}           # 10 from F17.10
-  if [[ "$phase_part" =~ ^F([0-9]+)$ ]]; then
-    phase_num=${BASH_REMATCH[1]}
+  bare=$(strip_phase_sigil "$phase_part")
+  # A numeric phase must carry the sigil to count as one: a bare "17" is not an
+  # id in this grammar, and treating it as phase 17 would sort it alongside F17.
+  if [[ ( -z "$TASKPUMP_PHASE_SIGIL" || "$bare" != "$phase_part" ) && "$bare" =~ ^[0-9]+$ ]]; then
+    phase_num=$bare
   else
     # Non-numeric phase (e.g., F-MERGE). Sort after numeric phases.
     phase_num=999999
@@ -147,22 +204,23 @@ phase_sort_key() {
 # either ("F55,F58..F60"). Non-numeric phase tokens (e.g. "F-MERGE") pass through
 # uppercased as single tokens; they cannot participate in a range.
 expand_phases() {
-  local spec=$1 comp a b lo hi i n
+  local spec=$1 comp a b lo hi i n sigil=$TASKPUMP_PHASE_SIGIL
   local IFS=','
   for comp in $spec; do
     comp="${comp//[[:space:]]/}"
     [[ -z "$comp" ]] && continue
     if [[ "$comp" == *..* ]]; then
       a="${comp%%..*}"; b="${comp##*..}"
-      a="${a#[Ff]}"; b="${b#[Ff]}"
-      [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ ]] || die "bad phase range '$comp' (expected FN..FM)"
+      a=$(strip_phase_sigil "$a"); b=$(strip_phase_sigil "$b")
+      [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ ]] \
+        || die "bad phase range '$comp' (expected ${sigil}N..${sigil}M)"
       if (( a <= b )); then lo=$a; hi=$b; else lo=$b; hi=$a; fi
-      for (( i=lo; i<=hi; i++ )); do printf 'F%s\n' "$i"; done
+      for (( i=lo; i<=hi; i++ )); do printf '%s%s\n' "$sigil" "$i"; done
     else
       comp="${comp%%.*}"            # tolerate a full id: F55.2 -> F55
-      n="${comp#[Ff]}"
+      n=$(strip_phase_sigil "$comp")
       if [[ "$n" =~ ^[0-9]+$ ]]; then
-        printf 'F%s\n' "$n"
+        printf '%s%s\n' "$sigil" "$n"
       else
         printf '%s\n' "${comp^^}"   # non-numeric phase, e.g. F-MERGE
       fi
@@ -191,31 +249,33 @@ json_object() {
 
 # ── Git helpers ───────────────────────────────────────────────────────────────
 git_commit_state() {
-  # Commits the current state of ARACHNE_TASKS_DIR with a given message.
-  # Respects ARACHNE_TASK_NOCOMMIT and ARACHNE_TASK_PUSH.
+  # Commits the current state of TASKPUMP_TASKS_DIR with a given message.
+  # Respects TASKPUMP_TASK_NOCOMMIT and TASKPUMP_TASK_PUSH.
   local msg=$1
-  if [[ "$ARACHNE_TASK_NOCOMMIT" == "1" ]]; then
-    dbg "skipping commit (ARACHNE_TASK_NOCOMMIT=1): $msg"
+  if [[ "$TASKPUMP_TASK_NOCOMMIT" == "1" ]]; then
+    dbg "skipping commit (TASKPUMP_TASK_NOCOMMIT=1): $msg"
     return 0
   fi
   local tasks_git_root
-  tasks_git_root=$(git -C "$ARACHNE_TASKS_DIR" rev-parse --show-toplevel 2>/dev/null || true)
+  tasks_git_root=$(git -C "$TASKPUMP_TASKS_DIR" rev-parse --show-toplevel 2>/dev/null || true)
   if [[ -z "$tasks_git_root" ]]; then
-    dbg "not a git repo at $ARACHNE_TASKS_DIR; skipping commit"
+    dbg "not a git repo at $TASKPUMP_TASKS_DIR; skipping commit"
     return 0
   fi
-  git -C "$tasks_git_root" add -A -- "$ARACHNE_TASKS_DIR"
+  git -C "$tasks_git_root" add -A -- "$TASKPUMP_TASKS_DIR"
   if git -C "$tasks_git_root" diff --cached --quiet; then
     dbg "no changes to commit for: $msg"
     return 0
   fi
-  git -C "$tasks_git_root" -c user.name='arachne-task' -c user.email='task@arachne.local' commit -m "$msg" >/dev/null
+  git -C "$tasks_git_root" \
+    -c user.name="$TASKPUMP_COMMITTER_NAME" -c user.email="$TASKPUMP_COMMITTER_EMAIL" \
+    commit -m "$msg" >/dev/null
   dbg "committed: $msg"
-  if [[ "$ARACHNE_TASK_PUSH" == "1" ]]; then
+  if [[ "$TASKPUMP_TASK_PUSH" == "1" ]]; then
     # Retry push with fetch-rebase + jittered backoff on non-fast-forward.
-    # Under 10-12 concurrent agents, many small ops/ pushes collide; jitter
+    # Under 10-12 concurrent agents, many small ledger pushes collide; jitter
     # spreads the retries so they don't thundering-herd the same remote ref.
-    local try max=${ARACHNE_PUSH_RETRIES:-6} branch
+    local try max=$TASKPUMP_PUSH_RETRIES branch
     branch=$(git -C "$tasks_git_root" rev-parse --abbrev-ref HEAD)
     for (( try=1; try<=max; try++ )); do
       if git -C "$tasks_git_root" push 2>/dev/null; then
@@ -245,10 +305,10 @@ git_commit_state() {
 # lifetime of the process via FD 9 (auto-released on exit). Degrades to a no-op
 # where flock is unavailable (e.g. a stock macOS host).
 acquire_state_lock() {
-  [[ "$ARACHNE_TASK_NOCOMMIT" == "1" ]] && return 0
+  [[ "$TASKPUMP_TASK_NOCOMMIT" == "1" ]] && return 0
   command -v flock >/dev/null 2>&1 || { dbg "flock unavailable; no state lock"; return 0; }
   local root lockfile
-  root=$(git -C "$ARACHNE_TASKS_DIR" rev-parse --show-toplevel 2>/dev/null || echo "")
+  root=$(git -C "$TASKPUMP_TASKS_DIR" rev-parse --show-toplevel 2>/dev/null || echo "")
   lockfile="${root:-/tmp}/.arachne-task.lock"
   # Open fd 9 to the lockfile for the lifetime of the process. The `2>/dev/null`
   # MUST be scoped to a brace group: `exec 9>… 2>/dev/null` with no command would
@@ -256,8 +316,8 @@ acquire_state_lock() {
   # subsequent stderr (every warning + `die` reason). The brace group restores
   # fd 2 after the open while leaving fd 9 (set by exec) in place.
   { exec 9>"$lockfile"; } 2>/dev/null || { dbg "cannot open lockfile $lockfile"; return 0; }
-  if ! flock -w "${ARACHNE_LOCK_WAIT:-120}" 9; then
-    die "could not acquire state lock ($lockfile) within ${ARACHNE_LOCK_WAIT:-120}s"
+  if ! flock -w "$TASKPUMP_LOCK_WAIT" 9; then
+    die "could not acquire state lock ($lockfile) within ${TASKPUMP_LOCK_WAIT}s"
   fi
   dbg "acquired state lock $lockfile"
 }
@@ -266,8 +326,8 @@ acquire_state_lock() {
 
 # List task files as newline-separated paths.
 list_all_files() {
-  [[ -d "$ARACHNE_TASKS_DIR" ]] || return 0
-  find "$ARACHNE_TASKS_DIR" -maxdepth 1 -name '*.md' -type f | sort
+  [[ -d "$TASKPUMP_TASKS_DIR" ]] || return 0
+  find "$TASKPUMP_TASKS_DIR" -maxdepth 1 -name '*.md' -type f | sort
 }
 
 # True if all blockers of <file> are status: done.
@@ -305,9 +365,9 @@ cmd_next() {
   # Normalise the phase filter to the bare phase token (e.g. F51): accept
   # "F51", "f51", "51", or a full task id like "F51.2" and keep only "F51".
   if [[ -n "$phase" ]]; then
-    phase=${phase%%.*}                 # F51.2 -> F51
-    phase=${phase#[Ff]}                # F51 / f51 -> 51
-    phase="F${phase}"                  # 51 -> F51 (canonical)
+    phase=${phase%%.*}                            # F51.2 -> F51
+    phase=$(strip_phase_sigil "$phase")           # F51 / f51 -> 51
+    phase="${TASKPUMP_PHASE_SIGIL}${phase}"       # 51 -> F51 (canonical)
   fi
 
   # Walk tasks, collect (sort_key, id, file) for eligible ones.
@@ -344,7 +404,7 @@ cmd_next() {
 
   if (( ${#candidates[@]} == 0 )); then
     # No eligible task. Write an empty-ish JSON to the out file and exit 1.
-    printf '%s\n' "null" >| "$ARACHNE_TASK_OUT"
+    printf '%s\n' "null" >| "$TASKPUMP_TASK_OUT"
     echo "null"
     return 1
   fi
@@ -362,7 +422,7 @@ cmd_next() {
 
   # Emit JSON.
   local goal; goal=$(fm_get "$top_file" '.goal')
-  [[ -z "$goal" ]] && echo "warning: task $top_id has no goal — run '/goal $top_id' or 'arachne-task goal $top_id --set \"...\"'" >&2
+  [[ -z "$goal" ]] && echo "warning: task $top_id has no goal — set one with '$TASKPUMP_PROG_NAME goal $top_id --set \"...\"'" >&2
   local json
   json=$(jq -n \
     --arg id "$top_id" \
@@ -370,7 +430,7 @@ cmd_next() {
     --arg branch "$branch" \
     --arg goal "$goal" \
     '{id: $id, file: $file, branch: $branch, goal: $goal, ready: true}')
-  printf '%s\n' "$json" >| "$ARACHNE_TASK_OUT"
+  printf '%s\n' "$json" >| "$TASKPUMP_TASK_OUT"
   printf '%s\n' "$json"
   return 0
 }
@@ -555,7 +615,7 @@ cmd_list() {
 }
 
 cmd_claim() {
-  local id="" branch="" turns="50"
+  local id="" branch="" turns="$TASKPUMP_TURN_BUDGET_DEFAULT"
   while (( $# )); do
     case $1 in
       --branch) branch=$2; shift 2;;
@@ -566,7 +626,7 @@ cmd_claim() {
       *) [[ -z "$id" ]] && id=$1 || die "too many positional args"; shift;;
     esac
   done
-  [[ -z "$id" ]] && die "usage: arachne-task claim <id> --branch <b> [--turns <n>]"
+  [[ -z "$id" ]] && die "usage: $TASKPUMP_PROG_NAME claim <id> --branch <b> [--turns <n>]"
   [[ -z "$branch" ]] && die "--branch is required"
   local file; file=$(task_file_required "$id")
 
@@ -605,7 +665,7 @@ cmd_claim() {
 # Used by heartbeat to detect productive commits.
 code_head_sha() {
   local code_repo_root
-  code_repo_root=$(git -C "$ARACHNE_CODE_REPO" rev-parse --show-toplevel 2>/dev/null || true)
+  code_repo_root=$(git -C "$TASKPUMP_CODE_REPO" rev-parse --show-toplevel 2>/dev/null || true)
   [[ -z "$code_repo_root" ]] && { printf ''; return; }
   git -C "$code_repo_root" rev-parse HEAD 2>/dev/null || printf ''
 }
@@ -613,7 +673,7 @@ code_head_sha() {
 # List files touched by commits from <since_sha>..HEAD in the code repo.
 code_files_touched_since() {
   local since_sha=$1 code_repo_root
-  code_repo_root=$(git -C "$ARACHNE_CODE_REPO" rev-parse --show-toplevel 2>/dev/null || true)
+  code_repo_root=$(git -C "$TASKPUMP_CODE_REPO" rev-parse --show-toplevel 2>/dev/null || true)
   [[ -z "$code_repo_root" ]] && return
   [[ -z "$since_sha" ]] && return
   git -C "$code_repo_root" diff --name-only "$since_sha"..HEAD 2>/dev/null || true
@@ -629,7 +689,7 @@ cmd_heartbeat() {
       *) [[ -z "$id" ]] && id=$1 || die "too many positional args"; shift;;
     esac
   done
-  [[ -z "$id" ]] && die "usage: arachne-task heartbeat <id> [--start|--end]"
+  [[ -z "$id" ]] && die "usage: $TASKPUMP_PROG_NAME heartbeat <id> [--start|--end]"
   local file; file=$(task_file_required "$id")
 
   local status; status=$(fm_get "$file" '.status')
@@ -740,7 +800,7 @@ cmd_complete() {
       *) [[ -z "$id" ]] && id=$1 || die "too many positional args"; shift;;
     esac
   done
-  [[ -z "$id" ]] && die "usage: arachne-task complete <id> [--commits <sha,sha>] [--defer-wiring \"note\"]"
+  [[ -z "$id" ]] && die "usage: $TASKPUMP_PROG_NAME complete <id> [--commits <sha,sha>] [--defer-wiring \"note\"]"
   local file; file=$(task_file_required "$id")
 
   local now; now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -794,7 +854,7 @@ cmd_block() {
       *) [[ -z "$id" ]] && id=$1 || die "too many positional args"; shift;;
     esac
   done
-  [[ -z "$id" ]] && die "usage: arachne-task block <id> --reason \"...\""
+  [[ -z "$id" ]] && die "usage: $TASKPUMP_PROG_NAME block <id> --reason \"...\""
   [[ -z "$reason" ]] && die "--reason is required"
   local file; file=$(task_file_required "$id")
   local now; now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -820,7 +880,7 @@ cmd_needs_review() {
       *) [[ -z "$id" ]] && id=$1 || die "too many positional args"; shift;;
     esac
   done
-  [[ -z "$id" ]] && die "usage: arachne-task needs-review <id> --reason \"...\""
+  [[ -z "$id" ]] && die "usage: $TASKPUMP_PROG_NAME needs-review <id> --reason \"...\""
   [[ -z "$reason" ]] && die "--reason is required"
   local file; file=$(task_file_required "$id")
   local now; now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -850,7 +910,7 @@ cmd_release() {
       *) [[ -z "$id" ]] && id=$1 || die "too many positional args"; shift;;
     esac
   done
-  [[ -z "$id" ]] && die "usage: arachne-task release <id> --reason \"...\""
+  [[ -z "$id" ]] && die "usage: $TASKPUMP_PROG_NAME release <id> --reason \"...\""
   [[ -z "$reason" ]] && die "--reason is required"
   local file; file=$(task_file_required "$id")
 
@@ -898,7 +958,7 @@ cmd_reopen() {
       *) [[ -z "$id" ]] && id=$1 || die "too many positional args"; shift;;
     esac
   done
-  [[ -z "$id" ]] && die "usage: arachne-task reopen <id> --reason \"...\""
+  [[ -z "$id" ]] && die "usage: $TASKPUMP_PROG_NAME reopen <id> --reason \"...\""
   [[ -z "$reason" ]] && die "--reason is required"
   local file; file=$(task_file_required "$id")
 
@@ -978,7 +1038,7 @@ cmd_resume_attempt() {
       *) [[ -z "$id" ]] && id=$1 || die "too many positional args"; shift;;
     esac
   done
-  [[ -z "$id" ]] && die "usage: arachne-task resume-attempt <id> --head <sha> [--max N]"
+  [[ -z "$id" ]] && die "usage: $TASKPUMP_PROG_NAME resume-attempt <id> --head <sha> [--max N]"
   [[ -z "$head" ]] && die "--head is required (the branch head sha at this resume)"
   # Validated rather than escaped: the sha is interpolated into a yq expression,
   # and a hex-only shape is a cheaper guarantee than getting the quoting right.
@@ -1028,7 +1088,7 @@ cmd_defer() {
       *) [[ -z "$id" ]] && id=$1 || die "too many positional args"; shift;;
     esac
   done
-  [[ -z "$id" ]] && die "usage: arachne-task defer <id> --reason \"what wiring was deferred\""
+  [[ -z "$id" ]] && die "usage: $TASKPUMP_PROG_NAME defer <id> --reason \"what wiring was deferred\""
   [[ -z "$reason" ]] && die "--reason is required"
   local file; file=$(task_file_required "$id")
   local now; now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -1060,7 +1120,7 @@ cmd_undefer() {
       *) [[ -z "$id" ]] && id=$1 || die "too many positional args"; shift;;
     esac
   done
-  [[ -z "$id" ]] && die "usage: arachne-task undefer <id> --caller \"<file:line> — what wired it\""
+  [[ -z "$id" ]] && die "usage: $TASKPUMP_PROG_NAME undefer <id> --caller \"<file:line> — what wired it\""
   [[ -z "$caller" ]] && die "--caller is required (name the non-test call site)"
   local file; file=$(task_file_required "$id")
   [[ "$(fm_get "$file" '.wiring_deferred')" == "true" ]] \
@@ -1169,11 +1229,11 @@ cmd_scrub() {
     [[ -z "$failures" ]] && failures=0
 
     # Heartbeat-staleness: reclaim a claim whose last beat (or claim time, if it
-    # never beat) is older than ARACHNE_CLAIM_STALE_HOURS (default 24h). This
+    # never beat) is older than TASKPUMP_CLAIM_STALE_HOURS (default 24h). This
     # catches an alive-but-hung container that never fires another heartbeat —
     # the residual gap A1's dead-container check cannot reach.
     local stale_hours stale=0 ts ts_epoch now_epoch
-    stale_hours="${ARACHNE_CLAIM_STALE_HOURS:-24}"
+    stale_hours="$TASKPUMP_CLAIM_STALE_HOURS"
     [[ "$stale_hours" =~ ^[0-9]+$ ]] || stale_hours=24
     ts=$(fm_get "$file" '.last_heartbeat_ts')
     [[ -z "$ts" ]] && ts=$(fm_get "$file" '.claimed_at')
@@ -1193,7 +1253,7 @@ cmd_scrub() {
       "
       echo "scrub: $id → needs-review (budget=0)"
       scrubbed=$((scrubbed + 1))
-    elif (( failures >= 3 )); then
+    elif (( failures >= TASKPUMP_FAILURE_LIMIT )); then
       fm_set "$file" "
         .status = \"stuck\" |
         .claimed_by = null |
@@ -1222,7 +1282,8 @@ cmd_scrub() {
   # The per-file lines above already went to stdout; this summary is the only
   # thing on stderr, so `scrub 2>&1 | tee` does not double-report each path.
   if (( broken > 0 )); then
-    printf 'arachne-task: %d task file(s) invisible to the frontier (see UNPARSEABLE/NO-ID above)\n' "$broken" >&2
+    printf '%s: %d task file(s) invisible to the frontier (see UNPARSEABLE/NO-ID above)\n' \
+      "$TASKPUMP_PROG_NAME" "$broken" >&2
     return 3
   fi
   return 0
@@ -1259,7 +1320,7 @@ cmd_goal() {
     return 0
   fi
 
-  [[ -z "$id" ]] && die "usage: arachne-task goal <id> [--set \"text\"]  |  goal --missing"
+  [[ -z "$id" ]] && die "usage: $TASKPUMP_PROG_NAME goal <id> [--set \"text\"]  |  goal --missing"
   local file; file=$(task_file_required "$id")
 
   if (( do_set )); then
@@ -1325,7 +1386,7 @@ cmd_title() {
     esac
   done
 
-  [[ -z "$id" ]] && die "usage: arachne-task title <id> [--set \"text\"]"
+  [[ -z "$id" ]] && die "usage: $TASKPUMP_PROG_NAME title <id> [--set \"text\"]"
   local file; file=$(task_file_required "$id")
 
   if (( do_set )); then
@@ -1359,7 +1420,7 @@ cmd_blockers() {
     esac
   done
 
-  [[ -z "$id" ]] && die "usage: arachne-task blockers <id> [--set A,B | --add X | --remove X | --clear]"
+  [[ -z "$id" ]] && die "usage: $TASKPUMP_PROG_NAME blockers <id> [--set A,B | --add X | --remove X | --clear]"
   local file; file=$(task_file_required "$id")
 
   # Read form.
@@ -1434,10 +1495,13 @@ cmd_create() {
     esac
   done
 
-  [[ -z "$id" ]] && die "usage: arachne-task create <id> --title \"...\" [--phase FN] [--goal \"...\"] [--files a,b] [--blockers X,Y] [--milestone m]"
+  [[ -z "$id" ]] && die "usage: $TASKPUMP_PROG_NAME create <id> --title \"...\" [--phase FN] [--goal \"...\"] [--files a,b] [--blockers X,Y] [--milestone m]"
   [[ -z "$title" ]] && die "create requires --title"
-  # Phase-anchored ids only (FN.M) — see the anti-pattern against a parallel #N scheme.
-  [[ "$id" =~ ^F[0-9]+(\.[0-9]+)?$ ]] || die "id must be phase-anchored (e.g. F45.23), got: $id"
+  # Phase-anchored ids only — an id that does not name its phase cannot be
+  # grouped, ranged, or ordered, and a parallel flat "#N" scheme alongside the
+  # phase scheme has been rejected. TASKPUMP_ID_PATTERN says what shape counts.
+  [[ "$id" =~ $TASKPUMP_ID_PATTERN ]] \
+    || die "id must be phase-anchored, matching $TASKPUMP_ID_PATTERN (e.g. ${TASKPUMP_PHASE_SIGIL}45.23), got: $id"
   [[ -z "$phase" ]] && phase=${id%%.*}
 
   # Lock BEFORE the exists-check: the check and the write are one
@@ -1455,7 +1519,7 @@ cmd_create() {
   fi
 
   local b
-  local file="$ARACHNE_TASKS_DIR/$id.md"
+  local file="$TASKPUMP_TASKS_DIR/$id.md"
   {
     printf -- '---\n'
     printf 'id: %s\n' "$(yaml_scalar "$id")"
@@ -1515,23 +1579,22 @@ cmd_resolve() {
   # re-deriving the resolution rules by hand.
   local what=${1:---all}
   case $what in
-    --tasks-dir) printf '%s\n' "$ARACHNE_TASKS_DIR";;
-    --code-repo) printf '%s\n' "$ARACHNE_CODE_REPO";;
+    --tasks-dir) printf '%s\n' "$TASKPUMP_TASKS_DIR";;
+    --code-repo) printf '%s\n' "$TASKPUMP_CODE_REPO";;
     --all)
-      printf 'tasks_dir  %s\n' "$ARACHNE_TASKS_DIR"
-      printf 'task_out   %s\n' "$ARACHNE_TASK_OUT"
-      printf 'code_repo  %s\n' "$ARACHNE_CODE_REPO"
-      printf 'script     %s\n' "$_arachne_script_root"
-      printf 'cwd_root   %s\n' "${_arachne_cwd_root:-<none>}"
+      printf 'tasks_dir  %s\n' "$TASKPUMP_TASKS_DIR"
+      printf 'task_out   %s\n' "$TASKPUMP_TASK_OUT"
+      printf 'code_repo  %s\n' "$TASKPUMP_CODE_REPO"
+      printf 'script     %s\n' "$_tp_script_root"
+      printf 'cwd_root   %s\n' "${_tp_cwd_root:-<none>}"
       ;;
-    *) die "usage: arachne-task resolve [--tasks-dir|--code-repo|--all]";;
+    *) die "usage: $TASKPUMP_PROG_NAME resolve [--tasks-dir|--code-repo|--all]";;
   esac
 }
 
 usage() {
+  printf 'usage: %s <command> [args]\n\n' "$TASKPUMP_PROG_NAME"
   cat <<'EOF'
-usage: arachne-task <command> [args]
-
 Commands:
   next [--branch <b>] [--phase <FN>] Emit next ready task as JSON (incl. goal).
                                      --phase scopes to one epic (e.g. F51).
@@ -1560,7 +1623,8 @@ Commands:
   create <id> --title "..." [--phase FN] [--goal "..."] [--files a,b]
          [--blockers X,Y] [--milestone m]
                                      Author a new task file. Ids must be
-                                       phase-anchored (FN.M). Refuses to
+                                       phase-anchored, matching
+                                       TASKPUMP_ID_PATTERN. Refuses to
                                        overwrite an existing task.
   claim <id> --branch <b> [--turns N]  Atomically claim a task.
   heartbeat <id> [--start|--end]     Budget + failure tracking.
@@ -1599,19 +1663,50 @@ Commands:
                                        invocation resolves to. Use it when a
                                        worktree's task state looks wrong.
 
-Env:
-  ARACHNE_TASKS_DIR   tasks dir (default: <repo-root>/ops/task-loop/tasks)
-  ARACHNE_TASK_OUT    next-task JSON path (default: <parent>/.next-task)
-  ARACHNE_TASK_PUSH=1 push after commits
-  ARACHNE_TASK_NOCOMMIT=1 skip commits (fixture mode)
-  ARACHNE_TASK_DEBUG=1 print debug traces
-  ARACHNE_CODE_REPO   code repo root (default: <repo-root>) — used by heartbeat
+Config (env or taskpump.conf; the legacy ARACHNE_* spelling of each still works):
+  Locations
+    TASKPUMP_LEDGER_PROBE   ledger path relative to a workspace root, and the
+                              default tasks dir  (default: ops/task-loop/tasks)
+    TASKPUMP_TASKS_DIR      tasks dir            (default: <root>/<probe>)
+    TASKPUMP_TASK_OUT       next-task JSON path  (default: <parent>/.next-task)
+    TASKPUMP_CODE_REPO      code repo root — what heartbeat measures commits in
+                                                 (default: <root>)
+  Git
+    TASKPUMP_TASK_PUSH=1    push after each state-mutating commit. A ledger with
+                              no remote warns once and succeeds; a push that
+                              fails against a real remote is retried.
+    TASKPUMP_PUSH_RETRIES   push attempts before giving up          (default: 6)
+    TASKPUMP_COMMITTER_NAME / TASKPUMP_COMMITTER_EMAIL
+                            identity on ledger commits (default: arachne-task /
+                              task@arachne.local)
+  Id grammar
+    TASKPUMP_ID_PATTERN     regex `create` validates a new id against
+                                            (default: ^F[0-9]+(\.[0-9]+)?$)
+    TASKPUMP_PHASE_SIGIL    alphabetic prefix on a phase token; phase ranges
+                              strip and re-apply it                 (default: F)
+  Tripwires and concurrency
+    TASKPUMP_TURN_BUDGET_DEFAULT  `claim` budget when --turns is omitted    (50)
+    TASKPUMP_FAILURE_LIMIT  consecutive unproductive iterations before scrub
+                              marks a task stuck                    (default: 3)
+    TASKPUMP_CLAIM_STALE_HOURS   heartbeat staleness threshold     (default: 24)
+    TASKPUMP_LOCK_WAIT      seconds to wait for the state lock    (default: 120)
+  Misc
+    TASKPUMP_TASK_NOCOMMIT=1  skip commits and the state lock (fixture mode)
+    TASKPUMP_TASK_DEBUG=1     print debug traces
+    TASKPUMP_PROG_NAME        name used in this tool's own diagnostics
 
-The workspace is $PWD's git worktree when that worktree has an ops/ checkout,
-otherwise the directory above this script. Since each worktree carries both its
-own copy of this CLI and its own ops/, preferring the caller's workspace keeps a
-claim made inside a worktree out of the primary checkout's ledger. The env vars
-above still override; `resolve` prints what a given invocation picked.
+The id grammar contract: an id is PHASE or PHASE.N, and the phase is everything
+before the first `.`. TASKPUMP_ID_PATTERN validates a new id; the phase split
+plus TASKPUMP_PHASE_SIGIL derive the phase from it. Phase grouping (--phase),
+range expansion (--phases F55..F63) and ordering are all built on that split, so
+the dot is part of the contract even though the sigil and the pattern are yours.
+
+The workspace is $PWD's git worktree when that worktree carries a ledger of its
+own (TASKPUMP_LEDGER_PROBE resolves there), otherwise the directory above this
+script. Since each worktree carries both its own copy of this CLI and its own
+ledger, preferring the caller's workspace keeps a claim made inside a worktree
+out of the primary checkout's ledger. The config above still overrides;
+`resolve` prints what a given invocation picked.
 EOF
 }
 
