@@ -968,30 +968,18 @@ sessions_selected() {
     return 0
 }
 
-# sessions_apply_moves -- replay a --moves string against the session cursor, the
-# same trick graph_apply_moves plays for the node cursor: assertions without a
-# pty. Navigation only — Enter (open) has no printable character to replay, and
-# inventing an alias would mean testing a keymap the user never touches; the
-# action itself is covered through the GRAPH tab's `o`.
-sessions_apply_moves() {
-    [[ -n "$MOVES" ]] || return 0
-    local i c pend=0
-    for (( i=0; i<${#MOVES}; i++ )); do
-        c="${MOVES:i:1}"
-        if (( pend )); then
-            pend=0
-            [[ "$c" == g ]] && { SESS_SEL=0; continue; }
-        fi
-        case "$c" in
-            g) pend=1 ;;
-            j) SESS_SEL=$(( SESS_SEL + 1 )) ;;
-            k) SESS_SEL=$(( SESS_SEL - 1 )) ;;
-            G) SESS_SEL=$(( SESS_N - 1 )) ;;
-            *) : ;;
-        esac
-    done
-    (( SESS_SEL < 0 )) && SESS_SEL=0
-    (( SESS_N > 0 && SESS_SEL >= SESS_N )) && SESS_SEL=$(( SESS_N - 1 ))
+# sessions_replay_key -- one session-cursor motion, named as the live key loop
+# names it. Navigation only: Enter (open) has no printable character to replay,
+# and inventing an alias would mean testing a keymap the user never touches —
+# the action itself is covered through the GRAPH tab's `o`.
+sessions_replay_key() {
+    case "$1" in
+        j) SESS_SEL=$(( SESS_SEL + 1 )) ;;
+        k) SESS_SEL=$(( SESS_SEL - 1 )) ;;
+        G) SESS_SEL=$(( SESS_N - 1 )) ;;
+        .) SESS_SEL=0; SCROLL=0; PAN=0 ;;
+        *) : ;;
+    esac
     return 0
 }
 
@@ -1366,31 +1354,17 @@ graph_move() {  # $1 = h|l|k|j|g|G|^|$
     return 0
 }
 
-# graph_apply_moves -- replay a --moves string against the cursor. This is what
-# makes navigation testable headlessly, the same way --tab made the DAG itself
-# testable: no pty, no key injection, just an assertion on the status bar.
-graph_apply_moves() {
-    [[ -n "$MOVES" ]] || return 0
-    local i c pend=0
-    for (( i=0; i<${#MOVES}; i++ )); do
-        c="${MOVES:i:1}"
-        # `g` is a prefix, exactly as in the live key loop: gg is first-layer,
-        # a lone g is a no-op. Replaying them differently would make the
-        # headless assertions test a keymap the user never touches.
-        if (( pend )); then
-            pend=0
-            [[ "$c" == g ]] && { graph_move g; continue; }
-        fi
-        case "$c" in
-            g)             pend=1 ;;
-            h|l|k|j|G)     graph_move "$c" ;;
-            '^'|'_'|0)     graph_move '^' ;;
-            '$')           graph_move '$' ;;
-            .)             CURSOR="$(graph_default_cursor)" ;;
-            o)             open_task_file "$CURSOR" ;;
-            *)             : ;;
-        esac
-    done
+# graph_replay_key -- one node-cursor motion, named as the live key loop names it.
+graph_replay_key() {
+    case "$1" in
+        h|l|k|j|G)     graph_move "$1" ;;
+        '^'|'_'|0)     graph_move '^' ;;
+        '$')           graph_move '$' ;;
+        .)             CURSOR="$(graph_default_cursor)" ;;
+        o)             open_task_file "$CURSOR" ;;
+        *)             : ;;
+    esac
+    return 0
 }
 
 # graph_follow -- pan and scroll so the selection stays on screen. This is what
@@ -1489,22 +1463,80 @@ render_graph_top() {
     rule
 }
 
+# graph_prepare -- everything the node cursor needs before it can be moved.
+# One-shot has no prior frame, so the index is primed with a throwaway render
+# before the selection can be described. Costs one extra gawk pass, off the
+# interactive path entirely. Idempotent: the cursor only affects the picture,
+# not the index, so re-running it after a move changes nothing.
+graph_prepare() {
+    [[ -n "$(graph_phases)" ]] && { render_graph >/dev/null 2>&1 || true; }
+    graph_load_index
+    graph_cur_ok || CURSOR="$(graph_default_cursor)"
+    return 0
+}
+
+# moves_enter_tab -- prepare whichever tab the walker just landed on, so a
+# motion after a switch acts on real state rather than the previous tab's.
+moves_enter_tab() {
+    if (( TAB == 1 )); then graph_prepare; else sessions_cursor_sync; fi
+    return 0
+}
+
+# apply_moves -- replay a --moves string. This is what makes navigation testable
+# headlessly, the same way --tab made the DAG itself testable: no pty, no key
+# injection, just an assertion on the status bar.
+#
+# ONE walker for both tabs, because `gt` / `gT` move BETWEEN them: a per-tab
+# replayer cannot express "j, switch tab, j" at all, and while the tab bar was
+# the one surface --moves could not reach, the tab switch was pinned only by
+# grepping the source for its case arm. Motions dispatch to whichever tab is
+# current at that point in the string, so the replay follows the same path a
+# reader's fingers would.
+#
+# `g` is a prefix, exactly as in the live key loop: gg is first-layer/first-
+# session, gt/gT switch tab, a lone g moves nothing, and any other key cancels
+# the prefix and still acts. Replaying them differently would make the headless
+# assertions test a keymap the user never touches.
+apply_moves() {
+    [[ -n "$MOVES" ]] || return 0
+    local i c pend=0
+    for (( i=0; i<${#MOVES}; i++ )); do
+        c="${MOVES:i:1}"
+        if (( pend )); then
+            pend=0
+            case "$c" in
+                g) if (( TAB == 1 )); then graph_move g; else SESS_SEL=0; SCROLL=0; fi
+                   continue ;;
+                t) tab_switch next; moves_enter_tab; continue ;;
+                T) tab_switch prev; moves_enter_tab; continue ;;
+            esac
+            # anything else: the prefix is cancelled, and the key still acts
+        fi
+        if [[ "$c" == g ]]; then
+            pend=1
+        elif (( TAB == 1 )); then
+            graph_replay_key "$c"
+        else
+            sessions_replay_key "$c"
+        fi
+    done
+    # Clamped once, at the end: the session cursor is an index into a list whose
+    # length is only known after a sync, and an intermediate clamp would turn
+    # "down twice then up" into a different answer than the live loop gives.
+    (( SESS_SEL < 0 )) && SESS_SEL=0
+    (( SESS_N > 0 && SESS_SEL >= SESS_N )) && SESS_SEL=$(( SESS_N - 1 ))
+    return 0
+}
+
 render_all() {  # one-shot / pipe: top then body, no viewport clipping
+    if (( TAB == 1 )); then graph_prepare; else sessions_cursor_sync; fi
+    apply_moves
     if (( TAB == 1 )); then
-        # One-shot has no prior frame, so prime the index with a throwaway render
-        # before describing the selection. Costs one extra gawk pass, off the
-        # interactive path entirely.
-        [[ -n "$(graph_phases)" ]] && { render_graph >/dev/null 2>&1 || true; }
-        graph_load_index
-        graph_cur_ok || CURSOR="$(graph_default_cursor)"
-        graph_apply_moves
         graph_follow
         render_graph_top
         render_graph
         return 0
     fi
-    sessions_cursor_sync
-    sessions_apply_moves
     render_top
     render_sessions "$(term_width)"
 }
@@ -2032,11 +2064,36 @@ tab_switch() {
     return 0
 }
 
-# --show-help -- print the panel the ? overlay paints, for the tab --tab picked,
-# and exit. The overlay needs a pty; this is the seam every assertion about the
-# panel's content and width goes through, the same way --decode-keys is the seam
-# for the key decoder and --moves for the cursor.
+# moves_apply_tab_switches -- the gt / gT subset of a --moves string, for callers
+# that have a TAB but no cursor to walk. The panel is a static per-tab surface,
+# so replaying the motions would be work with nothing to show for it; replaying
+# the switches means --show-help can be asked "which tab does gt land on", which
+# is the one question about tab switching a headless run can actually answer.
+moves_apply_tab_switches() {
+    [[ -n "$MOVES" ]] || return 0
+    local i c pend=0
+    for (( i=0; i<${#MOVES}; i++ )); do
+        c="${MOVES:i:1}"
+        if (( pend )); then
+            pend=0
+            case "$c" in
+                g) continue ;;
+                t) tab_switch next; continue ;;
+                T) tab_switch prev; continue ;;
+            esac
+        fi
+        if [[ "$c" == g ]]; then pend=1; fi
+    done
+    return 0
+}
+
+# --show-help -- print the panel the ? overlay paints, for the tab --tab picked
+# (and any tab switch --moves replays), then exit. The overlay needs a pty; this
+# is the seam every assertion about the panel's content and width goes through,
+# the same way --decode-keys is the seam for the key decoder and --moves for the
+# cursor.
 if (( SHOW_HELP )); then
+    moves_apply_tab_switches
     help_lines
     exit 0
 fi
