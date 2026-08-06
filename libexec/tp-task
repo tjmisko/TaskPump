@@ -248,6 +248,10 @@ json_object() {
 }
 
 # ── Git helpers ───────────────────────────────────────────────────────────────
+# Set once a no-remote warning has been emitted, so a process that mutates more
+# than once says it a single time.
+_tp_warned_no_remote=0
+
 git_commit_state() {
   # Commits the current state of TASKPUMP_TASKS_DIR with a given message.
   # Respects TASKPUMP_TASK_NOCOMMIT and TASKPUMP_TASK_PUSH.
@@ -271,30 +275,46 @@ git_commit_state() {
     -c user.name="$TASKPUMP_COMMITTER_NAME" -c user.email="$TASKPUMP_COMMITTER_EMAIL" \
     commit -m "$msg" >/dev/null
   dbg "committed: $msg"
-  if [[ "$TASKPUMP_TASK_PUSH" == "1" ]]; then
-    # Retry push with fetch-rebase + jittered backoff on non-fast-forward.
-    # Under 10-12 concurrent agents, many small ledger pushes collide; jitter
-    # spreads the retries so they don't thundering-herd the same remote ref.
-    local try max=$TASKPUMP_PUSH_RETRIES branch
-    branch=$(git -C "$tasks_git_root" rev-parse --abbrev-ref HEAD)
-    for (( try=1; try<=max; try++ )); do
-      if git -C "$tasks_git_root" push 2>/dev/null; then
-        dbg "pushed (attempt $try)"
-        return 0
-      fi
-      dbg "push rejected (attempt $try/$max); fetch + rebase onto origin/$branch"
-      git -C "$tasks_git_root" fetch origin >/dev/null 2>&1 || true
-      if ! git -C "$tasks_git_root" rebase "origin/$branch" >/dev/null 2>&1; then
-        # Leave no half-finished rebase behind for the next invocation.
-        git -C "$tasks_git_root" rebase --abort >/dev/null 2>&1 || true
-        dbg "rebase failed (attempt $try); aborted, will retry push"
-      fi
-      # Backoff with jitter: 0.2s .. ~1.5s, seeded per-process so concurrent
-      # agents desynchronize.
-      sleep "$(awk "BEGIN{srand($$+$try); printf \"%.2f\", 0.2 + rand()*1.3}")"
-    done
-    die "push failed after $max retries"
+  [[ "$TASKPUMP_TASK_PUSH" == "1" ]] || return 0
+
+  # A ledger with no remote is a legitimate configuration — a solo repo keeping
+  # its task DAG in-tree has nowhere to push and never will. Treating that as a
+  # failed push would spend six jittered retries and then `die`, failing the verb
+  # *after* its commit already landed: the caller sees a non-zero exit for a
+  # mutation that actually succeeded, and a supervisor reading that exit code
+  # concludes the ledger write was lost. Warn once and succeed instead. A push
+  # that fails against a remote which does exist is still worth retrying, so
+  # that path is untouched.
+  if [[ -z "$(git -C "$tasks_git_root" remote 2>/dev/null)" ]]; then
+    if (( _tp_warned_no_remote == 0 )); then
+      warn "ledger repo has no push remote; committed locally (set TASKPUMP_TASK_PUSH=0 to silence)"
+      _tp_warned_no_remote=1
+    fi
+    return 0
   fi
+
+  # Retry push with fetch-rebase + jittered backoff on non-fast-forward.
+  # Under 10-12 concurrent agents, many small ledger pushes collide; jitter
+  # spreads the retries so they don't thundering-herd the same remote ref.
+  local try max=$TASKPUMP_PUSH_RETRIES branch
+  branch=$(git -C "$tasks_git_root" rev-parse --abbrev-ref HEAD)
+  for (( try=1; try<=max; try++ )); do
+    if git -C "$tasks_git_root" push 2>/dev/null; then
+      dbg "pushed (attempt $try)"
+      return 0
+    fi
+    dbg "push rejected (attempt $try/$max); fetch + rebase onto origin/$branch"
+    git -C "$tasks_git_root" fetch origin >/dev/null 2>&1 || true
+    if ! git -C "$tasks_git_root" rebase "origin/$branch" >/dev/null 2>&1; then
+      # Leave no half-finished rebase behind for the next invocation.
+      git -C "$tasks_git_root" rebase --abort >/dev/null 2>&1 || true
+      dbg "rebase failed (attempt $try); aborted, will retry push"
+    fi
+    # Backoff with jitter: 0.2s .. ~1.5s, seeded per-process so concurrent
+    # agents desynchronize.
+    sleep "$(awk "BEGIN{srand($$+$try); printf \"%.2f\", 0.2 + rand()*1.3}")"
+  done
+  die "push failed after $max retries"
 }
 
 # ── Cross-agent state lock ─────────────────────────────────────────────────────
