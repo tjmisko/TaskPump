@@ -472,41 +472,82 @@ detect_stalled_orphans() {
 }
 
 # ── Feed gate ──────────────────────────────────────────────────────────────────
-# Echoes a one-line reason and returns 10 to pause feeding, or returns 0 to feed.
+# A gate answers one question before the pump launches anything: is it a good
+# idea to start MORE work right now? It never stops work already running.
+#
+# The chain is an ordered list of command lines, one per line. Each is run with
+# stdout and stderr captured together (the tools that predate this contract
+# write their reason to stderr) and judged by exit status:
+#
+#   0    feed OK
+#   10   pause launching; its output is the reason the operator sees
+#   else a broken gate — warn and FEED ANYWAY
+#
+# That last rule is deliberate: a gate that cannot reach its meter must never
+# silently halt a multi-day drain. Every gate shipped here fails open too.
+#
+# The default chain is exactly what was hardcoded before — network health, host
+# token freshness, the usage ceiling, free disk — with the three --no-*-gate
+# flags dropping their entry. A configured TASKPUMP_GATES replaces the whole
+# chain and is used verbatim; the flags still export their disable switches, so
+# a gate that honors them keeps working either way.
+default_gates() {
+  [[ "$HEALTH_GATE" -eq 1 ]] && printf '%s\n' "$TP_GATES_DIR/net-health"
+  printf '%s\n' "$TP_GATES_DIR/claude-token-fresh"
+  [[ "$USAGE_GATE" -eq 1 ]] && printf '%s\n' "$ARACHNE_USAGE --gate"
+  [[ "$DISK_GATE"  -eq 1 ]] && printf '%s\n' "$TP_GATES_DIR/disk-low"
+  return 0
+}
+
+# Everything a gate might need, since a gate is a separate process.
+export_gate_env() {
+  export TASKPUMP_HEALTH_GATE="$HEALTH_GATE"
+  export TASKPUMP_USAGE_GATE="$USAGE_GATE"
+  export TASKPUMP_DISK_GATE="$DISK_GATE"
+  export TASKPUMP_HEALTH_WINDOW="$HEALTH_WINDOW"
+  export TASKPUMP_USAGE_CEILING="$CEILING"
+  export TASKPUMP_USAGE_RESET_FILE="$RESET_FILE"
+  export TASKPUMP_CREDENTIALS="$CLAUDE_DIR/.credentials.json"
+  export TASKPUMP_DISK_WATCHDOG="$ARACHNE_DISK_WATCHDOG"
+  # The legacy spellings the un-migrated tools still read.
+  export HEALTH_GATE HEALTH_WINDOW
+  export ARACHNE_USAGE_RESET_FILE="$RESET_FILE"
+  export ARACHNE_DISK_WATCHDOG="$ARACHNE_DISK_WATCHDOG"
+  export ARACHNE_DISK_GATE="$DISK_GATE"
+}
+
+# Strip a leading "<toolname>: " so a tool that prefixes all its diagnostics
+# does not have to special-case the gate path. Only a bare token counts, so a
+# reason that merely contains a colon is left alone.
+strip_gate_prefix() {
+  local r="$1"
+  [[ "$r" =~ ^[A-Za-z0-9._-]+:\ (.*)$ ]] && r="${BASH_REMATCH[1]}"
+  printf '%s' "$r"
+}
+
 GATE_REASON=""
 feed_gate() {
   GATE_REASON=""
-  if apl_network_unhealthy; then
-    GATE_REASON="brcmfmac wedge signature in last ${HEALTH_WINDOW}s"
-    return 10
-  fi
-  # Host OAuth token freshness (access-token-only container model): containers can
-  # no longer self-refresh, so launching one with an already-expired host token
-  # just 401s and dies. Pause launching until the host token is refreshed. Cheap
-  # local check; self-contained (honors ARACHNE_TOKEN_GATE); fail-open.
-  local treason trc
-  treason="$(apl_host_token_stale "$CLAUDE_DIR/.credentials.json")"; trc=$?
-  if [[ "$trc" -eq 10 ]]; then
-    GATE_REASON="$treason"
-    return 10
-  fi
-  if [[ "$USAGE_GATE" -eq 1 ]]; then
-    local reason rc
-    reason="$(TASKPUMP_USAGE_RESET_FILE="$RESET_FILE" ARACHNE_USAGE_RESET_FILE="$RESET_FILE" \
-      "$ARACHNE_USAGE" --gate --ceiling "$CEILING" 2>&1)"; rc=$?
-    if [[ "$rc" -eq 10 ]]; then
-      GATE_REASON="${reason#arachne-usage: }"
-      return 10
+  export_gate_env
+  local gates spec rc reason
+  gates="${TASKPUMP_GATES:-$(default_gates)}"
+  while IFS= read -r spec; do
+    [[ -z "${spec//[[:space:]]/}" ]] && continue
+    # A gate entry is a command line; splitting on whitespace is the point.
+    # shellcheck disable=SC2086
+    set -- $spec
+    if [[ ! -x "$1" ]]; then
+      warn "gate not executable, skipping: $1"
+      continue
     fi
-  fi
-  if [[ "$DISK_GATE" -eq 1 ]]; then
-    local dreason drc
-    dreason="$(apl_disk_low)"; drc=$?
-    if [[ "$drc" -eq 10 ]]; then
-      GATE_REASON="$dreason"
-      return 10
-    fi
-  fi
+    rc=0
+    reason="$("$@" 2>&1)" || rc=$?
+    case "$rc" in
+      0) ;;
+      10) GATE_REASON="$(strip_gate_prefix "$reason")"; return 10 ;;
+      *) warn "gate '$1' failed (rc=$rc); feeding anyway${reason:+ — $reason}" ;;
+    esac
+  done <<<"$gates"
   return 0
 }
 

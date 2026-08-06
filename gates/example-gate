@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# gates/example-gate — a no-op gate, here to be copied.
+#
+# A gate answers one question before the pump launches anything: is it a good
+# idea to start MORE work right now? It never stops work already running. Add
+# yours to TASKPUMP_GATES (an ordered, newline-separated list of command lines);
+# the first one to answer "pause" wins and its reason is what the operator sees.
+#
+# THE CONTRACT
+#   stdout   a one-line reason, when pausing. If it begins with "<toolname>: ",
+#            that prefix is stripped before display, so a tool that prefixes all
+#            its diagnostics does not have to special-case this path.
+#   exit 0   feed OK — say nothing
+#   exit 10  pause launching
+#   other    treated as a broken gate: the pump warns and FEEDS ANYWAY
+#
+# That last line is the important one. Gates fail open by design: a gate that
+# cannot reach its meter, or that crashes, must not silently halt a multi-day
+# drain. Write yours the same way — if you cannot answer, exit 0.
+#
+# Things worth gating on: a paid API's quota, a shared build farm's queue depth,
+# a maintenance window, a downstream service's health, the cost budget so far.
+#
+# HELP-END
+set -uo pipefail
+
+[[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && {
+  awk 'NR==1{next} /^# HELP-END/{exit} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"
+  exit 0
+}
+
+# Replace this with the real question.
+#
+#   if some_meter_is_exhausted; then
+#     printf 'the meter is exhausted; retrying after it resets\n'
+#     exit 10
+#   fi
+
+exit 0

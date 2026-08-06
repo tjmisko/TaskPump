@@ -218,6 +218,9 @@ cmd_json() {
 }
 
 cmd_gate() {
+  # The pump's --no-usage-gate exports this; honoring it here means a custom
+  # TASKPUMP_GATES chain that still lists this gate also respects the flag.
+  [[ "${TASKPUMP_USAGE_GATE:-1}" -eq 1 ]] || return 0
   local ceiling="$ARACHNE_USAGE_CEILING"
   while (( $# )); do
     case $1 in

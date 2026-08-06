@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# gates/net-health — pause launching while the host's network looks wedged.
+#
+# THE GATE CONTRACT
+#   stdout   a one-line reason, when pausing
+#   exit 0   feed OK
+#   exit 10  pause launching (running agents are never touched)
+#   other    treated as a broken gate: the pump warns and feeds anyway
+#
+# This gate is host-specific and every generic consumer should drop it from
+# TASKPUMP_GATES. It exists because the machine TaskPump grew up on — an
+# Apple-Silicon laptop on the brcmfmac driver — wedges its WiFi firmware under
+# the aggregate packet load of roughly ten simultaneous streaming agents. The
+# RX ring starves, the firmware hangs, and only a device reset clears it. The
+# rotating pool cap keeps that from happening; this gate stops feeding when it
+# has happened anyway, so a recovery is not fighting fresh launches.
+#
+# Configuration:
+#   TASKPUMP_HEALTH_GATE        0 disables the gate entirely (default 1)
+#   TASKPUMP_HEALTH_WINDOW      how far back to look, seconds (default 120)
+#   TASKPUMP_HEALTH_PROBE_CMD   command whose output is searched
+#                               (default: journalctl -k -b 0 --since "<N> sec ago")
+#   TASKPUMP_HEALTH_SIGNATURES  extended-regex alternation of failure strings
+#
+# Harmless on a host with no journalctl and no matching signatures: it simply
+# feeds. Nothing here is fatal — a probe we cannot run never wedges the pump.
+# HELP-END
+set -uo pipefail
+
+_tp_self_root="$(CDPATH= cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+# shellcheck source=../lib/config.sh
+. "$_tp_self_root/lib/config.sh"
+tp_load_config
+# shellcheck source=../lib/pump-lib.sh
+. "$TP_LIB_DIR/pump-lib.sh"
+
+[[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { apl_help "$0"; exit 0; }
+
+HEALTH_GATE="${TASKPUMP_HEALTH_GATE:-${HEALTH_GATE:-1}}"
+HEALTH_WINDOW="${TASKPUMP_HEALTH_WINDOW:-${HEALTH_WINDOW:-120}}"
+export HEALTH_GATE HEALTH_WINDOW
+
+if apl_network_unhealthy; then
+  printf 'brcmfmac wedge signature in last %ss\n' "$HEALTH_WINDOW"
+  exit 10
+fi
+exit 0

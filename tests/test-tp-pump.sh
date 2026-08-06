@@ -823,6 +823,64 @@ grep -qF '`make check` are clean' <<<"$note" && pass "resume note uses the confi
 grep -qF '{{' <<<"$note" && fail "unsubstituted placeholder left in the resume note:\n$note" \
   || pass "no placeholder survives the resume note"
 
+echo "--- Test 24: the feed gate is a pluggable, fail-open chain ---"
+GBIN="$TMP/gates"; mkdir -p "$GBIN"
+mkgate() {  # mkgate <name> <exit> <message>
+  cat >| "$GBIN/$1" <<EOF
+#!/usr/bin/env bash
+echo "$3"
+exit $2
+EOF
+  chmod +x "$GBIN/$1"
+}
+mkgate feed-ok      0  "nothing to say"
+mkgate pause-quota 10  "quota exhausted, retrying after reset"
+mkgate pause-second 10 "the second gate would also pause"
+mkgate broken       7  "the meter is on fire"
+mkgate prefixed    10  "prefixed: reason after the tool name"
+
+gate_plan() { TASKPUMP_GATES="$1" pump F56; }
+
+out=$(gate_plan "$GBIN/feed-ok")
+have "$out" 'GATE: feed-ok' && pass "a chain of one passing gate feeds" || fail "custom chain blocked:\n$out"
+out=$(gate_plan "$GBIN/pause-quota")
+have "$out" 'GATE: PAUSED — quota exhausted' && pass "a custom gate's reason reaches the plan" \
+  || fail "custom gate reason missing:\n$out"
+
+# Order decides which reason the operator reads, so it has to be honored.
+out=$(gate_plan "$(printf '%s\n%s\n' "$GBIN/pause-quota" "$GBIN/pause-second")")
+have "$out" 'quota exhausted' && pass "the first pausing gate wins" || fail "chain order ignored:\n$out"
+out=$(gate_plan "$(printf '%s\n%s\n' "$GBIN/pause-second" "$GBIN/pause-quota")")
+have "$out" 'the second gate would also pause' && pass "reordering changes which reason wins" \
+  || fail "chain order ignored on reverse:\n$out"
+
+# Fail-open is the whole safety story: a broken gate must not halt a multi-day
+# drain, and it must say so rather than failing silently.
+out=$(gate_plan "$(printf '%s\n%s\n' "$GBIN/broken" "$GBIN/feed-ok")" 2>&1)
+have "$out" 'GATE: feed-ok' && pass "a gate that errors fails OPEN" || fail "broken gate halted feeding:\n$out"
+have "$out" 'failed \(rc=7\)' && pass "a broken gate is reported, not swallowed" || fail "no warning for a broken gate:\n$out"
+out=$(gate_plan "$GBIN/not-a-real-gate" 2>&1)
+have "$out" 'gate not executable' && pass "a missing gate is reported" || fail "missing gate silent:\n$out"
+have "$out" 'GATE: feed-ok' && pass "a missing gate fails OPEN" || fail "missing gate halted feeding:\n$out"
+
+# A tool that prefixes every diagnostic with its own name should not have to
+# special-case this path.
+out=$(gate_plan "$GBIN/prefixed")
+have "$out" 'GATE: PAUSED — reason after the tool name' && pass "a leading tool-name prefix is stripped" \
+  || fail "prefix not stripped:\n$out"
+
+# The shipped example is a working no-op, so copying it cannot break a chain.
+out=$(gate_plan "$TP_ROOT/gates/example-gate")
+have "$out" 'GATE: feed-ok' && pass "the shipped example gate is a no-op" || fail "example gate paused:\n$out"
+
+# The three --no-*-gate flags still drop their entry from the DEFAULT chain.
+out=$(STUB_GATE_RC=10 pump F56 --no-usage-gate)
+have "$out" 'GATE: feed-ok' && pass "--no-usage-gate drops the usage gate" || fail "--no-usage-gate ignored:\n$out"
+out=$(STUB_DISK_GATE_RC=10 pump F56)
+have "$out" 'GATE: PAUSED' && pass "the disk gate is in the default chain" || fail "disk gate missing:\n$out"
+out=$(STUB_DISK_GATE_RC=10 pump F56 --no-disk-gate)
+have "$out" 'GATE: feed-ok' && pass "--no-disk-gate drops the disk gate" || fail "--no-disk-gate ignored:\n$out"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"

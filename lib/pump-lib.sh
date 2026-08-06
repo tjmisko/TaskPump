@@ -74,16 +74,21 @@ apl_help() {
 
 # brcmfmac wedge signatures — the Apple-Silicon WiFi firmware hang that the
 # rotating-pool cap exists to avoid (see CLAUDE.md "Parallel runs").
-APL_WEDGE_SIGNATURES='Failed to alloc SKB|Firmware reported general error|Timeout on response for query command'
+APL_WEDGE_SIGNATURES="${TASKPUMP_HEALTH_SIGNATURES:-Failed to alloc SKB|Firmware reported general error|Timeout on response for query command}"
 
-# apl_network_unhealthy — 0 (true) when the kernel journal shows a brcmfmac wedge
+# apl_network_unhealthy — 0 (true) when the health probe's output shows a wedge
 # signature within the last HEALTH_WINDOW seconds. Graceful: 1 (healthy) when the
-# gate is off (HEALTH_GATE != 1), journalctl is absent, or nothing matches.
+# gate is off (HEALTH_GATE != 1), the probe command is absent, or nothing
+# matches. The probe is configurable (TASKPUMP_HEALTH_PROBE_CMD) because a
+# systemd kernel journal is a Linux-and-systemd assumption, not a universal one.
 apl_network_unhealthy() {
   [[ "${HEALTH_GATE:-1}" -eq 1 ]] || return 1
-  command -v journalctl >/dev/null 2>&1 || return 1
-  if journalctl -k -b 0 --since "${HEALTH_WINDOW:-120} sec ago" 2>/dev/null \
-      | grep -qiE "$APL_WEDGE_SIGNATURES"; then
+  local probe="${TASKPUMP_HEALTH_PROBE_CMD:-}"
+  if [[ -z "$probe" ]]; then
+    command -v journalctl >/dev/null 2>&1 || return 1
+    probe="journalctl -k -b 0 --since '${HEALTH_WINDOW:-120} sec ago'"
+  fi
+  if eval "$probe" 2>/dev/null | grep -qiE "$APL_WEDGE_SIGNATURES"; then
     return 0
   fi
   return 1
