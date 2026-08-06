@@ -137,6 +137,9 @@ STATE_DIR="${TASKPUMP_STATE_DIR:-$REPO_ROOT}"
 AGENT_LOG_NAME="${TASKPUMP_AGENT_LOG_NAME:-.arachne-agent.log}"
 BRIEF_OUT_NAME="${TASKPUMP_BRIEF_OUT_NAME:-.arachne-phase-brief.md}"
 RESUME_NOTE_NAME="${TASKPUMP_RESUME_NOTE_NAME:-.arachne-resume.md}"
+# Written inside the container rather than here, but named here so one place
+# owns every filename the run drops into a worktree.
+GOAL_NOTE_NAME="${TASKPUMP_GOAL_NOTE_NAME:-.arachne-goal.md}"
 # Fingerprint of the last pre-tick hook output, so a persistent condition is
 # notified once rather than every tick. Survives a supervisor restart.
 HOOK_MARK_FILE="${TASKPUMP_HOOK_MARK_FILE:-${TASKPUMP_FSGUARD_MARK_FILE:-$STATE_DIR/.arachne-fsguard.notified}}"
@@ -893,6 +896,8 @@ launch_phase() {
     TP_AGENT_HOME="$CLAUDE_DIR" \
     TP_AGENT_CONFIG="$CLAUDE_JSON" \
     TP_AGENT_LOG_NAME="$AGENT_LOG_NAME" \
+    TP_GOAL_NOTE_NAME="$GOAL_NOTE_NAME" \
+    TP_TASKS_DIR="$TASKS_DIR" \
     TP_MEMORY_MAX="${AGENT_MEMORY_MAX:-3g}"   AGENT_MEMORY_MAX="${AGENT_MEMORY_MAX:-3g}" \
     TP_MEMORY_SWAP="${AGENT_MEMORY_SWAP:-5g}" AGENT_MEMORY_SWAP="${AGENT_MEMORY_SWAP:-5g}" \
     TP_DOCKER="$DOCKER"                DOCKER="$DOCKER" \

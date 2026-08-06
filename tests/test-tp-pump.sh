@@ -300,7 +300,7 @@ echo "--- Test 12b: the runner contract the pump exports ---"
 for v in TP_WORKSPACE TP_BRANCH TP_CONTAINER_NAME TP_IMAGE TP_ENTRYPOINT TP_TASK_ID \
          TP_PHASE TP_MODEL TP_MAX_TURNS TP_REPO_ROOT TP_BRIEF TP_RESUME_NOTE \
          TP_LEDGER_REPO TP_AGENT_HOME TP_AGENT_CONFIG TP_MEMORY_MAX TP_MEMORY_SWAP \
-         TP_DOCKER; do
+         TP_DOCKER TP_AGENT_LOG_NAME TP_GOAL_NOTE_NAME TP_TASKS_DIR; do
   grep -qF "$v=" "$PUMP" && pass "runner contract exports $v" || fail "runner contract missing $v"
 done
 # The legacy twins the in-container entrypoint still reads.
