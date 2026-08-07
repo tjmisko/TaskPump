@@ -287,7 +287,7 @@
 #                           #   caller's repo root)
 # TASKPUMP_MONITOR_MAIN_ROOT=  # primary checkout, used for cache keys and notes
 # TASKPUMP_MONITOR_INTERVAL=  # --watch refresh seconds; fractional ok (default: 1)
-# TASKPUMP_MONITOR_TITLE=   # title-line text (default: Arachne Task Pump)
+# TASKPUMP_MONITOR_TITLE=   # title-line text (default: TaskPump)
 # TASKPUMP_MONITOR_COLS=    # terminal width override (default: the real width)
 # TASKPUMP_MONITOR_LINES=   # terminal height override (default: the real height)
 # TASKPUMP_MONITOR_LOG=     # redraw-instrumentation log (default: empty = off)

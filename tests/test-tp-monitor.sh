@@ -1209,9 +1209,9 @@ for _ in 1 2 3 4 5; do grep -q 'containers running' <<<"$empty_x" && break
 grep -q '(no runner containers running or recently exited)' <<<"$empty_x" \
     && pass "the empty-state line names the configured prefix" \
     || fail "empty state still hardcodes a prefix:\n$(grep -i 'containers' <<<"$empty_x")"
-# The title is deployment copy, and keeps its historical default.
-grep -q '^Arachne Task Pump — ' <<<"$(strip_ansi <<<"$("$CLI" 2>/dev/null)")" \
-    && pass "the title keeps its default" || fail "default title changed"
+# The title is deployment copy; the shipped default is the generic product name.
+grep -q '^TaskPump — ' <<<"$(strip_ansi <<<"$("$CLI" 2>/dev/null)")" \
+    && pass "the title defaults to the product name" || fail "default title changed"
 grep -q '^Widget Pipeline — ' <<<"$(TASKPUMP_MONITOR_TITLE='Widget Pipeline' "$CLI" 2>/dev/null | strip_ansi)" \
     && pass "TASKPUMP_MONITOR_TITLE retitles the frame" || fail "title not configurable"
 

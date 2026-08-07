@@ -1074,9 +1074,10 @@ term_height() {
 hbar() { local w="$1" s; printf -v s '%*s' "$w" ''; printf '%s' "${s// /─}"; }
 
 # The title names the run this dashboard is watching, so it is deployment copy
-# rather than the tool's own name. It keeps its historical default so an existing
-# install's frame is unchanged; set TASKPUMP_MONITOR_TITLE to retitle it.
-MONITOR_TITLE="${TASKPUMP_MONITOR_TITLE:-Arachne Task Pump}"
+# rather than the tool's own name. The default is the generic product name
+# (owner decision 2026-08-06); a consumer retitles the frame with
+# TASKPUMP_MONITOR_TITLE — Arachne pins its historical title in its conf.
+MONITOR_TITLE="${TASKPUMP_MONITOR_TITLE:-TaskPump}"
 
 header() {  # $1 = optional suffix tag
     printf '%s%s%s %s— %s%s%s\n' \
