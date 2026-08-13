@@ -137,7 +137,7 @@ The keys a generic project actually needs.
 | Key | What it configures |
 |---|---|
 | `TASKPUMP_TASKS_DIR` | The directory of task markdown files. The single most important key. |
-| `TASKPUMP_LEDGER_PROBE` | The path, relative to a candidate workspace, whose presence means "this workspace owns a ledger". It is how a worktree's own ledger is told apart from the primary's. `TASKPUMP_TASKS_SUBDIR` is accepted as a fallback spelling; write the canonical one. |
+| `TASKPUMP_LEDGER_PROBE` | The path, relative to a candidate workspace, whose presence means "this workspace owns a ledger". It is how a worktree's own ledger is told apart from the primary's. A *discovered* `taskpump.conf` marks its own directory as the first candidate, ahead of `$PWD`'s worktree root — a directory carrying its own conf and ledger owns them even inside a larger TaskPump-shaped repo. `TASKPUMP_TASKS_SUBDIR` is accepted as a fallback spelling; write the canonical one. |
 | `TASKPUMP_LEDGER_REPO` | The ledger checkout itself, when it is a repository separate from the code. |
 | `TASKPUMP_ID_PATTERN` | The regex ids must match (§[LEDGER-CONTRACT.md §7](LEDGER-CONTRACT.md#7-the-id-grammar-contract)). |
 | `TASKPUMP_CODE_REPO` | The repository whose commits the heartbeat productivity check measures. Distinct from the ledger repo — they are frequently different. |

@@ -31,8 +31,8 @@
 #   TASKPUMP_WORKSPACE_PATH          WORKSPACE_PATH       /workspace
 #   TASKPUMP_REPO_ROOT               REPO_ROOT            $WORKSPACE_PATH
 #   TASKPUMP_LEDGER_REPO             —                    $REPO_ROOT/ops
-#   TASKPUMP_TASKS_DIR               ARACHNE_TASKS_DIR    $LEDGER_REPO/task-loop/tasks
-#   TASKPUMP_TASK_OUT                ARACHNE_TASK_OUT     $LEDGER_REPO/task-loop/.next-task
+#   TASKPUMP_TASKS_DIR               ARACHNE_TASKS_DIR    $LEDGER_REPO/tasks
+#   TASKPUMP_TASK_OUT                ARACHNE_TASK_OUT     $LEDGER_REPO/.next-task
 #   TASKPUMP_TASK_FILE_EXT           —                    .md
 #   TASKPUMP_BRIEF                   ARACHNE_BRIEF        (required)
 #   TASKPUMP_RESUME_NOTE             ARACHNE_RESUME_NOTE  (none)
@@ -41,7 +41,8 @@
 #   TASKPUMP_MAX_TURNS               MAX_TURNS            600
 #   TASKPUMP_AGENT_MODEL             AGENT_MODEL          opus
 #   TASKPUMP_SAFETY_TURNS            —                    3
-#   TASKPUMP_WORKSPACE_TASK_CLI      —                    scripts/arachne-task
+#   TASKPUMP_WORKSPACE_TASK_CLI      —                    tp (on PATH; startup fails
+#                                                         loudly when it is absent)
 #   TASKPUMP_CONTAINER_USER          —                    dev
 #   TASKPUMP_CONTAINER_HOME          —                    /home/$CONTAINER_USER
 #   TASKPUMP_PRE_FLIGHT              —                    (none; see below)
@@ -114,9 +115,10 @@ LEDGER_REPO="$(ep_first TASKPUMP_LEDGER_REPO TP_LEDGER_REPO)"
 : "${LEDGER_REPO:=$REPO_ROOT/ops}"
 
 TASKS_DIR="$(ep_first TASKPUMP_TASKS_DIR TP_TASKS_DIR ARACHNE_TASKS_DIR)"
-: "${TASKS_DIR:=$LEDGER_REPO/task-loop/tasks}"
+: "${TASKS_DIR:=$LEDGER_REPO/tasks}"
 TASK_OUT="$(ep_first TASKPUMP_TASK_OUT TP_TASK_OUT ARACHNE_TASK_OUT)"
-: "${TASK_OUT:=$LEDGER_REPO/task-loop/.next-task}"
+# Kept at dirname(TASKS_DIR)/.next-task, mirroring tp-task's own derivation.
+: "${TASK_OUT:=$LEDGER_REPO/.next-task}"
 TASK_FILE_EXT="$(ep_first TASKPUMP_TASK_EXT TASKPUMP_TASK_FILE_EXT TP_TASK_FILE_EXT)"
 : "${TASK_FILE_EXT:=.md}"
 
@@ -133,9 +135,24 @@ SAFETY_TURNS="$(ep_first TASKPUMP_SAFETY_TURNS TP_SAFETY_TURNS)"
 : "${SAFETY_TURNS:=3}"
 
 WORKSPACE_TASK_CLI="$(ep_first TASKPUMP_WORKSPACE_TASK_CLI TP_WORKSPACE_TASK_CLI)"
-: "${WORKSPACE_TASK_CLI:=scripts/arachne-task}"
+: "${WORKSPACE_TASK_CLI:=tp}"
 TASK_CLI="$WORKSPACE_TASK_CLI"
-[[ "$TASK_CLI" == /* ]] || TASK_CLI="$WORKSPACE_PATH/$TASK_CLI"
+case "$TASK_CLI" in
+    /*) ;;                                      # absolute: used as given
+    */*) TASK_CLI="$WORKSPACE_PATH/$TASK_CLI";; # relative path: under the workspace
+    *)
+        # A bare command name resolves on PATH inside the container. Until the
+        # agent image actually carries tp (G4.3), a bare run must fail HERE —
+        # at startup, before the session — rather than let the agent discover a
+        # missing ledger CLI mid-session and burn the iteration on it. The
+        # error names both fixes.
+        if ! command -v "$TASK_CLI" >/dev/null 2>&1; then
+            echo "ERROR: task CLI '$TASK_CLI' is not on PATH in this container." >&2
+            echo "Fix one of: set TASKPUMP_WORKSPACE_TASK_CLI to the ledger CLI's path in the workspace, or provide 'tp' in the agent image." >&2
+            exit 1
+        fi
+        ;;
+esac
 
 CONTAINER_USER="$(ep_first TASKPUMP_CONTAINER_USER TP_CONTAINER_USER)"
 : "${CONTAINER_USER:=dev}"

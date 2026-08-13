@@ -21,7 +21,7 @@ feature.
 
 ```
 generic-project/
-  taskpump.conf     # tasks live in tasks/, ids look like T1 / T2.1
+  taskpump.conf     # zero ledger keys: tasks/ and T-ids are the defaults now
   tasks/
     T1.md           # done      — the foundation everything else waits on
     T2.1.md         # open      — blocker done, so this is the frontier
@@ -34,9 +34,11 @@ generic-project/
 
 ## What it demonstrates
 
-**A non-`F` id grammar.** Ids are `T<n>` and `T<n>.<m>`, configured by
-`TASKPUMP_ID_PATTERN`. Phase derivation, ordering, and range syntax all work off
-the shape, not the letter.
+**The default id grammar.** Ids are `T<n>` and `T<n>.<m>` — since the v0.1.0
+default flips this is the shipped `TASKPUMP_ID_PATTERN`, so the fixture's conf
+no longer sets it. Phase derivation, ordering, and range syntax all work off
+the shape, not the letter; a consumer with different ids sets the pattern and
+sigil keys.
 
 **The eligibility predicate, and its two counts.** Three tasks are `open`, but
 only one is eligible:

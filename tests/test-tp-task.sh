@@ -878,6 +878,34 @@ else
   fail "custom-probe resolution got '$got', expected '$WS_C/tasks'"
 fi
 
+# A DISCOVERED taskpump.conf marks its own directory as a workspace (G1.6): a
+# subdirectory carrying a conf and the probed ledger owns its own ledger even
+# when the enclosing worktree also answers the probe — the generic-project
+# fixture's situation, sitting inside a repo whose root has a tasks/ of its own.
+SUBWS="$WS_C/vendor/subproject"
+mkdir -p "$SUBWS/tasks"
+printf '# marks this directory as its own TaskPump workspace\n' >| "$SUBWS/taskpump.conf"
+got=$( cd "$SUBWS" && env "${TP_ENV_UNSET[@]}" TASKPUMP_NO_CONF=0 \
+        TASKPUMP_LEDGER_PROBE=tasks ARACHNE_TASK_NOCOMMIT=1 \
+        "$WS_A/libexec/tp-task" resolve --tasks-dir )
+if [[ "$got" == "$SUBWS/tasks" ]]; then
+  pass "a discovered conf anchors resolution to its own directory"
+else
+  fail "conf-anchored resolution got '$got', expected '$SUBWS/tasks'"
+fi
+
+# An EXPLICIT TASKPUMP_CONFIG is deliberate configuration, not a workspace
+# marker: it may live anywhere (a suite's pins file), so it must never move the
+# ledger to wherever the file happens to sit.
+got=$( cd "$WS_C" && env "${TP_ENV_UNSET[@]}" TASKPUMP_NO_CONF=1 \
+        TASKPUMP_CONFIG="$SUBWS/taskpump.conf" TASKPUMP_LEDGER_PROBE=tasks \
+        ARACHNE_TASK_NOCOMMIT=1 "$WS_A/libexec/tp-task" resolve --tasks-dir )
+if [[ "$got" == "$WS_C/tasks" ]]; then
+  pass "an explicit TASKPUMP_CONFIG does not anchor resolution to the file's directory"
+else
+  fail "explicit-config resolution got '$got', expected '$WS_C/tasks'"
+fi
+
 # And the negative: under the pinned ops/task-loop/tasks probe, that same
 # workspace does NOT look like it carries a ledger, so resolution falls back to
 # the script's workspace. This is what proves the probe is doing the deciding.
@@ -1278,13 +1306,15 @@ ledger_fingerprint() {
 # The operation under test: file two tasks, wire one behind the other, then
 # claim and complete the blocker. Touches create/blockers/claim/complete, so a
 # spelling that failed to arrive would change the outcome rather than merely the
-# path taken to it.
+# path taken to it. These runners deliberately CLEAR both spellings of every
+# key, so `create` here validates against the BAKED default grammar — T-shaped
+# ids since the G1.6 flip, hence T ids in an otherwise F-shaped suite.
 seed_ledger() {
   local runner=$1
-  $runner create F80.1 --title "Blocker task" --goal "Unblock F80.2." >/dev/null
-  $runner create F80.2 --title "Dependent task" --blockers "F80.1" >/dev/null
-  $runner claim F80.1 --branch feat/dual --turns 9 >/dev/null
-  $runner complete F80.1 --commits "abc1234,def5678" >/dev/null </dev/null
+  $runner create T80.1 --title "Blocker task" --goal "Unblock T80.2." >/dev/null
+  $runner create T80.2 --title "Dependent task" --blockers "T80.1" >/dev/null
+  $runner claim T80.1 --branch feat/dual --turns 9 >/dev/null
+  $runner complete T80.1 --commits "abc1234,def5678" >/dev/null </dev/null
 }
 
 DUAL_LEGACY="$TMPDIR_TEST/dual-legacy/tasks"
@@ -1359,8 +1389,8 @@ got=$(env "${TP_ENV_UNSET[@]}" \
 
 env "${TP_ENV_UNSET[@]}" \
   ARACHNE_TASKS_DIR="$PREC_LEGACY" TASKPUMP_TASKS_DIR="$PREC_CANON" \
-  ARACHNE_TASK_NOCOMMIT=1 "$CLI" create F81.1 --title "Precedence" >/dev/null
-[[ -f "$PREC_CANON/F81.1.md" && ! -f "$PREC_LEGACY/F81.1.md" ]] \
+  ARACHNE_TASK_NOCOMMIT=1 "$CLI" create T81.1 --title "Precedence" >/dev/null
+[[ -f "$PREC_CANON/T81.1.md" && ! -f "$PREC_LEGACY/T81.1.md" ]] \
   && pass "the write lands in the canonical dir, not the legacy one" \
   || fail "precedence write went to the wrong ledger"
 

@@ -46,11 +46,11 @@
 #                              (default: $PWD's git worktree, else the install)
 #   TASKPUMP_TASKS_DIR         the ledger itself (default: <root>/<subdir>)
 #   TASKPUMP_TASKS_SUBDIR      ledger path within the repo
-#                              (default: ops/task-loop/tasks)
+#                              (default: tasks)
 #   TASKPUMP_TASK_EXT          task-file extension (default: .md)
 #   TASKPUMP_PUMP_STATE_FILE   pump state, for the implicit phase range
 #   TASKPUMP_PUMP_STATE_NAME   its filename (default: .taskpump-pump.state)
-#   TASKPUMP_PHASE_SIGIL       letter a phase token starts with (default: F)
+#   TASKPUMP_PHASE_SIGIL       letter a phase token starts with (default: T)
 #   TASKPUMP_PHASE_SEPARATOR   what ends the phase within an id (default: .)
 #   TASKPUMP_DAG_LAYOUT        the layout program (default: lib/dag-layout.awk)
 #   TASKPUMP_AWK               the gawk binary (default: gawk)
@@ -78,12 +78,12 @@ _tp_repo_default() {
     printf '%s' "$TP_ROOT"
 }
 REPO_ROOT="${TASKPUMP_DAG_REPO_ROOT:-$(_tp_repo_default)}"
-TASKS_SUBDIR="${TASKPUMP_LEDGER_PROBE:-${TASKPUMP_TASKS_SUBDIR:-ops/task-loop/tasks}}"
+TASKS_SUBDIR="${TASKPUMP_LEDGER_PROBE:-${TASKPUMP_TASKS_SUBDIR:-tasks}}"
 TASKS_DIR="${TASKPUMP_TASKS_DIR:-$REPO_ROOT/$TASKS_SUBDIR}"
 TASK_EXT="${TASKPUMP_TASK_EXT:-.md}"
 PUMP_STATE_NAME="${TASKPUMP_PUMP_STATE_NAME:-.taskpump-pump.state}"
 PUMP_STATE="${TASKPUMP_PUMP_STATE_FILE:-$REPO_ROOT/$PUMP_STATE_NAME}"
-PHASE_SIGIL="${TASKPUMP_PHASE_SIGIL:-F}"
+PHASE_SIGIL="${TASKPUMP_PHASE_SIGIL:-T}"
 PHASE_SEP="${TASKPUMP_PHASE_SEPARATOR:-.}"
 LAYOUT_AWK="${TASKPUMP_DAG_LAYOUT:-$TP_LIB_DIR/dag-layout.awk}"
 AWK_BIN="${TASKPUMP_AWK:-gawk}"
