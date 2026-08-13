@@ -1,0 +1,46 @@
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Edit",
+      "Write",
+      "Glob",
+      "Grep",
+      "Bash(git:*)",
+      "Bash(gh pr:*)",
+      "Bash(gh issue:*)",
+      "Bash(jq:*)",
+      "Bash(yq:*)",
+      "Bash(gawk:*)",
+      "Bash(awk:*)",
+      "Bash(grep:*)",
+      "Bash(sed:*)",
+      "Bash(ls:*)",
+      "Bash(cat:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)",
+      "Bash(wc:*)",
+      "Bash(diff:*)",
+      "Bash(find:*)",
+      "Bash(sort:*)",
+      "Bash(uniq:*)",
+      "Bash(mkdir:*)",
+      "Bash(mv:*)",
+      "Bash(cp:*)",
+      "Bash(touch:*)",
+      "Bash(chmod:*)",
+      "Bash(bash tests/:*)",
+      "Bash(./tests/run-all.sh:*)",
+      "Bash(./tests/run-all.sh)",
+      "Bash(libexec/tp-task:*)",
+      "Bash(./libexec/tp-task:*)",
+      "Bash(bin/tp:*)",
+      "Bash(./bin/tp:*)"
+    ],
+    "deny": [
+      "Bash(docker:*)",
+      "Bash(systemctl:*)",
+      "Bash(sudo:*)"
+    ]
+  }
+}

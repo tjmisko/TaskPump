@@ -5,7 +5,8 @@
 # on PATH, git + jq, and an unprivileged `dev` user for the session. On top of
 # the bare contract: mikefarah yq v4 and gawk, because the workspace task CLI
 # (libexec/tp-task) runs inside the container and needs them; gh, because the
-# phase-drain brief directs agents to open draft PRs.
+# phase-drain brief directs agents to open draft PRs; iptables, because the
+# pre-flight hook (hooks/agent-preflight) installs the egress allowlist.
 #
 # Build (what TASKPUMP_IMAGE_BUILD pins, context = this directory so the COPY
 # below resolves):
@@ -13,7 +14,7 @@
 FROM node:22-bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      bash ca-certificates curl gawk gh git jq procps \
+      bash ca-certificates curl gawk gh git iptables jq procps \
     && rm -rf /var/lib/apt/lists/*
 
 # mikefarah yq v4 — a different tool from Debian's python-yq; the entrypoint's

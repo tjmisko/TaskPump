@@ -1,0 +1,93 @@
+#!/bin/bash
+# hooks/agent-preflight — TaskPump's own container pre-flight (G0.5).
+#
+# The project-specific half of the launch, run by the entrypoint's
+# TASKPUMP_PRE_FLIGHT hook: as root, inside the container, after credentials
+# are installed and before the session starts. The conf pins this file by its
+# in-checkout path, so the copy that runs is the agent worktree's own.
+# Structure follows runners/claude-docker/preflight-example.sh (Arachne's,
+# shipped as reference); the allowlist here is cut down to what a TaskPump
+# agent actually needs: the Anthropic API and GitHub. No package registries —
+# nothing installs at session time.
+#
+# Fatal vs not, per the reference's reasoning: the firewall is fatal (an agent
+# with unrestricted egress is not the sandbox anyone agreed to — and a firewall
+# that cannot be VERIFIED dropping traffic counts as no firewall); the smoke
+# test is not.
+
+set -euo pipefail
+
+: "${WORKSPACE_PATH:=/workspace}"
+: "${REPO_ROOT:=$WORKSPACE_PATH}"
+: "${LOG_FILE:=$WORKSPACE_PATH/.taskpump-agent.log}"
+: "${TASKPUMP_CONTAINER_HOME:=/home/dev}"
+
+say() { echo "$*" | tee -a "$LOG_FILE"; }
+
+# ── Firewall ──────────────────────────────────────────────────────────────────
+# Egress allowlist — the hard sandbox; the Auto Mode classifier is the second
+# layer, not the first. Hostname rules resolve at insert time; the GitHub CIDR
+# blocks come from api.github.com/meta — refresh them there when pushes start
+# failing.
+say "Configuring firewall..."
+iptables -A OUTPUT -o lo -j ACCEPT
+iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
+iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
+iptables -A OUTPUT -d api.anthropic.com -j ACCEPT
+iptables -A OUTPUT -d 140.82.112.0/20 -j ACCEPT
+iptables -A OUTPUT -d 143.55.64.0/20  -j ACCEPT
+iptables -A OUTPUT -d 192.30.252.0/22 -j ACCEPT
+iptables -A OUTPUT -d 185.199.108.0/22 -j ACCEPT
+iptables -A OUTPUT -d 20.201.28.0/22  -j ACCEPT
+iptables -A OUTPUT -d 20.205.243.0/24 -j ACCEPT
+iptables -A OUTPUT -d 20.207.73.0/24  -j ACCEPT
+iptables -A OUTPUT -d 20.233.83.0/24  -j ACCEPT
+iptables -A OUTPUT -d 20.248.137.0/24 -j ACCEPT
+iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+iptables -A OUTPUT -j DROP
+
+# Verify the DROP is live, not assumed: a disallowed host must fail to connect.
+# --max-time bounds the dropped SYN's hang; any successful connection means the
+# allowlist is not actually in force, and that is fatal.
+if curl -sS -o /dev/null --max-time 3 https://example.com/ 2>/dev/null; then
+    say "ERROR: egress to a disallowed host succeeded — firewall not in force"
+    exit 1
+fi
+say "Firewall configured (deny probe: blocked, as required)"
+
+# ── Agent settings: Auto Mode allow rules ─────────────────────────────────────
+# Written AFTER the credential copy on purpose — this must be the settings.json
+# the session actually reads. These live in the primary checkout (REPO_ROOT),
+# not the worktree, so every agent runs the same reviewed ruleset. The allow
+# rules keep routine git/test/ledger commands off the classifier so the
+# abort-after-repeated-blocks ceiling stays distant.
+AUTO_JSON="$REPO_ROOT/claude-settings-auto.json"
+if [[ -f "$AUTO_JSON" ]]; then
+    mkdir -p "$TASKPUMP_CONTAINER_HOME/.claude"
+    cp "$AUTO_JSON" "$TASKPUMP_CONTAINER_HOME/.claude/settings.json"
+    chown -R "${TASKPUMP_CONTAINER_USER:-dev}:${TASKPUMP_CONTAINER_USER:-dev}" \
+        "$TASKPUMP_CONTAINER_HOME/.claude" 2>/dev/null || true
+    say "Auto Mode settings installed from $AUTO_JSON"
+else
+    say "WARNING: $AUTO_JSON not found — session runs with classifier-only permissions"
+fi
+
+# ── Smoke test ────────────────────────────────────────────────────────────────
+# Deliberately non-fatal: worth shouting about, not worth refusing the session.
+say "Running smoke test..."
+smoke_rc=0
+claude --version >/dev/null 2>&1 || { say "SMOKE: claude CLI missing"; smoke_rc=1; }
+yq --version 2>/dev/null | grep -q mikefarah || { say "SMOKE: mikefarah yq missing"; smoke_rc=1; }
+jq --version >/dev/null 2>&1  || { say "SMOKE: jq missing"; smoke_rc=1; }
+gawk --version >/dev/null 2>&1 || { say "SMOKE: gawk missing"; smoke_rc=1; }
+gh --version >/dev/null 2>&1  || { say "SMOKE: gh missing"; smoke_rc=1; }
+[[ -x "$WORKSPACE_PATH/libexec/tp-task" ]] || { say "SMOKE: workspace task CLI not executable"; smoke_rc=1; }
+git -C "$WORKSPACE_PATH" status --porcelain >/dev/null 2>&1 \
+    || { say "SMOKE: git cannot read the workspace (ownership?)"; smoke_rc=1; }
+if [[ "$smoke_rc" -ne 0 ]]; then
+    say "WARNING: smoke test had failures (continuing)"
+else
+    say "Smoke test passed"
+fi
+
+say "Pre-flight complete"
