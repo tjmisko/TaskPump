@@ -14,9 +14,10 @@
 #     (in_progress, dead container) auto-resumes; a live one is never
 #     double-launched.
 #   * Feed gate: pause LAUNCHING new work — running agents are never killed —
-#     when any gate in TASKPUMP_GATES says so. The default chain is network
-#     health, host token freshness, the plan's usage ceiling, and free disk.
-#     Feeding resumes by itself when the gate clears.
+#     when any gate in TASKPUMP_GATES says so. The default chain is host token
+#     freshness, the plan's usage ceiling, and free disk; the shipped net-health
+#     gate joins it (first) when TASKPUMP_HEALTH_GATE=1. Feeding resumes by
+#     itself when the gate clears.
 #   * Disk discipline: a completed phase's worktree build dir is reclaimed each
 #     tick once its container has exited, so a multi-day drain's disk footprint
 #     stays bounded — when TASKPUMP_RECLAIM_CMD names how; unconfigured, the
@@ -164,7 +165,10 @@ GRAIN="phase"
 TICK="${TASKPUMP_TICK:-${POOL_TICK:-30}}"
 STAGGER="${TASKPUMP_STAGGER:-${POOL_STAGGER:-3}}"
 HEALTH_WINDOW="${TASKPUMP_HEALTH_WINDOW:-${HEALTH_WINDOW:-120}}"
-HEALTH_GATE=1
+# net-health is host-hardware policy (one machine's WiFi firmware signatures),
+# so it ships OFF: TASKPUMP_HEALTH_GATE=1 opts it into the default chain, ahead
+# of the generic three. The reference consumer pins 1 in examples/arachne.conf.
+HEALTH_GATE="${TASKPUMP_HEALTH_GATE:-0}"
 USAGE_GATE=1
 DISK_GATE=1
 BRANCH_PREFIX="${TASKPUMP_PUMP_BRANCH_PREFIX:-${TASKPUMP_BRANCH_PREFIX:-feat/}}"
@@ -516,17 +520,36 @@ detect_stalled_orphans() {
 # That last rule is deliberate: a gate that cannot reach its meter must never
 # silently halt a multi-day drain. Every gate shipped here fails open too.
 #
-# The default chain is exactly what was hardcoded before — network health, host
-# token freshness, the usage ceiling, free disk — with the three --no-*-gate
-# flags dropping their entry. A configured TASKPUMP_GATES replaces the whole
-# chain and is used verbatim; the flags still export their disable switches, so
-# a gate that honors them keeps working either way.
+# The default chain is token freshness, the usage ceiling, and free disk — with
+# the three --no-*-gate flags dropping their entry. The shipped net-health gate
+# is host-hardware policy and OFF by default; TASKPUMP_HEALTH_GATE=1 opts it in
+# at the head of the chain (a wedged host is the cheapest, most binding check).
+# A configured TASKPUMP_GATES replaces the whole chain and is used verbatim; the
+# flags still export their disable switches, so a gate that honors them keeps
+# working either way — note that means a net-health entry in a custom chain also
+# needs TASKPUMP_HEALTH_GATE=1 to actually probe.
 default_gates() {
   [[ "$HEALTH_GATE" -eq 1 ]] && printf '%s\n' "$TP_GATES_DIR/net-health"
   printf '%s\n' "$TP_GATES_DIR/claude-token-fresh"
   [[ "$USAGE_GATE" -eq 1 ]] && printf '%s\n' "$USAGE_BIN --gate"
   [[ "$DISK_GATE"  -eq 1 ]] && printf '%s\n' "$TP_GATES_DIR/disk-low"
   return 0
+}
+
+# The active chain as one display line: each entry's executable basename in
+# consultation order. Dry-run prints it, so an operator can confirm a gate is
+# wired and ordered as intended without waiting for one to trip (GATES.md §4).
+gate_chain_line() {
+  local gates spec line=""
+  gates="${TASKPUMP_GATES:-$(default_gates)}"
+  while IFS= read -r spec; do
+    [[ -z "${spec//[[:space:]]/}" ]] && continue
+    # A gate entry is a command line; splitting on whitespace is the point.
+    # shellcheck disable=SC2086
+    set -- $spec
+    line+="${line:+ -> }$(basename "$1")"
+  done <<<"$gates"
+  printf '%s' "${line:-(none)}"
 }
 
 # Everything a gate might need, since a gate is a separate process.
@@ -1496,6 +1519,7 @@ case "$MODE" in
     ;;
   dry)
     echo "[dry-run] no image build, no launches, no ops mutation"
+    echo "gates: $(gate_chain_line)"
     print_plan
     exit 0
     ;;

@@ -995,6 +995,27 @@ have "$out" 'GATE: PAUSED' && pass "the disk gate is in the default chain" || fa
 out=$(STUB_DISK_GATE_RC=10 pump F56 --no-disk-gate)
 have "$out" 'GATE: feed-ok' && pass "--no-disk-gate drops the disk gate" || fail "--no-disk-gate ignored:\n$out"
 
+echo "--- Test 24b: dry-run names the active gate chain (G1.7) ---"
+# Bare default: three gates, no net-health — it is host-hardware policy and
+# ships off. TASKPUMP_HEALTH_GATE=1 opts it in at the head of the chain; the
+# probe is stubbed inert so this host's real journal never reaches the suite.
+# (the usage entry names this suite's stub, arachne-usage — the line shows the
+# CONFIGURED binary, which is the point.)
+out=$("$PUMP" --dry-run --phases F56 2>&1)
+have "$out" '^gates: claude-token-fresh -> arachne-usage -> disk-low$' \
+  && pass "bare default chain is token-fresh -> usage -> disk-low" \
+  || fail "bare default chain wrong:\n$out"
+out=$(TASKPUMP_HEALTH_GATE=1 TASKPUMP_HEALTH_PROBE_CMD=true "$PUMP" --dry-run --phases F56 2>&1)
+have "$out" '^gates: net-health -> claude-token-fresh -> arachne-usage -> disk-low$' \
+  && pass "TASKPUMP_HEALTH_GATE=1 opts net-health in, first" \
+  || fail "opt-in chain wrong:\n$out"
+out=$(TASKPUMP_HEALTH_GATE=1 TASKPUMP_HEALTH_PROBE_CMD=true "$PUMP" --no-health-gate --dry-run --phases F56 2>&1)
+have "$out" '^gates: claude-token-fresh' && pass "--no-health-gate still drops net-health" \
+  || fail "--no-health-gate ignored:\n$out"
+out=$(TASKPUMP_GATES="$GBIN/pause-quota" pump F56)
+have "$out" '^gates: pause-quota$' && pass "a custom TASKPUMP_GATES chain is named verbatim" \
+  || fail "custom chain not named:\n$out"
+
 echo "--- Test 25: pre-tick hooks are a chain too ---"
 HBIN="$TMP/hooks"; mkdir -p "$HBIN"
 cat >| "$HBIN/quiet" <<'EOF'

@@ -1,4 +1,5 @@
 [dry-run] no image build, no launches, no ops mutation
+gates: net-health -> claude-token-fresh -> claude-usage -> disk-low
 arachne-pump plan — phases F79, grain phase, cap 4, ceiling 95%
 GATE: feed-ok
   RESUME   F79    -> feat/f79 (stalled on F79.4, in_progress; container dead, work committed)

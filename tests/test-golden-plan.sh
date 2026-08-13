@@ -192,6 +192,10 @@ PUMP="$REPO/libexec/tp-pump"
 # arachne.conf pins the host's proven ceiling (6), but the concurrency cap is a
 # host preference, not part of the equivalence promise, and the goldens were
 # captured at the pre-extraction cap of 4.
+# TASKPUMP_HEALTH_PROBE_CMD is a hermeticity seam, not a pin: the arachne.conf
+# pin TASKPUMP_HEALTH_GATE=1 keeps net-health at the head of the pinned chain
+# (G1.7 ships it off bare), and the inert probe keeps this host's real kernel
+# journal out of the fixture — the gate consults `true` and always feeds.
 pump() {
   ( cd "$REPO" && \
     TASKPUMP_CONFIG="$PINS_CONF" \
@@ -205,8 +209,9 @@ pump() {
     ARACHNE_PUMP_WORKTREES_DIR="$REPO/.worktrees" \
     ARACHNE_TOKEN_GATE=0 \
     ARACHNE_PUMP_NO_GH=1 \
+    TASKPUMP_HEALTH_PROBE_CMD=true \
     DOCKER="$BIN/docker" \
-    "$PUMP" --no-health-gate "$@" 2>&1 )
+    "$PUMP" "$@" 2>&1 )
 }
 
 # normalize — strip the two things that legitimately differ per run.
