@@ -1507,13 +1507,14 @@ detach_and_exit() {
 # detached re-exec itself never block on a UI.
 exec_monitor() {
   [[ "$MONITOR" -eq 1 ]] || return 0
-  [[ -t 0 && -t 1 ]] || { log "not a tty — skipping the monitor (run: $MONITOR_BIN --watch)"; return 0; }
+  [[ -t 0 && -t 1 ]] || { log "not a tty — skipping the monitor (run: $MONITOR_BIN)"; return 0; }
   [[ -x "$MONITOR_BIN" ]] || { log "no monitor at $MONITOR_BIN — skipping"; return 0; }
   # The supervisor writes .taskpump-pump.state on its first tick; give it a beat
   # so the monitor's opening frame shows the run instead of "no pump".
   sleep 2
   log "opening the monitor (q to close it; the pump keeps running)"
-  exec "$MONITOR_BIN" --watch
+  # No mode flag: the tty guard above means the monitor's own default watches.
+  exec "$MONITOR_BIN"
 }
 
 # ── Modes ──────────────────────────────────────────────────────────────────────
@@ -1604,7 +1605,7 @@ if [[ "$MODE" == "run" && "$DISK_GATE" -eq 1 && "${TASKPUMP_PUMP_NO_LAUNCH:-0}" 
 fi
 
 log "Pump: phases=$PHASES grain=$GRAIN cap=$JOBS (live via $CAP_FILE) ceiling=${CEILING}% tick=${TICK}s"
-log "Singular supervisor; Ctrl-C stops feeding but leaves running agents. Monitor: $MONITOR_BIN --watch"
+log "Singular supervisor; Ctrl-C stops feeding but leaves running agents. Monitor: $MONITOR_BIN"
 
 if [[ "$MODE" == "once" ]]; then
   do_tick

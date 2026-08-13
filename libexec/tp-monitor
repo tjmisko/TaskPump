@@ -22,24 +22,29 @@
 # caches, so a paint is cheap (tens of ms) and the first frame is instant —
 # cold caches show "…" placeholders that fill in within a couple seconds.
 #
-# In --watch the terminal autowrap is disabled (like btop/htop) so long lines
-# clip at the edge instead of wrapping, and the frame is clipped to the terminal
-# height, so the top never scrolls away.
+# Watching is the DEFAULT on a tty: calling the monitor interactively means
+# watching (issue #10). A non-tty invocation glances — one frame, then exit —
+# so a pipe never hangs on the loop. --glance and --interval force either
+# direction explicitly; --watch [N] survives as a deprecated alias.
+#
+# In the watcher the terminal autowrap is disabled (like btop/htop) so long
+# lines clip at the edge instead of wrapping, and the frame is clipped to the
+# terminal height, so the top never scrolls away.
 #
 # Notes: a free-text scratchpad scoped to the current pump run (keyed by the
 # pump's phase-range + start time, so a new run starts fresh). Persisted in
 # <notes dir>/<run>.md (gitignored).
 #
-# Refresh cadence: --watch defaults to 1s. Set TASKPUMP_MONITOR_INTERVAL to
-# change it once in your shell/config; a positional --watch <N> still wins.
-# Fractional seconds are accepted, e.g. --watch 0.5.
+# Refresh cadence: the watcher defaults to 1s. Set TASKPUMP_MONITOR_INTERVAL
+# to change it once in your shell/config; --interval <N> (or a bare positional
+# N) still wins. Fractional seconds are accepted, e.g. --interval 0.5.
 #
 # Usage:
-#   tp monitor                  # one paint
-#   tp monitor --watch          # refresh every 1s (cached, scrollable)
-#   tp monitor --watch 5        # refresh every 5s
-#   TASKPUMP_MONITOR_INTERVAL=3 tp monitor --watch   # every 3s (env)
-#   tp monitor --watch --log /tmp/mon.log   # log each redraw's timing
+#   tp monitor                  # live watcher (default on a tty; 1s cadence)
+#   tp monitor --interval 5     # live watcher, refresh every 5s
+#   tp monitor --glance         # one frame, exit (the default when piped)
+#   TASKPUMP_MONITOR_INTERVAL=3 tp monitor   # every 3s (env)
+#   tp monitor --log /tmp/mon.log   # log each redraw's timing
 #   tp monitor --no-disk        # hide the disk gauge
 #   tp monitor --demo           # synthetic sessions; no docker needed
 #   tp monitor --tab graph --cursor F79.5 --moves jj   # scripted focus
@@ -165,9 +170,11 @@ print_help() {
     awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$0"
 }
 
-# Refresh interval precedence: positional --watch <N> (set in the arg loop below)
+# Refresh interval precedence: --interval <N> / positional <N> (arg loop below)
 #   >  TASKPUMP_MONITOR_INTERVAL  >  built-in default (1s). Fractional ok.
-WATCH=0; INTERVAL="${TASKPUMP_MONITOR_INTERVAL:-1}"; DEMO=0
+# WATCH stays empty through the arg loop so "no mode flag given" is
+# distinguishable: the default is then resolved by tty-ness below.
+WATCH=""; INTERVAL="${TASKPUMP_MONITOR_INTERVAL:-1}"; DEMO=0
 MONITOR_LOG="${TASKPUMP_MONITOR_LOG:-}"        # redraw-instrumentation log (off if empty)
 SHOW_DISK="${TASKPUMP_MONITOR_DISK:-1}"        # disk gauge on by default; --no-disk / =0 off
 # Tabs: 0 = SESSIONS (gauges + live sessions), 1 = GRAPH (layered task DAG).
@@ -182,7 +189,11 @@ SHOW_HELP=0                                   # --show-help: print the key panel
 DAG_BIN="${TASKPUMP_DAG_BIN:-$TP_LIBEXEC_DIR/tp-dag-render}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --watch)        WATCH=1 ;;
+        --watch)        WATCH=1 ;;         # deprecated alias: watching is the tty default
+        --glance)       WATCH=0 ;;         # one frame, exit (the non-tty default)
+        --interval)     [[ -n "${2:-}" ]] || { echo "ERROR: --interval wants seconds" >&2; exit 1; }
+                        INTERVAL="$2"; WATCH=1; shift ;;
+        --interval=*)   INTERVAL="${1#--interval=}"; WATCH=1 ;;
         --demo)         DEMO=1 ;;          # render synthetic sessions; no docker needed
         --no-disk)      SHOW_DISK=0 ;;
         --tab)          case "${2:-}" in graph|dag) TAB=1 ;; sessions) TAB=0 ;;
@@ -200,7 +211,7 @@ while [[ $# -gt 0 ]]; do
         --decode-keys)  DECODE_KEYS="${2:-}"; shift ;;
         --decode-keys=*) DECODE_KEYS="${1#--decode-keys=}" ;;
         --show-help)    SHOW_HELP=1 ;;
-        [0-9]*)         INTERVAL="$1" ;;
+        [0-9]*)         INTERVAL="$1"; WATCH=1 ;;   # bare N = the old `--watch N`
         -h|--help)      print_help; exit 0 ;;
         *)              echo "ERROR: unknown arg '$1'" >&2; exit 1 ;;
     esac
@@ -210,6 +221,12 @@ done
 # garbage would surface as a bash arithmetic error instead of a usage message.
 if [[ -n "$DECODE_KEYS" && ! "$DECODE_KEYS" =~ ^[0-9]+$ ]]; then
     echo "ERROR: --decode-keys wants a count" >&2; exit 1
+fi
+
+# No mode flag given: watch on a tty, glance in a pipe (issue #10). Interactive
+# callers are here to watch; a pipeline must never hang on the redraw loop.
+if [[ -z "$WATCH" ]]; then
+    if [[ -t 1 ]]; then WATCH=1; else WATCH=0; fi
 fi
 
 # branch-slug -> "name<TAB>epic_task" lookup from the manifest.

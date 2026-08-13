@@ -146,8 +146,11 @@ something you forgot.
 ### 6. Watch
 
 ```bash
-tp monitor --watch
+tp monitor
 ```
+
+Watching is the default on a tty; piped output renders one frame and exits
+(`--glance` forces that, `--interval 5` sets the cadence).
 
 A live TUI with two tabs: `SESSIONS` for what agents are doing, `GRAPH` for the
 task DAG laid out by dependency, with the selected task's goal, budget, and

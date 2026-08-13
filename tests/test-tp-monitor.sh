@@ -225,6 +225,30 @@ LOGP="$TMP/interval-pos.log"
 TASKPUMP_MONITOR_INTERVAL=3 timeout 2 "$CLI" --watch 5 --log "$LOGP" >/dev/null 2>&1 </dev/null || true
 grep -qE 'interval=5s ' "$LOGP" 2>/dev/null && pass "positional --watch 5 beats env var" || fail "positional did not win: $(head -1 "$LOGP" 2>/dev/null)"
 
+# ── Test 9b: watch is the tty default; a pipe glances (issue #10) ─────────────
+echo "--- Test 9b: mode defaults — glance in a pipe, --glance, --interval ---"
+# Every invocation in this harness is non-tty, so the bare form must render ONE
+# frame and exit on its own: no timeout wrapper here on purpose — a regression
+# to looping would hang the suite at this line, which is the assertion.
+LOGG="$TMP/glance.log"
+"$CLI" --log "$LOGG" >/dev/null 2>&1 </dev/null; rc=$?
+[[ "$rc" -eq 0 ]] && pass "bare non-tty invocation exits 0 (glances)" || fail "bare non-tty rc=$rc"
+[[ "$(grep -c 'redraw=' "$LOGG")" -eq 1 ]] && pass "non-tty default renders exactly one frame" \
+  || fail "non-tty default frames != 1: $(grep -c 'redraw=' "$LOGG")"
+LOGG2="$TMP/glance2.log"
+"$CLI" --glance --log "$LOGG2" >/dev/null 2>&1 </dev/null
+[[ "$(grep -c 'redraw=' "$LOGG2")" -eq 1 ]] && pass "--glance renders exactly one frame" \
+  || fail "--glance frames != 1: $(grep -c 'redraw=' "$LOGG2")"
+# --interval forces the watcher even in a pipe, at the given cadence.
+LOGN="$TMP/interval-flag.log"
+timeout 2 "$CLI" --interval 5 --log "$LOGN" >/dev/null 2>&1 </dev/null || true
+grep -qE 'interval=5s ' "$LOGN" 2>/dev/null && pass "--interval 5 sets the cadence" \
+  || fail "--interval cadence wrong: $(head -1 "$LOGN" 2>/dev/null)"
+grep -q 'mode=batched' "$LOGN" 2>/dev/null && pass "--interval runs the watch loop in a pipe" \
+  || fail "--interval did not enter the watch loop"
+"$CLI" --interval >/dev/null 2>&1; rc=$?
+[[ "$rc" -ne 0 ]] && pass "--interval with no value is rejected" || fail "bare --interval accepted"
+
 # ── Test 10: gauge alignment — 5h / 7d / Disk bars start at the same column ─────
 echo "--- Test 10: gauge alignment ---"
 make_usage_stub 42 73
