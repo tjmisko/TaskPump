@@ -4,6 +4,31 @@ Notable changes to TaskPump. This project versions its **ledger contract**, not
 just its code: the rules for what constitutes a MAJOR, MINOR, or PATCH change are
 in [docs/LEDGER-CONTRACT.md §1](docs/LEDGER-CONTRACT.md#1-versioning).
 
+## Unreleased
+
+### Added
+
+- **Runner contract v2: `runner.sh list`.** A runner can now be *asked* which of
+  its agents are alive, instead of the supervisor inferring it by scraping
+  container names. `list` is a fleet verb — one call, one snapshot, no
+  per-agent input — so answering it costs one process per tick rather than one
+  per agent. An empty fleet is exit 0 with no output; a runtime that cannot be
+  reached is a non-zero exit with one line on stderr, because *"nothing is
+  running"* and *"I could not look"* demand opposite actions and the runner does
+  not get to guess which. The reference `claude-docker` runner implements it over
+  the pump's own enumeration (`lib/pump-lib.sh`), not a second copy of the
+  filter, so the names it prints are by construction the names the prefix scrape
+  would find. MINOR: additive to the contract, and the prefix scrape remains the
+  documented fallback, so an existing v1 runner keeps working unchanged. See
+  [docs/RUNNERS.md §1.3](docs/RUNNERS.md#13-list).
+
+  The pump does not call `list` yet — it still scrapes — so this lands
+  verifiable on its own.
+
+- `apl_live_agent_names_strict` in `lib/pump-lib.sh`: the existing enumeration
+  with the runtime's failure propagated instead of flattened into an empty list.
+  Both forms now share one `docker ps --filter` expression.
+
 ## 0.1.0 — 2026-08-13
 
 The extraction of TaskPump from Arachne, and its generalization into a tool any
@@ -222,7 +247,8 @@ these for finished:
 - Liveness enumeration matches on a container-name prefix rather than asking the
   runner, so a runner must name its agents `<prefix><branch-slug>`. A
   `runner.sh list` verb is the v2 fix (see
-  [docs/RUNNERS.md §1.3](docs/RUNNERS.md#13-what-v1-deliberately-leaves-out)).
+  [docs/RUNNERS.md §1.3](docs/RUNNERS.md#13-list); shipped in Unreleased, with
+  the prefix scrape kept as the fallback).
 - Branch-to-container-name slugging assumes a branch contains at most one `/`;
   a branch name that cannot round-trip the slug confuses liveness enumeration
   instead of being rejected at claim or launch time.

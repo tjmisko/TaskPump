@@ -10,17 +10,22 @@ without touching the scheduler.
 
 ---
 
-## 1. The runner contract, v1
+## 1. The runner contract, v2
 
 A runner is **an executable** taking a verb as its first argument.
 
 ```
 runner.sh launch      # start an agent; print its handle; exit non-zero on failure
 runner.sh stop        # stop the agent identified by the environment
+runner.sh list        # print every live agent's name; exit non-zero if it cannot look
 ```
 
 Everything else is passed through the environment, so the interface stays stable
 as inputs are added.
+
+`launch` and `stop` are asked about **one** agent, named by the environment.
+`list` is asked about the **fleet** and takes no per-agent input at all — the
+difference is what §1.3 is about.
 
 ### 1.1 `launch`
 
@@ -71,20 +76,63 @@ runtime is unreachable, the name is ambiguous — must still exit non-zero, or a
 teardown that silently did nothing is indistinguishable from one that worked.
 `tests/test-tp-runner-stop.sh` holds the reference runner to both halves.
 
-### 1.3 What v1 deliberately leaves out
+### 1.3 `list`
 
-**Liveness is not part of the runner contract in v1.** The pump discovers live
-agents by listing processes whose name carries the configured agent prefix, not
-by asking the runner. That is a real coupling, and it is deliberate: it is the
-mechanism the whole supervisor rests on
-([PUMP-MECHANISMS.md §2](PUMP-MECHANISMS.md#2-liveness-from-process-state-never-task-status)),
-it is proven, and moving it behind a plugin interface at the same time as
-everything else would put the load-bearing beam on new scaffolding.
+**Liveness is askable in v2.** A runner can be asked which of its agents are
+alive, instead of the supervisor inferring it by scraping container names.
 
-A `runner.sh list` verb is the obvious v2 addition. Until then, **a runner must
-name its agents `<prefix><branch-slug>`** and make them visible to the
-enumeration the pump performs. This is the sharpest constraint on writing a
-non-container runner, and the reason it is stated twice.
+```
+runner.sh list
+```
+
+**Inputs:** none per agent. `list` is called once per tick with no task, no
+workspace and no container name in hand, so it may read only what `stop` already
+reads from configuration — for the shipped runner, the agent-name prefix
+(`TP_AGENT_PREFIX`, or the shared `TASKPUMP_AGENT_PREFIX`). A runner that demands
+launch-shaped input is uncallable at exactly the moment it is needed.
+
+**Output:** the name of every live agent, one per line. These must be the names
+`launch` created (`<prefix><slug>`, §2), so the existing name→branch mapping
+keeps working.
+
+**Exit:**
+
+| Condition | Exit | Output |
+|---|---|---|
+| Agents are live | `0` | one name per line |
+| No agents are live | `0` | **nothing** — not a blank line |
+| Cannot enumerate (runtime unreachable) | non-zero | one line on stderr saying why |
+
+The last two rows are the contract. *"Nothing is running"* and *"I could not
+look"* are different answers that demand opposite actions, and a runner that
+reports the second as the first hands the supervisor a confident wrong answer —
+the pump's one non-negotiable safety property is that it never double-launches a
+live agent. **The runner never guesses the fallback; the caller decides.**
+
+The empty case is a real trap rather than a pedantic one: printing `"$names"`
+unconditionally emits a blank line when there are none, and a caller counting
+lines then sees one live agent where there are zero.
+
+#### The prefix scrape remains the fallback
+
+The pump still discovers live agents by listing processes whose name carries the
+configured agent prefix
+([PUMP-MECHANISMS.md §2](PUMP-MECHANISMS.md#2-liveness-from-process-state-never-task-status)).
+That path is the mechanism the whole supervisor rests on, it is proven, and it
+stays — `list` is the *preferred* source of liveness, not the only one, and a
+runner that does not implement it is still drivable.
+
+Which means **the naming contract is still mandatory**: a runner must name its
+agents `<prefix><branch-slug>` and make them visible to the pump's enumeration.
+This is the sharpest constraint on writing a non-container runner, and the reason
+it is stated twice. Implementing `list` does not buy you out of it — the fallback
+has to keep working, and the two answers have to be the same set.
+
+For a container runner that means `list` should share the pump's own enumeration
+rather than re-spelling the filter: two copies of one `docker ps --filter` is
+precisely how the two answers drift apart. The reference runner sources
+`lib/pump-lib.sh` for exactly this reason, and
+`tests/test-tp-runner-list.sh` asserts the two agree name for name.
 
 ---
 
@@ -119,7 +167,10 @@ set -euo pipefail
 case "${1:-}" in
   launch)
     cd "$TP_WORKSPACE"
+    # The name is load-bearing: `stop` and `list` below both find the process by
+    # it, so it has to survive into the process table (here, as argv).
     setsid my-agent \
+        --session-name "$TP_CONTAINER_NAME" \
         --prompt-file "$TP_WORKSPACE/.taskpump-brief.md" \
         --max-turns "$TP_MAX_TURNS" \
         > "$TP_WORKSPACE/.taskpump-agent.log" 2>&1 &
@@ -127,6 +178,12 @@ case "${1:-}" in
     ;;
   stop)
     pkill -f "$TP_CONTAINER_NAME" || true
+    ;;
+  list)
+    # Exit 0 with no output when nothing matches — pgrep's own exit 1 for "no
+    # match" would be read as "I could not look" (§1.3).
+    pgrep -a -f "${TP_AGENT_PREFIX:-tp-agent-}" \
+      | grep -o "${TP_AGENT_PREFIX:-tp-agent-}[^ ]*" || true
     ;;
   *)
     echo "runner: unknown verb: ${1:-}" >&2
@@ -139,6 +196,11 @@ This is enough to drive a real drain, and it is the right thing to build first
 when adapting TaskPump to a new agent. It provides no isolation whatsoever — the
 agent has your whole machine — which is fine for a supervised experiment and not
 fine for an unattended multi-day run.
+
+Note what `list` costs a process runner: the agent's name has to be recoverable
+from the running process. A container runtime keeps that mapping for you; a bare
+process does not, so the runner has to put the name somewhere durable — argv, as
+above, or a pid file it writes at launch and reads back here.
 
 ---
 
