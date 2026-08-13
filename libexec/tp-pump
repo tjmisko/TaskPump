@@ -127,16 +127,16 @@ WORKTREES_DIR="${TASKPUMP_PUMP_WORKTREES_DIR:-${TASKPUMP_WORKTREES_DIR:-$REPO_RO
 #                         (`tp task claim …`), matching the entrypoint's
 #                         workspace-CLI default of `tp`.
 #   TASKPUMP_VERIFY_CMDS  newline-separated commands a task must leave green;
-#                         rendered mid-sentence as `a` and `b`
+#                         rendered mid-sentence as `a` and `b`. Default: empty —
+#                         no shipped default can know a project's toolchain, so
+#                         the templates' {{#VERIFY_CMDS}} sections drop out
+#                         until a consumer names its own bar.
 #   TASKPUMP_PROJECT_BRIEF  one paragraph pointing an agent at the project's own
 #                         contributor documentation
 TASK_CLI="${TASKPUMP_TASK_CLI:-tp task}"
 TASK_CLI_NAME="$(basename "$TASK_CLI")"
-# Built outside the expansions: an apostrophe inside a ${x:-word} default is a
-# real quote to bash, and would swallow the rest of the file.
-_tp_default_verify=$'cargo fmt --all\ncargo clippy --workspace -- -D warnings'
 _tp_default_project_brief="Read the contributor documentation for this repository (CLAUDE.md, CONTRIBUTING.md, or equivalent) before writing code, then read the design note that phase {{PHASE}} is built against."
-VERIFY_CMDS="${TASKPUMP_VERIFY_CMDS:-$_tp_default_verify}"
+VERIFY_CMDS="${TASKPUMP_VERIFY_CMDS:-}"
 PROJECT_BRIEF="${TASKPUMP_PROJECT_BRIEF:-$_tp_default_project_brief}"
 
 # Where the run's dotfiles live. One knob moves them all out of the repo root;

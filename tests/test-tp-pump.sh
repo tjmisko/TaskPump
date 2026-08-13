@@ -916,6 +916,37 @@ have "$note" 'RESUME CONTEXT' && pass "the resume note keeps its heading" || fai
 have "$note" 'Do NOT start by running' && pass "the resume note keeps the next-returns-null warning" \
   || fail "the load-bearing warning is gone:\n$note"
 
+echo "--- Test 23c: an empty VERIFY_CMDS drops the verify sections cleanly (G1.7) ---"
+# The shipped default IS empty — no default can know a project's toolchain — so
+# the templates' {{#VERIFY_CMDS}} sections must vanish without a dangling
+# verify sentence, and reappear intact the moment a consumer sets the key.
+out=$(ARACHNE_PUMP_OPS_DIR="$TMP/no-such-ops" ARACHNE_PUMP_NO_GH=1 \
+  TASKPUMP_TASK_CLI="bin/tp task" \
+  TASKPUMP_PROJECT_BRIEF="Read HACKING.md first." "$PUMP" --render-brief F55 2>&1)
+have "$out" 'Verify with' && fail "empty VERIFY_CMDS left a dangling verify bullet:\n$out" \
+  || pass "no verify bullet when VERIFY_CMDS is empty"
+have "$out" 'clean on your branch' && fail "empty VERIFY_CMDS left a dangling done-criterion:\n$out" \
+  || pass "no verify done-criterion when VERIFY_CMDS is empty"
+grep -qF '{{' <<<"$out" && fail "section markers or placeholders survived:\n$out" \
+  || pass "no section marker survives the empty case"
+grep -qF "Run the task's tests." <<<"$out" && pass "the neighboring step survives the dropped section" \
+  || fail "a neighboring line was lost with the section:\n$out"
+out=$(ARACHNE_PUMP_OPS_DIR="$TMP/no-such-ops" ARACHNE_PUMP_NO_GH=1 \
+  TASKPUMP_TASK_CLI="bin/tp task" TASKPUMP_VERIFY_CMDS="make check" \
+  TASKPUMP_PROJECT_BRIEF="Read HACKING.md first." "$PUMP" --render-brief F55 2>&1)
+grep -qF 'Verify with `make check`' <<<"$out" && pass "a configured VERIFY_CMDS renders its section" \
+  || fail "configured VERIFY_CMDS section missing:\n$out"
+
+# The resume note's verify sentence follows the same contract.
+note=$(rnote ARACHNE_PUMP_OPS_DIR="$TMP/noops")
+have "$note" 'must be clean' && fail "empty VERIFY_CMDS left a dangling clean-clause:\n$note" \
+  || pass "resume note drops the verify clause when VERIFY_CMDS is empty"
+grep -qF '{{' <<<"$note" && fail "resume note kept a marker or placeholder:\n$note" \
+  || pass "resume note keeps no marker in the empty case"
+note=$(rnote ARACHNE_PUMP_OPS_DIR="$TMP/noops" TASKPUMP_VERIFY_CMDS="make check")
+grep -qF '`make check` must be clean' <<<"$note" && pass "resume note renders a configured VERIFY_CMDS" \
+  || fail "resume note verify clause missing:\n$note"
+
 echo "--- Test 24: the feed gate is a pluggable, fail-open chain ---"
 GBIN="$TMP/gates"; mkdir -p "$GBIN"
 mkgate() {  # mkgate <name> <exit> <message>

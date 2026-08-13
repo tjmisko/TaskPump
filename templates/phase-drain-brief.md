@@ -44,8 +44,10 @@ own exactly one thing: the {{PHASE}} frontier.
    - Implement against the task file's **Scope / Acceptance criteria** (read the
      task body at `{{TASK_DIR}}/{{PHASE}}.N.md`). Make small, committed
      increments.
+{{#VERIFY_CMDS}}
    - Verify with {{VERIFY_CMDS}}. A red gate is a **failed task**; fix it, never
      bypass it.
+{{/VERIFY_CMDS}}
    - Run the task's tests.
    - Conventional commit: `feat(<area>): {{PHASE}}.N <summary>`.
    - `{{TASK_CLI}} complete {{PHASE}}.N --commits <shas>` with completion notes
@@ -82,5 +84,7 @@ own exactly one thing: the {{PHASE}} frontier.
 
 - Every open {{PHASE}}.N either `complete`d (green verification, tests passing,
   commits recorded) or `block`ed with a reason.
+{{#VERIFY_CMDS}}
 - {{VERIFY_CMDS}} clean on your branch; the affected tests green.
+{{/VERIFY_CMDS}}
 - A draft PR against `{{BASE}}` carries the phase's work; nothing merged.

@@ -206,7 +206,7 @@ toolchain:
 | Key | What it configures |
 |---|---|
 | `TASKPUMP_BUILD_GATE` | The command that must pass before work is integrated. `cargo check` for Rust, `npm test` for Node, whatever your project's "is it broken" question is. `TASKPUMP_PUMP_BUILD_CMD` overrides it for the merge queue. |
-| `TASKPUMP_VERIFY_CMDS` | Newline-separated commands a task must leave green, quoted into the brief. The shipped default is Rust-shaped; a non-Rust consumer should set it. |
+| `TASKPUMP_VERIFY_CMDS` | Newline-separated commands a task must leave green, quoted into the brief. Empty by default — the templates' verify sections drop out until a consumer names its own bar. |
 | `TASKPUMP_PROJECT_BRIEF` | One paragraph pointing an agent at the project's own contributor documentation. |
 | `TASKPUMP_RECLAIM_CMD` | How to reclaim build output from a finished workspace, so a multi-day run's disk footprint stays bounded. |
 | `TASKPUMP_BRIEF_TEMPLATE` | The parameterized brief a launched agent is handed. |

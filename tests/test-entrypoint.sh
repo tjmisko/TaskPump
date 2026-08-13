@@ -763,7 +763,10 @@ pass "every template placeholder is documented in templates/README.md"
 # replacement for the blocks) and assert nothing is left unsubstituted. The
 # scalar set mirrors tp-pump's render map: PHASE, BASE, TASK_CLI, TASK_CLI_NAME,
 # TASK_DIR, and VERIFY_CMDS (a semicolon-joined single line via apl_join_commands);
-# DEPENDS_ON and PROJECT_BRIEF are whole-line blocks.
+# DEPENDS_ON and PROJECT_BRIEF are whole-line blocks. VERIFY_CMDS is non-empty
+# here, so the {{#VERIFY_CMDS}} section markers are simply dropped, mirroring
+# the renderer's kept-section path (G1.7); the dropped-section path is covered
+# by the renderer-contract suite in test-tp-pump.sh.
 DEPS_F="$WORK/deps.txt"
 printf 'Waits on F54.2 (another worktree).\nWaits on F56.1.\n' >| "$DEPS_F"
 PROJ_F="$WORK/project-brief.txt"
@@ -775,6 +778,8 @@ sed -e 's/{{PHASE}}/F55/g' \
     -e 's/{{TASK_CLI_NAME}}/arachne-task/g' \
     -e 's|{{TASK_DIR}}|ops/task-loop/tasks|g' \
     -e 's/{{VERIFY_CMDS}}/cargo fmt --check; cargo clippy/g' \
+    -e '/^{{#[A-Z_]*}}$/d' \
+    -e '/^{{\/[A-Z_]*}}$/d' \
     "$BRIEF_T" \
   | awk -v df="$DEPS_F" 'index($0, "{{DEPENDS_ON}}") { while ((getline line < df) > 0) print line; close(df); next } {print}' \
   | awk -v pf="$PROJ_F" 'index($0, "{{PROJECT_BRIEF}}") { while ((getline line < pf) > 0) print line; close(pf); next } {print}' \

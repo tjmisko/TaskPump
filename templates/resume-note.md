@@ -39,9 +39,11 @@ already satisfy, and do the rest. Then pick exactly one of these three endings.
 **All three release the tasks blocked behind this one; leaving it claimed and
 unfinished does not** — that is what stalled the pump.
 
-1. **Finish it.** `{{TASK_CLI}} complete <id> --commits <shas>`, once
-   {{VERIFY_CMDS}} are clean and
-   the affected crates' tests pass.
+1. **Finish it.** `{{TASK_CLI}} complete <id> --commits <shas>`, once the
+   affected tests pass.
+{{#VERIFY_CMDS}}
+   {{VERIFY_CMDS}} must be clean before you call it done.
+{{/VERIFY_CMDS}}
 2. **Split it.** If part of the work is genuinely done and the remainder needs
    judgement, a decision, or scope you cannot settle alone: `complete` the
    finished portion — stating precisely what you did and did NOT do in the

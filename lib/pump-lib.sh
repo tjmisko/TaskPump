@@ -21,11 +21,44 @@
 # it splices are multi-line command output (a git log, a status listing), and
 # every sed-based approach to that either mangles newlines or has to escape the
 # replacement text. Bash parameter substitution needs no escaping at all.
+#
+# Conditional sections: the lines between {{#KEY}} and {{/KEY}} (each marker
+# alone on its line) render only when KEY resolves to content — a non-empty
+# TPL_VARS value or a non-empty TPL_BLOCKS file. The marker lines themselves
+# are never emitted. Sections exist for the optional-value case: a template
+# sentence built around a value that rendered empty is worse than no sentence
+# at all (see the shipped templates' {{VERIFY_CMDS}} sections).
+
+# apl__tpl_has <key> — does <key> resolve to content in the caller's TPL maps?
+apl__tpl_has() {
+  local key="$1"
+  if [[ -n "${TPL_BLOCKS[$key]:-}" ]]; then
+    [[ -s "${TPL_BLOCKS[$key]}" ]]
+    return
+  fi
+  [[ -n "${TPL_VARS[$key]:-}" ]]
+}
+
 apl_render_template() {
   local tpl="$1" line key trimmed
+  local depth=0 skip_at=0
   while IFS= read -r line || [[ -n "$line" ]]; do
     trimmed="${line#"${line%%[![:space:]]*}"}"
     trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    if [[ "$trimmed" == '{{#'*'}}' ]]; then
+      key="${trimmed:3:${#trimmed}-5}"
+      depth=$((depth + 1))
+      if (( skip_at == 0 )) && ! apl__tpl_has "$key"; then
+        skip_at=$depth
+      fi
+      continue
+    fi
+    if [[ "$trimmed" == '{{/'*'}}' ]]; then
+      (( skip_at == depth )) && skip_at=0
+      (( depth > 0 )) && depth=$((depth - 1))
+      continue
+    fi
+    (( skip_at > 0 )) && continue
     if [[ "$trimmed" == '{{'*'}}' ]]; then
       key="${trimmed:2:${#trimmed}-4}"
       if [[ -n "${TPL_BLOCKS[$key]:-}" ]]; then

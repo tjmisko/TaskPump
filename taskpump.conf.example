@@ -151,14 +151,14 @@
 #                           #   TASKPUMP_FSGUARD_MARK_FILE is its older spelling)
 
 # ── Project-shaped behavior (tp pump) ────────────────────────────────────────
-# The keys that make the pump fit a language and a toolchain. The defaults here
-# are Rust-shaped for historical reasons; a non-Rust consumer should set them.
+# The keys that make the pump fit a language and a toolchain. None of them ship
+# with a toolchain baked in; a consumer names its own commands here.
 # TASKPUMP_BUILD_GATE=      # command that must pass before work is integrated
 #                           #   (default: empty = no build gate;
 #                           #   TASKPUMP_PUMP_BUILD_CMD overrides for the merge queue)
 # TASKPUMP_VERIFY_CMDS=     # newline-separated commands a task must leave green,
-#                           #   quoted into the brief (default: `cargo fmt --all` and
-#                           #   `cargo clippy --workspace -- -D warnings`)
+#                           #   quoted into the brief (default: empty — the brief's
+#                           #   verify sections are dropped until a consumer sets it)
 # TASKPUMP_PROJECT_BRIEF=   # one paragraph pointing an agent at the project's own
 #                           #   contributor docs (default: a generic "read CLAUDE.md,
 #                           #   CONTRIBUTING.md, or equivalent" paragraph)
