@@ -155,52 +155,115 @@ Two consequences:
 
 ---
 
-## 3. Writing a runner
+## 3. `runners/local` — the process runner
 
-The minimum viable runner starts a local process:
+TaskPump ships two runners. This is the one with nothing underneath it: no image
+to build, no daemon to talk to, nothing to install. It starts the agent as a
+plain host process.
+
+```bash
+TASKPUMP_RUNNER=runners/local/runner.sh
+TASKPUMP_LOCAL_AGENT_CMD='my-agent --prompt-file .taskpump-phase-brief.md'
+```
+
+That is the whole configuration. `TASKPUMP_LOCAL_AGENT_CMD` is required and has
+no default — there is no sane guess at what agent you are driving, and a
+plausible-but-wrong one would fail somewhere far from here. The command runs
+through `bash -c`, in the workspace, with the run's environment exported
+(`TASKPUMP_BRIEF`, `TASKPUMP_PHASE`, `TASKPUMP_TASK_ID`, `TASKPUMP_BRANCH`,
+`TASKPUMP_MAX_TURNS`, … and each one's legacy `ARACHNE_*` twin).
+
+### 3.1 It does not sandbox anything
+
+**The agent runs as you, with your permissions, your filesystem, your network
+and your credentials.** There is no mount policy, no egress allowlist, no
+read-only primary checkout, no memory cap — nothing between the agent and your
+machine but the agent's own restraint. Every guarantee in §4 belongs to the
+`claude-docker` runner and **none of them apply here**.
+
+That is fine for a supervised experiment, for a repository you would hand a
+colleague, or for an agent that isolates itself. It is **not** fine for an
+unattended multi-day drain of an untrusted workload. If that is what you are
+doing, use a runner that sandboxes, and read §4 first.
+
+### 3.2 How it keeps track
+
+A container runtime remembers the name→process mapping for you. Nothing does
+that for a bare process, so this runner writes one itself — `<name> <pgid>` per
+line, in a registry file:
+
+| Knob | Default |
+|---|---|
+| `TASKPUMP_LOCAL_REGISTRY` | `$TASKPUMP_STATE_DIR/.taskpump-local-agents`, else `$XDG_STATE_HOME/taskpump/local-agents` |
+| `TASKPUMP_LOCAL_STOP_GRACE_S` | `10` — seconds between `TERM` and `KILL` |
+| `TASKPUMP_AGENT_LOG_NAME` | `.taskpump-agent.log`, inside the workspace |
+
+Two details there are load-bearing, and both look like implementation choices
+until they bite:
+
+- **The recorded id is a process GROUP, not a pid.** An agent spawns children — a
+  language server, a test run, a subagent. Killing only the leader leaves them
+  running and holding the workspace, so the agent starts under `setsid` and
+  `stop` signals the whole group.
+- **A finished agent is dead even while its process-table entry survives.**
+  `kill -0` succeeds on a zombie, and an agent whose parent (this short-lived
+  runner) has exited is reparented to PID 1 — which, in any minimal container,
+  never reaps anything. Liveness therefore reads process *state* and treats `Z`
+  as gone. The obvious `kill -0` implementation reports a long-dead agent as
+  live forever: `stop` never finishes, `list` never prunes, and the pump never
+  relaunches the phase.
+
+`list` prunes what it walks, so the registry holds the live set and does not
+accumulate. `launch` refuses to start a second agent under a live name — the one
+guarantee `docker run --name` gives the container runner for free, and the pump's
+never-double-launch property leans on it.
+
+### 3.3 What a consumer still has to set
+
+The supervisor's launch prerequisites are container-shaped, and a process runner
+does not escape them yet:
+
+```bash
+TASKPUMP_IMAGE=unused-by-a-process-runner   # required to be non-empty
+TASKPUMP_IMAGE_BUILD=                       # empty ⇒ skip the image build
+```
+
+`TASKPUMP_IMAGE` is checked before any launch and deliberately has no default
+(§4.0), and an *unset* `TASKPUMP_IMAGE_BUILD` means "docker build the repo root".
+Neither applies here, so both need saying out loud. Setting them is the whole
+adaptation: `tests/test-tp-runner-local.sh` drives a real `tp-pump --once` this
+way with the container runtime pointed at a path that does not exist, and both
+the launch and the next tick's liveness work.
+
+### 3.4 Writing your own
+
+The skeleton, if you are adapting to something else entirely:
 
 ```bash
 #!/usr/bin/env bash
-# runners/local/runner.sh — run an agent as a plain host process.
 set -euo pipefail
 
 case "${1:-}" in
-  launch)
+  launch)  # start it, name it, print the handle, detach
     cd "$TP_WORKSPACE"
-    # The name is load-bearing: `stop` and `list` below both find the process by
-    # it, so it has to survive into the process table (here, as argv).
-    setsid my-agent \
-        --session-name "$TP_CONTAINER_NAME" \
-        --prompt-file "$TP_WORKSPACE/.taskpump-brief.md" \
-        --max-turns "$TP_MAX_TURNS" \
+    setsid my-agent --session-name "$TP_CONTAINER_NAME" \
         > "$TP_WORKSPACE/.taskpump-agent.log" 2>&1 &
-    echo "$!"                      # the handle
+    echo "$TP_CONTAINER_NAME"
     ;;
-  stop)
-    pkill -f "$TP_CONTAINER_NAME" || true
+  stop)    # idempotent: already gone is success (§1.2)
+    kill -TERM -- "-$(recorded_pgid_of "$TP_CONTAINER_NAME")" || true
     ;;
-  list)
-    # Exit 0 with no output when nothing matches — pgrep's own exit 1 for "no
-    # match" would be read as "I could not look" (§1.3).
-    pgrep -a -f "${TP_AGENT_PREFIX:-tp-agent-}" \
-      | grep -o "${TP_AGENT_PREFIX:-tp-agent-}[^ ]*" || true
+  list)    # every live agent, one per line; empty is exit 0 and no output (§1.3)
+    live_names || true
     ;;
-  *)
-    echo "runner: unknown verb: ${1:-}" >&2
-    exit 2
-    ;;
+  *) echo "runner: unknown verb: ${1:-}" >&2; exit 2 ;;
 esac
 ```
 
-This is enough to drive a real drain, and it is the right thing to build first
-when adapting TaskPump to a new agent. It provides no isolation whatsoever — the
-agent has your whole machine — which is fine for a supervised experiment and not
-fine for an unattended multi-day run.
-
-Note what `list` costs a process runner: the agent's name has to be recoverable
-from the running process. A container runtime keeps that mapping for you; a bare
-process does not, so the runner has to put the name somewhere durable — argv, as
-above, or a pid file it writes at launch and reads back here.
+The two things that are easy to get wrong are both in §1.3: an empty fleet must
+print **nothing** (not a blank line), and a failure to enumerate must exit
+non-zero rather than look like an empty fleet. And whatever you start, **name it
+`<prefix><branch-slug>`** (§2) — the fallback enumeration still depends on it.
 
 ---
 

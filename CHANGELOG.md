@@ -47,6 +47,23 @@ in [docs/LEDGER-CONTRACT.md §1](docs/LEDGER-CONTRACT.md#1-versioning).
   The monitor, cleanup and both watchdogs are read-only observers and keep
   scraping for now; delegation is opted into per caller, not per config key.
 
+- **`runners/local` — a shipped process runner.** Drives agents as plain host
+  processes: no image, no daemon, nothing to install. Two knobs
+  (`TASKPUMP_RUNNER`, `TASKPUMP_LOCAL_AGENT_CMD`) and a consumer with no
+  container runtime can run a drain. Implements all three verbs; `launch`
+  refuses to start a second agent under a live name.
+
+  **It sandboxes nothing** — the agent runs with your full host permissions.
+  Every guarantee in [RUNNERS.md §4](docs/RUNNERS.md#4-the-claude-docker-reference-runner)
+  belongs to the container runner and none of them apply. See
+  [RUNNERS.md §3](docs/RUNNERS.md#3-runnerslocal--the-process-runner).
+
+  Liveness is tracked through a registry of `<name> <pgid>` pairs, keyed on the
+  process *group* so an agent's children die with it, and read from process
+  *state* so a zombie is not mistaken for a live agent — `kill -0` succeeds on
+  one, and an orphaned agent under a container's non-reaping PID 1 stays a
+  zombie forever.
+
 ## 0.1.0 — 2026-08-13
 
 The extraction of TaskPump from Arachne, and its generalization into a tool any
