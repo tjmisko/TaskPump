@@ -1261,6 +1261,24 @@ out=$(pump F55..X9 2>&1); rc=$?
 [[ $rc -ne 0 ]] && pass "F55..X9 exits non-zero under the pinned F sigil" || fail "F55..X9 exited 0:\n$out"
 have "$out" "bad phase range 'F55..X9'" && pass "pinned-sigil range error surfaced" || fail "no range error:\n$out"
 
+echo "--- Test 30b2: the plan shows a gate that fed but had something to say ---"
+# The two Claude gates ship in the default chain, so a consumer driving another
+# agent runs them against credentials that will never exist. They must feed —
+# and the plan must SAY they skipped, because "GATE: feed-ok" on its own cannot
+# tell an operator whether the chain checked and approved or had nothing to
+# check. Those are opposite facts about how protected the run is.
+NOCREDHOME="$TMP/no-credentials-home"; mkdir -p "$NOCREDHOME"
+out=$(TASKPUMP_AGENT_HOME="$NOCREDHOME" TASKPUMP_USAGE_CACHE="$TMP/no-usage-cache.json" \
+      TASKPUMP_USAGE_GATE=1 TASKPUMP_USAGE=/nonexistent-so-the-real-gate-runs \
+      "$PUMP" --no-health-gate --no-disk-gate --dry-run --phases F55 2>&1); rc=$?
+[[ $rc -eq 0 ]] && pass "a host with no Claude credentials still plans (exit 0)" \
+  || fail "the plan failed without credentials (rc=$rc):\n$out"
+have "$out" 'GATE: feed-ok' && pass "the feed decision is unaffected by the absent credentials" \
+  || fail "an absent credentials file changed the feed decision:\n$out"
+have "$out" 'claude-token-fresh: skipped: no claude credentials' \
+  && pass "the token gate's skip and its reason reach the plan" \
+  || fail "the token gate skipped silently:\n$out"
+
 echo "--- Test 30c: a branch prefix whose branches cannot be named fails at tick zero ---"
 # Every phase in the range takes the same prefix, so a prefix that produces an
 # unmappable branch is a CONFIGURATION error, not a per-launch one. `x/y/` makes

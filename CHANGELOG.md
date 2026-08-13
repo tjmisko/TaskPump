@@ -25,6 +25,22 @@ in [docs/LEDGER-CONTRACT.md §1](docs/LEDGER-CONTRACT.md#1-versioning).
   The pump does not call `list` yet — it still scrapes — so this lands
   verifiable on its own.
 
+- **The two Claude gates skip cleanly on a host with no Claude credentials.**
+  Both ship in the default chain, so a consumer driving a different agent was
+  running them against a file that will never exist. They now feed with one
+  explanatory line — `claude-token-fresh: skipped: no claude credentials at
+  <path>` — instead of failing open silently, and `claude-usage` distinguishes
+  "there is no meter here" (permanent) from "the meter is unreachable"
+  (transient). Missing, unreadable, malformed and expiry-less credentials are all
+  absent input; a credentials file that can be read is measured exactly as
+  before, and nothing is ever cached from a failed read.
+
+  A silent feed is indistinguishable from a gate that looked and approved, and
+  those are opposite facts about how protected a run is. `tp pump --dry-run` now
+  prints what a *feeding* gate had to say under the `GATE:` line; the tick loop
+  stays quiet, since a persistent condition would otherwise print every 30s for
+  days. See [docs/GATES.md §2](docs/GATES.md#2-the-shipped-gates).
+
 - **A branch that cannot carry an agent name is now refused**, at the claim
   (`tp task claim --branch feat/a/b`) and at pump startup (a
   `TASKPUMP_BRANCH_PREFIX` whose branches would be unmappable aborts the run

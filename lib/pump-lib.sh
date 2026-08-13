@@ -463,11 +463,45 @@ apl_disk_low() {
 # file / expiresAt can't be read — a meter we can't read never wedges the pump.
 # `expiresAt` is epoch MILLISECONDS in Claude Code's credentials file.
 # ARACHNE_NOW_S overrides "now" (epoch seconds) for tests.
+# apl_host_credentials_problem <path> — one line saying why the host's Claude
+# credentials cannot be read, or nothing at all when they can. Always exits 0:
+# this classifies, it does not decide.
+#
+# The two Claude-specific gates ship in the DEFAULT gate chain, so a consumer
+# driving some other agent runs them against a file that will never exist. That
+# has to be a deliberate skip with a reason, not an accident of error handling —
+# a gate that silently feeds looks exactly like a gate that checked and approved,
+# and the difference matters the day it does need to pause. One classifier, so
+# both gates skip for the same reasons and say the same thing.
+apl_host_credentials_problem() {
+  local cred="$1"
+  if [[ -z "$cred" ]]; then
+    printf 'no credentials path configured'; return 0
+  fi
+  # Existence first, and jq later: on a host with neither, "no credentials" is
+  # the fact the operator can act on, and "install jq" is a distraction.
+  if [[ ! -e "$cred" ]]; then
+    printf 'no claude credentials at %s' "$cred"; return 0
+  fi
+  if [[ ! -r "$cred" ]]; then
+    printf 'claude credentials at %s are not readable' "$cred"; return 0
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    printf 'jq is not installed, so %s cannot be read' "$cred"; return 0
+  fi
+  if ! jq -e . "$cred" >/dev/null 2>&1; then
+    printf 'claude credentials at %s are not valid JSON' "$cred"; return 0
+  fi
+  printf ''
+}
+
 apl_host_token_stale() {
   [[ "${TASKPUMP_TOKEN_GATE:-${ARACHNE_TOKEN_GATE:-1}}" -eq 1 ]] || return 0
-  command -v jq >/dev/null 2>&1 || return 0
   local cred="$1" margin="${2:-${TASKPUMP_TOKEN_MARGIN_S:-${ARACHNE_TOKEN_MARGIN_S:-600}}}"
-  [[ -f "$cred" ]] || return 0
+  # Silent fail-open for every caller that is not a gate: unreadable credentials
+  # are not a stale token. The gate above this asks the same classifier and says
+  # the reason out loud.
+  [[ -z "$(apl_host_credentials_problem "$cred")" ]] || return 0
   local exp_ms exp_s now left
   exp_ms="$(jq -r '.claudeAiOauth.expiresAt // empty' "$cred" 2>/dev/null || true)"
   [[ "$exp_ms" =~ ^[0-9]+$ ]] || return 0

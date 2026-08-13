@@ -98,6 +98,22 @@ no fresh cache all report utilization as unknown and feed.
 Configured by `TASKPUMP_USAGE_CEILING` and the `TASKPUMP_USAGE_*` plumbing keys.
 No token ever appears on a command line or in output.
 
+**On a host with no Claude credentials it skips**, feeding with one line:
+
+```
+claude-usage: skipped: no claude credentials at ~/.claude/.credentials.json (usage gate feeds; nothing to meter)
+```
+
+That is a different sentence from the fail-open line (`bind_percent unknown —
+meter unreachable`) on purpose. "There is no meter here" is permanent and
+expected — it is what a consumer driving a non-Claude agent should see — while
+"the meter is unreachable" is transient and worth watching. An operator who
+cannot tell them apart waits for a recovery that is never coming.
+
+Nothing is cached on either path: the usage cache is only ever written from a
+payload that parsed, so an unread meter can never later be mistaken for a
+reading.
+
 ### `claude-token-fresh` — credential expiry
 
 Pauses when the host's OAuth access token is within a margin (default 600s) of
@@ -113,6 +129,39 @@ workspace for nothing.
 The gate clears as soon as a host-side session writes a fresh token. During a
 long **headless** run this is the gate most likely to pause you, and the fix is
 on the host, not in the pump.
+
+**On a host with no Claude credentials it skips**, feeding with one line on
+stderr and never exit 10:
+
+```
+claude-token-fresh: skipped: no claude credentials at ~/.claude/.credentials.json
+```
+
+The same for a file that is unreadable, is not valid JSON, or carries no OAuth
+expiry — all of them are *absent input*, not a stale token. A credentials file
+that is present and readable is measured exactly as before.
+
+The skip is loud on purpose. This gate is in the default chain, so it runs on
+hosts driving some other agent entirely; a silent feed there would be
+indistinguishable from a gate that looked and approved, and those are opposite
+facts about how protected the run is. The line goes to **stderr** because stdout
+is reserved for the pause reason (§1) — a skip is not a pause.
+
+### Where a skip shows up
+
+`tp pump --dry-run` prints what a *feeding* gate had to say, indented under the
+gate line:
+
+```
+GATE: feed-ok
+  claude-token-fresh: skipped: no claude credentials at /home/you/.claude/.credentials.json
+  claude-usage: skipped: no claude credentials at /home/you/.claude/.credentials.json (usage gate feeds; nothing to meter)
+```
+
+The tick loop stays quiet about it: a persistent condition — and "this host has
+no Claude credentials" is as persistent as they get — would otherwise print
+every tick for days. The plan is the mode whose job is explaining what the chain
+decided; that is where the explanation belongs.
 
 ### `disk-low` — free space
 

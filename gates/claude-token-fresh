@@ -25,6 +25,13 @@
 #
 # Fails open everywhere: a missing file, absent jq, or an unreadable expiry all
 # feed. A meter we cannot read must never wedge the pump.
+#
+# It fails open LOUDLY, though. This gate ships in the default chain, so it runs
+# on hosts driving a non-Claude agent where the credentials file will never
+# exist. Those runs get one line on stderr — `skipped: no claude credentials at
+# <path>` — and exit 0. A silent feed would be indistinguishable from a gate that
+# looked and approved, which is the opposite fact about how protected the run is.
+# The skip line goes to stderr because stdout is reserved for the pause reason.
 # HELP-END
 set -uo pipefail
 
@@ -38,6 +45,26 @@ tp_load_config
 [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { apl_help "$0"; exit 0; }
 
 CRED="${TASKPUMP_CREDENTIALS:-$HOME/.claude/.credentials.json}"
+
+# This gate ships in the DEFAULT chain, so it runs on hosts driving some other
+# agent, against a file that will never exist. Say so, once, on stderr, and feed.
+#
+# Out loud, because a silent feed is indistinguishable from a gate that looked
+# and approved — and the two are opposite facts about how protected the run is.
+# On stderr, because stdout is where this gate says why it PAUSED (the contract
+# at the top of this file), and a skip is not a pause.
+skip="$(apl_host_credentials_problem "$CRED")"
+if [[ -n "$skip" ]]; then
+  printf 'claude-token-fresh: skipped: %s\n' "$skip" >&2
+  exit 0
+fi
+
+# Credentials that are readable but carry no OAuth expiry are the same kind of
+# absent input: nothing to measure, so nothing to pause on.
+if ! jq -e '.claudeAiOauth.expiresAt | numbers' "$CRED" >/dev/null 2>&1; then
+  printf 'claude-token-fresh: skipped: no OAuth expiry in %s\n' "$CRED" >&2
+  exit 0
+fi
 
 reason="$(apl_host_token_stale "$CRED")" || rc=$?
 rc="${rc:-0}"

@@ -638,8 +638,12 @@ strip_gate_prefix() {
 }
 
 GATE_REASON=""
+# Lines from gates that FED but had something to say (a skip, a fail-open). The
+# pause reason has its own variable because it is a decision; these are notes.
+GATE_NOTES=""
 feed_gate() {
   GATE_REASON=""
+  GATE_NOTES=""
   export_gate_env
   local gates spec rc reason
   gates="${TASKPUMP_GATES:-$(default_gates)}"
@@ -655,7 +659,13 @@ feed_gate() {
     rc=0
     reason="$("$@" 2>&1)" || rc=$?
     case "$rc" in
-      0) ;;
+      # A gate that feeds and explains itself — "skipped: no claude credentials
+      # at …" from the two Claude gates on a host driving some other agent — is
+      # collected for whoever is asking the chain to explain itself. Collected,
+      # not logged: a persistent condition would otherwise print every tick for
+      # days. print_plan is where it surfaces, which is the mode whose whole job
+      # is showing the operator what the chain decided and why.
+      0) [[ -n "$reason" ]] && GATE_NOTES+="${GATE_NOTES:+$'\n'}$(basename "$1"): $(strip_gate_prefix "$reason")" ;;
       10) GATE_REASON="$(strip_gate_prefix "$reason")"; return 10 ;;
       *) warn "gate '$1' failed (rc=$rc); feeding anyway${reason:+ — $reason}" ;;
     esac
@@ -1309,6 +1319,14 @@ print_plan() {
   local gate_line; if feed_gate; then gate_line="GATE: feed-ok"; else gate_line="GATE: PAUSED — $GATE_REASON"; fi
   echo "$PROG_NAME plan — phases $PHASES, grain $GRAIN, cap $(JOBS=$JOBS apl_read_cap), ceiling $CEILING%"
   echo "$gate_line"
+  # What a feeding gate had to say — a Claude gate skipping on a host with no
+  # Claude credentials, say. Indented under the gate line because it explains
+  # that line: "feed-ok" alone cannot tell an operator whether the chain checked
+  # and approved or had nothing to check.
+  local note
+  while IFS= read -r note; do
+    [[ -n "$note" ]] && printf '  %s\n' "$note"
+  done <<<"$GATE_NOTES"
   local p
   for p in "${PLAN_LAUNCH[@]:-}";  do [[ -n "$p" ]] && printf '  LAUNCH   %-6s -> %s\n' "$p" "$(phase_branch "$p")"; done
   for p in "${PLAN_RUNNING[@]:-}"; do [[ -n "$p" ]] && printf '  RUNNING  %-6s -> %s (live container)\n' "$p" "$(phase_branch "$p")"; done
