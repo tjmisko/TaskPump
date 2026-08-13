@@ -4,7 +4,7 @@ Notable changes to TaskPump. This project versions its **ledger contract**, not
 just its code: the rules for what constitutes a MAJOR, MINOR, or PATCH change are
 in [docs/LEDGER-CONTRACT.md §1](docs/LEDGER-CONTRACT.md#1-versioning).
 
-## Unreleased (0.1.0-dev)
+## 0.1.0 — 2026-08-13
 
 The extraction of TaskPump from Arachne, and its generalization into a tool any
 repository can use.
