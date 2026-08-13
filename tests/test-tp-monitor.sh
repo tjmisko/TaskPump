@@ -83,7 +83,7 @@ export TASKPUMP_MANIFEST="$TMP/empty-manifest.tsv"; : >| "${TASKPUMP_MANIFEST}"
 # the dedicated disk test (Test 8) re-enables it against stubs + a seeded cache.
 export TASKPUMP_MONITOR_DISK=0
 # EVERY cache the monitor keeps — sessions, pump queue, disk, and the GRAPH tab's
-# node index — lives at "$TMPDIR/arachne-monitor-*.<cksum of repo root>.tsv". The
+# node index — lives at "$TMPDIR/taskpump-monitor-*.<cksum of repo root>.tsv". The
 # key is the repo root, not this harness, so without isolation the fixtures read
 # whatever a real monitor run left behind: a stubbed "no containers" docker would
 # assert against the host's actual agents, and an F96 cursor fixture would

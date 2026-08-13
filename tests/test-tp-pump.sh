@@ -832,10 +832,10 @@ grep -qiF 'not found' <<<"$out" && fail "still dying on a missing consumer templ
 
 echo "--- Test 22: TASKPUMP_STATE_DIR relocates the run's dotfiles ---"
 # The state-file NAME is pinned so that half tests relocation, not the default
-# spelling (the .arachne-* filename defaults flip to .taskpump-* in G1.3). The
-# pool cap has no name-in-state-dir key — an explicit TASKPUMP_POOL_CAP_FILE is
-# a path resolved against the cwd — so the cap assertion necessarily reads the
-# bare default name; G1.3 updates it to .taskpump-pool-cap in the flip commit.
+# spelling (the .arachne-* filename defaults flipped to .taskpump-* in G1.3).
+# The pool cap has no name-in-state-dir key — an explicit TASKPUMP_POOL_CAP_FILE
+# is a path resolved against the cwd — so the cap assertion necessarily reads
+# the bare default name, .taskpump-pool-cap since the G1.3 flip.
 SD="$TMP/state-dir"; mkdir -p "$SD"
 mk F55.0 done; mk F55.1 done; mk F56.0 done; mk F57.0 done
 TASKPUMP_NOTIFY_CMD=true TASKPUMP_PUMP_NO_LAUNCH=1 ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
@@ -844,7 +844,7 @@ TASKPUMP_NOTIFY_CMD=true TASKPUMP_PUMP_NO_LAUNCH=1 ARACHNE_PUMP_OPS_DIR="$TMP/no
   "$PUMP" --no-health-gate --phases F55..F57 --once >/dev/null 2>&1
 [[ -f "$SD/.pinned-pump.state" ]] && pass "state file follows TASKPUMP_STATE_DIR" \
   || fail "state file not written under $SD"
-[[ -f "$SD/.arachne-pool-cap" ]] && pass "pool-cap file follows TASKPUMP_STATE_DIR (default name; G1.3 flips it)" \
+[[ -f "$SD/.taskpump-pool-cap" ]] && pass "pool-cap file follows TASKPUMP_STATE_DIR (default name)" \
   || fail "cap file not written under $SD"
 # An individual filename still overrides the directory.
 TASKPUMP_NOTIFY_CMD=true TASKPUMP_PUMP_NO_LAUNCH=1 ARACHNE_PUMP_OPS_DIR="$TMP/noops" \

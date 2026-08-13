@@ -152,7 +152,7 @@ Consequences worth knowing:
 The session's prompt is `cat`-ed in this order:
 
 1. **goal note** — the lead task's one-line goal, written to
-   `$WORKSPACE/.arachne-goal.md` from the task file's frontmatter;
+   `$WORKSPACE/.taskpump-goal.md` from the task file's frontmatter;
 2. **resume note** — present only on a resumed stalled claim;
 3. **the brief**.
 
@@ -162,7 +162,7 @@ amendment rather than the premise it is.
 
 The brief resolves as an absolute path, or relative to the ledger checkout, the
 repo root, or the workspace — in that order. A resume-note path that does not
-exist in the container falls back to `$WORKSPACE/.arachne-resume.md`.
+exist in the container falls back to `$WORKSPACE/.taskpump-resume.md`.
 
 ### What the task CLI sees
 

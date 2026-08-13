@@ -45,20 +45,22 @@
 #   TASKPUMP_CONTAINER_USER          —                    dev
 #   TASKPUMP_CONTAINER_HOME          —                    /home/$CONTAINER_USER
 #   TASKPUMP_PRE_FLIGHT              —                    (none; see below)
-#   TASKPUMP_AGENT_LOG_NAME          —                    .arachne-agent.log
-#   TASKPUMP_GOAL_NOTE_NAME          —                    .arachne-goal.md
-#   TASKPUMP_RESUME_NOTE_NAME        —                    .arachne-resume.md
-#   TASKPUMP_RO_PROBE_FILE           —                    .arachne-rotest
+#   TASKPUMP_AGENT_LOG_NAME          —                    .taskpump-agent.log
+#   TASKPUMP_GOAL_NOTE_NAME          —                    .taskpump-goal.md
+#   TASKPUMP_RESUME_NOTE_NAME        —                    .taskpump-resume.md
+#   TASKPUMP_RO_PROBE_FILE           —                    .taskpump-rotest
 #   TASKPUMP_HOST_CRED_MOUNT         —                    /tmp/claude-home
 #   TASKPUMP_HOST_CONFIG_MOUNT       —                    /tmp/claude-home-json/.claude.json
 #   TASKPUMP_CRED_REFRESH_INTERVAL_S CRED_REFRESH_INTERVAL_S  300
 #   TASKPUMP_AGENT_WALL_TIMEOUT_S    AGENT_WALL_TIMEOUT_S (unset)
 #   GITHUB_TOKEN                     —                    (unset)
 #
-# The dotfile names default to their pre-TaskPump values on purpose. The monitor
-# and the cleanup sweeper find a running agent by looking for
-# `<worktree>/.arachne-agent.log`; renaming it here would make live agents
-# invisible to the tools that supervise them.
+# The agent-log NAME is load-bearing: the monitor and the cleanup sweeper find a
+# running agent by looking for `<worktree>/$TASKPUMP_AGENT_LOG_NAME`, so every
+# tool in a run must resolve the same name. Changing the default (or the key)
+# under a LIVE drain makes running agents invisible to the tools that supervise
+# them — an operator keeping the historical names pins them in taskpump.conf
+# (see examples/arachne.conf).
 #
 # ── The pre-flight hook ───────────────────────────────────────────────────────
 #
@@ -145,13 +147,13 @@ AGENT_CLAUDE_JSON="$CONTAINER_HOME/.claude.json"
 PRE_FLIGHT="$(ep_first TASKPUMP_PRE_FLIGHT TP_PRE_FLIGHT)"
 
 AGENT_LOG_NAME="$(ep_first TASKPUMP_AGENT_LOG_NAME TP_AGENT_LOG_NAME)"
-: "${AGENT_LOG_NAME:=.arachne-agent.log}"
+: "${AGENT_LOG_NAME:=.taskpump-agent.log}"
 GOAL_NOTE_NAME="$(ep_first TASKPUMP_GOAL_NOTE_NAME TP_GOAL_NOTE_NAME)"
-: "${GOAL_NOTE_NAME:=.arachne-goal.md}"
+: "${GOAL_NOTE_NAME:=.taskpump-goal.md}"
 RESUME_NOTE_NAME="$(ep_first TASKPUMP_RESUME_NOTE_NAME TP_RESUME_NOTE_NAME)"
-: "${RESUME_NOTE_NAME:=.arachne-resume.md}"
+: "${RESUME_NOTE_NAME:=.taskpump-resume.md}"
 RO_PROBE_FILE="$(ep_first TASKPUMP_RO_PROBE_FILE TP_RO_PROBE_FILE)"
-: "${RO_PROBE_FILE:=.arachne-rotest}"
+: "${RO_PROBE_FILE:=.taskpump-rotest}"
 
 HOST_CRED_MOUNT="$(ep_first TASKPUMP_HOST_CRED_MOUNT TP_HOST_CRED_MOUNT)"
 : "${HOST_CRED_MOUNT:=/tmp/claude-home}"
