@@ -644,6 +644,33 @@ else
   pass "no blanket RW primary mount"
 fi
 
+# The ledger-is-primary shape (G0.4). TaskPump's own dogfood keeps the ledger
+# tasks/ in the code repo, so TP_LEDGER_REPO == TP_REPO_ROOT. Docker rejects
+# duplicate mount points, so that shape must collapse the :ro primary and the
+# RW ledger mounts into a single RW mount of the checkout — here the blanket
+# mount IS the contract, and the .git overlay is subsumed by it.
+got=$(launch_line TP_LEDGER_REPO="$R6")
+got_norm=${got//$R6/@R@}
+grep -qE -- "$BLANKET_RE" <<<"$got_norm" \
+  && pass "ledger==primary mounts the checkout read-write" \
+  || fail "ledger==primary is missing the RW checkout mount:\n$got_norm"
+grep -qF -- "-v @R@:@R@:ro" <<<"$got_norm" \
+  && fail "ledger==primary still emits the :ro primary mount (duplicate mount point)" \
+  || pass "ledger==primary drops the :ro primary mount"
+grep -qF -- "-v @R@/.git:@R@/.git" <<<"$got_norm" \
+  && fail "ledger==primary still emits the .git overlay (subsumed by the RW root)" \
+  || pass "ledger==primary drops the redundant .git overlay"
+grep -qF -- "-v @R@/wt:@R@/wt" <<<"$got_norm" \
+  && pass "ledger==primary keeps the workspace mount" \
+  || fail "ledger==primary lost the workspace mount:\n$got_norm"
+mount_count=$(grep -oF -- "-v @R@:@R@" <<<"$got_norm" | wc -l)
+[[ "$mount_count" -eq 1 ]] \
+  && pass "ledger==primary mounts the checkout exactly once" \
+  || fail "ledger==primary mounts the checkout $mount_count times:\n$got_norm"
+grep -qF -- "-e TASKPUMP_LEDGER_REPO=@R@ " <<<"$got_norm" \
+  && pass "ledger==primary forwards TASKPUMP_LEDGER_REPO as the checkout" \
+  || fail "TASKPUMP_LEDGER_REPO env wrong in ledger==primary shape:\n$got_norm"
+
 got=$(launch_line TP_ENTRYPOINT=/tp-entrypoint.sh TP_IMAGE=other TP_MEMORY_MAX=8g)
 got_norm=${got//$R6/@R@}
 grep -qF -- 'other /tp-entrypoint.sh' <<<"$got_norm" \

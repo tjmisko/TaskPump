@@ -191,6 +191,32 @@ do_launch() {
     [[ -n "${!name-}" ]] && passthrough_args+=(-e "$name=${!name}")
   done
 
+  # The mount set. Host and container paths are identical on purpose: a git
+  # worktree's .git file stores an absolute gitdir path, so matching paths let
+  # git resolve without a repair inside the container.
+  #
+  # When the ledger IS the primary checkout (TaskPump's own dogfood: ledger
+  # tasks/ in the code repo, TP_LEDGER_REPO == TP_REPO_ROOT), the read-only
+  # primary mount and the read-write ledger mount name the same destination,
+  # and docker rejects duplicate mount points outright. The shape collapses to
+  # a single RW mount of the checkout — the read-only-primary hardening
+  # deliberately does not hold there (the entrypoint's mount self-check warns,
+  # by design), and the .git overlay is subsumed by it.
+  local mount_args=(
+    -v "$claude_dir":/tmp/claude-home:ro
+    -v "$claude_json":/tmp/claude-home-json/.claude.json:ro
+  )
+  if [[ "$ledger_repo" == "$repo_root" ]]; then
+    mount_args+=(-v "$repo_root":"$repo_root" -v "$wt":"$wt")
+  else
+    mount_args+=(
+      -v "$repo_root":"$repo_root":ro
+      -v "$repo_root/.git":"$repo_root/.git"
+      -v "$wt":"$wt"
+      -v "$ledger_repo":"$ledger_repo"
+    )
+  fi
+
   # A stale container of the same name blocks `--name`. Removing it is the same
   # idempotency the pump had inline; failure here is never fatal because the
   # usual cause is that there is nothing to remove.
@@ -223,12 +249,7 @@ do_launch() {
     -e TASKPUMP_MAX_TURNS="$max_turns" \
     -e TASKPUMP_AGENT_MODEL="$model" \
     ${passthrough_args[@]+"${passthrough_args[@]}"} \
-    -v "$claude_dir":/tmp/claude-home:ro \
-    -v "$claude_json":/tmp/claude-home-json/.claude.json:ro \
-    -v "$repo_root":"$repo_root":ro \
-    -v "$repo_root/.git":"$repo_root/.git" \
-    -v "$wt":"$wt" \
-    -v "$ledger_repo":"$ledger_repo" \
+    "${mount_args[@]}" \
     -w "$wt" \
     "$image" "$entrypoint") || rc=$?
 
