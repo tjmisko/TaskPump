@@ -312,7 +312,7 @@
 #                           #   (default: start --always-new-process --class %CLASS%
 #                           #   --cwd %CWD% --)
 # TASKPUMP_MONITOR_TASK_CLASS=  # window class for that spawned viewer, so a compositor
-#                           #   can rule on it (default: arachne-task)
+#                           #   can rule on it (default: taskpump-task)
 # TASKPUMP_MONITOR_OPEN_CMD=  # replaces the whole spawn; the file path is appended
 #                           #   (default: empty = use the terminal keys above)
 # TASKPUMP_MONITOR_USAGE_WINDOWS=  # comma-separated `label=datefmt` list of usage gauges

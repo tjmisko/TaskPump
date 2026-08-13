@@ -1691,7 +1691,7 @@ edit_in_nvim() {  # file
 # to open, so it falls back to handing THIS terminal to the editor, which the
 # notes popout already knows how to do and undo.
 TASK_TERM="${TASKPUMP_MONITOR_TERM:-wezterm}"                   # GUI terminal to spawn
-TASK_WIN_CLASS="${TASKPUMP_MONITOR_TASK_CLASS:-arachne-task}"   # for Hyprland windowrules
+TASK_WIN_CLASS="${TASKPUMP_MONITOR_TASK_CLASS:-taskpump-task}"   # for Hyprland windowrules
 # The terminal's argv, up to but not including the editor and the file, which are
 # always appended. %CLASS% and %CWD% expand. The default is wezterm's spelling;
 # a different terminal is a config change rather than a code change.
