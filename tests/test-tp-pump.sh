@@ -1160,6 +1160,47 @@ out=$(pump F55..X9 2>&1); rc=$?
 [[ $rc -ne 0 ]] && pass "F55..X9 exits non-zero under the pinned F sigil" || fail "F55..X9 exited 0:\n$out"
 have "$out" "bad phase range 'F55..X9'" && pass "pinned-sigil range error surfaced" || fail "no range error:\n$out"
 
+echo "--- Test 31: a real run requires TASKPUMP_IMAGE; --dry-run does not (G1.5) ---"
+# The image default (arachne) is gone. A REAL run with no image configured must
+# abort up front — before the image build and before any runner call — naming
+# the key to set. --dry-run keeps planning imageless, unchanged.
+mk F55.0 open; mk F55.1 open F55.0; mk F56.0 open; mk F57.0 open F55.1
+IMGHOME="$TMP/agent-home"; mkdir -p "$IMGHOME"
+RUNLOG="$TMP/runner-calls.log"; : >| "$RUNLOG"
+cat >| "$BIN/recording-runner" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$RUNLOG"
+exit 0
+EOF
+chmod +x "$BIN/recording-runner"
+imageless_once() {  # a real --once tick (no NO_LAUNCH), fixture-homed, no image
+  TASKPUMP_NOTIFY_CMD=true \
+  TASKPUMP_AGENT_HOME="$IMGHOME" \
+  TASKPUMP_RUNNER="$BIN/recording-runner" \
+  ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
+  ARACHNE_PUMP_STATE_FILE="$TMP/img.state" \
+  ARACHNE_POOL_CAP_FILE="$TMP/cap" \
+  ARACHNE_PUMP_LOG="$TMP/pump.log" \
+  ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+  "$PUMP" --no-health-gate --phases F55..F57 --once 2>&1
+}
+out=$(imageless_once); rc=$?
+[[ $rc -ne 0 ]] && pass "an imageless real --once run exits non-zero (rc=$rc)" \
+  || fail "imageless launch exited 0:\n$out"
+have "$out" 'TASKPUMP_IMAGE' && pass "the abort names TASKPUMP_IMAGE" \
+  || fail "error does not name TASKPUMP_IMAGE:\n$out"
+[[ -s "$RUNLOG" ]] && fail "the runner was called despite no image:\n$(cat "$RUNLOG")" \
+  || pass "no runner call before the abort"
+have "$out" 'Building' && fail "the image build ran despite no image:\n$out" \
+  || pass "no image build before the abort"
+# Same fixture, --dry-run: the full plan still prints with no image configured.
+out=$(TASKPUMP_AGENT_HOME="$IMGHOME" pump F55..F57); rc=$?
+[[ $rc -eq 0 ]] && pass "--dry-run exits 0 with no image configured" \
+  || fail "imageless dry-run rc=$rc:\n$out"
+have "$out" 'LAUNCH +F55' && have "$out" 'LAUNCH +F56' && have "$out" 'WAITING +F57' \
+  && pass "--dry-run still prints the full plan imageless" \
+  || fail "imageless dry-run plan incomplete:\n$out"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"

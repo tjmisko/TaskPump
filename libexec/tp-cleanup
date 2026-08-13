@@ -179,7 +179,7 @@ do_stuck() {
 }
 
 # ── busy_worktrees -- emit the .worktrees paths that currently host a live
-#    arachne-agent-* container (one per line). Used to skip a worktree whose
+#    prefix-named agent container (one per line). Used to skip a worktree whose
 #    agent is mid-build, so reclaiming target/ never yanks the rug from a
 #    running session. Empty when docker is absent or no agents run.
 busy_worktrees() {

@@ -31,9 +31,12 @@
 #   TASKPUMP_PUMP_JOBS=4
 #   TASKPUMP_PUMP_CEILING=95
 #
+#   # Required unless taskpump.conf sets it: the image agents launch from.
+#   # There is no default; a real run aborts loudly without one.
+#   TASKPUMP_IMAGE=my-project-agent
+#
 #   # Optional: anything else the pump reads. The file is sourced by systemd, so
 #   # one KEY=value per line, no quoting, no expansion.
-#   # TASKPUMP_IMAGE=arachne
 #   # TASKPUMP_PRE_FLIGHT=/preflight.sh
 #   # GITHUB_TOKEN=ghp_...
 #

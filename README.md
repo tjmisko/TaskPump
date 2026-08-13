@@ -54,7 +54,8 @@ Add these when you start running agents:
 
 ```bash
 TASKPUMP_BUILD_GATE='npm test'          # what "is the tree broken?" means here
-TASKPUMP_IMAGE=my-project-agent         # the image agents launch from
+TASKPUMP_IMAGE=my-project-agent         # the image agents launch from — no default;
+                                        #   a real run aborts loudly without one
 TASKPUMP_PUMP_JOBS=1                    # start at one; raise after you watch a drain
 ```
 

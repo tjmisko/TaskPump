@@ -130,6 +130,22 @@ TaskPump is meant to live inside a consumer repo as a submodule or beside it on
 have opposite answers, and conflating them is what caused the wrong-ledger
 incident.
 
+**Runner defaults are TaskPump's own (G1.5).** Three flips, each pinned to its
+historical value in `examples/arachne.conf`:
+
+- `TASKPUMP_AGENT_PREFIX` defaults to `tp-agent-` (was `arachne-agent-`). This
+  is the name liveness enumeration matches on. **Do not upgrade under a live
+  drain:** a supervisor restarted with the new default cannot see containers
+  named under the old one — finish or stop the drain first, or pin the old
+  prefix.
+- `TASKPUMP_IMAGE` has **no default** (was `arachne`). A real run with no image
+  configured aborts before any launch, naming the key; `--dry-run` still plans
+  imageless. A wrong silent default is strictly worse than a loud missing one.
+- `TASKPUMP_ENTRYPOINT` defaults to `/entrypoint.sh` (was Arachne's
+  `/entrypoint-parallel.sh`) — where the image contract bakes the shipped
+  runner's own `entrypoint.sh`. See
+  [docs/RUNNERS.md §4.0](docs/RUNNERS.md#40-the-image-contract).
+
 ### Removed
 
 - The `run-parallel.sh` half of the read-only-mount test guard. That launcher

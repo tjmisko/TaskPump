@@ -35,7 +35,9 @@
 #   TP_CONTAINER_NAME   ARACHNE_CONTAINER_NAME  required — `docker run --name`
 #   TP_IMAGE            ARACHNE_IMAGE       required — image to run
 #   TP_ENTRYPOINT       ARACHNE_ENTRYPOINT  in-container entrypoint path
-#                                           (default /entrypoint-parallel.sh)
+#                                           (default /entrypoint.sh — where the
+#                                           image contract bakes this runner's
+#                                           own entrypoint.sh; docs/RUNNERS.md)
 #   TP_LEDGER_REPO      ARACHNE_PUMP_OPS_DIR  ledger checkout, mounted RW
 #                                           (default $TP_REPO_ROOT/ops)
 #   TP_BRANCH           ARACHNE_BRANCH      informational; forwarded to the agent
@@ -151,7 +153,7 @@ do_launch() {
   cname="$(first_set TP_CONTAINER_NAME ARACHNE_CONTAINER_NAME)"
   image="$(first_set TP_IMAGE ARACHNE_IMAGE)"
   entrypoint="$(first_set TP_ENTRYPOINT ARACHNE_ENTRYPOINT)"
-  : "${entrypoint:=/entrypoint-parallel.sh}"
+  : "${entrypoint:=/entrypoint.sh}"
 
   [[ -n "$wt" ]]        || die "TP_WORKSPACE (or WORKSPACE_PATH) is required"
   [[ -n "$repo_root" ]] || die "TP_REPO_ROOT (or REPO_ROOT) is required"

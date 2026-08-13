@@ -246,7 +246,7 @@ Which runner launches agents, and how. See [RUNNERS.md](RUNNERS.md).
 |---|---|
 | `TASKPUMP_RUNNER` | The runner **executable** to launch agents with — a path, not a runner name. |
 | `TASKPUMP_DOCKER` | The container-runtime binary. |
-| `TASKPUMP_IMAGE`, `TASKPUMP_IMAGE_BUILD` | The image to run, and the command that builds it before the first launch. |
+| `TASKPUMP_IMAGE`, `TASKPUMP_IMAGE_BUILD` | The image to run, and the command that builds it before the first launch. The image has **no default**: a real run (never `--dry-run`) aborts before any launch when it is unset. See [RUNNERS.md §4.0](RUNNERS.md#40-the-image-contract). |
 | `TASKPUMP_AGENT_PREFIX` | Container-name prefix, **including its trailing dash**. The liveness probe of [PUMP-MECHANISMS.md §2](PUMP-MECHANISMS.md#2-liveness-from-process-state-never-task-status) matches on it, so it must be distinctive. `TASKPUMP_AGENT_CONTAINER_PREFIX` is accepted as a fallback spelling. |
 | `TASKPUMP_ENTRYPOINT` | In-image entrypoint path. |
 | `TASKPUMP_MAX_TURNS`, `TASKPUMP_AGENT_MODEL` | Forwarded to each launched agent. |

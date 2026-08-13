@@ -137,7 +137,7 @@ apl_repair_worktree_gitignore() {
 # from a branch, both watchdogs count by it, cleanup maps a name back to a
 # worktree, and tooling outside this repo greps for it. So it is one knob, read
 # through one accessor, and its default must not drift.
-apl_agent_prefix() { printf '%s' "${TASKPUMP_AGENT_PREFIX:-arachne-agent-}"; }
+apl_agent_prefix() { printf '%s' "${TASKPUMP_AGENT_PREFIX:-tp-agent-}"; }
 
 # apl_docker — the container-runtime binary. TASKPUMP_DOCKER is the canonical
 # spelling; DOCKER is the legacy one every existing harness sets.

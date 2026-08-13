@@ -544,11 +544,12 @@ want+=' -e TASKPUMP_AGENT_MODEL=opus'
 want+=' -v @R@/claude-home:/tmp/claude-home:ro'
 want+=' -v @R@/claude.json:/tmp/claude-home-json/.claude.json:ro'
 want+=' -v @R@:@R@:ro -v @R@/.git:@R@/.git -v @R@/wt:@R@/wt -v @R@/ops:@R@/ops'
-# The trailing /entrypoint-parallel.sh is the bare ENTRYPOINT default (this
-# launch passes no TP_ENTRYPOINT). G1.5 flips that default to the shipped
-# runner's own entrypoint and updates this line in the same commit; the
-# override path is covered separately below.
-want+=' -w @R@/wt agentimg /entrypoint-parallel.sh'
+# The trailing /entrypoint.sh is the bare ENTRYPOINT default (this launch
+# passes no TP_ENTRYPOINT): the shipped runner's own entrypoint at the path
+# the image contract bakes it (G1.5; docs/RUNNERS.md §4.0). Arachne's
+# /entrypoint-parallel.sh layout arrives only via its conf pin; the override
+# path is covered separately below.
+want+=' -w @R@/wt agentimg /entrypoint.sh'
 [[ $rc -eq 0 ]] && pass "launch exits 0 and prints the container id" || fail "launch rc=$rc:\n$got"
 if [[ "$got_norm" == "$want" ]]; then
   pass "launch reproduces the golden docker run line exactly"
