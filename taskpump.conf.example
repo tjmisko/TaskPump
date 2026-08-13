@@ -68,10 +68,10 @@
 #                           #   a task stuck (default: 3)
 # TASKPUMP_TURN_BUDGET_DEFAULT=  # `claim` budget when --turns is omitted (default: 50)
 # TASKPUMP_LOCK_WAIT=       # seconds to wait for the state lock (default: 120)
-# TASKPUMP_COMMITTER_NAME=  # identity for ledger commits (default: arachne-task)
-# TASKPUMP_COMMITTER_EMAIL= # (default: task@arachne.local)
+# TASKPUMP_COMMITTER_NAME=  # identity for ledger commits (default: tp-task)
+# TASKPUMP_COMMITTER_EMAIL= # (default: task@taskpump.local)
 # TASKPUMP_PROG_NAME=       # the name the CLI calls itself in diagnostics
-#                           #   (default: arachne-task)
+#                           #   (default: tp-task)
 # TASKPUMP_TASK=            # path to the task CLI other tools invoke; set it when the
 #                           #   tools are not co-installed (default: <install>/libexec/tp-task)
 
