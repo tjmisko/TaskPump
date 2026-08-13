@@ -29,6 +29,24 @@ in [docs/LEDGER-CONTRACT.md §1](docs/LEDGER-CONTRACT.md#1-versioning).
   with the runtime's failure propagated instead of flattened into an empty list.
   Both forms now share one `docker ps --filter` expression.
 
+- **The pump's liveness now delegates to `runner.sh list`** when the configured
+  runner has it, and scrapes agent names when it does not — so a runner that
+  starts something other than a container becomes visible to the supervisor
+  instead of reading as permanently dead. The capability is probed once at
+  startup (exit 2 = "no such verb" = v1 runner; any other failure means the
+  runner *has* the verb and its runtime is merely unreachable, so a blip at
+  startup does not disable delegation for the whole run).
+
+  Mid-run, a liveness source that cannot answer falls back to the scrape and logs
+  one line per tick — but the two passes that act on *absence*, reclaiming
+  orphaned claims and detecting stalled phases, are skipped for that tick.
+  A blind tick reads as "every agent died at once", and acting on it would
+  release every claim in the range. See
+  [docs/PUMP-MECHANISMS.md §2](docs/PUMP-MECHANISMS.md#2-liveness-from-process-state-never-task-status).
+
+  The monitor, cleanup and both watchdogs are read-only observers and keep
+  scraping for now; delegation is opted into per caller, not per config key.
+
 ## 0.1.0 — 2026-08-13
 
 The extraction of TaskPump from Arachne, and its generalization into a tool any

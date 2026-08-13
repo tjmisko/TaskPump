@@ -550,6 +550,65 @@ err=$(STUB_LIVE="" STUB_AHEAD=3 claim_tick F95 2>&1 >/dev/null)
 [[ "$(status_of F95.1)" == "in_progress" ]] && pass "orphan with commits left parked (not reopened)" || fail "F95.1 wrongly reopened despite commits: $(status_of F95.1)"
 have "$err" 'committed work' && pass "parked-with-commits surfaced via warn" || fail "no committed-work warning:\n$err"
 
+# 17e: liveness went dark → reclaim does NOTHING. The absence-driven passes read
+# "no live agents" from a source that has failed exactly as they read it from a
+# fleet that has died, and a runner-backed pump answering for a non-container
+# runner gets an EMPTY fallback scrape — so one bad tick would release every
+# claim in the range and put every phase on the resume path. Skipping costs a
+# tick of latency on a genuinely dead agent; acting costs the fleet.
+cat >| "$BIN/runner-v2-broken" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  list) echo "runner.sh: cannot list agents (rc=1): daemon unreachable" >&2; exit 1 ;;
+  *) exit 0 ;;
+esac
+EOF
+# The control: same shape, but it answers. An empty answer from a runner that
+# ANSWERED is authoritative, and reclaim must still run — a guard that cannot
+# tell these apart would strand orphaned claims forever.
+cat >| "$BIN/runner-v2-empty" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  list) exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$BIN/runner-v2-broken" "$BIN/runner-v2-empty"
+
+mkclaim F95.1 feat/f95
+err=$(TASKPUMP_RUNNER="$BIN/runner-v2-broken" STUB_LIVE="" STUB_AHEAD=0 claim_tick F95 2>&1 >/dev/null)
+[[ "$(status_of F95.1)" == "in_progress" ]] \
+  && pass "degraded liveness reclaims nothing (no mass release on a blind tick)" \
+  || fail "F95.1 was reclaimed on a blind liveness tick: $(status_of F95.1)"
+have "$err" 'runner liveness unavailable' \
+  && pass "the blind tick says so, once" \
+  || fail "no degraded-liveness warning:\n$err"
+
+# 17f: the same runner, answering an empty fleet → reclaim runs as before.
+mkclaim F95.1 feat/f95
+out=$(TASKPUMP_RUNNER="$BIN/runner-v2-empty" STUB_LIVE="" STUB_AHEAD=0 claim_tick F95 2>/dev/null)
+[[ "$(status_of F95.1)" == "open" ]] \
+  && pass "an authoritative empty fleet still reclaims the orphaned claim" \
+  || fail "reclaim stopped working behind the degraded guard: status=$(status_of F95.1)"
+
+# 17g: the runner is the liveness source, not `docker ps`. The runtime shows
+# nothing; the runner reports the agent alive; the claim must survive. This is
+# the whole point of the delegation — a non-container runner's agents are
+# invisible to a container scrape.
+cat >| "$BIN/runner-v2-live" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  list) printf '%s\n' "arachne-agent-feat-f95"; exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$BIN/runner-v2-live"
+mkclaim F95.1 feat/f95
+TASKPUMP_RUNNER="$BIN/runner-v2-live" STUB_LIVE="" STUB_AHEAD=0 claim_tick F95 >/dev/null 2>&1
+[[ "$(status_of F95.1)" == "in_progress" ]] \
+  && pass "an agent only the runner can see is not reclaimed" \
+  || fail "an agent the runner reported live was reclaimed: $(status_of F95.1)"
+
 echo "--- Test 18: scrub integrity findings reach the pump log with their paths ---"
 # do_tick used to run `scrub >/dev/null 2>&1 || warn "scrub failed (continuing)"`,
 # which threw away the only actionable detail — which file is invisible — and

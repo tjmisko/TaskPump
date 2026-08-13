@@ -254,11 +254,115 @@ apl_live_agent_names_strict() {
   grep "^$prefix" <<<"$out" || true
 }
 
+# ── Liveness, from the runner when the caller opted into one ──────────────────
+# The mechanism is unchanged and non-negotiable: liveness comes from process
+# state, never from task status (design D3). What is pluggable now is only where
+# that process state is READ. A container runner's agents are visible to
+# `docker ps`; a runner that starts something else — a plain process, a VM, a
+# remote executor — has agents no `docker ps` will ever show, and the supervisor
+# would read them as dead and launch over them.
+#
+# Opt-in per caller, by variable rather than by config key. APL_LIVENESS_RUNNER
+# is set in-process by the supervisor that wants runner-backed liveness; it is
+# deliberately NOT derived from TASKPUMP_RUNNER, because every read-only observer
+# in this stack (the monitor, cleanup, both watchdogs) loads the same config file
+# and would silently switch with it. They keep scraping until each is migrated
+# on purpose.
+
+# Cache of the capability probe, for the life of the process:
+#   unset  not probed yet        1  runner answers `list`
+#   0      v1 runner (no verb)
+APL_RUNNER_LIST_CAP="${APL_RUNNER_LIST_CAP-}"
+
+# apl__runner_list <runner> — ask a runner for its live agents. Passes the fleet
+# prefix and the container runtime, which are the only inputs `list` may read
+# (docs/RUNNERS.md §1.3), and keeps the runner's exit status.
+apl__runner_list() {
+  TP_AGENT_PREFIX="$(apl_agent_prefix)" \
+  TASKPUMP_AGENT_PREFIX="$(apl_agent_prefix)" \
+  TASKPUMP_DOCKER="$(apl_docker)" \
+  DOCKER="$(apl_docker)" \
+  "$1" list
+}
+
+# apl_runner_list_supported <runner> — does this runner implement `list`? Probed
+# once and cached; a supervisor asks liveness every tick and must not pay a
+# capability probe each time.
+#
+# Exit 2 is the answer that means "I do not have that verb" — it is what a shell
+# CLI returns for a usage error, what the reference runner returns, and what a v1
+# runner written against the documented skeleton returns. Every OTHER non-zero
+# means the runner HAS the verb and could not answer it right now (its runtime is
+# unreachable), which is a transient condition, not a missing capability: the
+# probe reports supported, and the per-tick path below handles the failure. The
+# distinction matters because misreading "runtime blipped at pump start" as "v1
+# runner" would silently scrape for the rest of the run — which for a
+# non-container runner means every agent is invisible for the rest of the run.
+apl_runner_list_supported() {
+  local runner="$1"
+  [[ -n "${APL_RUNNER_LIST_CAP:-}" ]] && return $(( 1 - APL_RUNNER_LIST_CAP ))
+  [[ -n "$runner" && -x "$runner" ]] || { APL_RUNNER_LIST_CAP=0; return 1; }
+  local rc=0
+  apl__runner_list "$runner" >/dev/null 2>&1 || rc=$?
+  if [[ $rc -eq 2 ]]; then
+    APL_RUNNER_LIST_CAP=0
+    return 1
+  fi
+  APL_RUNNER_LIST_CAP=1
+  return 0
+}
+
+# The exit status that means "this list is the fallback scrape, because the
+# runner that should have answered could not". EX_TEMPFAIL, the same code the
+# pre-flight hook uses for "the environment was not ready" — the answer is not
+# wrong on purpose, it is merely not authoritative.
+#
+# A status, not a global: every liveness call site in this stack reads the answer
+# through `$( )` or `< <( )`, both of which run the function in a SUBSHELL, so a
+# variable it sets would never reach the caller. The one signal that does survive
+# a subshell is the exit status.
+APL_LIVENESS_DEGRADED_RC=75
+
+# apl_live_agents — the pluggable enumeration. The runner's answer when this
+# caller opted into a runner that supports `list`, the prefix scrape otherwise.
+#
+# Fail-open, and this is the important half: when a supporting runner errors, the
+# call still PRINTS the scrape rather than failing empty, because liveness going
+# dark must never wedge the supervisor. But it exits 75, because for a
+# non-container runner that fallback answer is not merely stale — it is empty,
+# and "everything died" is the most destructive wrong answer this function can
+# give. A caller that would only decline to launch can ignore the status; a
+# caller that would ACT on absence (reclaiming claims, tearing something down)
+# must not.
+apl_live_agents() {
+  local runner="${APL_LIVENESS_RUNNER:-}"
+  [[ -n "$runner" ]] || { apl_live_agent_names; return 0; }
+  apl_runner_list_supported "$runner" || { apl_live_agent_names; return 0; }
+
+  local prefix; prefix="$(apl_agent_prefix)"
+  local out rc=0
+  out="$(apl__runner_list "$runner" 2>/dev/null)" || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    apl_live_agent_names
+    return "$APL_LIVENESS_DEGRADED_RC"
+  fi
+  # The prefix filter is applied here as well as inside the runner: a
+  # third-party runner's `list` is not obliged to have been asked about only one
+  # fleet, and a name outside this pump's prefix cannot be mapped back to one of
+  # its branches anyway.
+  [[ -n "$out" ]] || return 0
+  grep "^$prefix" <<<"$out" || true
+}
+
 # apl_live_agent_slugs — the same set, each name reduced to its branch slug
-# (name minus the prefix; the slug is the branch with `/` → `-`).
+# (name minus the prefix; the slug is the branch with `/` → `-`). Propagates the
+# degraded status; a pipe would swallow it.
 apl_live_agent_slugs() {
   local prefix; prefix="$(apl_agent_prefix)"
-  apl_live_agent_names | sed "s|^$prefix||"
+  local out rc=0
+  out="$(apl_live_agents)" || rc=$?
+  [[ -n "$out" ]] && sed "s|^$prefix||" <<<"$out"
+  return "$rc"
 }
 
 # apl_count_live_agents — count of live agent containers (optionally only those

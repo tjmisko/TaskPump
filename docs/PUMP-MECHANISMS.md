@@ -100,6 +100,37 @@ outside and needs no cooperation.
 This also makes the pump **restart-safe**: a supervisor that restarts mid-run
 re-derives what is live by looking, and never disturbs an in-flight agent.
 
+### Where the pump looks
+
+The mechanism above is unchanged. What is pluggable is only the **source** of
+that process state:
+
+1. **Ask the runner.** If the configured runner implements `list`
+   ([RUNNERS.md §1.3](RUNNERS.md#13-list)), the pump asks it once per tick and
+   uses its answer. Probed once at startup and cached for the run.
+2. **Scrape agent names.** Otherwise — a v1 runner with no `list` verb — the
+   pump enumerates processes whose name carries the configured agent prefix,
+   exactly as before.
+
+Asking matters because scraping only works for a *container* runner. A runner
+that starts a plain process, a VM, or a remote executor has agents no
+`docker ps` will ever show, so the supervisor would read every one of them as
+dead and launch over them. Delegation is what makes those runners usable at all.
+
+**When the source goes dark**, the pump falls back to the scrape for that tick
+and logs one line — liveness failing must never wedge the supervisor. But a
+fallback answer is explicitly marked as not authoritative, because for a
+non-container runner it is not merely stale, it is *empty*: "every agent died at
+once". So the two passes that act on **absence** — reclaiming an orphaned claim
+(above) and detecting a stalled phase (mechanism 4) — are skipped entirely on
+such a tick. They resume next tick.
+
+That asymmetry is the whole discipline: a wrongly-absent agent on the *launch*
+path costs at most one redundant launch decision, which the next tick corrects.
+On the *reclaim* path it releases every claim in the range and resumes every
+running phase at once. Fail open where the cost is bounded; refuse to act where
+it is not.
+
 ---
 
 ## 3. Budget-gated launching that never kills in-flight work

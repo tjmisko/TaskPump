@@ -98,6 +98,11 @@ MONITOR_BIN="${TASKPUMP_MONITOR_BIN:-$TP_LIBEXEC_DIR/tp-monitor}"
 # HOW — the sandbox, the mounts, the credentials. See runners/claude-docker.
 RUNNER="${TASKPUMP_RUNNER:-$TP_ROOT/runners/claude-docker/runner.sh}"
 DOCKER="${TASKPUMP_DOCKER:-${DOCKER:-docker}}"
+# Liveness is the runner's to answer when it can (docs/RUNNERS.md §1.3). This
+# opts THIS process in; the read-only observers that share pump-lib (the monitor,
+# cleanup, both watchdogs) load the same config and deliberately do not, so they
+# keep scraping container names until each is migrated on purpose.
+APL_LIVENESS_RUNNER="$RUNNER"
 # No default image on purpose (G1.5): a wrong-but-plausible default launches the
 # wrong agent silently, so a real run fails loudly below when this is empty.
 # --dry-run and NO_LAUNCH ticks never launch and keep working imageless.
@@ -380,14 +385,47 @@ phase_open_count() {
   "$TASK_BIN" ready --phase "$1" --count 2>/dev/null || echo 0
 }
 
-# Is a phase's worktree branch currently owned by a LIVE container? (D3)
+# Is a phase's worktree branch currently owned by a LIVE agent? (D3)
+#
+# Reads the pluggable enumeration: the runner's own `list` when it has one, the
+# container-name scrape otherwise (docs/RUNNERS.md §1.3). A degraded answer is
+# used as-is here — this is the launch path, where the cost of reading a live
+# agent as dead is bounded and self-correcting, unlike the reclaim path below.
 phase_live() {
   local want; want="$(phase_container "$1")"
   local name
   while IFS= read -r name; do
     [[ "$name" == "$want" ]] && return 0
-  done < <(apl_live_agent_names)
+  done < <(apl_live_agents)
   return 1
+}
+
+# ── Liveness that is safe to act on ───────────────────────────────────────────
+# Two passes below do something IRREVERSIBLE on the strength of an agent being
+# absent: reclaim releases its claim, and stall detection hands its phase to the
+# resume path. Both are correct against a true absence and catastrophic against a
+# false one — a liveness source that has gone dark reports every agent dead at
+# once, so a single bad answer reclaims or resumes the entire fleet.
+#
+# apl_live_agents is fail-open by design (it prints the fallback scrape rather
+# than nothing), and says so with exit 75. This wrapper turns that status into
+# the only safe response for an absence-driven pass: don't run it this tick.
+# Skipping costs one tick of latency on a genuinely dead agent, which the next
+# tick recovers; acting costs a fleet.
+LIVENESS_DEGRADED_TICK=0
+live_slugs() {   # prints live branch slugs; returns non-zero when not authoritative
+  local out rc=0
+  out="$(apl_live_agent_slugs)" || rc=$?
+  [[ -n "$out" ]] && printf '%s\n' "$out"
+  if (( rc != 0 )); then
+    # One line per tick, not per caller: two passes ask the same question.
+    if (( LIVENESS_DEGRADED_TICK == 0 )); then
+      warn "runner liveness unavailable this tick; falling back to container-name enumeration and skipping absence-driven passes (reclaim, stall detection)"
+      LIVENESS_DEGRADED_TICK=1
+    fi
+    return 1
+  fi
+  return 0
 }
 
 # Lowest eligible task id in a phase (the epic/safety-net task for the container).
@@ -413,7 +451,11 @@ phase_lead_task() {
 # The branch/worktree is never touched, so a released task resumes its prior work.
 reclaim_orphaned_claims() {
   local -A live=()
-  local s; while IFS= read -r s; do [[ -n "$s" ]] && live["$s"]=1; done < <(apl_live_agent_slugs)
+  local slugs
+  # Absence-driven: a liveness source that cannot answer would read as every
+  # agent having died, and this pass would release every claim in the range.
+  slugs="$(live_slugs)" || return 0
+  local s; while IFS= read -r s; do [[ -n "$s" ]] && live["$s"]=1; done <<<"$slugs"
   local reclaimed=0 parked=0 id status branch _rest parked_ids=""
   while read -r id status branch _rest; do
     [[ "$id" == "ID" || "$status" != "in_progress" ]] && continue
@@ -480,7 +522,11 @@ detect_stalled_orphans() {
   STALL_TASK=(); STALL_STATUS=()
   [[ "$RESUME_STALLED" -eq 1 ]] || return 0
   local -A live=()
-  local s; while IFS= read -r s; do [[ -n "$s" ]] && live["$s"]=1; done < <(apl_live_agent_slugs)
+  local slugs
+  # Absence-driven, and the more expensive of the two to get wrong: a false
+  # "everything died" would put every running phase on the resume path.
+  slugs="$(live_slugs)" || return 0
+  local s; while IFS= read -r s; do [[ -n "$s" ]] && live["$s"]=1; done <<<"$slugs"
   local id status branch _rest phase pbranch ahead
   while read -r id status branch _rest; do
     [[ "$id" == "ID" ]] && continue
@@ -1347,6 +1393,7 @@ run_pre_tick_hooks() {
 
 # ── One tick: scrub, plan, reclaim, gate, top up the pool to cap ───────────────
 do_tick() {
+  LIVENESS_DEGRADED_TICK=0   # the degraded-liveness warning is once per tick
   git -C "$OPS_DIR" pull --ff-only >/dev/null 2>&1 || warn "ops pull --ff-only failed (continuing)"
   # Capture rather than discard: a scrub that finds invisible task files (exit
   # 3) has the one detail worth acting on — the paths. Dropping them left the
@@ -1580,6 +1627,15 @@ if [[ "${TASKPUMP_PUMP_NO_LAUNCH:-0}" -ne 1 ]]; then
   # than a loud missing one.
   [[ -n "$IMAGE" ]] || die "no container image configured: set TASKPUMP_IMAGE (--dry-run works without one)"
   [[ -x "$RUNNER" ]] || die "no agent runner at $RUNNER (set TASKPUMP_RUNNER)"
+  # Probe the liveness source once, HERE, in the main shell: every tick reads
+  # liveness from a subshell, where a cached answer would not survive. Placed
+  # after the image check on purpose — the prerequisites must abort before this
+  # process ever calls the runner.
+  if apl_runner_list_supported "$RUNNER"; then
+    log "liveness: asking the runner ($RUNNER list)"
+  else
+    log "liveness: runner has no list verb (contract v1); enumerating names matching $(apl_agent_prefix)*"
+  fi
   if [[ -n "$IMAGE_BUILD_CMD" ]]; then
     log "Building the $IMAGE image ..."
     ( cd "$REPO_ROOT" && eval "$IMAGE_BUILD_CMD" ) >/dev/null || die "image build failed"
