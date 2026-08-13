@@ -919,7 +919,15 @@ launch_phase() {
   fi
   [[ -f "$wt/$SUBMODULE_PROBE" ]] || git -C "$wt" submodule update --init --recursive 2>&1 | tail -1 || true
   if ! apl_ensure_worktrees_visible "$REPO_ROOT" "$wt"; then
-    warn "worktree still gitignored: $wt — fix .gitignore; skipping $phase"; return 1
+    # Name the deciding pattern and its file: "fix .gitignore" sent an operator
+    # whose GLOBAL excludes caused this to the wrong file (G0.6).
+    local ign_src
+    # The `--` before the path is load-bearing: the no-mounts-in-the-pump guard
+    # greps this file for the volume-flag-then-quoted-path spelling and cannot
+    # tell git's verbose flag from a docker mount without it.
+    ign_src="$(git -C "$REPO_ROOT" check-ignore -v -- "$wt" 2>/dev/null | head -1)"
+    warn "worktree still gitignored: $wt (deciding pattern: ${ign_src:-unknown}) — skipping $phase"
+    return 1
   fi
 
   # v2: refresh a reused/stale worktree with newly-integrated upstream deps. A
