@@ -159,7 +159,7 @@ do_stuck() {
         # 1) snapshot worktree progress
         if [[ -d "$wt/.git" || -f "$wt/.git" ]]; then
             act "git -C '$wt' add -A"
-            act "git -C '$wt' -c user.name=arachne-cleanup -c user.email=cleanup@arachne.local commit -m 'wip: tp-cleanup pre-stop snapshot' --allow-empty"
+            act "git -C '$wt' -c user.name=tp-cleanup -c user.email=cleanup@taskpump.local commit -m 'wip: tp-cleanup pre-stop snapshot' --allow-empty"
         fi
         # 2) stop the container
         act "$(apl_docker) stop --time=$DOCKER_GRACE_SEC '$cname'"
