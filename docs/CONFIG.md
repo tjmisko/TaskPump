@@ -42,6 +42,25 @@ Installation paths are a different question and *are* resolved from the tools'
 own location, through their realpath, so a symlink on `PATH` still finds its own
 installation.
 
+### Turning discovery off
+
+`TASKPUMP_NO_CONF=1` suppresses the walk entirely: no ambient `taskpump.conf` is
+loaded, and a tool sees its baked defaults plus whatever the environment sets —
+nothing else. An explicit `TASKPUMP_CONFIG` still loads; the switch turns off
+*ambient* discovery, not deliberate configuration. In full:
+
+```
+TASKPUMP_CONFIG (explicit file)  >  TASKPUMP_NO_CONF=1 (no walk)  >  the walk
+```
+
+This is a hermeticity seam, not a tuning knob. The test suites export it so
+that the conf of whatever repository they happen to run from — TaskPump's own
+included — cannot leak into fixture invocations; a suite that tests discovery
+itself opts back in per-invocation with `TASKPUMP_NO_CONF=0` or an explicit
+`TASKPUMP_CONFIG`. It is environment-only by construction: by the time a config
+file could say anything, the decision it governs has already been made, which
+is also why it appears here and not in `taskpump.conf.example`.
+
 ### File syntax
 
 The file is sourced by bash with `allexport`, so it is `KEY=value` per line.

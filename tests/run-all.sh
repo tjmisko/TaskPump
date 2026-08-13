@@ -17,6 +17,16 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 export ARACHNE_NOTIFY_CMD=true
 export TASKPUMP_NOTIFY_CMD=true
 
+# Hermeticity: the tools discover taskpump.conf by walking up from $PWD, so a
+# conf in whatever repo these suites happen to run from (TaskPump's own dogfood
+# conf included) would leak into every fixture invocation that does not override
+# a key — a foreign sigil failing range parses, and a TASKPUMP_BUILD_GATE of
+# './tests/run-all.sh' that once made the pump suite re-enter this very script
+# unboundedly. Each suite exports this itself for standalone runs; a suite that
+# tests conf discovery opts back in per-invocation (TASKPUMP_NO_CONF=0 or an
+# explicit TASKPUMP_CONFIG, which outranks the switch).
+export TASKPUMP_NO_CONF=1
+
 filter="${1:-}"
 
 suites=()

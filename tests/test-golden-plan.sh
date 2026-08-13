@@ -31,6 +31,11 @@ TP_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 GOLDEN="$SCRIPT_DIR/golden"
 UPDATE="${UPDATE_GOLDEN:-0}"
 
+# Hermeticity: "with NO taskpump.conf present" is this suite's whole premise, so
+# a conf discovered from the repo it happens to run from must never leak in.
+# run-all.sh exports the same switch; this one covers standalone runs.
+export TASKPUMP_NO_CONF=1
+
 PASS=0; FAIL=0
 pass() { printf 'PASS: %s\n' "$*"; PASS=$((PASS + 1)); }
 fail() { printf 'FAIL: %s\n' "$*" >&2; FAIL=$((FAIL + 1)); }

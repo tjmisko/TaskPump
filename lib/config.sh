@@ -27,6 +27,21 @@
 #
 #   environment  >  taskpump.conf  >  defaults baked into each tool
 #
+# ── The hermeticity off-switch ───────────────────────────────────────────────
+#
+# TASKPUMP_NO_CONF=1 suppresses the discovery walk entirely: no ambient
+# taskpump.conf is loaded, and a tool sees its baked defaults plus whatever the
+# environment sets — nothing else. An explicit TASKPUMP_CONFIG still loads: the
+# switch turns off *ambient* discovery, not deliberate configuration, so a
+# caller under the switch can still opt into a named fixture file.
+#
+# This exists for the test suites (2026-08-12): they claim hermeticity, but the
+# tools they invoke discover config from $PWD — so running them from a repo
+# that carries a taskpump.conf (TaskPump's own dogfood conf, or any consumer's)
+# leaked that conf into every fixture invocation that did not override a key.
+# It is environment-only by construction: by the time a config file could say
+# anything, the decision it governs has already been made.
+#
 # ── Legacy alias promotion ───────────────────────────────────────────────────
 #
 # The tools still read ARACHNE_* names; the config file speaks TASKPUMP_*. Until
@@ -143,7 +158,16 @@ tp_load_config() {
     pre_canon["${name#TASKPUMP_}"]="${!name}"
   done < <(tp__names_with_prefix TASKPUMP_)
 
-  TP_CONFIG_FILE="${TASKPUMP_CONFIG:-$(tp__discover_config)}"
+  # Explicit config > the off-switch > the discovery walk. The legacy spelling
+  # of the switch is honored inline: the generic ARACHNE_* bridge below runs
+  # after this decision, so it cannot bridge a key that governs loading itself.
+  if [[ -n "${TASKPUMP_CONFIG:-}" ]]; then
+    TP_CONFIG_FILE="$TASKPUMP_CONFIG"
+  elif [[ "${TASKPUMP_NO_CONF:-${ARACHNE_NO_CONF:-0}}" == "1" ]]; then
+    TP_CONFIG_FILE=""
+  else
+    TP_CONFIG_FILE="$(tp__discover_config)"
+  fi
   if [[ -n "$TP_CONFIG_FILE" ]]; then
     if [[ -f "$TP_CONFIG_FILE" ]]; then
       tp__source_config "$TP_CONFIG_FILE"

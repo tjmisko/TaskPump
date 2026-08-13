@@ -22,6 +22,14 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 TP_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 CLI="$TP_ROOT/libexec/tp-task"
 
+# Hermeticity: ignore any taskpump.conf in the repo this suite happens to run
+# from — the tools discover config by walking up from $PWD, and a leaked conf
+# reconfigures every fixture invocation below. The dual-invocation section is
+# the one part of this suite that TESTS discovery, and it opts back in
+# per-invocation with TASKPUMP_NO_CONF=0. run-all.sh exports the same switch;
+# this one covers standalone runs.
+export TASKPUMP_NO_CONF=1
+
 # ── Environment hermeticity ──────────────────────────────────────────────────
 # Every config key tp-task reads, by suffix. Both spellings of each are cleared
 # from the environment before any fixture is set up, and TP_ENV_UNSET carries
@@ -1284,11 +1292,14 @@ seed_ledger canon_cli
 
 # 3. taskpump.conf, discovered from $PWD. Nothing about the ledger is in the
 # environment for this one — the config file is the only thing pointing at it.
+# Discovery is exactly what this case tests, so it opts back out of the suite's
+# hermeticity switch; the walk still stops at $DUAL_CONF_WS's own git root, so
+# no enclosing repo's conf can reach it.
 cat >| "$DUAL_CONF_WS/taskpump.conf" <<CONF
 TASKPUMP_TASKS_DIR=$DUAL_CONF
 TASKPUMP_TASK_NOCOMMIT=1
 CONF
-conf_cli() { ( cd "$DUAL_CONF_WS" && env "${TP_ENV_UNSET[@]}" "$CLI" "$@" ); }
+conf_cli() { ( cd "$DUAL_CONF_WS" && env "${TP_ENV_UNSET[@]}" TASKPUMP_NO_CONF=0 "$CLI" "$@" ); }
 seed_ledger conf_cli
 
 fp_legacy=$(ledger_fingerprint "$DUAL_LEGACY")
@@ -1344,12 +1355,12 @@ env "${TP_ENV_UNSET[@]}" \
 # was explicit about where the ledger is.
 ENV_OVER_CONF="$TMPDIR_TEST/env-over-conf/tasks"
 mkdir -p "$ENV_OVER_CONF"
-got=$( cd "$DUAL_CONF_WS" && env "${TP_ENV_UNSET[@]}" \
+got=$( cd "$DUAL_CONF_WS" && env "${TP_ENV_UNSET[@]}" TASKPUMP_NO_CONF=0 \
         ARACHNE_TASKS_DIR="$ENV_OVER_CONF" "$CLI" resolve --tasks-dir )
 [[ "$got" == "$ENV_OVER_CONF" ]] && pass "a legacy env export outranks taskpump.conf" \
   || fail "env-over-conf resolved to '$got', expected '$ENV_OVER_CONF'"
 
-got=$( cd "$DUAL_CONF_WS" && env "${TP_ENV_UNSET[@]}" \
+got=$( cd "$DUAL_CONF_WS" && env "${TP_ENV_UNSET[@]}" TASKPUMP_NO_CONF=0 \
         TASKPUMP_TASKS_DIR="$ENV_OVER_CONF" "$CLI" resolve --tasks-dir )
 [[ "$got" == "$ENV_OVER_CONF" ]] && pass "a canonical env export outranks taskpump.conf" \
   || fail "env-over-conf resolved to '$got', expected '$ENV_OVER_CONF'"
