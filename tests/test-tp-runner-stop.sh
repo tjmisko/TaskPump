@@ -28,6 +28,12 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 TP_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 RUNNER="$TP_ROOT/runners/claude-docker/runner.sh"
 
+# Hermeticity: ignore any taskpump.conf in the repo this suite happens to run
+# from — the tools discover config by walking up from $PWD, and a leaked conf
+# reconfigures every fixture invocation below. run-all.sh exports the same
+# switch; this one covers standalone runs.
+export TASKPUMP_NO_CONF=1
+
 WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
 
 PASS=0; FAIL=0

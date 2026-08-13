@@ -11,6 +11,16 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 TP_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 PUMP="$TP_ROOT/libexec/tp-pump"
 REAL_TASK="$TP_ROOT/libexec/tp-task"
+
+# Hermeticity: ignore any taskpump.conf in the repo this suite happens to run
+# from — the tools discover config by walking up from $PWD, and a leaked conf
+# reconfigures every fixture invocation below. From TaskPump's own dogfood conf
+# that leak once failed 37 range parses (TASKPUMP_PHASE_SIGIL=G vs the F
+# fixtures) and hung Test 13, whose gate-less integration ticks eval'd the
+# conf's TASKPUMP_BUILD_GATE='./tests/run-all.sh' — re-entering the whole suite
+# unboundedly. run-all.sh exports the same switch; this covers standalone runs.
+export TASKPUMP_NO_CONF=1
+
 PASS=0; FAIL=0
 pass() { printf 'PASS: %s\n' "$*"; PASS=$((PASS + 1)); }
 fail() { printf 'FAIL: %s\n' "$*" >&2; FAIL=$((FAIL + 1)); }

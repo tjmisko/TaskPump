@@ -14,6 +14,12 @@ TP_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
 CLEANUP="$TP_ROOT/libexec/tp-cleanup"
 WATCHDOG="$TP_ROOT/libexec/tp-disk-watchdog"
 
+# Hermeticity: ignore any taskpump.conf in the repo this suite happens to run
+# from — the tools discover config by walking up from $PWD, and a leaked conf
+# reconfigures every fixture invocation below. run-all.sh exports the same
+# switch; this one covers standalone runs.
+export TASKPUMP_NO_CONF=1
+
 PASS=0; FAIL=0
 pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
