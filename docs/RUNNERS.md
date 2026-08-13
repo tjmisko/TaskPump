@@ -148,6 +148,37 @@ The shipped runner launches Claude Code in a Docker container. It is a reference
 in both senses: it is what the mechanisms were proven against, and it is the
 worked example of what a hardened runner has to handle.
 
+### 4.0 The image contract
+
+TaskPump ships the runner, not the image. **`TASKPUMP_IMAGE` has no default**: a
+real run aborts before any launch when it is unset, because a wrong-but-plausible
+default would launch the wrong agent silently, and a loud missing name is
+strictly better. (`--dry-run` plans without an image.)
+
+The image a consumer names must satisfy this contract:
+
+- **The runner's in-container half is baked at `/entrypoint.sh`.** That path is
+  the `TASKPUMP_ENTRYPOINT` default, and the file is the shipped
+  `runners/claude-docker/entrypoint.sh`:
+
+  ```dockerfile
+  COPY runners/claude-docker/entrypoint.sh /entrypoint.sh
+  RUN chmod +x /entrypoint.sh
+  ```
+
+  An image that bakes it elsewhere sets `TASKPUMP_ENTRYPOINT` to match — that is
+  how the reference consumer runs: `examples/arachne.conf` pins its historical
+  `/entrypoint-parallel.sh` layout.
+
+- **What the entrypoint finds inside:** the `claude` CLI on `PATH`, `git`, `jq`,
+  and an unprivileged user to drop to (`TASKPUMP_CONTAINER_USER`, default `dev`,
+  home `/home/dev`). The container starts as root and hands the session to that
+  user with `su` — see *Why root* in `runners/claude-docker/README.md`.
+
+- **Everything project-shaped stays out of the image contract.** Toolchains,
+  smoke tests, and the egress allowlist arrive through the pre-flight hook
+  (§4.4), which is what keeps one image contract serving many projects.
+
 Its guarantees:
 
 ### 4.1 Access-token-only credentials
