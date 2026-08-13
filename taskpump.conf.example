@@ -68,6 +68,10 @@
 #                           #   a task stuck (default: 3)
 # TASKPUMP_TURN_BUDGET_DEFAULT=  # `claim` budget when --turns is omitted (default: 50)
 # TASKPUMP_LOCK_WAIT=       # seconds to wait for the state lock (default: 120)
+# TASKPUMP_LOCK_NAME=       # the state lockfile's name, created in the ledger's git
+#                           #   root and flock-shared by inode across containers —
+#                           #   every concurrent agent must resolve the same name
+#                           #   (default: .taskpump-task.lock)
 # TASKPUMP_COMMITTER_NAME=  # identity for ledger commits (default: tp-task)
 # TASKPUMP_COMMITTER_EMAIL= # (default: task@taskpump.local)
 # TASKPUMP_PROG_NAME=       # the name the CLI calls itself in diagnostics

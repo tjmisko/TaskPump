@@ -84,13 +84,13 @@ chmod +x "$BIN/docker" "$BIN/claude-usage" "$BIN/disk-watchdog"
 # ── Reference pins ────────────────────────────────────────────────────────────
 # The flip census: every shipped default the v0.1.0 flips (G1.3–G1.7) change,
 # by config-key suffix. examples/arachne.conf pins each one to its historical
-# value; that file is the reference pin set (G1.1's audit), and G1.3 adds the
-# ledger-lock name to it when the key exists.
+# value; that file is the reference pin set (G1.1's audit), extended by G1.3
+# with the ledger-lock name (LOCK_NAME, a key the flip introduced).
 FLIP_CENSUS=(
-  # G1.3 — state, log, and note filenames
+  # G1.3 — state, log, and note filenames, plus the ledger-lock name
   PUMP_STATE_NAME PUMP_LOG POOL_CAP_FILE USAGE_RESET_FILE DISK_WATCHDOG_LOG
   HOOK_MARK_FILE AGENT_LOG_NAME BRIEF_OUT_NAME RESUME_NOTE_NAME GOAL_NOTE_NAME
-  RO_PROBE_FILE MONITOR_NOTES_DIRNAME MONITOR_CACHE_BASE
+  RO_PROBE_FILE MONITOR_NOTES_DIRNAME MONITOR_CACHE_BASE LOCK_NAME
   # G1.4 — identity strings
   COMMITTER_NAME COMMITTER_EMAIL PROG_NAME PUMP_PROG_NAME MONITOR_TASK_CLASS
   # G1.5 — runner defaults

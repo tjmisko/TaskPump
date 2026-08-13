@@ -38,7 +38,8 @@ pass() { printf 'PASS: %s\n' "$*"; PASS=$((PASS + 1)); }
 for _suffix in TASKS_DIR TASK_OUT CODE_REPO TASK_PUSH PUSH TASK_NOCOMMIT \
                TASK_DEBUG LEDGER_PROBE COMMITTER_NAME COMMITTER_EMAIL \
                ID_PATTERN PHASE_SIGIL TURN_BUDGET_DEFAULT FAILURE_LIMIT \
-               CLAIM_STALE_HOURS LOCK_WAIT PUSH_RETRIES PROG_NAME CONFIG; do
+               CLAIM_STALE_HOURS LOCK_WAIT LOCK_NAME PUSH_RETRIES PROG_NAME \
+               CONFIG; do
   unset "ARACHNE_$_suffix" "TASKPUMP_$_suffix" 2>/dev/null || true
 done
 unset _suffix

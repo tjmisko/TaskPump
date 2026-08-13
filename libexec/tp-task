@@ -86,6 +86,10 @@ fi
 : "${TASKPUMP_FAILURE_LIMIT:=3}"
 : "${TASKPUMP_CLAIM_STALE_HOURS:=24}"
 : "${TASKPUMP_LOCK_WAIT:=120}"
+# The cross-agent state lockfile's NAME, created in the ledger's git root. Every
+# concurrent agent must resolve the same name or they stop excluding each other,
+# so change it only between runs, never under a live drain.
+: "${TASKPUMP_LOCK_NAME:=.taskpump-task.lock}"
 : "${TASKPUMP_PUSH_RETRIES:=6}"
 
 # Name this tool answers to in its own diagnostics. The reference consumer pins
@@ -331,7 +335,7 @@ acquire_state_lock() {
   command -v flock >/dev/null 2>&1 || { dbg "flock unavailable; no state lock"; return 0; }
   local root lockfile
   root=$(git -C "$TASKPUMP_TASKS_DIR" rev-parse --show-toplevel 2>/dev/null || echo "")
-  lockfile="${root:-/tmp}/.arachne-task.lock"
+  lockfile="${root:-/tmp}/$TASKPUMP_LOCK_NAME"
   # Open fd 9 to the lockfile for the lifetime of the process. The `2>/dev/null`
   # MUST be scoped to a brace group: `exec 9>… 2>/dev/null` with no command would
   # apply 2>/dev/null to the *current shell permanently*, silently swallowing all
@@ -1712,6 +1716,8 @@ Config (env or taskpump.conf; the legacy ARACHNE_* spelling of each still works)
                               marks a task stuck                    (default: 3)
     TASKPUMP_CLAIM_STALE_HOURS   heartbeat staleness threshold     (default: 24)
     TASKPUMP_LOCK_WAIT      seconds to wait for the state lock    (default: 120)
+    TASKPUMP_LOCK_NAME      the state lockfile's name, created in the ledger's
+                              git root         (default: .taskpump-task.lock)
   Misc
     TASKPUMP_TASK_NOCOMMIT=1  skip commits and the state lock (fixture mode)
     TASKPUMP_TASK_DEBUG=1     print debug traces

@@ -150,6 +150,7 @@ The keys a generic project actually needs.
 | `TASKPUMP_FAILURE_LIMIT` | Consecutive unproductive iterations before `scrub` marks a task stuck. |
 | `TASKPUMP_TURN_BUDGET_DEFAULT` | The `claim` turn budget when `--turns` is omitted. |
 | `TASKPUMP_LOCK_WAIT` | Seconds to wait for the state lock before failing. |
+| `TASKPUMP_LOCK_NAME` | The state lockfile's name, created in the ledger's git root. Shared by inode across every container that bind-mounts the repo, so every concurrent agent must resolve the same name — change it only between runs. |
 | `TASKPUMP_PUSH_RETRIES` | Retries for a contended push. |
 | `TASKPUMP_COMMITTER_NAME`, `TASKPUMP_COMMITTER_EMAIL` | The identity ledger state commits are made under. |
 | `TASKPUMP_TASK` | Path to the task CLI other tools invoke. Set it when the tools are not co-installed. |
