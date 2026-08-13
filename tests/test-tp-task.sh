@@ -1278,13 +1278,15 @@ ledger_fingerprint() {
 # The operation under test: file two tasks, wire one behind the other, then
 # claim and complete the blocker. Touches create/blockers/claim/complete, so a
 # spelling that failed to arrive would change the outcome rather than merely the
-# path taken to it.
+# path taken to it. These runners deliberately CLEAR both spellings of every
+# key, so `create` here validates against the BAKED default grammar — T-shaped
+# ids since the G1.6 flip, hence T ids in an otherwise F-shaped suite.
 seed_ledger() {
   local runner=$1
-  $runner create F80.1 --title "Blocker task" --goal "Unblock F80.2." >/dev/null
-  $runner create F80.2 --title "Dependent task" --blockers "F80.1" >/dev/null
-  $runner claim F80.1 --branch feat/dual --turns 9 >/dev/null
-  $runner complete F80.1 --commits "abc1234,def5678" >/dev/null </dev/null
+  $runner create T80.1 --title "Blocker task" --goal "Unblock T80.2." >/dev/null
+  $runner create T80.2 --title "Dependent task" --blockers "T80.1" >/dev/null
+  $runner claim T80.1 --branch feat/dual --turns 9 >/dev/null
+  $runner complete T80.1 --commits "abc1234,def5678" >/dev/null </dev/null
 }
 
 DUAL_LEGACY="$TMPDIR_TEST/dual-legacy/tasks"
@@ -1359,8 +1361,8 @@ got=$(env "${TP_ENV_UNSET[@]}" \
 
 env "${TP_ENV_UNSET[@]}" \
   ARACHNE_TASKS_DIR="$PREC_LEGACY" TASKPUMP_TASKS_DIR="$PREC_CANON" \
-  ARACHNE_TASK_NOCOMMIT=1 "$CLI" create F81.1 --title "Precedence" >/dev/null
-[[ -f "$PREC_CANON/F81.1.md" && ! -f "$PREC_LEGACY/F81.1.md" ]] \
+  ARACHNE_TASK_NOCOMMIT=1 "$CLI" create T81.1 --title "Precedence" >/dev/null
+[[ -f "$PREC_CANON/T81.1.md" && ! -f "$PREC_LEGACY/T81.1.md" ]] \
   && pass "the write lands in the canonical dir, not the legacy one" \
   || fail "precedence write went to the wrong ledger"
 

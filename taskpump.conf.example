@@ -45,7 +45,7 @@
 # TASKPUMP_LEDGER_PROBE=    # path, relative to a candidate workspace, whose presence
 #                           #   means "this workspace owns a ledger" — how a worktree's
 #                           #   own ledger is told from the primary's
-#                           #   (default: ops/task-loop/tasks; TASKPUMP_TASKS_SUBDIR accepted)
+#                           #   (default: tasks; TASKPUMP_TASKS_SUBDIR accepted)
 # TASKPUMP_LEDGER_REPO=     # the ledger checkout the pump refreshes and pushes
 #                           #   (default: <repo root>/ops)
 # TASKPUMP_CODE_REPO=       # repo whose commits the heartbeat productivity check
@@ -56,7 +56,7 @@
 # TASKPUMP_TASK_EXT=        # task-file extension (default: .md;
 #                           #   TASKPUMP_TASK_FILE_EXT accepted)
 # TASKPUMP_ID_PATTERN=      # regex `create` validates a new id against
-#                           #   (default: ^F[0-9]+(\.[0-9]+)?$)
+#                           #   (default: ^T[0-9]+(\.[0-9]+)?$)
 # TASKPUMP_TASK_PUSH=       # 1 = git push after each state commit (default: 0;
 #                           #   TASKPUMP_PUSH accepted)
 # TASKPUMP_PUSH_RETRIES=    # push attempts before giving up (default: 6)
@@ -82,7 +82,7 @@
 # ── Id grammar (tp monitor, tp dag-render) ───────────────────────────────────
 # How an id is split into phase and sub-task for grouping and layout. These are
 # the parsing half of TASKPUMP_ID_PATTERN above; keep the three consistent.
-# TASKPUMP_PHASE_SIGIL=     # letter a phase token starts with (default: F)
+# TASKPUMP_PHASE_SIGIL=     # letter a phase token starts with (default: T)
 # TASKPUMP_PHASE_SEPARATOR= # what ends the phase within an id (default: .)
 
 # ── Pump scheduling (tp pump) ────────────────────────────────────────────────

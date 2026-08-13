@@ -50,7 +50,7 @@ tp_load_config
 # root. It answers "does this worktree carry a ledger of its own?" and, when no
 # explicit tasks dir is given, it *is* the ledger's location — one key rather
 # than two spellings of the same path that can drift apart.
-: "${TASKPUMP_LEDGER_PROBE:=ops/task-loop/tasks}"
+: "${TASKPUMP_LEDGER_PROBE:=tasks}"
 
 _tp_script_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 _tp_script_root="$(cd "$_tp_script_dir/.." && pwd)"
@@ -78,8 +78,8 @@ fi
 : "${TASKPUMP_COMMITTER_EMAIL:=task@taskpump.local}"
 
 # Id grammar. See the contract at the top of this file.
-: "${TASKPUMP_ID_PATTERN:=^F[0-9]+(\.[0-9]+)?$}"
-: "${TASKPUMP_PHASE_SIGIL:=F}"
+: "${TASKPUMP_ID_PATTERN:=^T[0-9]+(\.[0-9]+)?$}"
+: "${TASKPUMP_PHASE_SIGIL:=T}"
 
 # Tripwire + concurrency constants.
 : "${TASKPUMP_TURN_BUDGET_DEFAULT:=50}"
@@ -1635,7 +1635,7 @@ Commands:
                                        — "how many tasks can launch now?". 0 while
                                        --count > 0 signals a stall (work, none
                                        ready). --count wins if both are given.
-                                     --phases accepts FN, FN..FM, and comma lists.
+                                     --phases accepts TN, TN..TM, and comma lists.
   list [--status <s>]                Human-readable listing (flags missing goals).
   goal <id> [--set "text"]           Read or set a task's one-line outcome goal.
   goal --missing                     List open/in_progress tasks with no goal.
@@ -1646,7 +1646,7 @@ Commands:
                                        reject self-blocking — an unresolvable
                                        blocker silently removes a task from the
                                        frontier with no diagnostic.
-  create <id> --title "..." [--phase FN] [--goal "..."] [--files a,b]
+  create <id> --title "..." [--phase TN] [--goal "..."] [--files a,b]
          [--blockers X,Y] [--milestone m]
                                      Author a new task file. Ids must be
                                        phase-anchored, matching
@@ -1692,7 +1692,7 @@ Commands:
 Config (env or taskpump.conf; the legacy ARACHNE_* spelling of each still works):
   Locations
     TASKPUMP_LEDGER_PROBE   ledger path relative to a workspace root, and the
-                              default tasks dir  (default: ops/task-loop/tasks)
+                              default tasks dir  (default: tasks)
     TASKPUMP_TASKS_DIR      tasks dir            (default: <root>/<probe>)
     TASKPUMP_TASK_OUT       next-task JSON path  (default: <parent>/.next-task)
     TASKPUMP_CODE_REPO      code repo root — what heartbeat measures commits in
@@ -1707,9 +1707,9 @@ Config (env or taskpump.conf; the legacy ARACHNE_* spelling of each still works)
                               task@taskpump.local)
   Id grammar
     TASKPUMP_ID_PATTERN     regex `create` validates a new id against
-                                            (default: ^F[0-9]+(\.[0-9]+)?$)
+                                            (default: ^T[0-9]+(\.[0-9]+)?$)
     TASKPUMP_PHASE_SIGIL    alphabetic prefix on a phase token; phase ranges
-                              strip and re-apply it                 (default: F)
+                              strip and re-apply it                 (default: T)
   Tripwires and concurrency
     TASKPUMP_TURN_BUDGET_DEFAULT  `claim` budget when --turns is omitted    (50)
     TASKPUMP_FAILURE_LIMIT  consecutive unproductive iterations before scrub
@@ -1726,7 +1726,7 @@ Config (env or taskpump.conf; the legacy ARACHNE_* spelling of each still works)
 The id grammar contract: an id is PHASE or PHASE.N, and the phase is everything
 before the first `.`. TASKPUMP_ID_PATTERN validates a new id; the phase split
 plus TASKPUMP_PHASE_SIGIL derive the phase from it. Phase grouping (--phase),
-range expansion (--phases F55..F63) and ordering are all built on that split, so
+range expansion (--phases T55..T63) and ordering are all built on that split, so
 the dot is part of the contract even though the sigil and the pattern are yours.
 
 The workspace is $PWD's git worktree when that worktree carries a ledger of its

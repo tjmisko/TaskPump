@@ -134,10 +134,10 @@ MANIFEST="${TASKPUMP_MANIFEST:-${MANIFEST:-$REPO_ROOT/$MANIFEST_SUBPATH}}"
 # files from another.
 # TASKPUMP_LEDGER_PROBE is the shared spelling (tp-task resolves the ledger with
 # it); TASKS_SUBDIR is accepted as a monitor-local override for compatibility.
-TASKS_SUBDIR="${TASKPUMP_LEDGER_PROBE:-${TASKPUMP_TASKS_SUBDIR:-ops/task-loop/tasks}}"
+TASKS_SUBDIR="${TASKPUMP_LEDGER_PROBE:-${TASKPUMP_TASKS_SUBDIR:-tasks}}"
 TASKS_DIR="${TASKPUMP_TASKS_DIR:-$REPO_ROOT/$TASKS_SUBDIR}"
 TASK_EXT="${TASKPUMP_TASK_EXT:-.md}"
-PHASE_SIGIL="${TASKPUMP_PHASE_SIGIL:-F}"
+PHASE_SIGIL="${TASKPUMP_PHASE_SIGIL:-T}"
 PHASE_SEP="${TASKPUMP_PHASE_SEPARATOR:-.}"
 
 # Agent workspace shape: what a container is called, what its log is called, and

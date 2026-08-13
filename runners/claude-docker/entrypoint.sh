@@ -31,8 +31,8 @@
 #   TASKPUMP_WORKSPACE_PATH          WORKSPACE_PATH       /workspace
 #   TASKPUMP_REPO_ROOT               REPO_ROOT            $WORKSPACE_PATH
 #   TASKPUMP_LEDGER_REPO             —                    $REPO_ROOT/ops
-#   TASKPUMP_TASKS_DIR               ARACHNE_TASKS_DIR    $LEDGER_REPO/task-loop/tasks
-#   TASKPUMP_TASK_OUT                ARACHNE_TASK_OUT     $LEDGER_REPO/task-loop/.next-task
+#   TASKPUMP_TASKS_DIR               ARACHNE_TASKS_DIR    $LEDGER_REPO/tasks
+#   TASKPUMP_TASK_OUT                ARACHNE_TASK_OUT     $LEDGER_REPO/.next-task
 #   TASKPUMP_TASK_FILE_EXT           —                    .md
 #   TASKPUMP_BRIEF                   ARACHNE_BRIEF        (required)
 #   TASKPUMP_RESUME_NOTE             ARACHNE_RESUME_NOTE  (none)
@@ -114,9 +114,10 @@ LEDGER_REPO="$(ep_first TASKPUMP_LEDGER_REPO TP_LEDGER_REPO)"
 : "${LEDGER_REPO:=$REPO_ROOT/ops}"
 
 TASKS_DIR="$(ep_first TASKPUMP_TASKS_DIR TP_TASKS_DIR ARACHNE_TASKS_DIR)"
-: "${TASKS_DIR:=$LEDGER_REPO/task-loop/tasks}"
+: "${TASKS_DIR:=$LEDGER_REPO/tasks}"
 TASK_OUT="$(ep_first TASKPUMP_TASK_OUT TP_TASK_OUT ARACHNE_TASK_OUT)"
-: "${TASK_OUT:=$LEDGER_REPO/task-loop/.next-task}"
+# Kept at dirname(TASKS_DIR)/.next-task, mirroring tp-task's own derivation.
+: "${TASK_OUT:=$LEDGER_REPO/.next-task}"
 TASK_FILE_EXT="$(ep_first TASKPUMP_TASK_EXT TASKPUMP_TASK_FILE_EXT TP_TASK_FILE_EXT)"
 : "${TASK_FILE_EXT:=.md}"
 

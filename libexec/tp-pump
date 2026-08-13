@@ -293,7 +293,7 @@ fi
 # Numeric ranges + comma lists; non-numeric tokens pass through uppercased.
 # Honors TASKPUMP_PHASE_SIGIL exactly as arachne-task does: with sigil G,
 # "G55", "g55" and "55" all canonicalize to "G55".
-: "${TASKPUMP_PHASE_SIGIL:=F}"
+: "${TASKPUMP_PHASE_SIGIL:=T}"
 
 # Drop a leading sigil from a phase token, case-insensitively (tp-task's
 # strip_phase_sigil, mirrored here because tp-task is an executable, not a lib).
