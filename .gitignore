@@ -22,4 +22,12 @@
 .arachne-task.lock
 .auto-trunk.lock
 .auto-trunk-quarantine
-.worktrees/
+# Worktrees must be VISIBLE to git: the pump refuses to launch into a
+# gitignored worktree (tp-pump's check-ignore guard — the 2026-04-14 incident),
+# and the operator's global excludes (~/.config/git/ignore) ignores
+# **/.worktrees/** in every repo. A repo-level negation outranks the global
+# source, so this line is what lets the dogfood pump launch at all; fs-guard's
+# default allowlist (^\.worktrees/) is what tolerates the untracked dirt this
+# re-exposes. Do NOT add a bare `.worktrees/` ignore here — the pump's
+# gitignore-repair hook deletes it on every tick (that is the incident).
+!.worktrees/**
