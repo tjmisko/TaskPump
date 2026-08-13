@@ -33,6 +33,13 @@ _tp_self_root="$(CDPATH='' cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")"
 # shellcheck source=../lib/config.sh
 . "$_tp_self_root/lib/config.sh"
 tp_load_config
+# The naming contract (docs/RUNNERS.md §2) is shared with the supervisor, and a
+# claim is where a branch enters the ledger — so the rule for what a branch name
+# may be lives in one place and both tools read it, rather than each keeping its
+# own opinion. A checkout without the lib is not a working install; nothing here
+# guesses a fallback.
+# shellcheck source=../lib/pump-lib.sh
+. "${TP_LIB_DIR:-$_tp_self_root/lib}/pump-lib.sh"
 
 # ── Workspace resolution ──────────────────────────────────────────────────────
 # Resolve the workspace whose ledger we operate on. Env vars still override.
@@ -669,6 +676,17 @@ cmd_claim() {
   done
   [[ -z "$id" ]] && die "usage: $TASKPUMP_PROG_NAME claim <id> --branch <b> [--turns <n>]"
   [[ -z "$branch" ]] && die "--branch is required"
+  # The claim is where the branch enters the ledger, so it is where a branch that
+  # cannot carry an agent name has to be stopped. Letting it through costs
+  # nothing here and everything later: the agent launches under a name liveness
+  # cannot map back, the pump reads the phase as dead, and it launches a second
+  # agent on the same branch (docs/RUNNERS.md §2).
+  local branch_problem
+  if ! branch_problem="$(apl_branch_slug_reject_reason "$branch")"; then
+    die "$branch_problem
+the agent name is the branch with \"/\" replaced by \"-\", and that mapping has to
+be reversible; use a branch name with at most one \"/\" (for example feat/g3)"
+  fi
   local file; file=$(task_file_required "$id")
 
   local status; status=$(fm_get "$file" '.status')

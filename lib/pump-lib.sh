@@ -212,6 +212,59 @@ apl_agent_prefix() { printf '%s' "${TASKPUMP_AGENT_PREFIX:-tp-agent-}"; }
 # spelling; DOCKER is the legacy one every existing harness sets.
 apl_docker() { printf '%s' "${TASKPUMP_DOCKER:-${DOCKER:-docker}}"; }
 
+# apl_branch_slug_reject_reason <branch> — empty output and exit 0 when the
+# branch can carry an agent name; one line saying what is wrong and exit 1 when
+# it cannot.
+#
+# The slug is the branch with `/` → `-` (docs/RUNNERS.md §2), and that map is
+# the join key of the whole stack: the pump derives a name from a branch, both
+# watchdogs count by it, cleanup maps a name back to a worktree. The encoding is
+# frozen — container names already exist on operators' hosts — so a branch the
+# encoding cannot carry has to be refused at the door instead.
+#
+# Refused, and why each one is not pedantry:
+#
+#   more than one `/`   `feat/a/b` and `feat/a-b` produce the same slug, so the
+#                       reverse mapping cannot tell them apart. This is the case
+#                       the docs called "does not round-trip cleanly" and then
+#                       let through anyway: the branch launches, and the FAILURE
+#                       shows up much later somewhere else — an agent whose
+#                       container is invisible to liveness, so the pump launches
+#                       a second one on the same branch.
+#   leading `/`         yields a name starting with `-`, which is not a legal
+#                       container name (and reads as a flag to half the CLIs
+#                       that will be handed it).
+#   trailing `/`        yields a name ending in `-` and a slug that collides
+#                       with the branch without it.
+#   whitespace          a name that cannot survive being written to a
+#                       whitespace-delimited registry (runners/local) or read
+#                       back out of `docker ps --format`.
+#
+# One rule, one place: tp-task refuses the claim, the pump refuses the run at
+# startup, and neither gets to have its own opinion about what is legal.
+apl_branch_slug_reject_reason() {
+  local branch="$1"
+  if [[ -z "$branch" ]]; then
+    printf 'the branch name is empty\n'; return 1
+  fi
+  if [[ "$branch" =~ [[:space:]] ]]; then
+    printf 'branch %s contains whitespace, which an agent name cannot carry\n' "$branch"; return 1
+  fi
+  if [[ "$branch" == /* ]]; then
+    printf 'branch %s starts with "/", which would make the agent name start with "-"\n' "$branch"; return 1
+  fi
+  if [[ "$branch" == */ ]]; then
+    printf 'branch %s ends with "/", which would make the agent name end with "-"\n' "$branch"; return 1
+  fi
+  local slashes="${branch//[^\/]/}"
+  if (( ${#slashes} > 1 )); then
+    printf 'branch %s has %d "/" separators; the agent name maps "/" to "-", so %s cannot be mapped back to one branch\n' \
+      "$branch" "${#slashes}" "${branch//\//-}"
+    return 1
+  fi
+  return 0
+}
+
 # apl__runtime_ps_names <prefix> — the ONE `docker ps` filter expression in the
 # stack. Prints the runtime's answer verbatim, and leaves its exit status and its
 # stderr alone: the two callers below differ only in what they do with those.

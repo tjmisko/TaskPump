@@ -149,9 +149,31 @@ Two consequences:
 
 - **The prefix must be distinctive.** Enumeration matches on it; a prefix that
   collides with other containers on the host will confuse liveness.
-- **Branch names with more than one `/` do not round-trip cleanly** back to a
-  branch. Keep branch names to one separator (`feat/t12`), which is what the
-  default branch prefix produces.
+- **A branch name may contain at most one `/`.** `feat/a/b` and `feat/a-b`
+  produce the same slug, so the name cannot be mapped back to one branch.
+
+### Enforced, not advisory
+
+The second rule used to be a recommendation, and a branch that broke it launched
+normally — the failure surfaced much later and somewhere else, as an agent whose
+name liveness could not map back, a phase the pump therefore read as dead, and a
+second agent launched on the same branch. That is the one thing the supervisor
+must never do, so the rule is now checked at both doors:
+
+| Where | What happens |
+|---|---|
+| `tp task claim --branch <b>` | Refused, naming the ambiguous slug it would have produced. Nothing is written. |
+| `tp pump` startup | The branch the run *would* construct is validated once, before any tick. A bad `TASKPUMP_BRANCH_PREFIX` (`--branch-prefix`) aborts the run naming the key. |
+
+Also refused: a leading `/` (the name would start with `-`, which is not a legal
+container name), a trailing `/`, and whitespace (a name that cannot survive a
+whitespace-delimited registry or `docker ps --format`).
+
+**The encoding itself is frozen.** Container names already exist on operators'
+hosts, so the fix for an unmappable branch is a different branch name, never a
+cleverer slug. One rule lives in `lib/pump-lib.sh`
+(`apl_branch_slug_reject_reason`) and both tools read it, so neither gets its own
+opinion about what is legal.
 
 ---
 

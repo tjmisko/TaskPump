@@ -423,6 +423,33 @@ got=$(APL_RUNNER_LIST_CAP=0 APL_LIVENESS_RUNNER="$BIN/runner-v2" DOCKER="$BIN/fa
   && pass "an inherited 'unsupported' verdict is reused, not re-probed" \
   || fail "the cached capability was ignored: '$got'"
 
+echo "--- the branch-naming rule: one place, because two tools enforce it ---"
+# The slug map (`/` → `-`) is the join key of the whole stack, and it is FROZEN —
+# container names already exist on operators' hosts. So a branch the encoding
+# cannot carry is refused rather than re-encoded, and the rule lives here rather
+# than once in tp-task and once in the pump.
+for good in feat/g3 feat/f79-x main wip-thing a/b; do
+  apl_branch_slug_reject_reason "$good" >/dev/null \
+    && pass "branch '$good' is accepted" \
+    || fail "branch '$good' was rejected: $(apl_branch_slug_reject_reason "$good")"
+done
+
+# Two separators is the case the docs called "does not round-trip" and then let
+# through anyway. feat/a/b and feat/a-b both slug to feat-a-b.
+for bad in feat/a/b a/b/c/d /leading trailing/ "has space" ""; do
+  got=$(apl_branch_slug_reject_reason "$bad" 2>&1); rc=$?
+  [[ $rc -ne 0 && -n "$got" ]] \
+    && pass "branch '$bad' is rejected with a reason" \
+    || fail "branch '$bad' was accepted (rc=$rc)"
+done
+
+# The message has to carry the collision, not just say no: an operator looking
+# at "feat-a-b" understands immediately why two branches cannot both have it.
+got=$(apl_branch_slug_reject_reason "feat/a/b" 2>&1 || true)
+[[ "$got" == *"feat-a-b"* ]] \
+  && pass "the reason names the ambiguous slug it would have produced" \
+  || fail "the reason does not show the collision: '$got'"
+
 echo "--- pool cap: one shared fallback, not three private ones ---"
 CAP_FILE="$TMP/absent-cap"
 [[ "$(JOBS=4 apl_read_cap)" == "4" ]] && pass "caller's JOBS wins when no cap file exists" \

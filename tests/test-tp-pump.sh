@@ -1261,6 +1261,30 @@ out=$(pump F55..X9 2>&1); rc=$?
 [[ $rc -ne 0 ]] && pass "F55..X9 exits non-zero under the pinned F sigil" || fail "F55..X9 exited 0:\n$out"
 have "$out" "bad phase range 'F55..X9'" && pass "pinned-sigil range error surfaced" || fail "no range error:\n$out"
 
+echo "--- Test 30c: a branch prefix whose branches cannot be named fails at tick zero ---"
+# Every phase in the range takes the same prefix, so a prefix that produces an
+# unmappable branch is a CONFIGURATION error, not a per-launch one. `x/y/` makes
+# `x/y/f55`, whose slug `x-y-f55` is also what `x/y-f55` and `x-y/f55` produce —
+# liveness could not map the name back to one branch. Left unchecked the run
+# launches fine and the failure surfaces much later as a phase the pump thinks
+# is dead, so it launches a second agent on the same branch.
+out=$(TASKPUMP_BRANCH_PREFIX=x/y/ pump F55 2>&1); rc=$?
+[[ $rc -ne 0 ]] && pass "a prefix that cannot round-trip aborts the run (rc=$rc)" \
+  || fail "an unmappable branch prefix was accepted:\n$out"
+have "$out" 'TASKPUMP_BRANCH_PREFIX' && pass "the abort names the key to fix" \
+  || fail "the error does not name the key:\n$out"
+have "$out" 'x-y-f55' && pass "the abort shows the ambiguous name it would produce" \
+  || fail "the error does not show the collision:\n$out"
+have "$out" 'plan — phases' && fail "the plan printed despite the bad prefix:\n$out" \
+  || pass "nothing is planned before the abort"
+# The shipped default still works, and so does a prefix with no separator at all.
+out=$(pump F55 2>&1); rc=$?
+[[ $rc -eq 0 ]] && have "$out" 'plan — phases F55' && pass "the default feat/ prefix is unaffected" \
+  || fail "the default prefix broke:\n$out"
+out=$(TASKPUMP_BRANCH_PREFIX=wip- pump F55 2>&1); rc=$?
+[[ $rc -eq 0 ]] && pass "a prefix with no '/' at all is accepted" \
+  || fail "a separator-free prefix was refused:\n$out"
+
 echo "--- Test 31: a real run requires TASKPUMP_IMAGE; --dry-run does not (G1.5) ---"
 # The image default (arachne) is gone. A REAL run with no image configured must
 # abort up front — before the image build and before any runner call — naming

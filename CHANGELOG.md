@@ -25,6 +25,20 @@ in [docs/LEDGER-CONTRACT.md §1](docs/LEDGER-CONTRACT.md#1-versioning).
   The pump does not call `list` yet — it still scrapes — so this lands
   verifiable on its own.
 
+- **A branch that cannot carry an agent name is now refused**, at the claim
+  (`tp task claim --branch feat/a/b`) and at pump startup (a
+  `TASKPUMP_BRANCH_PREFIX` whose branches would be unmappable aborts the run
+  before tick zero, naming the key).
+
+  The agent name is the branch with `/` → `-`, so `feat/a/b` and `feat/a-b`
+  produce the same name. This was documented as advisory and **silently broken
+  in practice**: the branch launched, liveness could not map the name back, the
+  pump read the phase as dead, and it launched a second agent on the same branch
+  — the one thing the supervisor must never do. Also refused: a leading or
+  trailing `/`, and whitespace. The slug encoding is unchanged (existing
+  container names keep matching); one rule in `lib/pump-lib.sh` serves both
+  tools. See [docs/RUNNERS.md §2](docs/RUNNERS.md#2-naming-and-identity).
+
 - `apl_live_agent_names_strict` in `lib/pump-lib.sh`: the existing enumeration
   with the runtime's failure propagated instead of flattened into an empty list.
   Both forms now share one `docker ps --filter` expression.
