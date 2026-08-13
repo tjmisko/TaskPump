@@ -20,6 +20,12 @@ WATCHDOG="$TP_ROOT/libexec/tp-disk-watchdog"
 # switch; this one covers standalone runs.
 export TASKPUMP_NO_CONF=1
 
+# Reference pin (G1.2): the live-agent skip in Test 3 matches the stub's
+# arachne-agent-* container name through this prefix. It used to arrive through
+# the baked default, which G1.5 flips to tp-agent-; the historical spelling is
+# pinned here with the examples/arachne.conf value.
+export TASKPUMP_AGENT_PREFIX=arachne-agent-
+
 PASS=0; FAIL=0
 pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
@@ -55,6 +61,11 @@ assert_has "feat/b target listed"            "$out" "$FIX/.worktrees/feat/b/targ
 assert_has "reclaimed 2, skipped 0 live"     "$out" "reclaimed 2 worktree target dir(s); skipped 0 live"
 assert_has "primary left alone by default"   "$out" "left alone (pass --include-primary to reclaim)"
 assert_no  "primary not reclaimed by default" "$out" "primary: $FIX/target"
+# Bare built-in behavior, deliberately: with no reclaim command configured,
+# tp-cleanup still falls back to its cargo-shaped target/ logic today. G1.7
+# makes that logic conditional on a configured TASKPUMP_RECLAIM_CMD and updates
+# these assertions (and Test 4's message) in the same commit as the change;
+# examples/arachne.conf pins TASKPUMP_RECLAIM_CMD='cargo clean' for Arachne.
 if command -v cargo >/dev/null 2>&1; then
   assert_has "feat/a uses cargo clean (Cargo.toml present)" "$out" "cargo clean --manifest-path '$FIX/.worktrees/feat/a/Cargo.toml'"
   assert_has "feat/b falls back to rm -rf (no Cargo.toml)"  "$out" "rm -rf '$FIX/.worktrees/feat/b/target'"
@@ -100,6 +111,7 @@ WATCHDOG="$TPFIX/libexec/tp-disk-watchdog"
 out="$(ARACHNE_DISK_REPO_ROOT="$FIX" FREE_GB_OVERRIDE=3 PANIC_THRESHOLD_GB=5 PAUSE_THRESHOLD_GB=10 \
        "$WATCHDOG" --once --dry-run 2>&1)"
 assert_has "panic state entered (free=3 < panic=5)" "$out" "HEALTHY → PANIC"
+# The "cargo target/" wording is the built-in fallback's; G1.7 rewrites it.
 assert_has "reclaim_targets ran"                    "$out" "reclaiming cargo target/ dirs (worktrees + primary)"
 assert_has "cleanup invoked with targets+primary+dry-run" "$out" "STUB-CLEANUP-CALLED args: --targets --include-primary --dry-run"
 assert_has "docker prune still attempted"           "$out" "would run tp-cleanup --docker"

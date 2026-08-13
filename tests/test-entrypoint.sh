@@ -317,16 +317,20 @@ EOF
 }
 
 echo "--- canonical vs legacy environment equivalence ---"
+# The goal-note NAME is pinned on both sides (its .arachne-goal.md default
+# flips to .taskpump-goal.md in G1.3, and the name is incidental to what these
+# cases assert). GOAL_NOTE_NAME has no legacy spelling, so pinning it on the
+# legacy side too keeps the comparison exact without diluting it.
 R1=$(mk_ws canon)
 out_canon=$(run_ep TASKPUMP_ENTRYPOINT_TEST_MODE=plan \
   TP_WORKSPACE="$R1/wt" TP_REPO_ROOT="$R1" TP_BRIEF="$R1/brief.md" \
   TP_TASK_ID=F9.1 TP_PHASE=F9 TP_MODEL=haiku TP_MAX_TURNS=42 \
-  TASKPUMP_TASKS_DIR="$R1/tasks")
+  TASKPUMP_TASKS_DIR="$R1/tasks" TASKPUMP_GOAL_NOTE_NAME=.arachne-goal.md)
 rc_canon=$?
 out_legacy=$(run_ep TASKPUMP_ENTRYPOINT_TEST_MODE=plan \
   WORKSPACE_PATH="$R1/wt" REPO_ROOT="$R1" ARACHNE_BRIEF="$R1/brief.md" \
   ARACHNE_TASK_ID=F9.1 ARACHNE_PHASE=F9 AGENT_MODEL=haiku MAX_TURNS=42 \
-  ARACHNE_TASKS_DIR="$R1/tasks")
+  ARACHNE_TASKS_DIR="$R1/tasks" TASKPUMP_GOAL_NOTE_NAME=.arachne-goal.md)
 rc_legacy=$?
 [[ $rc_canon -eq 0 && $rc_legacy -eq 0 ]] \
   && pass "plan mode exits 0 under both spellings" \
@@ -366,8 +370,13 @@ grep -q '^model=opus$'  <<<"$rep_def" && pass "model defaults to opus"      || f
 grep -q '^max_turns=600$' <<<"$rep_def" && pass "max_turns defaults to 600" || fail "max_turns default wrong:\n$rep_def"
 grep -q '^safety_turns=3$' <<<"$rep_def" && pass "safety_turns defaults to 3" || fail "safety_turns default wrong:\n$rep_def"
 grep -q "^ledger_repo=$R2/ops$" <<<"$rep_def" && pass "ledger repo defaults to <repo>/ops" || fail "ledger default wrong:\n$rep_def"
+# Bare-default assertion, deliberately: today the shipped default is still the
+# historical consumer shim. G1.6 flips it to `tp` on PATH (with a loud startup
+# error until the CLI is mounted) and updates this assertion in the same commit
+# as the flip. The arachne.conf-pinned spelling stays covered by the override
+# cases just below.
 grep -q "^task_cli=$R2/wt/scripts/arachne-task$" <<<"$rep_def" \
-  && pass "workspace task CLI defaults to scripts/arachne-task under the workspace" \
+  && pass "workspace task CLI defaults to scripts/arachne-task under the workspace (flips in G1.6)" \
   || fail "task CLI default wrong:\n$rep_def"
 
 # The workspace task CLI is the consumer's shim and must be overridable, both by
@@ -417,20 +426,24 @@ for name in TASKPUMP_TASKS_DIR TP_TASKS_DIR TASKPUMP_AGENT_LOG_NAME TP_AGENT_LOG
 done
 
 echo "--- stdin assembly ordering ---"
+# Both note NAMES are pinned (G1.3 flips their .arachne-* defaults); the
+# ordering and the convention-fallback mechanism are what these cases assert.
 R3=$(mk_ws ordering)
 printf 'resume preamble\n' >| "$R3/wt/.arachne-resume.md"
 rep_ord=$(report "$(run_ep TASKPUMP_ENTRYPOINT_TEST_MODE=plan \
   TP_WORKSPACE="$R3/wt" TP_REPO_ROOT="$R3" TP_BRIEF="$R3/brief.md" \
   TP_RESUME_NOTE="$R3/wt/.arachne-resume.md" \
-  TP_TASK_ID=F9.1 TASKPUMP_TASKS_DIR="$R3/tasks")")
+  TP_TASK_ID=F9.1 TASKPUMP_TASKS_DIR="$R3/tasks" \
+  TASKPUMP_GOAL_NOTE_NAME=.arachne-goal.md)")
 grep -q "prompt_parts=$R3/wt/.arachne-goal.md $R3/wt/.arachne-resume.md $R3/brief.md" <<<"$rep_ord" \
   && pass "stdin order is goal, then resume note, then brief" \
   || fail "stdin assembly order wrong:\n$rep_ord"
 # The resume note is also findable by convention when the env path does not
-# resolve inside the container.
+# resolve inside the container. The conventional NAME is the configured one.
 rep_conv=$(report "$(run_ep TASKPUMP_ENTRYPOINT_TEST_MODE=plan \
   TP_WORKSPACE="$R3/wt" TP_REPO_ROOT="$R3" TP_BRIEF="$R3/brief.md" \
-  TP_RESUME_NOTE=/host/only/path/.arachne-resume.md)")
+  TP_RESUME_NOTE=/host/only/path/.arachne-resume.md \
+  TASKPUMP_RESUME_NOTE_NAME=.arachne-resume.md)")
 grep -q "$R3/wt/.arachne-resume.md" <<<"$rep_conv" \
   && pass "an unresolvable resume path falls back to the conventional workspace file" \
   || fail "resume-note fallback did not fire:\n$rep_conv"
@@ -531,6 +544,10 @@ want+=' -e TASKPUMP_AGENT_MODEL=opus'
 want+=' -v @R@/claude-home:/tmp/claude-home:ro'
 want+=' -v @R@/claude.json:/tmp/claude-home-json/.claude.json:ro'
 want+=' -v @R@:@R@:ro -v @R@/.git:@R@/.git -v @R@/wt:@R@/wt -v @R@/ops:@R@/ops'
+# The trailing /entrypoint-parallel.sh is the bare ENTRYPOINT default (this
+# launch passes no TP_ENTRYPOINT). G1.5 flips that default to the shipped
+# runner's own entrypoint and updates this line in the same commit; the
+# override path is covered separately below.
 want+=' -w @R@/wt agentimg /entrypoint-parallel.sh'
 [[ $rc -eq 0 ]] && pass "launch exits 0 and prints the container id" || fail "launch rc=$rc:\n$got"
 if [[ "$got_norm" == "$want" ]]; then

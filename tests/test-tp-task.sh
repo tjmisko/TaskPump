@@ -138,6 +138,17 @@ export ARACHNE_TASK_OUT="$TASKS_REPO/task-loop/.next-task"
 export ARACHNE_CODE_REPO="$CODE_REPO"
 export ARACHNE_TASK_PUSH=0
 
+# Reference pins (G1.2): this suite is the Arachne-shaped half of the pair —
+# test-tp-task-generic.sh drives a deliberately different shape. Its F grammar
+# used to arrive silently through the tools' baked defaults; the v0.1.0 flips
+# (G1.6) retire those defaults, so the shape is pinned here explicitly, with
+# the same values examples/arachne.conf pins for the reference consumer. The
+# legacy spellings, deliberately, like every other key this suite sets. The
+# TP_ENV_UNSET cases below still clear these: what those cases exercise is
+# resolution mechanics, with the probe re-pinned per invocation.
+export ARACHNE_ID_PATTERN='^F[0-9]+(\.[0-9]+)?$'
+export ARACHNE_PHASE_SIGIL=F
+
 # Fixtures:
 #   F17.1 — status=done (a satisfied blocker)
 #   F17.2 — open, no blockers → eligible
@@ -779,11 +790,14 @@ fi
 # silently drift apart. These cases run the CLI with no ARACHNE_TASKS_DIR set,
 # so they exercise the default-resolution path the rest of the suite overrides.
 resolution_root_of() {
-  # Print the tasks dir the CLI resolves when run from $1, with no config of any
-  # kind in the environment — TP_ENV_UNSET clears both spellings of every key,
-  # which is what makes this the default-resolution path rather than a test of
-  # whichever spelling happened to survive.
+  # Print the tasks dir the CLI resolves when run from $1. TP_ENV_UNSET clears
+  # both spellings of every key, so nothing the suite exported can pre-answer
+  # the question; only the ledger probe is then re-pinned to the Arachne shape
+  # these fixtures are built in (the examples/arachne.conf value — the shipped
+  # default until G1.6 flips it to `tasks`). What these cases exercise is the
+  # workspace-vs-script-root MECHANISM, not the probed path's default.
   ( cd "$1" && env "${TP_ENV_UNSET[@]}" \
+      TASKPUMP_LEDGER_PROBE=ops/task-loop/tasks \
       ARACHNE_TASK_NOCOMMIT=1 "$2" resolve --tasks-dir 2>/dev/null )
 }
 
@@ -864,14 +878,14 @@ else
   fail "custom-probe resolution got '$got', expected '$WS_C/tasks'"
 fi
 
-# And the negative: with the default probe, that same workspace does NOT look
-# like it carries a ledger, so resolution falls back to the script's workspace.
-# This is what proves the probe is doing the deciding.
+# And the negative: under the pinned ops/task-loop/tasks probe, that same
+# workspace does NOT look like it carries a ledger, so resolution falls back to
+# the script's workspace. This is what proves the probe is doing the deciding.
 got=$(resolution_root_of "$WS_C" "$WS_A/libexec/tp-task")
 if [[ "$got" == "$WS_A/ops/task-loop/tasks" ]]; then
-  pass "the default probe does not match a differently-shaped workspace"
+  pass "the pinned probe does not match a differently-shaped workspace"
 else
-  fail "default-probe fallback got '$got', expected '$WS_A/ops/task-loop/tasks'"
+  fail "pinned-probe fallback got '$got', expected '$WS_A/ops/task-loop/tasks'"
 fi
 
 # ── title / blockers / create verbs ──────────────────────────────────────────

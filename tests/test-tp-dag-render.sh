@@ -31,6 +31,11 @@ TD="$TMP/tasks"; mkdir -p "$TD"
 export TASKPUMP_TASKS_DIR="$TD"
 export TASKPUMP_PUMP_STATE_FILE="$TMP/no-such.state"
 
+# Reference pin (G1.2): the fixtures below are F-grammar and the --phases
+# ranges parse through the sigil, whose baked default flips to T in G1.6.
+# Pinned with the examples/arachne.conf value.
+export TASKPUMP_PHASE_SIGIL=F
+
 # mktask <id> <phase> <status> <claimed_by> [blocker ...]
 mktask() {
     local id="$1" ph="$2" st="$3" by="$4"; shift 4

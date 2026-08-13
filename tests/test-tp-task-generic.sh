@@ -278,13 +278,22 @@ err=$("$CLI" title T2.1 --set "Ship the widget twice" 2>&1 >/dev/null)
   || fail "warned about the remote with TASKPUMP_TASK_PUSH=0: '$err'"
 
 # ── diagnostics carry the configured program name ────────────────────────────
-# The default is the historical `arachne-task`, so existing output stays
-# byte-identical; a consumer who does not want to be told about Arachne when a
-# verb misfires sets TASKPUMP_PROG_NAME.
 echo
 echo "--- program name in diagnostics ---"
+# Conf-pinned: the reference consumer names the historical prefix explicitly in
+# examples/arachne.conf (TASKPUMP_PROG_NAME=arachne-task), so this assertion
+# survives every default flip. TASKPUMP_CONFIG outranks the suite's
+# TASKPUMP_NO_CONF hermeticity switch, and this suite's exported TASKPUMP_*
+# fixture env still outranks the conf — so only keys the suite leaves unset
+# (PROG_NAME among them) arrive from the pins.
+err=$(TASKPUMP_CONFIG="$TP_ROOT/examples/arachne.conf" "$CLI" block T2.1 2>&1 >/dev/null || true)
+[[ "$err" == "arachne-task: "* ]] && pass "the arachne.conf pin keeps the historical prefix" \
+  || fail "conf-pinned diagnostic prefix was '$err'"
+# Bare default: today the shipped default is still the historical spelling.
+# G1.4 flips it to `tp-task: ` and updates this assertion in the same commit
+# as the flip.
 err=$("$CLI" block T2.1 2>&1 >/dev/null || true)
-[[ "$err" == "arachne-task: "* ]] && pass "diagnostics default to the historical prefix" \
+[[ "$err" == "arachne-task: "* ]] && pass "bare default prefix is still the historical spelling (flips in G1.4)" \
   || fail "default diagnostic prefix was '$err'"
 err=$(TASKPUMP_PROG_NAME=widget-tasks "$CLI" block T2.1 2>&1 >/dev/null || true)
 [[ "$err" == "widget-tasks: "* ]] && pass "TASKPUMP_PROG_NAME rebrands diagnostics" \
