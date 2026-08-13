@@ -170,7 +170,8 @@
 #                           #   brief; resolves the same three ways, ending at
 #                           #   <install>/templates/resume-note.md
 # TASKPUMP_TASK_CLI=        # how an agent invokes the ledger CLI from inside its
-#                           #   worktree (default: scripts/arachne-task)
+#                           #   worktree — the spelling briefs quote at the agent
+#                           #   (default: tp task)
 # TASKPUMP_SUBMODULE_PROBE= # a path that proves the ledger submodule is populated
 #                           #   (default: ops/planning/STATUS.md)
 # TASKPUMP_RECLAIM_CMD=     # how to reclaim build output from a finished workspace, so
@@ -284,8 +285,9 @@
 #                           #   (default: none)
 # TASKPUMP_CONTAINER_USER=  # user the session runs as (default: dev)
 # TASKPUMP_CONTAINER_HOME=  # its home (default: /home/<container user>)
-# TASKPUMP_WORKSPACE_TASK_CLI=  # the ledger CLI's path within the workspace, as the
-#                           #   container invokes it (default: scripts/arachne-task)
+# TASKPUMP_WORKSPACE_TASK_CLI=  # the ledger CLI the container invokes: absolute, or
+#                           #   workspace-relative, or a bare command found on PATH
+#                           #   (default: tp — startup fails loudly if it is absent)
 # TASKPUMP_SAFETY_TURNS=    # turn budget for the entrypoint's safety-net claim (default: 3)
 # TASKPUMP_AGENT_WALL_TIMEOUT_S=  # wall-clock cap on a session; firing exits 124
 #                           #   (default: unset = no cap)

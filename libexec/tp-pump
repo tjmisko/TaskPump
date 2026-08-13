@@ -118,14 +118,19 @@ fi
 # against a fixture tree (single source for both launch_phase and reclaim).
 WORKTREES_DIR="${TASKPUMP_PUMP_WORKTREES_DIR:-${TASKPUMP_WORKTREES_DIR:-$REPO_ROOT/.worktrees}}"
 
-# What the templates say about this project. The defaults reproduce Arachne's
-# wording exactly, so a rendered brief or resume note is unchanged for it.
-#   TASKPUMP_TASK_CLI     how an agent invokes the ledger CLI from its worktree
+# What the templates say about this project. Arachne's wording survives through
+# the examples/arachne.conf pins, not through what is baked here.
+#   TASKPUMP_TASK_CLI     how an agent invokes the ledger CLI from its worktree.
+#                         Default `tp task` — the README quickstart's own
+#                         spelling for every ledger verb, so a rendered brief
+#                         commands something an agent with tp on PATH can run
+#                         (`tp task claim …`), matching the entrypoint's
+#                         workspace-CLI default of `tp`.
 #   TASKPUMP_VERIFY_CMDS  newline-separated commands a task must leave green;
 #                         rendered mid-sentence as `a` and `b`
 #   TASKPUMP_PROJECT_BRIEF  one paragraph pointing an agent at the project's own
 #                         contributor documentation
-TASK_CLI="${TASKPUMP_TASK_CLI:-scripts/arachne-task}"
+TASK_CLI="${TASKPUMP_TASK_CLI:-tp task}"
 TASK_CLI_NAME="$(basename "$TASK_CLI")"
 # Built outside the expansions: an apostrophe inside a ${x:-word} default is a
 # real quote to bash, and would swallow the rest of the file.

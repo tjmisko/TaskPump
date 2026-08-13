@@ -166,12 +166,17 @@ exist in the container falls back to `$WORKSPACE/.taskpump-resume.md`.
 
 ### What the task CLI sees
 
-The entrypoint invokes the **consumer's** task CLI from inside the workspace, at
-`TASKPUMP_WORKSPACE_TASK_CLI` (default `scripts/arachne-task`, relative to the
-workspace; an absolute value is used as given). That default names Arachne's own
-shim, which is correct: the container can only see what is mounted, and the
-TaskPump install directory is not among the mounts. A shim that `exec`s a path
-outside the mount set will fail at runtime while still passing an `-x` check.
+The entrypoint invokes the task CLI named by `TASKPUMP_WORKSPACE_TASK_CLI`. An
+absolute value is used as given; a relative path containing a `/` resolves
+under the workspace; a bare command name (the default, `tp`) resolves on the
+container's `PATH`. The container can only see what is mounted, and until the
+agent image carries `tp` (G4.3) a bare default cannot resolve — so the
+entrypoint fails loudly at startup, before the session, naming both fixes: set
+`TASKPUMP_WORKSPACE_TASK_CLI` to the ledger CLI's path in the workspace (the
+reference consumer pins `scripts/arachne-task`), or provide `tp` in the agent
+image. A shim that `exec`s a path outside the mount set will still fail at
+runtime while passing an `-x` check — the startup probe covers presence, not
+what the shim reaches for.
 
 There are exactly three call sites, all in the session script:
 

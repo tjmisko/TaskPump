@@ -36,6 +36,16 @@ export TASKPUMP_NO_CONF=1
 
 WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
 
+# The workspace-CLI default is a bare `tp` resolved on PATH (G1.6), and the
+# entrypoint refuses to start when it cannot be found. Most fixtures here are
+# not about that default, so a stub tp stays on PATH for the whole suite —
+# hermetic against whether the host has a real tp installed — and the bare-image
+# error path is exercised in its own cases below, under a PATH without it.
+TPBIN="$WORK/tp-on-path"; mkdir -p "$TPBIN"
+printf '#!/usr/bin/env bash\nexit 0\n' >| "$TPBIN/tp"
+chmod +x "$TPBIN/tp"
+export PATH="$TPBIN:$PATH"
+
 PASS=0; FAIL=0
 pass() { printf 'PASS: %s\n' "$*"; PASS=$((PASS + 1)); }
 fail() { printf 'FAIL: %s\n' "$*" >&2; FAIL=$((FAIL + 1)); }
@@ -370,13 +380,14 @@ grep -q '^model=opus$'  <<<"$rep_def" && pass "model defaults to opus"      || f
 grep -q '^max_turns=600$' <<<"$rep_def" && pass "max_turns defaults to 600" || fail "max_turns default wrong:\n$rep_def"
 grep -q '^safety_turns=3$' <<<"$rep_def" && pass "safety_turns defaults to 3" || fail "safety_turns default wrong:\n$rep_def"
 grep -q "^ledger_repo=$R2/ops$" <<<"$rep_def" && pass "ledger repo defaults to <repo>/ops" || fail "ledger default wrong:\n$rep_def"
-# Bare-default assertion, deliberately: today the shipped default is still the
-# historical consumer shim. G1.6 flips it to `tp` on PATH (with a loud startup
-# error until the CLI is mounted) and updates this assertion in the same commit
-# as the flip. The arachne.conf-pinned spelling stays covered by the override
-# cases just below.
-grep -q "^task_cli=$R2/wt/scripts/arachne-task$" <<<"$rep_def" \
-  && pass "workspace task CLI defaults to scripts/arachne-task under the workspace (flips in G1.6)" \
+grep -q "^tasks_dir=$R2/ops/tasks$" <<<"$rep_def" \
+  && pass "tasks dir defaults to <ledger>/tasks (G1.6 ledger shape)" \
+  || fail "tasks dir default wrong:\n$rep_def"
+# The bare default is `tp`, found on PATH (the suite keeps a stub there); the
+# no-tp-on-PATH error path has its own section below. The arachne.conf-pinned
+# spelling stays covered by the override cases just after this.
+grep -q '^task_cli=tp$' <<<"$rep_def" \
+  && pass "workspace task CLI defaults to tp on PATH (G1.6)" \
   || fail "task CLI default wrong:\n$rep_def"
 
 # The workspace task CLI is the consumer's shim and must be overridable, both by
@@ -393,6 +404,51 @@ rep_cli=$(report "$(run_ep TASKPUMP_ENTRYPOINT_TEST_MODE=plan \
 grep -q '^task_cli=/usr/local/bin/tp$' <<<"$rep_cli" \
   && pass "an absolute TASKPUMP_WORKSPACE_TASK_CLI is used as given" \
   || fail "absolute task-CLI override wrong:\n$rep_cli"
+# The arachne.conf-pinned spelling, literally: a consumer that vendors its shim
+# keeps exactly the pre-flip behaviour.
+rep_cli=$(report "$(run_ep TASKPUMP_ENTRYPOINT_TEST_MODE=plan \
+  TP_WORKSPACE="$R2/wt" TP_REPO_ROOT="$R2" TP_BRIEF="$R2/brief.md" \
+  TASKPUMP_WORKSPACE_TASK_CLI=scripts/arachne-task)")
+grep -q "^task_cli=$R2/wt/scripts/arachne-task$" <<<"$rep_cli" \
+  && pass "the arachne.conf-pinned scripts/arachne-task resolves under the workspace as before" \
+  || fail "pinned task-CLI spelling wrong:\n$rep_cli"
+
+# ── The bare-image error: workspace CLI unset, no tp on PATH ───────────────────
+# Until G4.3 mounts tp into the agent image, the bare default cannot resolve in
+# a container. That must fail at STARTUP, before the session banner, with an
+# error naming both fixes — an agent discovering its ledger CLI missing
+# mid-session burns the whole iteration on a misconfiguration.
+echo "--- bare default without tp on PATH ---"
+NOTP="$WORK/no-tp-bin"; mkdir -p "$NOTP"
+# Everything plan mode needs, minus tp: bash for run_ep's re-exec, tee and date
+# for the startup banner the pinned-CLI contrast case reaches.
+ln -s "$(command -v bash)" "$NOTP/bash"
+ln -s "$(command -v tee)"  "$NOTP/tee"
+ln -s "$(command -v date)" "$NOTP/date"
+out_notp=$(run_ep TASKPUMP_ENTRYPOINT_TEST_MODE=plan PATH="$NOTP" \
+  TP_WORKSPACE="$R2/wt" TP_REPO_ROOT="$R2" TP_BRIEF="$R2/brief.md")
+rc_notp=$?
+[[ $rc_notp -eq 1 ]] \
+  && pass "workspace CLI unset + no tp on PATH exits 1 (operator misconfiguration)" \
+  || fail "missing-CLI run exited $rc_notp:\n$out_notp"
+grep -q "task CLI 'tp' is not on PATH" <<<"$out_notp" \
+  && pass "the error says what is missing" || fail "no missing-CLI diagnostic:\n$out_notp"
+grep -q 'TASKPUMP_WORKSPACE_TASK_CLI' <<<"$out_notp" \
+  && pass "the error names the config-key fix" || fail "error does not name TASKPUMP_WORKSPACE_TASK_CLI:\n$out_notp"
+grep -q "provide 'tp' in the agent image" <<<"$out_notp" \
+  && pass "the error names the provide-tp-in-the-image fix" || fail "error does not name the image fix:\n$out_notp"
+grep -q 'TaskPump agent started' <<<"$out_notp" \
+  && fail "the missing-CLI error fired after startup began (must be before the banner)" \
+  || pass "the error fires before the startup banner — launch time, not mid-session"
+# A configured CLI is exempt from the PATH probe: paths are resolved, not
+# PATH-searched, so the same tp-less environment plans fine when the consumer
+# pinned its shim.
+out_pinned=$(run_ep TASKPUMP_ENTRYPOINT_TEST_MODE=plan PATH="$NOTP" \
+  TP_WORKSPACE="$R2/wt" TP_REPO_ROOT="$R2" TP_BRIEF="$R2/brief.md" \
+  TASKPUMP_WORKSPACE_TASK_CLI=scripts/arachne-task)
+grep -q "^task_cli=$R2/wt/scripts/arachne-task$" <<<"$(report "$out_pinned")" \
+  && pass "a set workspace CLI is used as before even with no tp on PATH" \
+  || fail "pinned CLI failed without tp on PATH:\n$out_pinned"
 
 # The TP_ spelling must work for EVERY key, not just the headline ones. The pump
 # was exporting TP_TASKS_DIR / TP_AGENT_LOG_NAME / TP_GOAL_NOTE_NAME against an

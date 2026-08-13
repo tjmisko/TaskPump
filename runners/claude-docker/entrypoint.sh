@@ -41,7 +41,8 @@
 #   TASKPUMP_MAX_TURNS               MAX_TURNS            600
 #   TASKPUMP_AGENT_MODEL             AGENT_MODEL          opus
 #   TASKPUMP_SAFETY_TURNS            —                    3
-#   TASKPUMP_WORKSPACE_TASK_CLI      —                    scripts/arachne-task
+#   TASKPUMP_WORKSPACE_TASK_CLI      —                    tp (on PATH; startup fails
+#                                                         loudly when it is absent)
 #   TASKPUMP_CONTAINER_USER          —                    dev
 #   TASKPUMP_CONTAINER_HOME          —                    /home/$CONTAINER_USER
 #   TASKPUMP_PRE_FLIGHT              —                    (none; see below)
@@ -134,9 +135,24 @@ SAFETY_TURNS="$(ep_first TASKPUMP_SAFETY_TURNS TP_SAFETY_TURNS)"
 : "${SAFETY_TURNS:=3}"
 
 WORKSPACE_TASK_CLI="$(ep_first TASKPUMP_WORKSPACE_TASK_CLI TP_WORKSPACE_TASK_CLI)"
-: "${WORKSPACE_TASK_CLI:=scripts/arachne-task}"
+: "${WORKSPACE_TASK_CLI:=tp}"
 TASK_CLI="$WORKSPACE_TASK_CLI"
-[[ "$TASK_CLI" == /* ]] || TASK_CLI="$WORKSPACE_PATH/$TASK_CLI"
+case "$TASK_CLI" in
+    /*) ;;                                      # absolute: used as given
+    */*) TASK_CLI="$WORKSPACE_PATH/$TASK_CLI";; # relative path: under the workspace
+    *)
+        # A bare command name resolves on PATH inside the container. Until the
+        # agent image actually carries tp (G4.3), a bare run must fail HERE —
+        # at startup, before the session — rather than let the agent discover a
+        # missing ledger CLI mid-session and burn the iteration on it. The
+        # error names both fixes.
+        if ! command -v "$TASK_CLI" >/dev/null 2>&1; then
+            echo "ERROR: task CLI '$TASK_CLI' is not on PATH in this container." >&2
+            echo "Fix one of: set TASKPUMP_WORKSPACE_TASK_CLI to the ledger CLI's path in the workspace, or provide 'tp' in the agent image." >&2
+            exit 1
+        fi
+        ;;
+esac
 
 CONTAINER_USER="$(ep_first TASKPUMP_CONTAINER_USER TP_CONTAINER_USER)"
 : "${CONTAINER_USER:=dev}"
