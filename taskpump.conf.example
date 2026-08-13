@@ -259,7 +259,9 @@
 #                           #   with — not a runner name
 #                           #   (default: <install>/runners/claude-docker/runner.sh)
 # TASKPUMP_DOCKER=          # container-runtime binary (default: docker)
-# TASKPUMP_IMAGE=           # container image name (default: arachne)
+# TASKPUMP_IMAGE=           # container image name. NO DEFAULT: a real run aborts
+#                           #   loudly when unset — a wrong silent image is worse
+#                           #   than a loud missing one. --dry-run needs no image.
 # TASKPUMP_IMAGE_BUILD=     # command that builds the image before the first launch
 #                           #   (default: unset = never built)
 # TASKPUMP_ENTRYPOINT=      # in-image entrypoint path (default: /entrypoint-parallel.sh)

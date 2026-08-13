@@ -96,7 +96,10 @@ MONITOR_BIN="${TASKPUMP_MONITOR_BIN:-$TP_LIBEXEC_DIR/tp-monitor}"
 # HOW — the sandbox, the mounts, the credentials. See runners/claude-docker.
 RUNNER="${TASKPUMP_RUNNER:-$TP_ROOT/runners/claude-docker/runner.sh}"
 DOCKER="${TASKPUMP_DOCKER:-${DOCKER:-docker}}"
-IMAGE="${TASKPUMP_IMAGE:-arachne}"
+# No default image on purpose (G1.5): a wrong-but-plausible default launches the
+# wrong agent silently, so a real run fails loudly below when this is empty.
+# --dry-run and NO_LAUNCH ticks never launch and keep working imageless.
+IMAGE="${TASKPUMP_IMAGE:-}"
 ENTRYPOINT="${TASKPUMP_ENTRYPOINT:-/entrypoint-parallel.sh}"
 # Building the agent image once before the drain. Unset ⇒ the default docker
 # build of the repo root; set to the empty string ⇒ skip it entirely, which is
@@ -1515,6 +1518,10 @@ fi
 # Skip the (~9 GB) image build when we will not launch containers — keeps the
 # NO_LAUNCH tick (tests / live read-only validation) side-effect-free.
 if [[ "${TASKPUMP_PUMP_NO_LAUNCH:-0}" -ne 1 ]]; then
+  # Before the build and before any runner call: launching needs an image, and
+  # there is deliberately no default — a wrong silent image is strictly worse
+  # than a loud missing one.
+  [[ -n "$IMAGE" ]] || die "no container image configured: set TASKPUMP_IMAGE (--dry-run works without one)"
   [[ -x "$RUNNER" ]] || die "no agent runner at $RUNNER (set TASKPUMP_RUNNER)"
   if [[ -n "$IMAGE_BUILD_CMD" ]]; then
     log "Building the $IMAGE image ..."
