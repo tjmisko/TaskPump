@@ -264,7 +264,9 @@
 #                           #   than a loud missing one. --dry-run needs no image.
 # TASKPUMP_IMAGE_BUILD=     # command that builds the image before the first launch
 #                           #   (default: unset = never built)
-# TASKPUMP_ENTRYPOINT=      # in-image entrypoint path (default: /entrypoint-parallel.sh)
+# TASKPUMP_ENTRYPOINT=      # in-image entrypoint path (default: /entrypoint.sh —
+#                           #   where the image contract bakes the shipped runner's
+#                           #   entrypoint.sh; see docs/RUNNERS.md)
 # TASKPUMP_AGENT_PREFIX=    # container-name prefix, INCLUDING the trailing dash —
 #                           #   liveness enumeration matches on it, so it must be
 #                           #   distinctive on the host (default: tp-agent-;

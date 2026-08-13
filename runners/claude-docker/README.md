@@ -36,7 +36,7 @@ spelling. `lib/config.sh` promotes `TASKPUMP_X` to `ARACHNE_X`, so a key set in
 | `TP_REPO_ROOT` | `REPO_ROOT` | *(required)* | Primary checkout. Mounted **read-only**. |
 | `TP_CONTAINER_NAME` | `ARACHNE_CONTAINER_NAME` | *(required)* | `docker run --name`. |
 | `TP_IMAGE` | `ARACHNE_IMAGE` | *(required)* | Image to run. Deliberately has no default. |
-| `TP_ENTRYPOINT` | `ARACHNE_ENTRYPOINT` | `/entrypoint-parallel.sh` | In-container entrypoint path. |
+| `TP_ENTRYPOINT` | `ARACHNE_ENTRYPOINT` | `/entrypoint.sh` | In-container entrypoint path. The default is where the image contract bakes this runner's own `entrypoint.sh` — see [docs/RUNNERS.md §4.0](../../docs/RUNNERS.md#40-the-image-contract). |
 | `TP_LEDGER_REPO` | `ARACHNE_PUMP_OPS_DIR` | `$TP_REPO_ROOT/ops` | Ledger checkout. Mounted RW. |
 | `TP_BRANCH` | `ARACHNE_BRANCH` | *(empty)* | Informational; forwarded to the agent. |
 | `TP_TASK_ID` | `ARACHNE_TASK_ID` | *(empty)* | Lead task the agent is assigned. |
