@@ -289,11 +289,10 @@ echo "--- program name in diagnostics ---"
 err=$(TASKPUMP_CONFIG="$TP_ROOT/examples/arachne.conf" "$CLI" block T2.1 2>&1 >/dev/null || true)
 [[ "$err" == "arachne-task: "* ]] && pass "the arachne.conf pin keeps the historical prefix" \
   || fail "conf-pinned diagnostic prefix was '$err'"
-# Bare default: today the shipped default is still the historical spelling.
-# G1.4 flips it to `tp-task: ` and updates this assertion in the same commit
-# as the flip.
+# Bare default: the shipped default identifies as TaskPump (flipped in G1.4);
+# only the arachne.conf pin above keeps the historical `arachne-task: ` prefix.
 err=$("$CLI" block T2.1 2>&1 >/dev/null || true)
-[[ "$err" == "arachne-task: "* ]] && pass "bare default prefix is still the historical spelling (flips in G1.4)" \
+[[ "$err" == "tp-task: "* ]] && pass "bare default prefix is the TaskPump spelling" \
   || fail "default diagnostic prefix was '$err'"
 err=$(TASKPUMP_PROG_NAME=widget-tasks "$CLI" block T2.1 2>&1 >/dev/null || true)
 [[ "$err" == "widget-tasks: "* ]] && pass "TASKPUMP_PROG_NAME rebrands diagnostics" \

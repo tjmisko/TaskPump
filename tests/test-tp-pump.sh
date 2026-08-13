@@ -112,6 +112,11 @@ mk F57.0 open F55.1
 
 echo "--- Test 1: initial frontier (.0 roots launch; cross-phase-gated phase waits) ---"
 out=$(pump F55..F57)
+# Bare default: the plan header identifies as tp-pump (G1.4). The reference
+# consumer keeps `arachne-pump plan` via the TASKPUMP_PUMP_PROG_NAME pin in
+# examples/arachne.conf, which test-golden-plan.sh holds byte-identical.
+have "$out" '^tp-pump plan — phases F55\.\.F57' && pass "bare-default plan header identifies as tp-pump" \
+  || fail "plan header not tp-pump:\n$out"
 have "$out" 'LAUNCH +F55' && pass "F55 launches (F55.0 eligible)" || fail "F55 not LAUNCH:\n$out"
 have "$out" 'LAUNCH +F56' && pass "F56 launches (F56.0 eligible)" || fail "F56 not LAUNCH:\n$out"
 have "$out" 'WAITING +F57' && pass "F57 waits (F57.0 blocked on cross-phase F55.1)" || fail "F57 not WAITING:\n$out"

@@ -68,10 +68,10 @@
 #                           #   a task stuck (default: 3)
 # TASKPUMP_TURN_BUDGET_DEFAULT=  # `claim` budget when --turns is omitted (default: 50)
 # TASKPUMP_LOCK_WAIT=       # seconds to wait for the state lock (default: 120)
-# TASKPUMP_COMMITTER_NAME=  # identity for ledger commits (default: arachne-task)
-# TASKPUMP_COMMITTER_EMAIL= # (default: task@arachne.local)
+# TASKPUMP_COMMITTER_NAME=  # identity for ledger commits (default: tp-task)
+# TASKPUMP_COMMITTER_EMAIL= # (default: task@taskpump.local)
 # TASKPUMP_PROG_NAME=       # the name the CLI calls itself in diagnostics
-#                           #   (default: arachne-task)
+#                           #   (default: tp-task)
 # TASKPUMP_TASK=            # path to the task CLI other tools invoke; set it when the
 #                           #   tools are not co-installed (default: <install>/libexec/tp-task)
 
@@ -118,6 +118,9 @@
 # TASKPUMP_NOTIFY_CMD=      # command that reads a notification on stdin. Unset falls
 #                           #   back to notify-send when present, else log only. Set to
 #                           #   `true` to silence.
+# TASKPUMP_PUMP_PROG_NAME=  # the name the pump answers to as itself — diagnostics,
+#                           #   the plan header, the notify title, the transient
+#                           #   systemd unit (default: tp-pump)
 
 # ── Run state and file names (tp pump) ───────────────────────────────────────
 # One knob moves every dotfile a run drops; each name is still individually
@@ -309,7 +312,7 @@
 #                           #   (default: start --always-new-process --class %CLASS%
 #                           #   --cwd %CWD% --)
 # TASKPUMP_MONITOR_TASK_CLASS=  # window class for that spawned viewer, so a compositor
-#                           #   can rule on it (default: arachne-task)
+#                           #   can rule on it (default: taskpump-task)
 # TASKPUMP_MONITOR_OPEN_CMD=  # replaces the whole spawn; the file path is appended
 #                           #   (default: empty = use the terminal keys above)
 # TASKPUMP_MONITOR_USAGE_WINDOWS=  # comma-separated `label=datefmt` list of usage gauges

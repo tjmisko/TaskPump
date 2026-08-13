@@ -203,7 +203,14 @@ STATE_FILE="${TASKPUMP_PUMP_STATE_FILE:-$STATE_DIR/${TASKPUMP_PUMP_STATE_NAME:-.
 PUMP_LOG="${TASKPUMP_PUMP_LOG:-$STATE_DIR/.arachne-pump.log}"
 PUMP_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-warn() { printf 'arachne-pump: %s\n' "$*" >&2; }
+# Name this supervisor answers to as itself: the diagnostic prefix, the plan
+# header, the notify-send title, and the transient systemd unit. Pump-scoped
+# sibling of tp-task's TASKPUMP_PROG_NAME — the two tools identify themselves
+# differently, so they cannot share one key. The reference consumer pins the
+# historical `arachne-pump` in examples/arachne.conf.
+PROG_NAME="${TASKPUMP_PUMP_PROG_NAME:-tp-pump}"
+
+warn() { printf '%s: %s\n' "$PROG_NAME" "$*" >&2; }
 die()  { warn "$*"; exit 1; }
 log()  { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
 # Quiet per-tick skip traces (e.g. "already integrated") — off unless
@@ -1187,7 +1194,7 @@ compute_plan() {
 print_plan() {
   compute_plan
   local gate_line; if feed_gate; then gate_line="GATE: feed-ok"; else gate_line="GATE: PAUSED — $GATE_REASON"; fi
-  echo "arachne-pump plan — phases $PHASES, grain $GRAIN, cap $(JOBS=$JOBS apl_read_cap), ceiling $CEILING%"
+  echo "$PROG_NAME plan — phases $PHASES, grain $GRAIN, cap $(JOBS=$JOBS apl_read_cap), ceiling $CEILING%"
   echo "$gate_line"
   local p
   for p in "${PLAN_LAUNCH[@]:-}";  do [[ -n "$p" ]] && printf '  LAUNCH   %-6s -> %s\n' "$p" "$(phase_branch "$p")"; done
@@ -1404,7 +1411,7 @@ pump_notify() {
   if [[ -n "${TASKPUMP_NOTIFY_CMD:-}" ]]; then
     printf '%s\n' "$msg" | ${TASKPUMP_NOTIFY_CMD} >/dev/null 2>&1 || true
   elif command -v notify-send >/dev/null 2>&1; then
-    notify-send "arachne-pump" "$msg" >/dev/null 2>&1 || true
+    notify-send "$PROG_NAME" "$msg" >/dev/null 2>&1 || true
   fi
 }
 
@@ -1418,10 +1425,10 @@ detach_and_exit() {
   local -a fwd=()
   local a
   for a in "${ORIG_ARGS[@]}"; do [[ "$a" == "--detach" ]] || fwd+=("$a"); done
-  local unit="arachne-pump-$(printf '%s' "$PHASES" | tr -c 'A-Za-z0-9' '-')"
+  local unit="$PROG_NAME-$(printf '%s' "$PHASES" | tr -c 'A-Za-z0-9' '-')"
   if command -v systemd-run >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
     systemd-run --user --collect --unit="$unit" \
-      --description="Arachne usage-governed pump ($PHASES)" \
+      --description="$PROG_NAME usage-governed pump ($PHASES)" \
       --setenv=GITHUB_TOKEN="${GITHUB_TOKEN:-}" \
       "$0" "${fwd[@]}"
     log "detached as systemd --user unit '$unit'."
@@ -1432,7 +1439,7 @@ detach_and_exit() {
     local pid=$!
     disown "$pid" 2>/dev/null || true
     log "detached via setsid+nohup (pid=$pid, log=$PUMP_LOG)."
-    log "  stop: kill $pid   (or: pkill -f 'arachne-pump.*$PHASES')"
+    log "  stop: kill $pid   (or: pkill -f '$PROG_NAME.*$PHASES')"
   fi
   exec_monitor
   exit 0

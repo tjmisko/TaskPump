@@ -4,8 +4,9 @@
 #
 # Nothing here is project-specific. Every literal that used to name Arachne — the
 # ledger's location, the id grammar, the committer identity, the tripwire
-# constants — is a TASKPUMP_* config key whose baked default reproduces Arachne's
-# behaviour exactly, so a checkout with no taskpump.conf behaves as it always did.
+# constants — is a TASKPUMP_* config key. The reference consumer pins its
+# historical values in examples/arachne.conf (the v0.1.0 default flips retire the
+# Arachne-shaped baked defaults), so under those pins behaviour is unchanged.
 # See `tp-task --help` for the key list and lib/config.sh for how they resolve.
 #
 # ── The id grammar contract ──────────────────────────────────────────────────
@@ -73,8 +74,8 @@ fi
 
 # Ledger commit identity. Distinct from the operator's own git identity so a
 # ledger's history separates bookkeeping from authored work.
-: "${TASKPUMP_COMMITTER_NAME:=arachne-task}"
-: "${TASKPUMP_COMMITTER_EMAIL:=task@arachne.local}"
+: "${TASKPUMP_COMMITTER_NAME:=tp-task}"
+: "${TASKPUMP_COMMITTER_EMAIL:=task@taskpump.local}"
 
 # Id grammar. See the contract at the top of this file.
 : "${TASKPUMP_ID_PATTERN:=^F[0-9]+(\.[0-9]+)?$}"
@@ -87,9 +88,10 @@ fi
 : "${TASKPUMP_LOCK_WAIT:=120}"
 : "${TASKPUMP_PUSH_RETRIES:=6}"
 
-# Name this tool answers to in its own diagnostics. Left as the historical value
-# so existing output is byte-identical; a consumer rebranding the install sets it.
-: "${TASKPUMP_PROG_NAME:=arachne-task}"
+# Name this tool answers to in its own diagnostics. The reference consumer pins
+# the historical `arachne-task` in examples/arachne.conf; a consumer rebranding
+# the install sets its own.
+: "${TASKPUMP_PROG_NAME:=tp-task}"
 
 dbg() {
   [[ "$TASKPUMP_TASK_DEBUG" == "1" ]] && printf '[%s] %s\n' "$TASKPUMP_PROG_NAME" "$*" >&2
@@ -1697,8 +1699,8 @@ Config (env or taskpump.conf; the legacy ARACHNE_* spelling of each still works)
                               fails against a real remote is retried.
     TASKPUMP_PUSH_RETRIES   push attempts before giving up          (default: 6)
     TASKPUMP_COMMITTER_NAME / TASKPUMP_COMMITTER_EMAIL
-                            identity on ledger commits (default: arachne-task /
-                              task@arachne.local)
+                            identity on ledger commits (default: tp-task /
+                              task@taskpump.local)
   Id grammar
     TASKPUMP_ID_PATTERN     regex `create` validates a new id against
                                             (default: ^F[0-9]+(\.[0-9]+)?$)
