@@ -1069,6 +1069,65 @@ out=$(rnote ARACHNE_PUMP_OPS_DIR="$TMP/noops" TASKPUMP_RESUME_TEMPLATE="$TMP/gat
   && pass "{{BUILD_GATE}} and {{VERIFY_CMDS}} are the same value" \
   || fail "placeholder alias wrong: '$out'"
 
+echo "--- Test 29: pump_expand_phases honors TASKPUMP_PHASE_SIGIL (G0.1) ---"
+# A G-sigil ledger, hermetic from the F fixtures above. One open root in G56
+# so the plan distinguishes LAUNCH from DONE across the range.
+GTASKS="$TMP/gtasks"; mkdir -p "$GTASKS"
+cat >| "$GTASKS/G56.0.md" <<'EOF'
+---
+id: G56.0
+phase: G56
+title: fixture G56.0
+status: open
+claimed_by: null
+claimed_at: null
+turn_budget_remaining: null
+consecutive_failed_iterations: 0
+blockers: []
+completed_by_commits: []
+files: []
+goal: drain G56.0
+---
+# G56.0
+EOF
+gpump() { TASKPUMP_PHASE_SIGIL=G ARACHNE_TASKS_DIR="$GTASKS" "$PUMP" --no-health-gate --dry-run --phases "$1" "${@:2}"; }
+
+# 29a: an uppercase G range plans every phase in it.
+out=$(gpump G55..G59)
+ok=1
+for p in G55 G56 G57 G58 G59; do
+  have "$out" " +(LAUNCH|DONE|WAITING|RUNNING) +$p " || { ok=0; break; }
+done
+[[ $ok -eq 1 ]] && pass "G55..G59 plans all five phases" || fail "missing phase $p in plan:\n$out"
+have "$out" 'LAUNCH +G56' && pass "G56 launches (G56.0 eligible)" || fail "G56 not LAUNCH:\n$out"
+have "$out" 'DONE +G55' && pass "empty G55 shown DONE, not dropped" || fail "G55 not DONE:\n$out"
+
+# 29b: a lowercase range normalizes to the same canonical tokens.
+out=$(gpump g55..g59)
+have "$out" 'LAUNCH +G56' && pass "g55..g59 normalizes to G-phases" || fail "lowercase range not normalized:\n$out"
+
+# 29c: comma lists and single tokens are unchanged.
+out=$(gpump G55,G57)
+have "$out" 'DONE +G55' && have "$out" 'DONE +G57' && ! have "$out" 'G56' \
+  && pass "comma list plans exactly its members" || fail "comma list wrong:\n$out"
+out=$(gpump G56)
+have "$out" 'LAUNCH +G56' && pass "single token G56 plans G56" || fail "single token wrong:\n$out"
+
+echo "--- Test 30: a malformed --phases spec aborts the run up front (G0.1) ---"
+# The die used to fire inside a process substitution at the consumption sites,
+# so the pump reported the error and then planned against an EMPTY phase list.
+# 30a: G-sigil spelling from the acceptance criteria.
+out=$(TASKPUMP_PHASE_SIGIL=G ARACHNE_TASKS_DIR="$GTASKS" \
+      "$PUMP" --no-health-gate --dry-run --phases G1..X9 2>&1); rc=$?
+[[ $rc -ne 0 ]] && pass "G1..X9 exits non-zero (rc=$rc)" || fail "G1..X9 exited 0:\n$out"
+have "$out" "bad phase range 'G1..X9'" && pass "range error names the bad spec" || fail "no range error:\n$out"
+have "$out" 'plan — phases' && fail "plan header printed despite bad range:\n$out" || pass "no plan header before the abort"
+
+# 30b: same contract under the default F sigil.
+out=$(pump F55..X9 2>&1); rc=$?
+[[ $rc -ne 0 ]] && pass "F55..X9 exits non-zero under the default sigil" || fail "F55..X9 exited 0:\n$out"
+have "$out" "bad phase range 'F55..X9'" && pass "default-sigil range error surfaced" || fail "no range error:\n$out"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"

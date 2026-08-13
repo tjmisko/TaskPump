@@ -278,22 +278,44 @@ fi
 
 # ── Phase-range expansion (mirrors arachne-task's expand_phases for display) ───
 # Numeric ranges + comma lists; non-numeric tokens pass through uppercased.
+# Honors TASKPUMP_PHASE_SIGIL exactly as arachne-task does: with sigil G,
+# "G55", "g55" and "55" all canonicalize to "G55".
+: "${TASKPUMP_PHASE_SIGIL:=F}"
+
+# Drop a leading sigil from a phase token, case-insensitively (tp-task's
+# strip_phase_sigil, mirrored here because tp-task is an executable, not a lib).
+pump_strip_phase_sigil() {
+  local value=$1 sigil=$TASKPUMP_PHASE_SIGIL
+  if [[ -n "$sigil" && "${value,,}" == "${sigil,,}"* ]]; then
+    value=${value:${#sigil}}
+  fi
+  printf '%s' "$value"
+}
+
 pump_expand_phases() {
-  local spec=$1 comp a b lo hi i n
+  local spec=$1 comp a b lo hi i n sigil=$TASKPUMP_PHASE_SIGIL
   local IFS=','
   for comp in $spec; do
     comp="${comp//[[:space:]]/}"; [[ -z "$comp" ]] && continue
     if [[ "$comp" == *..* ]]; then
-      a="${comp%%..*}"; b="${comp##*..}"; a="${a#[Ff]}"; b="${b#[Ff]}"
-      [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ ]] || die "bad phase range '$comp'"
+      a="${comp%%..*}"; b="${comp##*..}"
+      a=$(pump_strip_phase_sigil "$a"); b=$(pump_strip_phase_sigil "$b")
+      [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ ]] \
+        || die "bad phase range '$comp' (expected ${sigil}N..${sigil}M)"
       if (( a <= b )); then lo=$a; hi=$b; else lo=$b; hi=$a; fi
-      for (( i=lo; i<=hi; i++ )); do printf 'F%s\n' "$i"; done
+      for (( i=lo; i<=hi; i++ )); do printf '%s%s\n' "$sigil" "$i"; done
     else
-      comp="${comp%%.*}"; n="${comp#[Ff]}"
-      if [[ "$n" =~ ^[0-9]+$ ]]; then printf 'F%s\n' "$n"; else printf '%s\n' "${comp^^}"; fi
+      comp="${comp%%.*}"; n=$(pump_strip_phase_sigil "$comp")
+      if [[ "$n" =~ ^[0-9]+$ ]]; then printf '%s%s\n' "$sigil" "$n"; else printf '%s\n' "${comp^^}"; fi
     fi
   done
 }
+
+# Validate the spec once, up front, in the MAIN shell. Every consumer below
+# reads this function through a process substitution, where `die` kills only
+# the subshell — a malformed range would be reported and then ignored, leaving
+# the pump to plan (and idle green) against an empty phase list.
+pump_expand_phases "$PHASES" >/dev/null
 
 # The tasks dir as an agent inside the worktree would name it. Absolute when the
 # ledger sits outside the code repo, which is also how an agent would reach it.
