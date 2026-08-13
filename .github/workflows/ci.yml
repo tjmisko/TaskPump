@@ -32,19 +32,12 @@ jobs:
 
       - name: Lint shell sources
         run: |
-          # Severity is pinned to `error` deliberately.
-          #
-          # These tools came out of Arachne as ~2k lines apiece of working,
-          # heavily-exercised shell. At `error` the tree is clean today, so CI
-          # is green from day one and any NEW error is unambiguously a
-          # regression somebody just introduced. At `warning` there are 38
-          # pre-existing findings — a red CI that everybody learns to ignore,
-          # which is worse than no CI.
-          #
-          # The intended path is to ratchet: clear the warning-level findings,
-          # then change `-S error` to `-S warning` here and never let it back
-          # down. Widening the severity to make a change pass is the one thing
-          # this must not be used for.
+          # Severity is pinned to `warning`, and the count is ZERO (G2.4
+          # cleared the 59 findings the tree carried out of extraction).
+          # This is the ratchet the original `-S error` pin promised: any
+          # warning this reports is one somebody just introduced. The
+          # severity never widens back to `error` — loosening it to make a
+          # change pass is the one thing this must not be used for.
           files=$(find bin libexec lib gates runners hooks \
                     -type f \( -name '*.sh' -o -perm -u+x \) 2>/dev/null | sort)
           if [ -z "$files" ]; then
@@ -55,7 +48,7 @@ jobs:
           # -x follows `source`d files so the shared lib/ code is analysed in
           # the context of each tool that sources it.
           # shellcheck disable=SC2086
-          shellcheck -S error -x $files
+          shellcheck -S warning -x $files
 
   tests:
     name: tests
