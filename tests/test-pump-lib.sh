@@ -310,6 +310,40 @@ grep -qxF 'build/wt/' "$GI/.gitignore" && fail "a configured ignore line was not
   || pass "TASKPUMP_WORKTREES_IGNORE_LINE picks the line to strip"
 grep -qxF '!build/wt/**' "$GI/.gitignore" && pass "its negation survives" || fail "negation stripped"
 
+echo "--- ensure worktrees visible: an operator-global excludes is overridden ---"
+# The 2026-08-13 dogfood canary: a global core.excludesFile ignoring
+# **/.worktrees/** in every repo made the pump skip every launch. The heal must
+# land in the repo's own info/exclude — never in a tracked file, never in the
+# operator's global config.
+EV="$TMP/ev"; mkdir -p "$EV"
+git -C "$EV" init -q -b main
+GX="$TMP/global-ignore"; printf '**/.worktrees/**\n' >| "$GX"
+git -C "$EV" config core.excludesFile "$GX"
+mkdir -p "$EV/.worktrees/feat/x"
+git -C "$EV" check-ignore -q .worktrees/feat/x \
+  && pass "control: the fixture's global excludes ignores the worktree" \
+  || fail "control: fixture global excludes is inert — the test proves nothing"
+apl_ensure_worktrees_visible "$EV" "$EV/.worktrees/feat/x" \
+  && pass "ensure reports the worktree visible" || fail "ensure returned still-ignored"
+git -C "$EV" check-ignore -q .worktrees/feat/x \
+  && fail "worktree still ignored after ensure" \
+  || pass "the global excludes is overridden"
+grep -qxF -- '!.worktrees/**' "$EV/.git/info/exclude" \
+  && pass "the negation landed in info/exclude" || fail "info/exclude has no negation"
+[[ -z "$(git -C "$EV" status --porcelain 2>/dev/null)" || "$(git -C "$EV" status --porcelain)" == *".worktrees"* ]] \
+  && pass "no tracked file was touched by the heal" || fail "heal dirtied the tree: $(git -C "$EV" status --porcelain)"
+ev_lines=$(wc -l < "$EV/.git/info/exclude")
+apl_ensure_worktrees_visible "$EV" "$EV/.worktrees/feat/x" || fail "re-run returned still-ignored"
+[[ "$ev_lines" -eq "$(wc -l < "$EV/.git/info/exclude")" ]] \
+  && pass "idempotent: a second ensure appends nothing" || fail "info/exclude grew on re-run"
+# The bare .gitignore line outranks info/exclude; both halves must compose.
+printf '.worktrees/\n' >| "$EV/.gitignore"
+apl_ensure_worktrees_visible "$EV" "$EV/.worktrees/feat/x" \
+  && pass "combined sources heal too (bare line + global excludes)" \
+  || fail "combined sources defeat ensure"
+git -C "$EV" check-ignore -q .worktrees/feat/x \
+  && fail "still ignored with combined sources" || pass "visible after the combined heal"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"

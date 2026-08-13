@@ -165,6 +165,42 @@ apl_repair_worktree_gitignore() {
   fi
 }
 
+# apl_ensure_worktrees_visible <repo_root> <path> — make sure <path> (a
+# worktree, or a probe under the worktrees dir) is not gitignored by ANY
+# source. Two mechanisms, matched to the two kinds of source:
+#   * the repo's own .gitignore — the bare re-ignore line the gh-worktree
+#     extension appends is deleted (apl_repair_worktree_gitignore, above);
+#   * every source BELOW .gitignore in precedence — typically an
+#     operator-global core.excludesFile ignoring **/.worktrees/** in every
+#     repo (observed 2026-08-13: the dogfood canary launched nothing) — is
+#     overridden by negations appended once to the repo's own
+#     $GIT_COMMON_DIR/info/exclude, which outranks the global file, is
+#     untracked (no dirty tree, no fs-guard noise), and leaves the operator's
+#     global config alone.
+# Returns 1 when the path is STILL ignored afterwards; the caller owns the
+# refusal and its message.
+apl_ensure_worktrees_visible() {
+  local repo_root="$1" probe="$2"
+  apl_repair_worktree_gitignore "$repo_root"
+  git -C "$repo_root" check-ignore -q "$probe" 2>/dev/null || return 0
+  local line="${TASKPUMP_WORKTREES_IGNORE_LINE:-.worktrees/}"
+  local base="${line%/}"
+  local common
+  common="$(git -C "$repo_root" rev-parse --git-common-dir 2>/dev/null)" || return 1
+  [[ "$common" == /* ]] || common="$repo_root/$common"
+  local excl="$common/info/exclude"
+  if ! grep -qxF -- "!$base/**" "$excl" 2>/dev/null; then
+    mkdir -p "${excl%/*}"
+    {
+      printf '# TaskPump: worktrees must be visible to git (launch guard);\n'
+      printf '# these negations outrank an operator-global excludes file.\n'
+      printf '!%s/\n' "$base"
+      printf '!%s/**\n' "$base"
+    } >> "$excl"
+  fi
+  ! git -C "$repo_root" check-ignore -q "$probe" 2>/dev/null
+}
+
 # ── Agent-container identity ──────────────────────────────────────────────────
 # The container-name prefix is this stack's join key: the pump derives a name
 # from a branch, both watchdogs count by it, cleanup maps a name back to a

@@ -9,18 +9,23 @@
 #   exit 0    fine
 #   non-zero  the pump warns and carries on with the tick
 #
-# What this repairs: the `gh worktree` extension appends a bare `.worktrees/`
-# line to .gitignore on every `worktree create`. Sitting after the intentional
-# `!.worktrees/` negations, it silently re-ignores every worktree — which hides
-# their files from ripgrep and from an agent's file search, and leaves the
-# primary checkout permanently dirty, which in turn makes the contamination
-# guard fire on every tick. A live run stalled on exactly that in 2026-06-24.
+# What this repairs: worktrees silently gitignored, from either direction. The
+# `gh worktree` extension appends a bare `.worktrees/` line to .gitignore on
+# every `worktree create`; sitting after the intentional `!.worktrees/`
+# negations, it re-ignores every worktree — hiding their files from ripgrep and
+# an agent's file search, and leaving the primary checkout permanently dirty,
+# which makes the contamination guard fire on every tick (a live run stalled on
+# exactly that, 2026-06-24). And an operator-global core.excludesFile ignoring
+# **/.worktrees/** everywhere does the same from below (the dogfood canary
+# launched nothing, 2026-08-13) — healed by negations appended once to the
+# repo's own info/exclude, which outranks the global file and is untracked.
 #
-# Idempotent: a no-op unless the bad line is present. Says nothing when there is
+# Idempotent: a no-op unless something is wrong. Says nothing when there is
 # nothing to repair, so it does not add a line to every tick's log.
 #
 # Configuration:
-#   TASKPUMP_WORKTREES_IGNORE_LINE   the line to strip (default `.worktrees/`)
+#   TASKPUMP_WORKTREES_IGNORE_LINE   the line to strip, and the dir the
+#                                    visibility probe checks (default `.worktrees/`)
 # HELP-END
 set -uo pipefail
 
@@ -34,5 +39,9 @@ tp_load_config
 [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { apl_help "$0"; exit 0; }
 
 repo_root="${1:-${TP_REPO_ROOT:-$PWD}}"
-apl_repair_worktree_gitignore "$repo_root"
+probe_base="${TASKPUMP_WORKTREES_IGNORE_LINE:-.worktrees/}"
+probe="$repo_root/${probe_base%/}/.tp-visibility-probe"
+if ! apl_ensure_worktrees_visible "$repo_root" "$probe"; then
+  echo "worktrees dir is still gitignored after repair: $(git -C "$repo_root" check-ignore -v "$probe" 2>/dev/null | head -1)"
+fi
 exit 0
