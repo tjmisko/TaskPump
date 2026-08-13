@@ -233,29 +233,8 @@ have "$(jq -r '.paused_reason // empty' "$STATE" 2>/dev/null)" 'disk gate' && pa
 
 echo "--- Test 10: reclaim sweep cleans completed-phase target/ dirs (A4 / F65.3) ---"
 WT="$TMP/wt"; STATE10="$TMP/pump10.state"
-# Stub cargo so `clean --manifest-path X` removes $(dirname X)/target with no real
-# build (honours the no-real-cargo test seam). Shadowed onto PATH for the tick.
-cat >| "$BIN/cargo" <<'EOF'
-#!/usr/bin/env bash
-if [[ "${1:-}" == "clean" ]]; then
-  shift; mp=""
-  while (($#)); do
-    case "$1" in
-      --manifest-path) mp="$2"; shift 2;;
-      --manifest-path=*) mp="${1#--manifest-path=}"; shift;;
-      *) shift;;
-    esac
-  done
-  [[ -n "$mp" ]] && rm -rf "$(dirname "$mp")/target"
-  exit 0
-fi
-exit 0
-EOF
-chmod +x "$BIN/cargo"
-
 plant_target() {  # fake done-phase worktree with a target/ dir + sentinel
   rm -rf "$WT"; mkdir -p "$WT/feat/f56/target"
-  : >| "$WT/feat/f56/Cargo.toml"
   echo sentinel >| "$WT/feat/f56/target/sentinel"
 }
 reclaim_tick() {  # one real tick with the reclaim sweep active, fixture-wired
@@ -271,20 +250,31 @@ reclaim_tick() {  # one real tick with the reclaim sweep active, fixture-wired
   "$PUMP" --no-health-gate "$@"
 }
 
-# 10a: a PLAN_DONE phase (all tasks done) with no live container → target reclaimed.
+# 10a: a PLAN_DONE phase (all tasks done) with no live container → target
+# reclaimed via the CONFIGURED command. There is no built-in fallback: the key
+# names the consumer's own reclaim (G1.7 retired the cargo one).
 mk F56.0 done; plant_target
-out=$(STUB_GATE_RC=0 ARACHNE_DISK_RECLAIM=1 reclaim_tick --phases F56 --once 2>&1)
+out=$(STUB_GATE_RC=0 ARACHNE_DISK_RECLAIM=1 TASKPUMP_RECLAIM_CMD='rm -rf target' \
+  reclaim_tick --phases F56 --once 2>&1)
 [[ ! -d "$WT/feat/f56/target" ]] && pass "reclaim removed F56 target/ on a DONE tick" || fail "F56 target/ survived reclaim:\n$out"
 have "$out" 'reclaimed F56' && pass "reclaim logged 'reclaimed F56'" || fail "no reclaim log line:\n$out"
 
+# 10a': no TASKPUMP_RECLAIM_CMD → the pass is a no-op that says so (G1.7).
+plant_target
+out=$(STUB_GATE_RC=0 ARACHNE_DISK_RECLAIM=1 reclaim_tick --phases F56 --once 2>&1)
+[[ -d "$WT/feat/f56/target" ]] && pass "unconfigured reclaim pass touches nothing" \
+  || fail "target/ removed with no reclaim command configured:\n$out"
+have "$out" 'TASKPUMP_RECLAIM_CMD unconfigured' && pass "unconfigured reclaim pass logs the no-op line" \
+  || fail "no unconfigured log line:\n$out"
+
 # 10b: ARACHNE_DISK_RECLAIM=0 → reclaim disabled, target survives.
 plant_target
-STUB_GATE_RC=0 ARACHNE_DISK_RECLAIM=0 reclaim_tick --phases F56 --once >/dev/null 2>&1
+STUB_GATE_RC=0 ARACHNE_DISK_RECLAIM=0 TASKPUMP_RECLAIM_CMD='rm -rf target' reclaim_tick --phases F56 --once >/dev/null 2>&1
 [[ -d "$WT/feat/f56/target" ]] && pass "ARACHNE_DISK_RECLAIM=0 leaves target/ intact" || fail "target removed despite RECLAIM=0"
 
 # 10c: a live container for F56 → target survives even though open_count=0.
 plant_target
-STUB_GATE_RC=0 ARACHNE_DISK_RECLAIM=1 STUB_LIVE="arachne-agent-feat-f56" reclaim_tick --phases F56 --once >/dev/null 2>&1
+STUB_GATE_RC=0 ARACHNE_DISK_RECLAIM=1 TASKPUMP_RECLAIM_CMD='rm -rf target' STUB_LIVE="arachne-agent-feat-f56" reclaim_tick --phases F56 --once >/dev/null 2>&1
 [[ -d "$WT/feat/f56/target" ]] && pass "live-phase target/ never reclaimed (phase_live guard)" || fail "live phase target/ was reclaimed"
 
 echo "--- Test 11: the read-only-primary mount, now the runner's to keep ---"

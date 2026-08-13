@@ -19,7 +19,8 @@
 #     Feeding resumes by itself when the gate clears.
 #   * Disk discipline: a completed phase's worktree build dir is reclaimed each
 #     tick once its container has exited, so a multi-day drain's disk footprint
-#     stays bounded (TASKPUMP_DISK_RECLAIM=0 disables).
+#     stays bounded — when TASKPUMP_RECLAIM_CMD names how; unconfigured, the
+#     pass is a no-op (TASKPUMP_DISK_RECLAIM=0 disables it entirely).
 #   * Drains: exits only when no open task remains in range AND no live agent
 #     container remains, then pushes the ledger and emits a summary.
 #
@@ -183,9 +184,10 @@ INTEGRATION_BASE="${TASKPUMP_PUMP_INTEGRATION_BASE:-${TASKPUMP_INTEGRATION:-main
 BUILD_GATE_CMD="${TASKPUMP_PUMP_BUILD_CMD:-${TASKPUMP_BUILD_GATE:-}}"
 TRUNK_LOCK_FILE="${TASKPUMP_PUMP_TRUNK_LOCK_FILE:-$STATE_DIR/.auto-trunk.lock}"
 QUARANTINE_FILE="${TASKPUMP_PUMP_QUARANTINE_FILE:-$STATE_DIR/.auto-trunk-quarantine}"
-# Reclaim of a finished phase's build artifacts. Empty ⇒ the default cargo
-# clean / rm -rf of <worktree>/target; a configured command is run with the
-# worktree as $1 and its cwd.
+# Reclaim of a finished phase's build artifacts. A configured command is run
+# with the worktree as its cwd; empty (the default) makes the per-tick reclaim
+# pass a no-op — only a consumer knows how its build output is reclaimed, so
+# there is no built-in fallback (G1.7 retired the cargo one).
 RECLAIM_CMD="${TASKPUMP_RECLAIM_CMD:-}"
 MAX_TURNS="${TASKPUMP_MAX_TURNS:-${MAX_TURNS:-600}}"
 AGENT_MODEL="${TASKPUMP_AGENT_MODEL:-${AGENT_MODEL:-opus}}"
@@ -1226,8 +1228,21 @@ print_plan() {
 # every commit are untouched. Runs every tick regardless of the feed gate, so a
 # disk-pressure pause can self-heal as completed phases free their target/ dirs.
 # Disabled with ARACHNE_DISK_RECLAIM=0.
+#
+# With no TASKPUMP_RECLAIM_CMD configured the pass is a no-op: only a consumer
+# knows how its build output is reclaimed, so there is no built-in fallback
+# (G1.7 retired the cargo clean / rm -rf one; examples/arachne.conf pins
+# 'cargo clean'). Logged once per run, not per tick.
+RECLAIM_UNCONFIGURED_LOGGED=0
 reclaim_done_targets() {
   [[ "${TASKPUMP_DISK_RECLAIM:-1}" -eq 1 ]] || return 0
+  if [[ -z "$RECLAIM_CMD" ]]; then
+    if [[ "$RECLAIM_UNCONFIGURED_LOGGED" -eq 0 ]]; then
+      log "reclaim pass: TASKPUMP_RECLAIM_CMD unconfigured — leaving finished workspaces' build output in place"
+      RECLAIM_UNCONFIGURED_LOGGED=1
+    fi
+    return 0
+  fi
   local p wt sz
   for p in "${PLAN_DONE[@]:-}"; do
     [[ -z "$p" ]] && continue
@@ -1235,20 +1250,10 @@ reclaim_done_targets() {
     [[ -d "$wt/target" ]] || continue
     phase_live "$p" && continue
     sz="$(du -sh "$wt/target" 2>/dev/null | cut -f1)"
-    if [[ -n "$RECLAIM_CMD" ]]; then
-      if ( cd "$wt" && eval "$RECLAIM_CMD" ) >/dev/null 2>&1; then
-        log "reclaimed $p target/ (${sz:-?}) via TASKPUMP_RECLAIM_CMD"
-      else
-        warn "TASKPUMP_RECLAIM_CMD failed for $p ($wt)"
-      fi
-    elif command -v cargo >/dev/null 2>&1; then
-      if cargo clean --manifest-path "$wt/Cargo.toml" >/dev/null 2>&1; then
-        log "reclaimed $p target/ (${sz:-?}) via cargo clean"
-      else
-        warn "cargo clean failed for $p ($wt); run '\''tp cleanup --targets'\'' to reclaim"
-      fi
-    elif rm -rf "$wt/target"; then
-      log "reclaimed $p target/ (${sz:-?}) via rm -rf (no cargo)"
+    if ( cd "$wt" && eval "$RECLAIM_CMD" ) >/dev/null 2>&1; then
+      log "reclaimed $p target/ (${sz:-?}) via TASKPUMP_RECLAIM_CMD"
+    else
+      warn "TASKPUMP_RECLAIM_CMD failed for $p ($wt)"
     fi
   done
 }

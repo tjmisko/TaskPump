@@ -129,10 +129,11 @@ set_cap() {
     log "  pool cap $cur → $n ($CAP_FILE)"
 }
 
-# ── reclaim_targets -- cargo clean worktree + primary target/ dirs to buy back
-#    space, delegating to arachne-cleanup --targets --include-primary (which
-#    skips any worktree hosting a live agent container, so a running build is
-#    never broken). Gated by PANIC_RECLAIM_TARGETS (default 1). Honours
+# ── reclaim_targets -- reclaim worktree + primary build output to buy back
+#    space, delegating to tp-cleanup --targets --include-primary (which skips
+#    any worktree hosting a live agent container, so a running build is never
+#    broken, and which itself touches nothing unless TASKPUMP_RECLAIM_CMD is
+#    configured). Gated by PANIC_RECLAIM_TARGETS (default 1). Honours
 #    --dry-run by forwarding it. Best-effort: a missing cleanup script is a
 #    logged no-op, never an error.
 reclaim_targets() {
@@ -144,7 +145,7 @@ reclaim_targets() {
     fi
     local args=(--targets --include-primary)
     [[ "$DRY_RUN" -eq 1 ]] && args+=(--dry-run)
-    log "  reclaiming cargo target/ dirs (worktrees + primary) to buy space"
+    log "  reclaiming build target/ dirs (worktrees + primary) to buy space"
     "$cleanup" "${args[@]}" 2>&1 | sed 's/^/    cleanup: /'
 }
 
@@ -179,7 +180,7 @@ react() {
         case "$NEW" in
             PANIC)
                 set_cap 0
-                reclaim_targets   # cargo clean worktree+primary target/ (skips live agents)
+                reclaim_targets   # reclaim worktree+primary build output (skips live agents)
                 docker_panic
                 log "cooling down ${COOLDOWN}s before re-arming"
                 [[ "$DRY_RUN" -eq 0 ]] && sleep "$COOLDOWN" ;;

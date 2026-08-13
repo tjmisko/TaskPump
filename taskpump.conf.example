@@ -175,8 +175,10 @@
 # TASKPUMP_SUBMODULE_PROBE= # a path that proves the ledger submodule is populated
 #                           #   (default: ops/planning/STATUS.md)
 # TASKPUMP_RECLAIM_CMD=     # how to reclaim build output from a finished workspace, so
-#                           #   a multi-day run's disk footprint stays bounded
-#                           #   (default: empty = built-in target/ removal)
+#                           #   a multi-day run's disk footprint stays bounded — run with
+#                           #   the workspace as its cwd, e.g. 'cargo clean'
+#                           #   (default: empty = the reclaim pass and the tp-cleanup
+#                           #   --targets sweep are no-ops that log themselves unconfigured)
 # TASKPUMP_DISK_RECLAIM=    # 0 = never reclaim build dirs on disk pressure (default: 1)
 # TASKPUMP_GATES=           # ordered, newline-separated list of gate COMMAND LINES —
 #                           #   each entry's first word must be an executable path; a

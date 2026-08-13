@@ -208,7 +208,7 @@ toolchain:
 | `TASKPUMP_BUILD_GATE` | The command that must pass before work is integrated. `cargo check` for Rust, `npm test` for Node, whatever your project's "is it broken" question is. `TASKPUMP_PUMP_BUILD_CMD` overrides it for the merge queue. |
 | `TASKPUMP_VERIFY_CMDS` | Newline-separated commands a task must leave green, quoted into the brief. Empty by default — the templates' verify sections drop out until a consumer names its own bar. |
 | `TASKPUMP_PROJECT_BRIEF` | One paragraph pointing an agent at the project's own contributor documentation. |
-| `TASKPUMP_RECLAIM_CMD` | How to reclaim build output from a finished workspace, so a multi-day run's disk footprint stays bounded. |
+| `TASKPUMP_RECLAIM_CMD` | How to reclaim build output from a finished workspace, so a multi-day run's disk footprint stays bounded. Empty by default: unconfigured, the per-tick reclaim pass and the `tp cleanup --targets` sweep touch nothing and log themselves unconfigured. |
 | `TASKPUMP_BRIEF_TEMPLATE` | The parameterized brief a launched agent is handed. |
 | `TASKPUMP_RESUME_TEMPLATE` | The resume preamble a stalled task's agent gets ahead of that brief. |
 | `TASKPUMP_TASK_CLI` | How an agent invokes the ledger CLI from inside its worktree. |
