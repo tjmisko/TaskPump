@@ -3,6 +3,15 @@
 # can be pointed at, and because the contamination guard's allowlist and this
 # file have to agree — a run file that is tracked here but allowlisted there is
 # a dirty tree nobody notices, and one that is neither is a warning every tick.
+.taskpump-pump.state
+.taskpump-pump.log
+.taskpump-pool-cap
+.taskpump-usage-reset
+.taskpump-fsguard.notified
+.taskpump-disk-watchdog.log
+.taskpump-task.lock
+# The historical spellings stay: a pump pointed here under the Arachne
+# reference pins (examples/arachne.conf) writes these names instead.
 .arachne-pump.state
 .arachne-pump.log
 .arachne-pool-cap
