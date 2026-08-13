@@ -131,16 +131,16 @@ PROJECT_BRIEF="${TASKPUMP_PROJECT_BRIEF:-$_tp_default_project_brief}"
 # Where the run's dotfiles live. One knob moves them all out of the repo root;
 # each filename is still individually overridable.
 STATE_DIR="${TASKPUMP_STATE_DIR:-$REPO_ROOT}"
-AGENT_LOG_NAME="${TASKPUMP_AGENT_LOG_NAME:-.arachne-agent.log}"
-BRIEF_OUT_NAME="${TASKPUMP_BRIEF_OUT_NAME:-.arachne-phase-brief.md}"
-RESUME_NOTE_NAME="${TASKPUMP_RESUME_NOTE_NAME:-.arachne-resume.md}"
+AGENT_LOG_NAME="${TASKPUMP_AGENT_LOG_NAME:-.taskpump-agent.log}"
+BRIEF_OUT_NAME="${TASKPUMP_BRIEF_OUT_NAME:-.taskpump-phase-brief.md}"
+RESUME_NOTE_NAME="${TASKPUMP_RESUME_NOTE_NAME:-.taskpump-resume.md}"
 # Written inside the container rather than here, but named here so one place
 # owns every filename the run drops into a worktree.
-GOAL_NOTE_NAME="${TASKPUMP_GOAL_NOTE_NAME:-.arachne-goal.md}"
+GOAL_NOTE_NAME="${TASKPUMP_GOAL_NOTE_NAME:-.taskpump-goal.md}"
 # Fingerprint of the last pre-tick hook output, so a persistent condition is
 # notified once rather than every tick. Survives a supervisor restart.
-HOOK_MARK_FILE="${TASKPUMP_HOOK_MARK_FILE:-${TASKPUMP_FSGUARD_MARK_FILE:-$STATE_DIR/.arachne-fsguard.notified}}"
-DISK_WATCHDOG_LOG="${TASKPUMP_DISK_WATCHDOG_LOG:-$STATE_DIR/.arachne-disk-watchdog.log}"
+HOOK_MARK_FILE="${TASKPUMP_HOOK_MARK_FILE:-${TASKPUMP_FSGUARD_MARK_FILE:-$STATE_DIR/.taskpump-fsguard.notified}}"
+DISK_WATCHDOG_LOG="${TASKPUMP_DISK_WATCHDOG_LOG:-$STATE_DIR/.taskpump-disk-watchdog.log}"
 
 # Defaults (flags override).
 PHASES=""
@@ -190,8 +190,8 @@ STALL_EXIT_TICKS="${TASKPUMP_PUMP_STALL_EXIT_TICKS:-${TASKPUMP_STALL_EXIT_TICKS:
 STALL_TICKS=0
 RESUME_TASK_ID=""
 LAST_PARKED_FP=""
-CAP_FILE="${TASKPUMP_POOL_CAP_FILE:-$STATE_DIR/.arachne-pool-cap}"
-RESET_FILE="${TASKPUMP_USAGE_RESET_FILE:-$STATE_DIR/.arachne-usage-reset}"
+CAP_FILE="${TASKPUMP_POOL_CAP_FILE:-$STATE_DIR/.taskpump-pool-cap}"
+RESET_FILE="${TASKPUMP_USAGE_RESET_FILE:-$STATE_DIR/.taskpump-usage-reset}"
 MODE="run"        # run | dry | list | once | render | resume-note | help
 DETACH=0
 # After --detach hands the supervisor to systemd, the launching terminal is free
@@ -199,8 +199,8 @@ DETACH=0
 # over by default. TASKPUMP_PUMP_MONITOR=0 or --no-monitor opts out; a non-tty
 # (cron, CI, a nested pump re-exec) opts out automatically.
 MONITOR="${TASKPUMP_PUMP_MONITOR:-1}"
-STATE_FILE="${TASKPUMP_PUMP_STATE_FILE:-$STATE_DIR/${TASKPUMP_PUMP_STATE_NAME:-.arachne-pump.state}}"
-PUMP_LOG="${TASKPUMP_PUMP_LOG:-$STATE_DIR/.arachne-pump.log}"
+STATE_FILE="${TASKPUMP_PUMP_STATE_FILE:-$STATE_DIR/${TASKPUMP_PUMP_STATE_NAME:-.taskpump-pump.state}}"
+PUMP_LOG="${TASKPUMP_PUMP_LOG:-$STATE_DIR/.taskpump-pump.log}"
 PUMP_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 # Name this supervisor answers to as itself: the diagnostic prefix, the plan
@@ -1453,7 +1453,7 @@ exec_monitor() {
   [[ "$MONITOR" -eq 1 ]] || return 0
   [[ -t 0 && -t 1 ]] || { log "not a tty — skipping the monitor (run: $MONITOR_BIN --watch)"; return 0; }
   [[ -x "$MONITOR_BIN" ]] || { log "no monitor at $MONITOR_BIN — skipping"; return 0; }
-  # The supervisor writes .arachne-pump.state on its first tick; give it a beat
+  # The supervisor writes .taskpump-pump.state on its first tick; give it a beat
   # so the monitor's opening frame shows the run instead of "no pump".
   sleep 2
   log "opening the monitor (q to close it; the pump keeps running)"

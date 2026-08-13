@@ -88,7 +88,7 @@
 # TASKPUMP_JOBS_FALLBACK=   # cap used when neither --jobs nor the cap file yields one
 #                           #   (default: 6)
 # TASKPUMP_POOL_CAP_FILE=   # live-editable pool cap, re-read each tick
-#                           #   (default: <state dir>/.arachne-pool-cap)
+#                           #   (default: <state dir>/.taskpump-pool-cap)
 # TASKPUMP_TICK=            # seconds between supervisor ticks (default: 30)
 # TASKPUMP_STAGGER=         # seconds between launches within one tick (default: 3)
 # TASKPUMP_PUMP_TASKS_DIR=  # tasks dir for the pump alone, independent of the ledger
@@ -130,20 +130,20 @@
 #                           #   both the state dir and the name below
 #                           #   (default: <state dir>/<TASKPUMP_PUMP_STATE_NAME>)
 # TASKPUMP_PUMP_STATE_NAME= # its filename within the state dir
-#                           #   (default: .arachne-pump.state)
-# TASKPUMP_PUMP_LOG=        # supervisor log path (default: <state dir>/.arachne-pump.log)
+#                           #   (default: .taskpump-pump.state)
+# TASKPUMP_PUMP_LOG=        # supervisor log path (default: <state dir>/.taskpump-pump.log)
 # TASKPUMP_AGENT_LOG_NAME=  # per-worktree agent log. The monitor and the cleanup
 #                           #   sweeper find a live agent by this filename, so renaming
 #                           #   it makes running agents invisible to them
-#                           #   (default: .arachne-agent.log)
+#                           #   (default: .taskpump-agent.log)
 # TASKPUMP_BRIEF_OUT_NAME=  # rendered brief written into each worktree
-#                           #   (default: .arachne-phase-brief.md)
-# TASKPUMP_GOAL_NOTE_NAME=  # goal note written into each worktree (default: .arachne-goal.md)
+#                           #   (default: .taskpump-phase-brief.md)
+# TASKPUMP_GOAL_NOTE_NAME=  # goal note written into each worktree (default: .taskpump-goal.md)
 # TASKPUMP_RESUME_NOTE_NAME=  # resume preamble written into a resumed worktree
-#                           #   (default: .arachne-resume.md)
+#                           #   (default: .taskpump-resume.md)
 # TASKPUMP_HOOK_MARK_FILE=  # fingerprint of the last pre-tick hook output, kept so
 #                           #   a persistent condition notifies once rather than
-#                           #   every tick (default: <state dir>/.arachne-fsguard.notified;
+#                           #   every tick (default: <state dir>/.taskpump-fsguard.notified;
 #                           #   TASKPUMP_FSGUARD_MARK_FILE is its older spelling)
 
 # ── Project-shaped behavior (tp pump) ────────────────────────────────────────
@@ -245,7 +245,7 @@
 # TASKPUMP_USAGE_HTTP_TIMEOUT=  # curl timeout, seconds (default: 8)
 # TASKPUMP_USAGE_RESET_FILE=  # reset-backstop file. The gate's own standalone
 #                           #   default is <repo root>/.claude-usage-reset; under the
-#                           #   pump it is resolved to <state dir>/.arachne-usage-reset
+#                           #   pump it is resolved to <state dir>/.taskpump-usage-reset
 #                           #   and handed down, which is the default that counts in
 #                           #   a driven run.
 # TASKPUMP_USAGE_DEBUG=     # 1 = trace the probe to stderr (default: 0)
@@ -288,7 +288,7 @@
 # TASKPUMP_HOST_CONFIG_MOUNT=  # where the host agent config is mounted
 #                           #   (default: /tmp/claude-home-json/.claude.json)
 # TASKPUMP_RO_PROBE_FILE=   # filename used to prove the primary mount is read-only
-#                           #   (default: .arachne-rotest)
+#                           #   (default: .taskpump-rotest)
 
 # ── Monitor (tp monitor) ─────────────────────────────────────────────────────
 # TASKPUMP_MONITOR_BIN=     # path to the monitor the pump hands off to
@@ -323,14 +323,14 @@
 # TASKPUMP_MONITOR_NOTES_DIR=  # directory of session notes
 #                           #   (default: <main root>/<notes dirname>)
 # TASKPUMP_MONITOR_NOTES_DIRNAME=  # that directory's name
-#                           #   (default: .arachne-monitor-notes)
+#                           #   (default: .taskpump-monitor-notes)
 # TASKPUMP_MONITOR_NOTES_FILE=  # a single notes file to tail, overriding the resolved
 #                           #   path (default: empty = resolve from the dir)
 # TASKPUMP_MONITOR_NOTES_TAIL=  # note lines shown in the panel (default: 6)
 # TASKPUMP_MONITOR_NOTES_COLW=  # max note width in the right column (default: 60)
 # The monitor redraws often and must not re-probe the world each frame, so every
 # probe is cached. Cache paths derive from the base unless set individually.
-# TASKPUMP_MONITOR_CACHE_BASE=  # cache path prefix (default: $TMPDIR/arachne-monitor)
+# TASKPUMP_MONITOR_CACHE_BASE=  # cache path prefix (default: $TMPDIR/taskpump-monitor)
 # TASKPUMP_MONITOR_SESS_CACHE=  # session probe cache file
 # TASKPUMP_MONITOR_SESS_TTL=  # session probe cache seconds (default: 2)
 # TASKPUMP_MONITOR_PUMP_CACHE=  # pump-state cache file
@@ -376,7 +376,7 @@
 # TASKPUMP_DISK_COOLDOWN=   # seconds to wait after a reclaim before another (default: 180)
 # TASKPUMP_PANIC_RECLAIM=   # 0 = prune only, never clean build dirs (default: 1)
 # TASKPUMP_DISK_WATCHDOG_LOG=  # its log path
-#                           #   (default: <state dir>/.arachne-disk-watchdog.log)
+#                           #   (default: <state dir>/.taskpump-disk-watchdog.log)
 
 # ── systemd unit (systemd/taskpump-pump.service) ─────────────────────────────
 # Read only by the unit file, which turns them into command-line flags. They are

@@ -51,7 +51,7 @@ set -euo pipefail
 
 : "${WORKSPACE_PATH:=/workspace}"
 : "${REPO_ROOT:=$WORKSPACE_PATH}"
-: "${LOG_FILE:=$WORKSPACE_PATH/.arachne-agent.log}"
+: "${LOG_FILE:=$WORKSPACE_PATH/.taskpump-agent.log}"
 
 # ── Firewall ───────────────────────────────────────────────────────────────────
 # Egress allowlist. This is the hard sandbox; the permission classifier is the

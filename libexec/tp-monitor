@@ -147,7 +147,7 @@ PHASE_SEP="${TASKPUMP_PHASE_SEPARATOR:-.}"
 # strip a trailing dash from whichever spelling arrives.
 AGENT_PREFIX="${TASKPUMP_AGENT_PREFIX:-${TASKPUMP_AGENT_CONTAINER_PREFIX:-arachne-agent-}}"
 AGENT_PREFIX="${AGENT_PREFIX%-}"
-AGENT_LOG_NAME="${TASKPUMP_AGENT_LOG_NAME:-.arachne-agent.log}"
+AGENT_LOG_NAME="${TASKPUMP_AGENT_LOG_NAME:-.taskpump-agent.log}"
 AGENT_LOG_SCAN="${TASKPUMP_AGENT_LOG_SCAN:-200}"
 # Single-quoted: the jq program contains "\\s+", and a double-quoted assignment
 # would collapse that to "\s+", which jq rejects as a bad string escape.
@@ -501,12 +501,12 @@ fi
 # The pump state + run notes live in the PRIMARY checkout (the pump always runs
 # from the main line), so resolve against MAIN_ROOT — the monitor then shows the
 # live pump even when run from a worktree. Override wins.
-PUMP_STATE_NAME="${TASKPUMP_PUMP_STATE_NAME:-.arachne-pump.state}"
+PUMP_STATE_NAME="${TASKPUMP_PUMP_STATE_NAME:-.taskpump-pump.state}"
 PUMP_STATE="${TASKPUMP_PUMP_STATE_FILE:-$MAIN_ROOT/$PUMP_STATE_NAME}"
 # Caches are keyed by a cksum of the main root so parallel checkouts, each with
 # their own pump, cannot read each other's frames.
 CACHE_KEY="$(printf '%s' "$MAIN_ROOT" | cksum | cut -d' ' -f1)"
-CACHE_BASE="${TASKPUMP_MONITOR_CACHE_BASE:-${TMPDIR:-/tmp}/arachne-monitor}"
+CACHE_BASE="${TASKPUMP_MONITOR_CACHE_BASE:-${TMPDIR:-/tmp}/taskpump-monitor}"
 
 # Disk gauge config (free-space colour thresholds mirror tp disk-watchdog).
 DISK_TTL="${TASKPUMP_MONITOR_DISK_TTL:-60}"          # heavy-sizing cache freshness (s)
@@ -529,7 +529,7 @@ TAIL_LINES="${TASKPUMP_MONITOR_TAIL_LINES:-2}"   # feed lines per session (compa
 # ── Notes field ──────────────────────────────────────────────────────────────
 # Scratchpad scoped to the current pump RUN (phases + started_at), so a new run
 # starts fresh. TASKPUMP_MONITOR_NOTES_FILE overrides the resolved path (tests).
-NOTES_DIRNAME="${TASKPUMP_MONITOR_NOTES_DIRNAME:-.arachne-monitor-notes}"
+NOTES_DIRNAME="${TASKPUMP_MONITOR_NOTES_DIRNAME:-.taskpump-monitor-notes}"
 NOTES_DIR="${TASKPUMP_MONITOR_NOTES_DIR:-$MAIN_ROOT/$NOTES_DIRNAME}"
 NOTES_TAIL="${TASKPUMP_MONITOR_NOTES_TAIL:-6}"    # note lines shown in the panel
 NOTES_COLW="${TASKPUMP_MONITOR_NOTES_COLW:-60}"   # max note width in the right column
@@ -1231,7 +1231,7 @@ declare -A GLAY GPOS GORD GCX GY GST GBY GTB GRA GBL GLIVE GGOAL GKIDS
 GLAYERS=()
 graph_index_file() { printf '%s' "$CACHE_BASE-dag.$CACHE_KEY.tsv"; }
 # The monitor owns the pump-state path, so it resolves the range and passes it
-# explicitly — the renderer must not have to re-find .arachne-pump.state.
+# explicitly — the renderer must not have to re-find .taskpump-pump.state.
 graph_phases() {
     [[ -f "$PUMP_STATE" ]] || return 0
     jq -r '.phases // ""' "$PUMP_STATE" 2>/dev/null || true

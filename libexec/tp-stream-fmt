@@ -2,7 +2,7 @@
 # stream-fmt.sh -- format stream-json output from claude -p into readable text
 #
 # Usage:
-#   tail -f .arachne-agent.log | ./scripts/stream-fmt.sh
+#   tail -f .taskpump-agent.log | ./scripts/stream-fmt.sh
 #   docker logs -f arachne-agent | ./scripts/stream-fmt.sh
 #
 # Color key:

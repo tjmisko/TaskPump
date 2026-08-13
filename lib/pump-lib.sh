@@ -108,7 +108,7 @@ apl_network_unhealthy() {
 
 # apl_read_cap — the live concurrency cap: CAP_FILE's contents if it holds a
 # positive integer (live-retunable mid-run), else the caller's JOBS, else
-# TASKPUMP_JOBS_FALLBACK. Lets an operator `echo 3 > .arachne-pool-cap` without
+# TASKPUMP_JOBS_FALLBACK. Lets an operator `echo 3 > .taskpump-pool-cap` without
 # restarting the supervisor.
 apl_read_cap() {
   local c="${JOBS:-$TASKPUMP_JOBS_FALLBACK}"
