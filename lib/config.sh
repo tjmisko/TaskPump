@@ -58,8 +58,8 @@ fi
 
 # ── Install layout ────────────────────────────────────────────────────────────
 # Derived from this file's own realpath, so symlinked installs resolve correctly.
-TP_LIB_DIR="$(CDPATH= cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
-TP_ROOT="$(CDPATH= cd -- "$TP_LIB_DIR/.." && pwd)"
+TP_LIB_DIR="$(CDPATH='' cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+TP_ROOT="$(CDPATH='' cd -- "$TP_LIB_DIR/.." && pwd)"
 TP_LIBEXEC_DIR="$TP_ROOT/libexec"
 TP_GATES_DIR="$TP_ROOT/gates"
 export TP_ROOT TP_LIB_DIR TP_LIBEXEC_DIR TP_GATES_DIR
@@ -103,7 +103,7 @@ tp__git_toplevel() {
 # and at / otherwise. Prints nothing when none is found — not an error.
 tp__discover_config() {
   local dir ceiling
-  dir="$(CDPATH= cd -- "$PWD" 2>/dev/null && pwd)" || return 0
+  dir="$(CDPATH='' cd -- "$PWD" 2>/dev/null && pwd)" || return 0
   ceiling="$(tp__git_toplevel)"
 
   while true; do

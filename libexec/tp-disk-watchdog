@@ -37,7 +37,7 @@
 set -uo pipefail
 
 # ── TaskPump config core ──────────────────────────────────────────────────────
-_tp_self_root="$(CDPATH= cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+_tp_self_root="$(CDPATH='' cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 # shellcheck source=../lib/config.sh
 . "$_tp_self_root/lib/config.sh"
 tp_load_config
@@ -46,7 +46,7 @@ tp_load_config
 
 # REPO_ROOT is the parent of this script's dir; overridable so the panic-reclaim
 # path can be unit-tested against a fixture tree with a stub arachne-cleanup.
-_default_repo_root="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
+_default_repo_root="$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)"
 REPO_ROOT="${TASKPUMP_DISK_REPO_ROOT:-$_default_repo_root}"
 STATE_DIR="${TASKPUMP_STATE_DIR:-$REPO_ROOT}"
 CAP_FILE="${TASKPUMP_POOL_CAP_FILE:-${CAP_FILE:-$STATE_DIR/.taskpump-pool-cap}}"

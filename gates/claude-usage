@@ -53,13 +53,13 @@
 set -euo pipefail
 
 # ── TaskPump config core ──────────────────────────────────────────────────────
-_tp_self_root="$(CDPATH= cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+_tp_self_root="$(CDPATH='' cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 # shellcheck source=../lib/config.sh
 . "$_tp_self_root/lib/config.sh"
 tp_load_config
 
-_script_dir="$(CDPATH= cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
-_repo_root="$(CDPATH= cd -- "$_script_dir/.." && pwd)"
+_script_dir="$(CDPATH='' cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+_repo_root="$(CDPATH='' cd -- "$_script_dir/.." && pwd)"
 
 : "${TASKPUMP_CREDENTIALS:=$HOME/.claude/.credentials.json}"
 : "${TASKPUMP_USAGE_CACHE:=/tmp/claude-plan-usage.json}"

@@ -8,7 +8,7 @@
 # own installation rather than the symlink's directory.
 set -euo pipefail
 
-TP_ROOT="$(CDPATH= cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+TP_ROOT="$(CDPATH='' cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 
 usage() {
   cat <<EOF

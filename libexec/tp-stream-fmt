@@ -13,7 +13,7 @@
 #   Cyan    = ralph iteration markers
 
 # ── TaskPump config core ──────────────────────────────────────────────────────
-_tp_self_root="$(CDPATH= cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+_tp_self_root="$(CDPATH='' cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 # shellcheck source=../lib/config.sh
 . "$_tp_self_root/lib/config.sh"
 tp_load_config
