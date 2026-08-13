@@ -138,6 +138,10 @@
 # TASKPUMP_GOAL_NOTE_NAME=  # goal note written into each worktree (default: .arachne-goal.md)
 # TASKPUMP_RESUME_NOTE_NAME=  # resume preamble written into a resumed worktree
 #                           #   (default: .arachne-resume.md)
+# TASKPUMP_HOOK_MARK_FILE=  # fingerprint of the last pre-tick hook output, kept so
+#                           #   a persistent condition notifies once rather than
+#                           #   every tick (default: <state dir>/.arachne-fsguard.notified;
+#                           #   TASKPUMP_FSGUARD_MARK_FILE is its older spelling)
 
 # ── Project-shaped behavior (tp pump) ────────────────────────────────────────
 # The keys that make the pump fit a language and a toolchain. The defaults here
@@ -236,8 +240,11 @@
 #                           #   (default: /tmp/claude-plan-usage.json)
 # TASKPUMP_USAGE_TTL=       # cache freshness, seconds (default: 60)
 # TASKPUMP_USAGE_HTTP_TIMEOUT=  # curl timeout, seconds (default: 8)
-# TASKPUMP_USAGE_RESET_FILE=  # reset-backstop file
-#                           #   (default: <repo root>/.claude-usage-reset)
+# TASKPUMP_USAGE_RESET_FILE=  # reset-backstop file. The gate's own standalone
+#                           #   default is <repo root>/.claude-usage-reset; under the
+#                           #   pump it is resolved to <state dir>/.arachne-usage-reset
+#                           #   and handed down, which is the default that counts in
+#                           #   a driven run.
 # TASKPUMP_USAGE_DEBUG=     # 1 = trace the probe to stderr (default: 0)
 
 # ── Runner selection and launch (runners/claude-docker/runner.sh) ────────────
@@ -392,8 +399,6 @@
 #   TASKPUMP_RESUME_NOTE      host path of the RENDERED resume preamble
 #                             (TASKPUMP_RESUME_TEMPLATE is the configurable one)
 #   TASKPUMP_ORIGINAL_CAP     the pool cap the disk watchdog must restore
-#   TASKPUMP_HOOK_MARK_FILE   dedup marker so a hook notifies once per condition
-#                             (TASKPUMP_FSGUARD_MARK_FILE is its older spelling)
 #   TASKPUMP_NOW_S            clock override; the test suites' seam
 #   TASKPUMP_ENTRYPOINT_TEST_MODE  entrypoint test seam: `plan` resolves and prints,
 #                             `preflight` also runs the hook — neither starts a session
