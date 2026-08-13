@@ -247,6 +247,44 @@ got=$(TASKPUMP_AGENT_PREFIX=tp-agent- DOCKER="$BIN/fake-runtime" STUB_NAMES="$re
   && pass "a custom prefix selects and strips consistently" \
   || fail "custom prefix enumeration: '$got'"
 
+# The tolerant form flattens "I could not look" into "nothing is live", which is
+# right for the pump's tick (guessing none costs one wasted launch decision) and
+# wrong for a runner answering `list`, whose caller must be able to tell the two
+# apart before deciding to fall back (docs/RUNNERS.md §1.3). Both forms exist for
+# that reason, over ONE filter expression — the drift these tests are for is a
+# second `docker ps --filter` growing next to the first.
+cat >| "$BIN/dead-runtime" <<'EOF'
+#!/usr/bin/env bash
+printf 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock.\n' >&2
+exit 1
+EOF
+chmod +x "$BIN/dead-runtime"
+
+got=$(DOCKER="$BIN/dead-runtime" apl_live_agent_names 2>/dev/null); rc=$?
+[[ $rc -eq 0 && -z "$got" ]] \
+  && pass "the tolerant enumeration reads an unreachable runtime as no agents" \
+  || fail "apl_live_agent_names should stay quiet and succeed; rc=$rc got='$got'"
+
+got=$(DOCKER="$BIN/dead-runtime" apl_live_agent_names_strict 2>/dev/null); rc=$?
+[[ $rc -ne 0 && -z "$got" ]] \
+  && pass "the strict enumeration propagates an unreachable runtime" \
+  || fail "apl_live_agent_names_strict swallowed a runtime failure; rc=$rc got='$got'"
+
+err=$(DOCKER="$BIN/dead-runtime" apl_live_agent_names_strict 2>&1 >/dev/null)
+[[ "$err" == *"Cannot connect to the Docker daemon"* ]] \
+  && pass "the strict enumeration leaves the runtime's stderr for its caller to word" \
+  || fail "the runtime's reason was swallowed: '$err'"
+
+got=$(TASKPUMP_AGENT_PREFIX=arachne-agent- DOCKER="$BIN/fake-runtime" STUB_NAMES="$mixed" apl_live_agent_names_strict | tr '\n' ' '); rc=$?
+[[ $rc -eq 0 && "$got" == "arachne-agent-feat-a arachne-agent-feat-b " ]] \
+  && pass "strict and tolerant select the same names when the runtime answers" \
+  || fail "strict enumeration diverged: rc=$rc '$got'"
+
+got=$(DOCKER="$BIN/fake-runtime" apl_live_agent_names_strict | wc -c); rc=$?
+[[ $rc -eq 0 && "$got" -eq 0 ]] \
+  && pass "an empty fleet is zero bytes, not a blank line" \
+  || fail "empty strict enumeration emitted $got bytes"
+
 echo "--- pool cap: one shared fallback, not three private ones ---"
 CAP_FILE="$TMP/absent-cap"
 [[ "$(JOBS=4 apl_read_cap)" == "4" ]] && pass "caller's JOBS wins when no cap file exists" \

@@ -212,16 +212,46 @@ apl_agent_prefix() { printf '%s' "${TASKPUMP_AGENT_PREFIX:-tp-agent-}"; }
 # spelling; DOCKER is the legacy one every existing harness sets.
 apl_docker() { printf '%s' "${TASKPUMP_DOCKER:-${DOCKER:-docker}}"; }
 
+# apl__runtime_ps_names <prefix> — the ONE `docker ps` filter expression in the
+# stack. Prints the runtime's answer verbatim, and leaves its exit status and its
+# stderr alone: the two callers below differ only in what they do with those.
+# `--filter name=` matches as a substring, so every caller still anchors the
+# prefix itself.
+apl__runtime_ps_names() {
+  "$(apl_docker)" ps --filter "name=$1" --format '{{.Names}}'
+}
+
 # apl_live_agent_names — the full name of every live agent container, one per
 # line. This is THE enumeration: five near-copies of it used to live in the
 # pump's lib, cleanup, and both watchdogs, and three of them called `docker`
 # literally — so a harness that stubbed the runtime still reached the real
 # daemon. Liveness comes from the container runtime, never from task status
 # (design D3).
+#
+# Deliberately tolerant: a runtime that cannot answer reads as "no agents are
+# live". That is the right shape for the pump's own tick — a supervisor that
+# guesses "none" launches something it will find already running next tick, and
+# a tick that died on a transient daemon hiccup would be worse.
 apl_live_agent_names() {
   local prefix; prefix="$(apl_agent_prefix)"
-  "$(apl_docker)" ps --filter "name=$prefix" --format '{{.Names}}' 2>/dev/null \
-    | grep "^$prefix" || true
+  apl__runtime_ps_names "$prefix" 2>/dev/null | grep "^$prefix" || true
+}
+
+# apl_live_agent_names_strict — the same set, with the runtime's failure kept
+# instead of flattened. Exits 0 with a possibly-empty list, or the runtime's own
+# non-zero status with its stderr untouched for the caller to word.
+#
+# The distinction the tolerant form throws away is the whole point of a runner's
+# `list` verb (docs/RUNNERS.md §1.3): its caller must be able to tell "nothing is
+# running" from "I could not look", because those two answers demand opposite
+# actions — launch, or fall back and do not launch.
+apl_live_agent_names_strict() {
+  local prefix; prefix="$(apl_agent_prefix)"
+  local out rc=0
+  out="$(apl__runtime_ps_names "$prefix")" || rc=$?
+  [[ $rc -eq 0 ]] || return "$rc"
+  [[ -n "$out" ]] || return 0
+  grep "^$prefix" <<<"$out" || true
 }
 
 # apl_live_agent_slugs — the same set, each name reduced to its branch slug
