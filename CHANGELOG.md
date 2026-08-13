@@ -6,6 +6,28 @@ in [docs/LEDGER-CONTRACT.md §1](docs/LEDGER-CONTRACT.md#1-versioning).
 
 ## Unreleased
 
+### Fixed
+
+- **A ledger-mutating command now refuses the install-root fallback** instead of
+  silently writing into TaskPump's own ledger. When no explicit tasks dir, no
+  discovered `taskpump.conf` and no cwd git toplevel answers the ledger probe,
+  resolution falls back to the installation's root — correct for the vendored
+  layout (the install root *is* the workspace), and a silent wrong answer
+  everywhere else.
+
+  It produced one: `tp task create` in a fresh repository with no `tasks/`
+  directory wrote the task into the TaskPump checkout's ledger, with a commit,
+  and was caught only because that ledger happened to be under watch
+  (2026-08-12). Both sides look fine afterwards, which is what makes it the worst
+  shape a wrong answer can take.
+
+  `create`, `claim`, `complete`, `block`, `scrub` and the rest now exit non-zero
+  naming what was probed, where resolution landed, and both fixes (`mkdir tasks`
+  or `TASKPUMP_TASKS_DIR=…`). Read-only commands keep working on purpose —
+  `resolve --tasks-dir` is the diagnostic the error points at. The vendored
+  layout is unaffected: when the install root is the caller's worktree, or sits
+  inside it, the fallback is correct and stays silent.
+
 ### Added
 
 - **Runner contract v2: `runner.sh list`.** A runner can now be *asked* which of

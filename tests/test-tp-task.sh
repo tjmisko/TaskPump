@@ -858,6 +858,81 @@ else
   fail "non-repo fallback resolved to '$got', expected '$WS_A/ops/task-loop/tasks'"
 fi
 
+# ── The install-root fallback must not be a silent WRITE target ───────────────
+# The fallback above is correct for the vendored layout and a silent wrong answer
+# everywhere else, and it has produced one incident: `tp task create` in a fresh
+# repository with no ledger wrote the task into TaskPump's OWN ledger, with a
+# commit, and was caught only because that ledger happened to be under watch
+# (2026-08-12). Both sides look fine afterwards — the operator's repository never
+# learns it was ignored, and the installation's ledger silently grows a task from
+# a project it has never heard of.
+#
+# So resolution keeps falling back (the cases above still pass, and `resolve`
+# still answers), but a MUTATING command refuses when the fallback lands outside
+# the caller's repository.
+mutate_from() {  # mutate_from <cwd> <cli> <verb...> — a mutation with nothing pre-answered
+  local dir=$1 cli=$2; shift 2
+  ( cd "$dir" && env "${TP_ENV_UNSET[@]}" \
+      TASKPUMP_LEDGER_PROBE=ops/task-loop/tasks \
+      ARACHNE_TASK_NOCOMMIT=1 "$cli" "$@" 2>&1 )
+}
+
+# The incident shape exactly: a fresh git repo with no ledger, TaskPump installed
+# somewhere else entirely.
+INCIDENT="$TMPDIR_TEST/incident"
+mkdir -p "$INCIDENT"
+git -C "$INCIDENT" init -q
+before=$(ls "$WS_A/ops/task-loop/tasks" | wc -l)
+rc=0; out=$(mutate_from "$INCIDENT" "$WS_A/libexec/tp-task" create T99 --title "must not land") || rc=$?
+[[ $rc -ne 0 ]] && pass "create in a ledger-less repo is refused" \
+  || fail "create wrote somewhere on the incident shape (rc=$rc):\n$out"
+[[ "$(ls "$WS_A/ops/task-loop/tasks" | wc -l)" -eq "$before" ]] \
+  && pass "nothing was written to the installation's own ledger" \
+  || fail "the refusal still wrote into $WS_A's ledger"
+[[ ! -e "$INCIDENT/tasks" && ! -e "$INCIDENT/ops" ]] \
+  && pass "nothing was written to the caller's repo either" \
+  || fail "a ledger was invented in the caller's repo"
+
+# The error has to be actionable, so it names what was probed, where resolution
+# landed, and both fixes. An error that says only "no" sends the operator to the
+# source.
+grep -q "$INCIDENT" <<<"$out" && pass "the error names the repository it probed" \
+  || fail "the error does not name the caller's repo:\n$out"
+grep -q "$WS_A" <<<"$out" && pass "the error names where resolution landed" \
+  || fail "the error does not name the install ledger:\n$out"
+grep -q 'mkdir ops/task-loop/tasks' <<<"$out" && pass "the error offers the mkdir fix" \
+  || fail "the error does not offer the mkdir fix:\n$out"
+grep -q 'TASKPUMP_TASKS_DIR' <<<"$out" && pass "the error offers the explicit-dir fix" \
+  || fail "the error does not offer the env fix:\n$out"
+
+# Read-only commands keep working — `resolve` is the diagnostic the error points
+# at, and an error that disables the tool you need to diagnose it is worse.
+rc=0; got=$(mutate_from "$INCIDENT" "$WS_A/libexec/tp-task" resolve --tasks-dir) || rc=$?
+[[ $rc -eq 0 && "$got" == "$WS_A/ops/task-loop/tasks" ]] \
+  && pass "resolve still prints where resolution would land" \
+  || fail "resolve was blocked too (rc=$rc): '$got'"
+
+# The vendored layout is the reason the fallback exists, and it must stay silent:
+# standing in the workspace whose install this is, the install root IS the
+# caller's repo.
+rc=0; out=$(mutate_from "$WS_A" "$WS_A/libexec/tp-task" create T98 --title "vendored is fine") || rc=$?
+[[ $rc -eq 0 ]] && pass "the vendored layout still mutates without complaint" \
+  || fail "the guard broke the vendored layout (rc=$rc):\n$out"
+[[ -f "$WS_A/ops/task-loop/tasks/T98.md" ]] \
+  && pass "the vendored write landed in its own ledger" \
+  || fail "the vendored create wrote nowhere"
+rm -f "$WS_A/ops/task-loop/tasks/T98.md"
+
+# An explicit tasks dir is an answer, not a fallback: the caller said where the
+# ledger is, so there is nothing to guess and nothing to refuse.
+mkdir -p "$INCIDENT/elsewhere"
+rc=0; out=$( cd "$INCIDENT" && env "${TP_ENV_UNSET[@]}" ARACHNE_TASK_NOCOMMIT=1 \
+    TASKPUMP_TASKS_DIR="$INCIDENT/elsewhere" "$WS_A/libexec/tp-task" \
+    create T97 --title "explicit is fine" 2>&1 ) || rc=$?
+[[ $rc -eq 0 && -f "$INCIDENT/elsewhere/T97.md" ]] \
+  && pass "an explicit TASKPUMP_TASKS_DIR is honoured without complaint" \
+  || fail "the guard fired on an explicit tasks dir (rc=$rc):\n$out"
+
 # An explicit ARACHNE_TASKS_DIR still wins over both.
 got=$( cd "$WS_B" && ARACHNE_TASKS_DIR="$TASKS" ARACHNE_TASK_NOCOMMIT=1 \
         "$WS_A/libexec/tp-task" resolve --tasks-dir )
