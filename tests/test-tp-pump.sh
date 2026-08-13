@@ -66,6 +66,17 @@ export ARACHNE_USAGE="$BIN/arachne-usage"
 export ARACHNE_DISK_WATCHDOG="$BIN/arachne-disk-watchdog"
 export DOCKER="$BIN/docker"
 
+# Reference pins (G1.2): the fixtures below are Arachne-shaped — F-grammar ids
+# and arachne-agent-* container names in the docker stubs. Those spellings used
+# to arrive through the tools' baked defaults; the v0.1.0 flips (G1.5 agent
+# prefix, G1.6 id grammar) retire them, so they are pinned here with the
+# examples/arachne.conf values. Tests that drive OTHER spellings (Test 20's
+# tp-agent- prefix, Test 29's G sigil) override these per invocation, which is
+# exactly how a differently-shaped consumer would.
+export TASKPUMP_ID_PATTERN='^F[0-9]+(\.[0-9]+)?$'
+export TASKPUMP_PHASE_SIGIL=F
+export TASKPUMP_AGENT_PREFIX=arachne-agent-
+
 mk() {  # mk <id> <status> [blockers_csv]
   local id=$1 status=$2 blockers=${3:-}
   local by="[]"; [[ -n "$blockers" ]] && by="[$(printf '%s' "$blockers" | sed 's/,/, /g')]"
@@ -815,14 +826,20 @@ grep -qiF 'not found' <<<"$out" && fail "still dying on a missing consumer templ
   || pass "no hard die on a missing consumer template"
 
 echo "--- Test 22: TASKPUMP_STATE_DIR relocates the run's dotfiles ---"
+# The state-file NAME is pinned so that half tests relocation, not the default
+# spelling (the .arachne-* filename defaults flip to .taskpump-* in G1.3). The
+# pool cap has no name-in-state-dir key — an explicit TASKPUMP_POOL_CAP_FILE is
+# a path resolved against the cwd — so the cap assertion necessarily reads the
+# bare default name; G1.3 updates it to .taskpump-pool-cap in the flip commit.
 SD="$TMP/state-dir"; mkdir -p "$SD"
 mk F55.0 done; mk F55.1 done; mk F56.0 done; mk F57.0 done
 TASKPUMP_NOTIFY_CMD=true TASKPUMP_PUMP_NO_LAUNCH=1 ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
   TASKPUMP_STATE_DIR="$SD" ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+  TASKPUMP_PUMP_STATE_NAME=.pinned-pump.state \
   "$PUMP" --no-health-gate --phases F55..F57 --once >/dev/null 2>&1
-[[ -f "$SD/.arachne-pump.state" ]] && pass "state file follows TASKPUMP_STATE_DIR" \
+[[ -f "$SD/.pinned-pump.state" ]] && pass "state file follows TASKPUMP_STATE_DIR" \
   || fail "state file not written under $SD"
-[[ -f "$SD/.arachne-pool-cap" ]] && pass "pool-cap file follows TASKPUMP_STATE_DIR" \
+[[ -f "$SD/.arachne-pool-cap" ]] && pass "pool-cap file follows TASKPUMP_STATE_DIR (default name; G1.3 flips it)" \
   || fail "cap file not written under $SD"
 # An individual filename still overrides the directory.
 TASKPUMP_NOTIFY_CMD=true TASKPUMP_PUMP_NO_LAUNCH=1 ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
@@ -1133,10 +1150,10 @@ out=$(TASKPUMP_PHASE_SIGIL=G ARACHNE_TASKS_DIR="$GTASKS" \
 have "$out" "bad phase range 'G1..X9'" && pass "range error names the bad spec" || fail "no range error:\n$out"
 have "$out" 'plan — phases' && fail "plan header printed despite bad range:\n$out" || pass "no plan header before the abort"
 
-# 30b: same contract under the default F sigil.
+# 30b: same contract under the suite's pinned F sigil.
 out=$(pump F55..X9 2>&1); rc=$?
-[[ $rc -ne 0 ]] && pass "F55..X9 exits non-zero under the default sigil" || fail "F55..X9 exited 0:\n$out"
-have "$out" "bad phase range 'F55..X9'" && pass "default-sigil range error surfaced" || fail "no range error:\n$out"
+[[ $rc -ne 0 ]] && pass "F55..X9 exits non-zero under the pinned F sigil" || fail "F55..X9 exited 0:\n$out"
+have "$out" "bad phase range 'F55..X9'" && pass "pinned-sigil range error surfaced" || fail "no range error:\n$out"
 
 echo
 echo "=============================================="

@@ -114,18 +114,23 @@ itick() {
 echo "--- the off-switch: a suite-style invocation ignores the poison conf ---"
 
 rm -f "$MARKER"
+# Bare-default contrast, deliberately: this suite's subject is discovery, and
+# the baked defaults are its observable. G1.6 flips the default sigil (F → T)
+# and the default ledger probe (ops/task-loop/tasks → tasks), and updates this
+# case and the resolve case below in the same commit as the flip.
 out=$(TASKPUMP_NO_CONF=1 itick F55..F55 2>&1); rc=$?
 [[ $rc -eq 0 ]] && pass "F-range tick exits 0 with the switch set" \
   || fail "F-range tick rc=$rc with the switch set:\n$out"
-have "$out" 'would integrate F55' && pass "the default F sigil is in force (F55 integrates)" \
+have "$out" 'would integrate F55' && pass "the default F sigil is in force (F55 integrates; flips in G1.6)" \
   || fail "no 'would integrate F55' with the switch set:\n$out"
 [[ ! -f "$MARKER" ]] && pass "the poison build gate never ran with the switch set" \
   || fail "poison TASKPUMP_BUILD_GATE executed despite TASKPUMP_NO_CONF=1"
 
 got=$( cd "$POISON" && env TASKPUMP_NO_CONF=1 ARACHNE_TASK_NOCOMMIT=1 \
         "$TASK" resolve --tasks-dir )
+# The */ops/task-loop/tasks shape is the baked default probe — G1.6 updates it.
 [[ "$got" != "poison-tasks" && "$got" == */ops/task-loop/tasks ]] \
-  && pass "tasks dir resolves to the baked default, not the poison conf's" \
+  && pass "tasks dir resolves to the baked default, not the poison conf's (default flips in G1.6)" \
   || fail "resolve --tasks-dir got '$got' with the switch set"
 
 echo

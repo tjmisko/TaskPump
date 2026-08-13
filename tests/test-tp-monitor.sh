@@ -37,6 +37,19 @@ EOF
 chmod +x "$BIN/docker"
 export PATH="$BIN:$PATH"
 
+# Reference pins (G1.2): the fixtures below speak the historical Arachne
+# spellings — arachne-agent-* containers in the docker stubs, .arachne-agent.log
+# worktree logs, F-grammar phases, and the arachne-task viewer window class.
+# Those used to be the tools' baked defaults; the v0.1.0 flips (G1.3 filenames,
+# G1.4 window class, G1.5 agent prefix, G1.6 sigil) retire them, so they are
+# pinned here with the examples/arachne.conf values. Test 33 drives the OTHER
+# spellings and overrides these per invocation, exactly as a differently-shaped
+# consumer would.
+export TASKPUMP_AGENT_PREFIX=arachne-agent-
+export TASKPUMP_AGENT_LOG_NAME=.arachne-agent.log
+export TASKPUMP_MONITOR_TASK_CLASS=arachne-task
+export TASKPUMP_PHASE_SIGIL=F
+
 # arachne-usage stub: --json emits a fixed payload with the two window bars; any
 # other mode is a no-op. Percentages chosen to be unambiguous in the output.
 make_usage_stub() {  # $1 = five% $2 = seven%
@@ -1195,7 +1208,11 @@ exit 0
 EOF
 chmod +x "$BIN/docker"
 XC="$TMP/x-sess.tsv"
-xmon() { TASKPUMP_AGENT_CONTAINER_PREFIX=runner TASKPUMP_AGENT_LOG_NAME=agent.jsonl \
+# TASKPUMP_AGENT_PREFIX is emptied so the suite's exported pin cannot mask the
+# TASKPUMP_AGENT_CONTAINER_PREFIX spelling this test exists to exercise — the
+# monitor reads the empty value as unset and falls through.
+xmon() { TASKPUMP_AGENT_PREFIX= \
+         TASKPUMP_AGENT_CONTAINER_PREFIX=runner TASKPUMP_AGENT_LOG_NAME=agent.jsonl \
          TASKPUMP_WORKTREES_DIR=trees TASKPUMP_MONITOR_REPO_ROOT="$XR" \
          TASKPUMP_TASKS_DIR="$GTD" TASKPUMP_MONITOR_SESS_CACHE="$XC" \
          TASKPUMP_MONITOR_COLS=140 "$CLI" 2>/dev/null | strip_ansi; }
@@ -1206,11 +1223,13 @@ grep -q 'custom-shaped feed line' <<<"$xout" \
     && pass "a renamed worktree dir + log name still yield feed lines" \
     || fail "custom log path not resolved:\n$xout"
 # The empty-state copy names the configured prefix rather than a fixed one.
+# (TASKPUMP_AGENT_PREFIX emptied again, same reason as xmon above.)
 printf '#!/usr/bin/env bash\nexit 0\n' >| "$BIN/docker"; chmod +x "$BIN/docker"
-empty_x=$(TASKPUMP_AGENT_CONTAINER_PREFIX=runner TASKPUMP_MONITOR_SESS_CACHE="$TMP/x-empty.tsv" \
+empty_x=$(TASKPUMP_AGENT_PREFIX= TASKPUMP_AGENT_CONTAINER_PREFIX=runner \
+          TASKPUMP_MONITOR_SESS_CACHE="$TMP/x-empty.tsv" \
           TASKPUMP_MONITOR_COLS=100 "$CLI" 2>/dev/null | strip_ansi)
 for _ in 1 2 3 4 5; do grep -q 'containers running' <<<"$empty_x" && break
-                       sleep 0.5; empty_x=$(TASKPUMP_AGENT_CONTAINER_PREFIX=runner \
+                       sleep 0.5; empty_x=$(TASKPUMP_AGENT_PREFIX= TASKPUMP_AGENT_CONTAINER_PREFIX=runner \
                        TASKPUMP_MONITOR_SESS_CACHE="$TMP/x-empty.tsv" TASKPUMP_MONITOR_COLS=100 \
                        "$CLI" 2>/dev/null | strip_ansi); done
 grep -q '(no runner containers running or recently exited)' <<<"$empty_x" \
