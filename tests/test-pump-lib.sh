@@ -136,8 +136,8 @@ EOF
 chmod +x "$BIN/docker"
 
 # The prefix is pinned per invocation (the examples/arachne.conf value): what
-# these cases assert is the counting, not the prefix's default spelling, and
-# the default flips to tp-agent- in G1.5.
+# these cases assert is the counting, not the prefix's default spelling, which
+# is tp-agent- since G1.5.
 names=$'arachne-agent-feat-a\narachne-agent-feat-b'
 got=$(TASKPUMP_AGENT_PREFIX=arachne-agent- DOCKER="$BIN/docker" STUB_NAMES="$names" apl_count_live_agents)
 [[ "$got" == "2" ]] && pass "counts 2 live arachne-agent containers" \
@@ -202,10 +202,10 @@ echo "--- agent identity: one prefix, one runtime, one enumeration ---"
 # The container-name prefix is the stack's join key. Its default must not drift
 # unannounced (tooling outside this repo greps for it), and it must be
 # overridable in one place rather than re-hardcoded per tool.
-# Bare default, deliberately: still the historical spelling today. G1.5 flips
-# it to tp-agent- and updates this assertion in the same commit as the flip.
-[[ "$(apl_agent_prefix)" == "arachne-agent-" ]] \
-  && pass "bare default agent prefix is arachne-agent- (flips in G1.5)" \
+# Bare default, deliberately: the shipped spelling is TaskPump's own (G1.5).
+# The historical arachne-agent- spelling survives only as the arachne.conf pin.
+[[ "$(apl_agent_prefix)" == "tp-agent-" ]] \
+  && pass "bare default agent prefix is tp-agent-" \
   || fail "default prefix drifted: '$(apl_agent_prefix)'"
 # Conf-pinned: the reference consumer's spelling survives the flip.
 [[ "$(TASKPUMP_AGENT_PREFIX=arachne-agent- apl_agent_prefix)" == "arachne-agent-" ]] \
@@ -231,7 +231,7 @@ chmod +x "$BIN/fake-runtime"
   || fail "legacy DOCKER ignored"
 
 # Prefix pinned per invocation here too — enumeration mechanics are the
-# subject, and the default spelling flips in G1.5.
+# subject, not the default spelling (tp-agent- since G1.5).
 mixed=$'arachne-agent-feat-a\nsome-other-container\narachne-agent-feat-b'
 got=$(TASKPUMP_AGENT_PREFIX=arachne-agent- DOCKER="$BIN/fake-runtime" STUB_NAMES="$mixed" apl_live_agent_names | tr '\n' ' ')
 [[ "$got" == "arachne-agent-feat-a arachne-agent-feat-b " ]] \

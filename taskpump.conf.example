@@ -265,7 +265,7 @@
 # TASKPUMP_ENTRYPOINT=      # in-image entrypoint path (default: /entrypoint-parallel.sh)
 # TASKPUMP_AGENT_PREFIX=    # container-name prefix, INCLUDING the trailing dash —
 #                           #   liveness enumeration matches on it, so it must be
-#                           #   distinctive on the host (default: arachne-agent-;
+#                           #   distinctive on the host (default: tp-agent-;
 #                           #   the dashless TASKPUMP_AGENT_CONTAINER_PREFIX accepted)
 # TASKPUMP_AGENT_MODEL=     # model alias forwarded to each agent (default: opus)
 # TASKPUMP_MAX_TURNS=       # turn cap for a session (default: 600)

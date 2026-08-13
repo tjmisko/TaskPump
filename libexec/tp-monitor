@@ -145,7 +145,7 @@ PHASE_SEP="${TASKPUMP_PHASE_SEPARATOR:-.}"
 # TASKPUMP_AGENT_PREFIX is the shared spelling (the pump names containers with
 # it, dash included); the monitor works with the dashless form internally, so
 # strip a trailing dash from whichever spelling arrives.
-AGENT_PREFIX="${TASKPUMP_AGENT_PREFIX:-${TASKPUMP_AGENT_CONTAINER_PREFIX:-arachne-agent-}}"
+AGENT_PREFIX="${TASKPUMP_AGENT_PREFIX:-${TASKPUMP_AGENT_CONTAINER_PREFIX:-tp-agent-}}"
 AGENT_PREFIX="${AGENT_PREFIX%-}"
 AGENT_LOG_NAME="${TASKPUMP_AGENT_LOG_NAME:-.taskpump-agent.log}"
 AGENT_LOG_SCAN="${TASKPUMP_AGENT_LOG_SCAN:-200}"
