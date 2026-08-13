@@ -32,6 +32,14 @@ contains newlines, and a mid-line match would produce ragged output. Keep block
 placeholders alone on their line, and note that indentation is not reapplied to
 the inserted lines.
 
+**Conditional section** — the lines between `{{#NAME}}` and `{{/NAME}}` (each
+marker alone on its line) render only when `NAME` resolves to content; the
+marker lines are never emitted. This is how a template mentions an *optional*
+value: `{{VERIFY_CMDS}}` is empty unless the consumer sets
+`TASKPUMP_VERIFY_CMDS`, and a sentence built around an empty value — "Verify
+with ." — is worse than no sentence at all, so both shipped templates wrap
+their verify prose in a `{{#VERIFY_CMDS}}` section.
+
 ### `phase-drain-brief.md`
 
 | Placeholder | Kind | Value |
@@ -41,7 +49,7 @@ the inserted lines.
 | `{{TASK_CLI}}` | scalar | How the agent invokes the task CLI in its workspace. |
 | `{{TASK_CLI_NAME}}` | scalar | The CLI's basename, for prose that names the tool. |
 | `{{TASK_DIR}}` | scalar | The tasks directory relative to the workspace, e.g. `ops/task-loop/tasks`. |
-| `{{VERIFY_CMDS}}` | scalar | The per-task verify commands, semicolon-joined onto one line. |
+| `{{VERIFY_CMDS}}` | scalar | The per-task verify commands, rendered as an inline phrase. Empty (and its `{{#VERIFY_CMDS}}` sections dropped) unless `TASKPUMP_VERIFY_CMDS` is set. |
 | `{{PROJECT_BRIEF}}` | block | `TASKPUMP_PROJECT_BRIEF` — a paragraph pointing the agent at the project's own docs. |
 | `{{DEPENDS_ON}}` | block | Cross-phase dependency summary, or a line stating there are none. |
 
@@ -58,7 +66,7 @@ the inserted lines.
 | `{{COMMITS}}` | block | `git log --oneline <base>..<branch>` — what the dead session already landed. |
 | `{{STATUS_SHORT}}` | block | `git status --short`. |
 | `{{DIFF_STAT}}` | block | `git diff --stat`. |
-| `{{VERIFY_CMDS}}` | scalar | The project's format/lint/test commands, semicolon-joined onto one line; must be clean before a task can be completed. |
+| `{{VERIFY_CMDS}}` | scalar | The project's format/lint/test commands, rendered as an inline phrase; must be clean before a task can be completed. Empty (sections dropped) unless `TASKPUMP_VERIFY_CMDS` is set. |
 
 `{{VERIFY_CMDS}}` is deliberately **not** called `BUILD_GATE`. `TASKPUMP_BUILD_GATE`
 already means something else — the merge queue's gate, which decides whether a

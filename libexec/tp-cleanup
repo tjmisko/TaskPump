@@ -23,6 +23,8 @@
 #   3. Releases the task claim so the next run can re-pick it.
 #
 # Configuration (taskpump.conf or the environment; legacy names still work):
+#   TASKPUMP_RECLAIM_CMD          the consumer's reclaim command; while unset
+#                                 the --targets sweep touches nothing
 #   TASKPUMP_STUCK_THRESHOLD_MIN  log-stale cutoff, minutes (default 15)
 #   TASKPUMP_STOP_GRACE_SEC       stop grace period, seconds (default 30)
 #   TASKPUMP_MANIFEST             manifest mapping containers to tasks
@@ -60,10 +62,16 @@ AGENT_LOG_NAME="${TASKPUMP_AGENT_LOG_NAME:-.taskpump-agent.log}"
 DRY_RUN=0
 MODE=""
 # --include-primary / RECLAIM_PRIMARY=1: also reclaim the PRIMARY checkout's
-# target/ (Arachne itself), not just worktrees. Off by default so a human's
+# build output, not just the worktrees'. Off by default so a human's
 # in-progress build in the primary checkout is never wiped without asking; the
 # disk watchdog turns it on under PANIC to buy maximum space.
 INCLUDE_PRIMARY="${TASKPUMP_RECLAIM_PRIMARY:-${RECLAIM_PRIMARY:-0}}"
+# The build-output sweep runs only when the consumer has said how build output
+# is reclaimed (TASKPUMP_RECLAIM_CMD, the same key the pump's per-tick pass
+# reads). The sweep's own target/ + cargo-clean logic is Rust-shaped, and a
+# rescue tool guessing at another toolchain's build dirs is worse than one that
+# says it is unconfigured (G1.7; examples/arachne.conf pins 'cargo clean').
+RECLAIM_CMD="${TASKPUMP_RECLAIM_CMD:-}"
 
 usage() { apl_help "$0"; }
 
@@ -207,12 +215,17 @@ reclaim_target() {
     return 0
 }
 
-# ── do_targets -- cargo clean target/ in every worktree (cheap to rebuild,
-#    typically 2-6 GB each), SKIPPING any worktree that currently hosts a live
-#    agent container so an in-flight build is never broken. With
+# ── do_targets -- reclaim build output (target/) in every worktree (cheap to
+#    rebuild, typically 2-6 GB each), SKIPPING any worktree that currently hosts
+#    a live agent container so an in-flight build is never broken. With
 #    --include-primary it also reclaims the primary checkout's own target/.
+#    Runs only when a reclaim command is configured; see RECLAIM_CMD above.
 do_targets() {
-    log "reclaiming cargo target/ dirs (dry-run=$DRY_RUN, include-primary=$INCLUDE_PRIMARY)"
+    if [[ -z "$RECLAIM_CMD" ]]; then
+        log "target reclaim skipped: TASKPUMP_RECLAIM_CMD unconfigured — nothing touched (set it to your project's reclaim command, e.g. 'cargo clean')"
+        return 0
+    fi
+    log "reclaiming build target/ dirs (dry-run=$DRY_RUN, include-primary=$INCLUDE_PRIMARY)"
     local busy; busy="$(busy_worktrees)"
     local found=0 skipped=0
     local wt

@@ -66,6 +66,17 @@ curl failure. Fail-open is the pump's backstop, not your error handling.
 
 ## 2. The shipped gates
 
+With no `TASKPUMP_GATES` configured, the pump consults **the default chain**:
+
+> `claude-token-fresh` → `claude-usage` → `disk-low`
+
+— credential freshness, plan utilization, free disk, in that order, each
+droppable via its own `--no-*-gate` flag or enable key. `net-health` also ships,
+but as **consumer-enabled** hardware policy: it joins the chain (first) only
+when `TASKPUMP_HEALTH_GATE=1` — see its section below. `tp pump --dry-run`
+prints the active chain as a `gates:` line, so what is actually wired is one
+command away.
+
 ### `claude-usage` — plan utilization
 
 Reads the OAuth usage endpoint (the same meter the Claude Code status toolbar
@@ -113,17 +124,24 @@ It shares its threshold with the disk watchdog, so the "pause launching" floor
 and the "reclaim now" floor are one knob rather than two that can disagree.
 Reclaim is separate from the gate: pausing buys time, reclaiming buys space.
 
-### `net-health` — host network wedge (hardware policy)
+### `net-health` — host network wedge (shipped, consumer-enabled)
 
 Pauses when the kernel journal shows a driver wedge signature within a recent
 window.
 
-**This gate is host-hardware policy, and a generic consumer should drop it.** It
-matches `brcmfmac` firmware-hang signatures specific to Apple-Silicon WiFi, where
-the aggregate packet load of many simultaneous streaming agents starves the RX
-ring and hangs the firmware until the device is reset. Nothing about that
-generalizes; on other hardware the gate matches nothing and costs a journal read
-per tick.
+**This gate is host-hardware policy, so it ships off**: it is not in the default
+chain, and stays inert until a consumer sets `TASKPUMP_HEALTH_GATE=1`, which
+puts it at the head of the chain. It stays shipped because its detection logic
+is a worked example of a real gate — and because of where it comes from: it
+matches `brcmfmac` firmware-hang signatures specific to Apple-Silicon WiFi,
+where the aggregate packet load of many simultaneous streaming agents starves
+the RX ring and hangs the firmware until the device is reset. Nothing about
+that generalizes; on other hardware the gate would match nothing and cost a
+journal read per tick, which is exactly why enabling it is the consumer's call
+(the reference consumer pins `TASKPUMP_HEALTH_GATE=1` in
+`examples/arachne.conf`). Note the key gates the *probe*, not just the chain
+entry: a `net-health` line in a custom `TASKPUMP_GATES` also needs
+`TASKPUMP_HEALTH_GATE=1` to actually look.
 
 Its **recovery half deliberately lives consumer-side.** Detecting a wedge and
 pausing is a feed decision, so it belongs in a gate. Reloading a kernel module
@@ -190,11 +208,12 @@ Gates are ordinary executables, so test them by running them:
 ./gates/my-gate; echo "exit=$?"
 ```
 
-Against the pump, `--dry-run` prints the plan including the gate decision and its
-reason, and launches nothing:
+Against the pump, `--dry-run` prints the active chain, the plan including the
+gate decision, and its reason — and launches nothing:
 
 ```bash
 tp pump --phases T1..T9 --dry-run
+# gates: claude-token-fresh -> claude-usage -> disk-low
 ```
 
 That is the fastest way to confirm a gate is wired, ordered where you expect, and

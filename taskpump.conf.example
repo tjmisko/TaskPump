@@ -151,14 +151,14 @@
 #                           #   TASKPUMP_FSGUARD_MARK_FILE is its older spelling)
 
 # ── Project-shaped behavior (tp pump) ────────────────────────────────────────
-# The keys that make the pump fit a language and a toolchain. The defaults here
-# are Rust-shaped for historical reasons; a non-Rust consumer should set them.
+# The keys that make the pump fit a language and a toolchain. None of them ship
+# with a toolchain baked in; a consumer names its own commands here.
 # TASKPUMP_BUILD_GATE=      # command that must pass before work is integrated
 #                           #   (default: empty = no build gate;
 #                           #   TASKPUMP_PUMP_BUILD_CMD overrides for the merge queue)
 # TASKPUMP_VERIFY_CMDS=     # newline-separated commands a task must leave green,
-#                           #   quoted into the brief (default: `cargo fmt --all` and
-#                           #   `cargo clippy --workspace -- -D warnings`)
+#                           #   quoted into the brief (default: empty — the brief's
+#                           #   verify sections are dropped until a consumer sets it)
 # TASKPUMP_PROJECT_BRIEF=   # one paragraph pointing an agent at the project's own
 #                           #   contributor docs (default: a generic "read CLAUDE.md,
 #                           #   CONTRIBUTING.md, or equivalent" paragraph)
@@ -175,16 +175,18 @@
 # TASKPUMP_SUBMODULE_PROBE= # a path that proves the ledger submodule is populated
 #                           #   (default: ops/planning/STATUS.md)
 # TASKPUMP_RECLAIM_CMD=     # how to reclaim build output from a finished workspace, so
-#                           #   a multi-day run's disk footprint stays bounded
-#                           #   (default: empty = built-in target/ removal)
+#                           #   a multi-day run's disk footprint stays bounded — run with
+#                           #   the workspace as its cwd, e.g. 'cargo clean'
+#                           #   (default: empty = the reclaim pass and the tp-cleanup
+#                           #   --targets sweep are no-ops that log themselves unconfigured)
 # TASKPUMP_DISK_RECLAIM=    # 0 = never reclaim build dirs on disk pressure (default: 1)
 # TASKPUMP_GATES=           # ordered, newline-separated list of gate COMMAND LINES —
 #                           #   each entry's first word must be an executable path; a
 #                           #   non-executable entry is skipped with a warning.
-#                           #   (default: <install>/gates/net-health,
-#                           #   gates/claude-token-fresh, `<usage bin> --gate`,
+#                           #   (default: gates/claude-token-fresh, `<usage bin> --gate`,
 #                           #   gates/disk-low — each included only while its own
-#                           #   enable flag is 1)
+#                           #   enable flag is 1; gates/net-health joins first when
+#                           #   TASKPUMP_HEALTH_GATE=1 opts it in)
 # TASKPUMP_PRE_TICK_HOOKS=  # newline-separated hook command lines run at the start of
 #                           #   each tick, same executable-path rule as gates
 #                           #   (default: <install>/hooks/gitignore-repair and
@@ -216,8 +218,10 @@
 
 # ── Gate: net-health (gates/net-health) ──────────────────────────────────────
 # Host-hardware policy, not a general one — it looks for the kernel signatures of
-# a specific WiFi firmware wedge. A consumer on other hardware drops this gate.
-# TASKPUMP_HEALTH_GATE=     # 0 disables the gate entirely (default: 1)
+# a specific WiFi firmware wedge. Shipped but OFF by default; a consumer whose
+# hardware needs it opts in.
+# TASKPUMP_HEALTH_GATE=     # 1 puts the gate at the head of the default chain
+#                           #   (default: 0 — the gate is not consulted)
 # TASKPUMP_HEALTH_WINDOW=   # how far back to look, seconds (default: 120)
 # TASKPUMP_HEALTH_PROBE_CMD=  # command whose output is searched (default: empty =
 #                           #   `journalctl -k -b 0 --since '<window> sec ago'`)

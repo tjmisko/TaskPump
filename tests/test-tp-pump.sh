@@ -233,29 +233,8 @@ have "$(jq -r '.paused_reason // empty' "$STATE" 2>/dev/null)" 'disk gate' && pa
 
 echo "--- Test 10: reclaim sweep cleans completed-phase target/ dirs (A4 / F65.3) ---"
 WT="$TMP/wt"; STATE10="$TMP/pump10.state"
-# Stub cargo so `clean --manifest-path X` removes $(dirname X)/target with no real
-# build (honours the no-real-cargo test seam). Shadowed onto PATH for the tick.
-cat >| "$BIN/cargo" <<'EOF'
-#!/usr/bin/env bash
-if [[ "${1:-}" == "clean" ]]; then
-  shift; mp=""
-  while (($#)); do
-    case "$1" in
-      --manifest-path) mp="$2"; shift 2;;
-      --manifest-path=*) mp="${1#--manifest-path=}"; shift;;
-      *) shift;;
-    esac
-  done
-  [[ -n "$mp" ]] && rm -rf "$(dirname "$mp")/target"
-  exit 0
-fi
-exit 0
-EOF
-chmod +x "$BIN/cargo"
-
 plant_target() {  # fake done-phase worktree with a target/ dir + sentinel
   rm -rf "$WT"; mkdir -p "$WT/feat/f56/target"
-  : >| "$WT/feat/f56/Cargo.toml"
   echo sentinel >| "$WT/feat/f56/target/sentinel"
 }
 reclaim_tick() {  # one real tick with the reclaim sweep active, fixture-wired
@@ -271,20 +250,31 @@ reclaim_tick() {  # one real tick with the reclaim sweep active, fixture-wired
   "$PUMP" --no-health-gate "$@"
 }
 
-# 10a: a PLAN_DONE phase (all tasks done) with no live container → target reclaimed.
+# 10a: a PLAN_DONE phase (all tasks done) with no live container → target
+# reclaimed via the CONFIGURED command. There is no built-in fallback: the key
+# names the consumer's own reclaim (G1.7 retired the cargo one).
 mk F56.0 done; plant_target
-out=$(STUB_GATE_RC=0 ARACHNE_DISK_RECLAIM=1 reclaim_tick --phases F56 --once 2>&1)
+out=$(STUB_GATE_RC=0 ARACHNE_DISK_RECLAIM=1 TASKPUMP_RECLAIM_CMD='rm -rf target' \
+  reclaim_tick --phases F56 --once 2>&1)
 [[ ! -d "$WT/feat/f56/target" ]] && pass "reclaim removed F56 target/ on a DONE tick" || fail "F56 target/ survived reclaim:\n$out"
 have "$out" 'reclaimed F56' && pass "reclaim logged 'reclaimed F56'" || fail "no reclaim log line:\n$out"
 
+# 10a': no TASKPUMP_RECLAIM_CMD → the pass is a no-op that says so (G1.7).
+plant_target
+out=$(STUB_GATE_RC=0 ARACHNE_DISK_RECLAIM=1 reclaim_tick --phases F56 --once 2>&1)
+[[ -d "$WT/feat/f56/target" ]] && pass "unconfigured reclaim pass touches nothing" \
+  || fail "target/ removed with no reclaim command configured:\n$out"
+have "$out" 'TASKPUMP_RECLAIM_CMD unconfigured' && pass "unconfigured reclaim pass logs the no-op line" \
+  || fail "no unconfigured log line:\n$out"
+
 # 10b: ARACHNE_DISK_RECLAIM=0 → reclaim disabled, target survives.
 plant_target
-STUB_GATE_RC=0 ARACHNE_DISK_RECLAIM=0 reclaim_tick --phases F56 --once >/dev/null 2>&1
+STUB_GATE_RC=0 ARACHNE_DISK_RECLAIM=0 TASKPUMP_RECLAIM_CMD='rm -rf target' reclaim_tick --phases F56 --once >/dev/null 2>&1
 [[ -d "$WT/feat/f56/target" ]] && pass "ARACHNE_DISK_RECLAIM=0 leaves target/ intact" || fail "target removed despite RECLAIM=0"
 
 # 10c: a live container for F56 → target survives even though open_count=0.
 plant_target
-STUB_GATE_RC=0 ARACHNE_DISK_RECLAIM=1 STUB_LIVE="arachne-agent-feat-f56" reclaim_tick --phases F56 --once >/dev/null 2>&1
+STUB_GATE_RC=0 ARACHNE_DISK_RECLAIM=1 TASKPUMP_RECLAIM_CMD='rm -rf target' STUB_LIVE="arachne-agent-feat-f56" reclaim_tick --phases F56 --once >/dev/null 2>&1
 [[ -d "$WT/feat/f56/target" ]] && pass "live-phase target/ never reclaimed (phase_live guard)" || fail "live phase target/ was reclaimed"
 
 echo "--- Test 11: the read-only-primary mount, now the runner's to keep ---"
@@ -916,6 +906,37 @@ have "$note" 'RESUME CONTEXT' && pass "the resume note keeps its heading" || fai
 have "$note" 'Do NOT start by running' && pass "the resume note keeps the next-returns-null warning" \
   || fail "the load-bearing warning is gone:\n$note"
 
+echo "--- Test 23c: an empty VERIFY_CMDS drops the verify sections cleanly (G1.7) ---"
+# The shipped default IS empty — no default can know a project's toolchain — so
+# the templates' {{#VERIFY_CMDS}} sections must vanish without a dangling
+# verify sentence, and reappear intact the moment a consumer sets the key.
+out=$(ARACHNE_PUMP_OPS_DIR="$TMP/no-such-ops" ARACHNE_PUMP_NO_GH=1 \
+  TASKPUMP_TASK_CLI="bin/tp task" \
+  TASKPUMP_PROJECT_BRIEF="Read HACKING.md first." "$PUMP" --render-brief F55 2>&1)
+have "$out" 'Verify with' && fail "empty VERIFY_CMDS left a dangling verify bullet:\n$out" \
+  || pass "no verify bullet when VERIFY_CMDS is empty"
+have "$out" 'clean on your branch' && fail "empty VERIFY_CMDS left a dangling done-criterion:\n$out" \
+  || pass "no verify done-criterion when VERIFY_CMDS is empty"
+grep -qF '{{' <<<"$out" && fail "section markers or placeholders survived:\n$out" \
+  || pass "no section marker survives the empty case"
+grep -qF "Run the task's tests." <<<"$out" && pass "the neighboring step survives the dropped section" \
+  || fail "a neighboring line was lost with the section:\n$out"
+out=$(ARACHNE_PUMP_OPS_DIR="$TMP/no-such-ops" ARACHNE_PUMP_NO_GH=1 \
+  TASKPUMP_TASK_CLI="bin/tp task" TASKPUMP_VERIFY_CMDS="make check" \
+  TASKPUMP_PROJECT_BRIEF="Read HACKING.md first." "$PUMP" --render-brief F55 2>&1)
+grep -qF 'Verify with `make check`' <<<"$out" && pass "a configured VERIFY_CMDS renders its section" \
+  || fail "configured VERIFY_CMDS section missing:\n$out"
+
+# The resume note's verify sentence follows the same contract.
+note=$(rnote ARACHNE_PUMP_OPS_DIR="$TMP/noops")
+have "$note" 'must be clean' && fail "empty VERIFY_CMDS left a dangling clean-clause:\n$note" \
+  || pass "resume note drops the verify clause when VERIFY_CMDS is empty"
+grep -qF '{{' <<<"$note" && fail "resume note kept a marker or placeholder:\n$note" \
+  || pass "resume note keeps no marker in the empty case"
+note=$(rnote ARACHNE_PUMP_OPS_DIR="$TMP/noops" TASKPUMP_VERIFY_CMDS="make check")
+grep -qF '`make check` must be clean' <<<"$note" && pass "resume note renders a configured VERIFY_CMDS" \
+  || fail "resume note verify clause missing:\n$note"
+
 echo "--- Test 24: the feed gate is a pluggable, fail-open chain ---"
 GBIN="$TMP/gates"; mkdir -p "$GBIN"
 mkgate() {  # mkgate <name> <exit> <message>
@@ -973,6 +994,27 @@ out=$(STUB_DISK_GATE_RC=10 pump F56)
 have "$out" 'GATE: PAUSED' && pass "the disk gate is in the default chain" || fail "disk gate missing:\n$out"
 out=$(STUB_DISK_GATE_RC=10 pump F56 --no-disk-gate)
 have "$out" 'GATE: feed-ok' && pass "--no-disk-gate drops the disk gate" || fail "--no-disk-gate ignored:\n$out"
+
+echo "--- Test 24b: dry-run names the active gate chain (G1.7) ---"
+# Bare default: three gates, no net-health — it is host-hardware policy and
+# ships off. TASKPUMP_HEALTH_GATE=1 opts it in at the head of the chain; the
+# probe is stubbed inert so this host's real journal never reaches the suite.
+# (the usage entry names this suite's stub, arachne-usage — the line shows the
+# CONFIGURED binary, which is the point.)
+out=$("$PUMP" --dry-run --phases F56 2>&1)
+have "$out" '^gates: claude-token-fresh -> arachne-usage -> disk-low$' \
+  && pass "bare default chain is token-fresh -> usage -> disk-low" \
+  || fail "bare default chain wrong:\n$out"
+out=$(TASKPUMP_HEALTH_GATE=1 TASKPUMP_HEALTH_PROBE_CMD=true "$PUMP" --dry-run --phases F56 2>&1)
+have "$out" '^gates: net-health -> claude-token-fresh -> arachne-usage -> disk-low$' \
+  && pass "TASKPUMP_HEALTH_GATE=1 opts net-health in, first" \
+  || fail "opt-in chain wrong:\n$out"
+out=$(TASKPUMP_HEALTH_GATE=1 TASKPUMP_HEALTH_PROBE_CMD=true "$PUMP" --no-health-gate --dry-run --phases F56 2>&1)
+have "$out" '^gates: claude-token-fresh' && pass "--no-health-gate still drops net-health" \
+  || fail "--no-health-gate ignored:\n$out"
+out=$(TASKPUMP_GATES="$GBIN/pause-quota" pump F56)
+have "$out" '^gates: pause-quota$' && pass "a custom TASKPUMP_GATES chain is named verbatim" \
+  || fail "custom chain not named:\n$out"
 
 echo "--- Test 25: pre-tick hooks are a chain too ---"
 HBIN="$TMP/hooks"; mkdir -p "$HBIN"

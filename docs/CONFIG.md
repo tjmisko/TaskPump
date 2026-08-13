@@ -206,9 +206,9 @@ toolchain:
 | Key | What it configures |
 |---|---|
 | `TASKPUMP_BUILD_GATE` | The command that must pass before work is integrated. `cargo check` for Rust, `npm test` for Node, whatever your project's "is it broken" question is. `TASKPUMP_PUMP_BUILD_CMD` overrides it for the merge queue. |
-| `TASKPUMP_VERIFY_CMDS` | Newline-separated commands a task must leave green, quoted into the brief. The shipped default is Rust-shaped; a non-Rust consumer should set it. |
+| `TASKPUMP_VERIFY_CMDS` | Newline-separated commands a task must leave green, quoted into the brief. Empty by default — the templates' verify sections drop out until a consumer names its own bar. |
 | `TASKPUMP_PROJECT_BRIEF` | One paragraph pointing an agent at the project's own contributor documentation. |
-| `TASKPUMP_RECLAIM_CMD` | How to reclaim build output from a finished workspace, so a multi-day run's disk footprint stays bounded. |
+| `TASKPUMP_RECLAIM_CMD` | How to reclaim build output from a finished workspace, so a multi-day run's disk footprint stays bounded. Empty by default: unconfigured, the per-tick reclaim pass and the `tp cleanup --targets` sweep touch nothing and log themselves unconfigured. |
 | `TASKPUMP_BRIEF_TEMPLATE` | The parameterized brief a launched agent is handed. |
 | `TASKPUMP_RESUME_TEMPLATE` | The resume preamble a stalled task's agent gets ahead of that brief. |
 | `TASKPUMP_TASK_CLI` | How an agent invokes the ledger CLI from inside its worktree. |
@@ -269,7 +269,7 @@ touches: `TASKPUMP_CONTAINER_USER` / `_HOME`, `TASKPUMP_WORKSPACE_TASK_CLI`,
 | `TASKPUMP_USAGE_GATE`, `TASKPUMP_USAGE`, `TASKPUMP_USAGE_CEILING` | Whether the usage gate runs, the binary that answers it, and the utilization percent at which it pauses. |
 | `TASKPUMP_USAGE_ENDPOINT`, `_CACHE`, `_TTL`, `_HTTP_TIMEOUT`, `_RESET_FILE`, `_DEBUG` | The usage probe's plumbing. |
 | `TASKPUMP_TOKEN_GATE`, `TASKPUMP_TOKEN_MARGIN_S` | The credential-freshness gate and how much headroom it wants. |
-| `TASKPUMP_HEALTH_GATE`, `TASKPUMP_HEALTH_WINDOW`, `TASKPUMP_HEALTH_PROBE_CMD`, `TASKPUMP_HEALTH_SIGNATURES` | The host-health gate: whether it runs, how far back it looks, what it looks *at*, and the failure signatures it matches. The shipped signatures are one machine's WiFi firmware; a consumer on other hardware drops this gate or replaces them. |
+| `TASKPUMP_HEALTH_GATE`, `TASKPUMP_HEALTH_WINDOW`, `TASKPUMP_HEALTH_PROBE_CMD`, `TASKPUMP_HEALTH_SIGNATURES` | The host-health gate: whether it runs (`TASKPUMP_HEALTH_GATE=1` opts it into the head of the default chain; it ships off), how far back it looks, what it looks *at*, and the failure signatures it matches. The shipped signatures are one machine's WiFi firmware; a consumer enabling it on other hardware replaces them. |
 | `TASKPUMP_DISK_GATE`, `TASKPUMP_DISK_RECLAIM`, `TASKPUMP_DISK_REPO_ROOT`, `TASKPUMP_DISK_WATCHDOG` | The low-disk gate and its reclaim behavior. Its floor is `TASKPUMP_DISK_PAUSE_GB`, shared with the watchdog (§3.7). |
 
 ### 3.5 Monitor — `tp monitor`

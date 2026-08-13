@@ -1,4 +1,5 @@
 [dry-run] no image build, no launches, no ops mutation
+gates: net-health -> claude-token-fresh -> claude-usage -> disk-low
 arachne-pump plan — phases F55..F57, grain phase, cap 4, ceiling 95%
 GATE: feed-ok
   LAUNCH   F55    -> feat/f55
