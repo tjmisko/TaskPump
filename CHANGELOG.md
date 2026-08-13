@@ -101,6 +101,23 @@ broken suite does not hide the rest, and prints a summary table.
 
 ### Changed
 
+**State, log, and note filename defaults are now `.taskpump-*`.** Every file a
+run drops — pump state and log, agent log, phase brief, goal and resume notes,
+pool cap, usage reset, disk-watchdog log, fs-guard mark, read-only probe,
+monitor notes dir, and the monitor cache base (`$TMPDIR/taskpump-monitor`) —
+defaults to a `.taskpump-*` spelling. Key names are unchanged; the historical
+`.arachne-*` names remain available purely through configuration, and
+`examples/arachne.conf` pins all of them for the reference consumer. The ledger
+lockfile, previously hardcoded, gained its own key in the same move:
+`TASKPUMP_LOCK_NAME` (default `.taskpump-task.lock`).
+
+**Do not upgrade under a live drain.** The agent-log name is how the monitor and
+the cleanup sweeper find a running agent, and the ledger lock only excludes
+agents that resolve the same filename — so flipping these defaults under running
+agents makes them invisible to their supervisors and splits the fleet across two
+locks. Finish or stop the drain first, or pin the historical names in
+`taskpump.conf` (as `examples/arachne.conf` does) before upgrading.
+
 **Layout.** Tools to `libexec/tp-*`, sourced code to `lib/`, the usage governor
 to `gates/claude-usage`, the container agent runner to `runners/claude-docker/`,
 the systemd unit to `systemd/`, design notes to `docs/design/`, suites to
