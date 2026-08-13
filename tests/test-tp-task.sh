@@ -878,6 +878,34 @@ else
   fail "custom-probe resolution got '$got', expected '$WS_C/tasks'"
 fi
 
+# A DISCOVERED taskpump.conf marks its own directory as a workspace (G1.6): a
+# subdirectory carrying a conf and the probed ledger owns its own ledger even
+# when the enclosing worktree also answers the probe — the generic-project
+# fixture's situation, sitting inside a repo whose root has a tasks/ of its own.
+SUBWS="$WS_C/vendor/subproject"
+mkdir -p "$SUBWS/tasks"
+printf '# marks this directory as its own TaskPump workspace\n' >| "$SUBWS/taskpump.conf"
+got=$( cd "$SUBWS" && env "${TP_ENV_UNSET[@]}" TASKPUMP_NO_CONF=0 \
+        TASKPUMP_LEDGER_PROBE=tasks ARACHNE_TASK_NOCOMMIT=1 \
+        "$WS_A/libexec/tp-task" resolve --tasks-dir )
+if [[ "$got" == "$SUBWS/tasks" ]]; then
+  pass "a discovered conf anchors resolution to its own directory"
+else
+  fail "conf-anchored resolution got '$got', expected '$SUBWS/tasks'"
+fi
+
+# An EXPLICIT TASKPUMP_CONFIG is deliberate configuration, not a workspace
+# marker: it may live anywhere (a suite's pins file), so it must never move the
+# ledger to wherever the file happens to sit.
+got=$( cd "$WS_C" && env "${TP_ENV_UNSET[@]}" TASKPUMP_NO_CONF=1 \
+        TASKPUMP_CONFIG="$SUBWS/taskpump.conf" TASKPUMP_LEDGER_PROBE=tasks \
+        ARACHNE_TASK_NOCOMMIT=1 "$WS_A/libexec/tp-task" resolve --tasks-dir )
+if [[ "$got" == "$WS_C/tasks" ]]; then
+  pass "an explicit TASKPUMP_CONFIG does not anchor resolution to the file's directory"
+else
+  fail "explicit-config resolution got '$got', expected '$WS_C/tasks'"
+fi
+
 # And the negative: under the pinned ops/task-loop/tasks probe, that same
 # workspace does NOT look like it carries a ledger, so resolution falls back to
 # the script's workspace. This is what proves the probe is doing the deciding.

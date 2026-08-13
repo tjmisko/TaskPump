@@ -55,9 +55,24 @@ tp_load_config
 _tp_script_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 _tp_script_root="$(cd "$_tp_script_dir/.." && pwd)"
 
+# A DISCOVERED taskpump.conf marks a workspace of its own. The discovery walk
+# (lib/config.sh) runs upward from $PWD and never past the enclosing git
+# worktree, so a conf it found is always within the caller's worktree — and it
+# is the more specific marker: a directory carrying its own taskpump.conf (a
+# fixture, a vendored subproject) owns its own ledger even when the enclosing
+# worktree also answers the probe. An EXPLICIT TASKPUMP_CONFIG never anchors:
+# deliberate configuration may live anywhere (a suite's pins file), and saying
+# where the config *is* is not saying where the ledger is.
+_tp_conf_root=""
+if [[ -z "${TASKPUMP_CONFIG:-}" && -n "${TP_CONFIG_FILE:-}" ]]; then
+  _tp_conf_root="$(CDPATH= cd -- "$(dirname "$TP_CONFIG_FILE")" 2>/dev/null && pwd || true)"
+fi
+
 _tp_repo_root="$_tp_script_root"
 _tp_cwd_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
-if [[ -n "$_tp_cwd_root" && -d "$_tp_cwd_root/$TASKPUMP_LEDGER_PROBE" ]]; then
+if [[ -n "$_tp_conf_root" && -d "$_tp_conf_root/$TASKPUMP_LEDGER_PROBE" ]]; then
+  _tp_repo_root="$_tp_conf_root"
+elif [[ -n "$_tp_cwd_root" && -d "$_tp_cwd_root/$TASKPUMP_LEDGER_PROBE" ]]; then
   _tp_repo_root="$_tp_cwd_root"
 fi
 
@@ -1729,12 +1744,13 @@ plus TASKPUMP_PHASE_SIGIL derive the phase from it. Phase grouping (--phase),
 range expansion (--phases T55..T63) and ordering are all built on that split, so
 the dot is part of the contract even though the sigil and the pattern are yours.
 
-The workspace is $PWD's git worktree when that worktree carries a ledger of its
-own (TASKPUMP_LEDGER_PROBE resolves there), otherwise the directory above this
-script. Since each worktree carries both its own copy of this CLI and its own
-ledger, preferring the caller's workspace keeps a claim made inside a worktree
-out of the primary checkout's ledger. The config above still overrides;
-`resolve` prints what a given invocation picked.
+The workspace is the directory of a DISCOVERED taskpump.conf when the ledger
+probe resolves there, else $PWD's git worktree when that worktree carries a
+ledger of its own (TASKPUMP_LEDGER_PROBE resolves there), otherwise the
+directory above this script. Since each worktree carries both its own copy of
+this CLI and its own ledger, preferring the caller's workspace keeps a claim
+made inside a worktree out of the primary checkout's ledger. The config above
+still overrides; `resolve` prints what a given invocation picked.
 EOF
 }
 
