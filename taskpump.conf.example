@@ -118,6 +118,9 @@
 # TASKPUMP_NOTIFY_CMD=      # command that reads a notification on stdin. Unset falls
 #                           #   back to notify-send when present, else log only. Set to
 #                           #   `true` to silence.
+# TASKPUMP_PUMP_PROG_NAME=  # the name the pump answers to as itself — diagnostics,
+#                           #   the plan header, the notify title, the transient
+#                           #   systemd unit (default: tp-pump)
 
 # ── Run state and file names (tp pump) ───────────────────────────────────────
 # One knob moves every dotfile a run drops; each name is still individually
