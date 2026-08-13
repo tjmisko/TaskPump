@@ -1543,7 +1543,6 @@ if [[ -f "$STATE_FILE" ]]; then
   fi
 fi
 
-[[ -d "$CLAUDE_DIR" ]] || die "no ~/.claude; run 'claude' to authenticate first"
 if [[ -z "${GITHUB_TOKEN:-}" ]] && command -v gh >/dev/null 2>&1; then
   GITHUB_TOKEN="$(gh auth token 2>/dev/null || true)"; export GITHUB_TOKEN
 fi
@@ -1555,6 +1554,9 @@ fi
 # Skip the (~9 GB) image build when we will not launch containers — keeps the
 # NO_LAUNCH tick (tests / live read-only validation) side-effect-free.
 if [[ "${TASKPUMP_PUMP_NO_LAUNCH:-0}" -ne 1 ]]; then
+  # Launch prerequisites only: a NO_LAUNCH tick starts no containers, so it
+  # must not require the operator's auth dir — CI runners have no ~/.claude.
+  [[ -d "$CLAUDE_DIR" ]] || die "no ~/.claude; run 'claude' to authenticate first"
   # Before the build and before any runner call: launching needs an image, and
   # there is deliberately no default — a wrong silent image is strictly worse
   # than a loud missing one.
