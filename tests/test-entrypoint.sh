@@ -733,15 +733,17 @@ RESUME_T="$TP_ROOT/templates/resume-note.md"
 [[ -f "$RESUME_T" ]] && pass "templates/resume-note.md ships"        || fail "no templates/resume-note.md"
 
 # placeholders_in <file> — the distinct {{NAME}} tokens a template uses.
-placeholders_in() { grep -oE '\{\{[A-Z_]+\}\}' "$1" | sort -u | tr '\n' ' ' | sed 's/ $//'; }
+# LC_ALL=C pins the collation: the recorded want-lists below are byte order,
+# and an unpinned sort flips TASK_CLI/TASK_CLI_NAME under UTF-8 locales.
+placeholders_in() { grep -oE '\{\{[A-Z_]+\}\}' "$1" | LC_ALL=C sort -u | tr '\n' ' ' | sed 's/ $//'; }
 
 got=$(placeholders_in "$BRIEF_T")
-want='{{BASE}} {{DEPENDS_ON}} {{PHASE}} {{PROJECT_BRIEF}} {{TASK_CLI}} {{TASK_CLI_NAME}} {{TASK_DIR}} {{VERIFY_CMDS}}'
+want='{{BASE}} {{DEPENDS_ON}} {{PHASE}} {{PROJECT_BRIEF}} {{TASK_CLI_NAME}} {{TASK_CLI}} {{TASK_DIR}} {{VERIFY_CMDS}}'
 [[ "$got" == "$want" ]] && pass "brief template uses exactly the placeholders the pump substitutes" \
   || fail "brief placeholder set drifted.\n  want: $want\n  got:  $got"
 
 got=$(placeholders_in "$RESUME_T")
-want='{{BRANCH}} {{COMMITS}} {{DIFF_STAT}} {{PHASE}} {{STATUS_SHORT}} {{TASK_CLI}} {{TASK_CLI_NAME}} {{TASK_FILE}} {{TASK_ID}} {{VERIFY_CMDS}}'
+want='{{BRANCH}} {{COMMITS}} {{DIFF_STAT}} {{PHASE}} {{STATUS_SHORT}} {{TASK_CLI_NAME}} {{TASK_CLI}} {{TASK_FILE}} {{TASK_ID}} {{VERIFY_CMDS}}'
 [[ "$got" == "$want" ]] && pass "resume template uses exactly the documented placeholder set" \
   || fail "resume placeholder set drifted.\n  want: $want\n  got:  $got"
 # BUILD_GATE means the merge queue's gate (TASKPUMP_BUILD_GATE). Reusing the name
