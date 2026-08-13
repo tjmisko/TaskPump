@@ -149,6 +149,63 @@ historical value in `examples/arachne.conf`:
   runner's own `entrypoint.sh`. See
   [docs/RUNNERS.md §4.0](docs/RUNNERS.md#40-the-image-contract).
 
+**Tool identity defaults are TaskPump's own (G1.4).** Everything a run signs —
+ledger commits, diagnostics, the pump's plan header and transient unit, the
+sweeper's snapshot commits, the monitor's task window class — spells TaskPump
+by default, each pinned to its historical spelling in `examples/arachne.conf`:
+
+- `TASKPUMP_PROG_NAME` defaults to `tp-task` (was `arachne-task`), and ledger
+  commits are authored `tp-task <task@taskpump.local>` via
+  `TASKPUMP_COMMITTER_NAME` / `TASKPUMP_COMMITTER_EMAIL` (was
+  `arachne-task <task@arachne.local>`).
+- The pump's warn prefix, plan header, notify title, and transient systemd unit
+  name derive from one new key, `TASKPUMP_PUMP_PROG_NAME`, default `tp-pump`
+  (previously hardcoded `arachne-pump`).
+- The stuck-agent sweep's pre-stop wip snapshot is committed as
+  `tp-cleanup <cleanup@taskpump.local>` (was the `arachne-cleanup` identity).
+- `TASKPUMP_MONITOR_TASK_CLASS` defaults to `taskpump-task` (was
+  `arachne-task`).
+
+**The ledger's default shape is `tasks/` and `T` ids (G1.6).** A repository
+that keeps its ledger in `tasks/` with `T`-shaped ids now needs no ledger
+configuration at all; Arachne's shape survives as `examples/arachne.conf` pins:
+
+- `TASKPUMP_LEDGER_PROBE` defaults to `tasks` (was `ops/task-loop/tasks`), in
+  `tp-task`'s resolution and the `tp-dag-render`/`tp-monitor` fallbacks alike;
+  the container entrypoint's tasks-dir fallback follows.
+- `TASKPUMP_ID_PATTERN` defaults to `^T[0-9]+(\.[0-9]+)?$` and
+  `TASKPUMP_PHASE_SIGIL` to `T` (were `^F[0-9]+(\.[0-9]+)?$` and `F`).
+- Default ledger resolution now lets a *discovered* `taskpump.conf` anchor: its
+  directory outranks `$PWD`'s worktree root, so a directory carrying its own
+  conf and `tasks/` — a fixture, a vendored subproject — owns its own ledger
+  even inside a larger TaskPump-shaped repository. An explicit
+  `TASKPUMP_CONFIG` never moves resolution.
+- The task CLI the pump quotes into briefs is `tp task`, and the one the
+  container entrypoint execs is `tp` (`TASKPUMP_TASK_CLI` /
+  `TASKPUMP_WORKSPACE_TASK_CLI`; both were `scripts/arachne-task`). An image
+  that cannot resolve `tp` fails at startup, before any heartbeat, naming both
+  remedies.
+
+**Supervisor policy defaults are project-neutral (G1.7).** No shipped default
+can know a consumer's toolchain or hardware, so the Rust- and host-shaped
+policies retire to `examples/arachne.conf` pins:
+
+- `TASKPUMP_VERIFY_CMDS` defaults to empty (was `cargo fmt --all` +
+  `cargo clippy --workspace -- -D warnings`). Brief templates gained
+  conditional sections, so an empty default drops the verify prose entirely
+  instead of rendering a dangling sentence.
+- The per-tick reclaim pass runs only when `TASKPUMP_RECLAIM_CMD` is
+  configured; the built-in `cargo clean` / `rm -rf` fallback is retired.
+  Unconfigured, the pass is a logged no-op, and `tp-cleanup`'s `--targets`
+  sweep is likewise armed only by a configured command.
+- The `net-health` gate ships **off** (`TASKPUMP_HEALTH_GATE` flips `1` → `0`).
+  Its probes match `brcmfmac` WiFi firmware signatures specific to one class of
+  host — host policy, not project policy — so it joins the chain (first) only
+  when a consumer opts in; its recovery half deliberately stays consumer-side
+  (see [docs/GATES.md](docs/GATES.md)). The default chain is
+  `claude-token-fresh -> claude-usage -> disk-low`, and `tp pump --dry-run` now
+  prints the active chain as a `gates:` line.
+
 ### Removed
 
 - The `run-parallel.sh` half of the read-only-mount test guard. That launcher
@@ -162,12 +219,10 @@ historical value in `examples/arachne.conf`:
 Tracked for the generalization work that follows this entry, so nobody mistakes
 these for finished:
 
-- The `net-health` gate matches `brcmfmac` WiFi firmware signatures specific to
-  one class of host. Generic consumers should drop it from `TASKPUMP_GATES`; its
-  recovery half deliberately stays consumer-side (see
-  [docs/GATES.md](docs/GATES.md)).
 - Liveness enumeration matches on a container-name prefix rather than asking the
   runner, so a runner must name its agents `<prefix><branch-slug>`. A
   `runner.sh list` verb is the v2 fix (see
   [docs/RUNNERS.md §1.3](docs/RUNNERS.md#13-what-v1-deliberately-leaves-out)).
-- Branch-to-container-name slugging assumes a branch contains at most one `/`.
+- Branch-to-container-name slugging assumes a branch contains at most one `/`;
+  a branch name that cannot round-trip the slug confuses liveness enumeration
+  instead of being rejected at claim or launch time.

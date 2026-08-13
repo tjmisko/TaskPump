@@ -2,30 +2,34 @@
 
 TaskPump is a task DAG and an agent supervisor for long-running autonomous work.
 
-Tasks are plain markdown files with YAML frontmatter — one file per task, holding
-its status, its blockers, its goal, and its claim. A single CLI is the only
-reader and writer of that state, so claims are atomic, every mutation is a git
-commit, and nothing is ever hand-edited into a shape the state machine would not
-allow. Because the ledger is just files in a directory, it diffs, it reviews in a
-pull request, it merges, and it survives every tool in this repository being
+Record tasks as markdown files with YAML frontmatter. Each task file records
+its status, its blockers, its goal, its definition of done, its claim, and
+relevant context for a coding agent. The `tp` CLI is the only reader and writer
+of task state, so claims are atomic, every mutation is a git commit, and
+nothing is ever hand-edited into a shape the state machine would not allow.
+Because the ledger is just files in a directory, it diffs, it reviews in a pull
+request, it merges, and it survives every tool in this repository being
 deleted.
 
-On top of that ledger sits a **pump**: a supervisor that recomputes the eligible
-frontier every tick, launches sandboxed agents against it, and keeps going for
-days. It never stores a queue — the frontier is derived from declared blockers,
-so newly-unblocked work enters on its own with nothing to requeue. It decides
-liveness by looking at processes rather than believing task status, because a
-process killed mid-run never gets to write anything. It governs itself against
-your plan's usage meter and pauses *feeding* rather than exhausting your quota,
-never killing work already in flight. It resumes a task stranded behind an
-abandoned claim, with a note telling the new agent what the dead one already
-committed. And it exits loudly on a genuine deadlock instead of idling green.
+On top of that ledger sits a **pump**, a supervisor that can keep a planned
+taskloop going for days by (1) recomputing the eligible frontier every tick and
+(2) launching sandboxed agents against eligible tasks. The open task frontier
+is derived from declared blockers. When work becomes unblocked, it becomes
+available on the frontier.
 
-Every one of those behaviours is in the second paragraph because an unattended
-run failed without it. The full accounting is in
-[docs/PUMP-MECHANISMS.md](docs/PUMP-MECHANISMS.md); the short version is that a
-supervisor which cannot distinguish "nothing to do" from "nothing I *can* do"
-will always resolve the ambiguity as health.
+**Robustness to Agent and Machine Failure**: The pump is designed assuming
+that unplanned interruptions will occur and that agents will not reliably
+finish their work. The supervisor derives liveness by looking at processes to
+corroborate the task status recorded by agents in their sessions for robustness
+against interruptions by the OOM killer, power failures, etc. This prevents
+dangling tasks and bad state from clogging the pump. The supervisor can also be
+configured to pause task ingestion when the plan's usage reaches a threshold.
+It resumes a task stranded behind an abandoned claim, with a note telling the
+new agent what the dead one already committed. And it exits loudly on a genuine
+deadlock instead of idling green.
+
+The full accounting of failures which led to the requirements that produced
+this design is in [docs/PUMP-MECHANISMS.md](docs/PUMP-MECHANISMS.md).
 
 ---
 
@@ -40,14 +44,25 @@ git clone https://github.com/tjmisko/TaskPump
 ln -s "$PWD/TaskPump/bin/tp" ~/.local/bin/tp
 ```
 
-### 1. Configure your project
+### 1. Point it at your project
 
-Write a `taskpump.conf` at the root of the repository you want driven. Two keys
-is a working configuration:
+TaskPump works bare. A repository that keeps its ledger in `tasks/` with
+`T`-shaped ids (`T1`, `T2.1`) needs **no** configuration at all — from the root
+of the repository you want driven:
 
 ```bash
-TASKPUMP_TASKS_DIR=tasks
-TASKPUMP_ID_PATTERN='^T[0-9]+(\.[0-9]+)?$'
+mkdir tasks
+```
+
+That directory's presence is what marks a repository as carrying its own
+ledger; `tp task resolve` prints which ledger any invocation would touch.
+
+A `taskpump.conf` at the same root is how you diverge from the defaults — a
+ledger somewhere else, a different id grammar:
+
+```bash
+TASKPUMP_TASKS_DIR=planning/tasks             # ledger lives elsewhere
+TASKPUMP_ID_PATTERN='^J[0-9]+(\.[0-9]+)?$'    # different sigil — set TASKPUMP_PHASE_SIGIL=J too
 ```
 
 Add these when you start running agents:
@@ -59,7 +74,7 @@ TASKPUMP_IMAGE=my-project-agent         # the image agents launch from — no de
 TASKPUMP_PUMP_JOBS=1                    # start at one; raise after you watch a drain
 ```
 
-`examples/minimal.conf` is that file with commentary;
+`examples/minimal.conf` is a commented conf to start from;
 `examples/arachne.conf` is a fully-configured real consumer, annotated with why
 each hardening default exists. [docs/CONFIG.md](docs/CONFIG.md) covers discovery
 and precedence, and `taskpump.conf.example` is the complete key census.
