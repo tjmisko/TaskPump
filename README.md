@@ -44,14 +44,25 @@ git clone https://github.com/tjmisko/TaskPump
 ln -s "$PWD/TaskPump/bin/tp" ~/.local/bin/tp
 ```
 
-### 1. Configure your project
+### 1. Point it at your project
 
-Write a `taskpump.conf` at the root of the repository you want driven. Two keys
-is a working configuration:
+TaskPump works bare. A repository that keeps its ledger in `tasks/` with
+`T`-shaped ids (`T1`, `T2.1`) needs **no** configuration at all — from the root
+of the repository you want driven:
 
 ```bash
-TASKPUMP_TASKS_DIR=tasks
-TASKPUMP_ID_PATTERN='^T[0-9]+(\.[0-9]+)?$'
+mkdir tasks
+```
+
+That directory's presence is what marks a repository as carrying its own
+ledger; `tp task resolve` prints which ledger any invocation would touch.
+
+A `taskpump.conf` at the same root is how you diverge from the defaults — a
+ledger somewhere else, a different id grammar:
+
+```bash
+TASKPUMP_TASKS_DIR=planning/tasks             # ledger lives elsewhere
+TASKPUMP_ID_PATTERN='^J[0-9]+(\.[0-9]+)?$'    # different sigil — set TASKPUMP_PHASE_SIGIL=J too
 ```
 
 Add these when you start running agents:
@@ -63,7 +74,7 @@ TASKPUMP_IMAGE=my-project-agent         # the image agents launch from — no de
 TASKPUMP_PUMP_JOBS=1                    # start at one; raise after you watch a drain
 ```
 
-`examples/minimal.conf` is that file with commentary;
+`examples/minimal.conf` is a commented conf to start from;
 `examples/arachne.conf` is a fully-configured real consumer, annotated with why
 each hardening default exists. [docs/CONFIG.md](docs/CONFIG.md) covers discovery
 and precedence, and `taskpump.conf.example` is the complete key census.
