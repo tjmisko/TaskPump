@@ -55,13 +55,13 @@
 set -euo pipefail
 
 # ── TaskPump config core ──────────────────────────────────────────────────────
-_tp_self_root="$(CDPATH= cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+_tp_self_root="$(CDPATH='' cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 # shellcheck source=../lib/config.sh
 . "$_tp_self_root/lib/config.sh"
 tp_load_config
 
-SCRIPT_DIR="$(CDPATH= cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
-REPO_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+REPO_ROOT="$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=../lib/pump-lib.sh
 source "$TP_LIB_DIR/pump-lib.sh"
 
@@ -763,7 +763,8 @@ render_brief_stream() {
 render_brief() {
   local phase="$1"
   [[ -f "$BRIEF_TEMPLATE" ]] || die "$(missing_brief_template_msg)"
-  local out="$WORKTREES_DIR/$(phase_branch "$phase")/$BRIEF_OUT_NAME"
+  local out
+  out="$WORKTREES_DIR/$(phase_branch "$phase")/$BRIEF_OUT_NAME"
   mkdir -p "$(dirname "$out")" 2>/dev/null || true
   render_brief_stream "$phase" >| "$out"
   printf '%s' "$out"
@@ -794,6 +795,7 @@ render_resume_note_stream() {
   git -C "$wt" diff --stat 2>/dev/null | tail -20 >| "$diff_stat" || true
 
   local -A TPL_VARS TPL_BLOCKS
+  # shellcheck disable=SC2034  # read by apl_render_template (lib/pump-lib.sh)
   TPL_VARS=(
     [TASK_ID]="$id"
     [PHASE]="$phase"
@@ -808,6 +810,7 @@ render_resume_note_stream() {
     # per-task verification commands.
     [BUILD_GATE]="$(apl_join_commands "$VERIFY_CMDS")"
   )
+  # shellcheck disable=SC2034  # read by apl_render_template (lib/pump-lib.sh)
   TPL_BLOCKS=(
     [COMMITS]="$commits"
     [STATUS_SHORT]="$status_short"
@@ -960,7 +963,12 @@ launch_phase() {
   # it through a process spawn per phase per tick is a cost worth measuring
   # first.
   local cid rc=0
+  # env, not shell prefix assignments: half of these are LEGACY="$LEGACY"
+  # forwards of the canonical value under the un-migrated name, which prefix
+  # syntax makes look like self-assignment confusion (SC2097/SC2098). As env
+  # arguments they read as what they are: the child's environment, spelled out.
   cid=$(
+    env \
     TP_WORKSPACE="$wt"                 WORKSPACE_PATH="$wt" \
     TP_BRANCH="$branch" \
     TP_CONTAINER_NAME="$cname" \
@@ -1464,7 +1472,8 @@ detach_and_exit() {
   local -a fwd=()
   local a
   for a in "${ORIG_ARGS[@]}"; do [[ "$a" == "--detach" ]] || fwd+=("$a"); done
-  local unit="$PROG_NAME-$(printf '%s' "$PHASES" | tr -c 'A-Za-z0-9' '-')"
+  local unit
+  unit="$PROG_NAME-$(printf '%s' "$PHASES" | tr -c 'A-Za-z0-9' '-')"
   if command -v systemd-run >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
     systemd-run --user --collect --unit="$unit" \
       --description="$PROG_NAME usage-governed pump ($PHASES)" \

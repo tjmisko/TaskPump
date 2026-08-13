@@ -107,7 +107,7 @@ if (( ${BASH_VERSINFO[0]:-0} < 4 )); then
 fi
 
 # ── TaskPump config core ──────────────────────────────────────────────────────
-_tp_self_root="$(CDPATH= cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+_tp_self_root="$(CDPATH='' cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 # shellcheck source=../lib/config.sh
 . "$_tp_self_root/lib/config.sh"
 tp_load_config
@@ -215,7 +215,7 @@ fi
 # branch-slug -> "name<TAB>epic_task" lookup from the manifest.
 declare -A SLUG_NAME SLUG_TASK SLUG_BRANCH
 if [[ -f "$MANIFEST" ]]; then
-    while IFS=$'\t' read -r name branch brief task _rest; do
+    while IFS=$'\t' read -r name branch _ task _rest; do
         [[ -z "${name// }" || "${name:0:1}" == "#" ]] && continue
         slug="${branch//\//-}"
         SLUG_NAME["$slug"]="$name"; SLUG_TASK["$slug"]="$task"; SLUG_BRANCH["$slug"]="$branch"
@@ -643,16 +643,16 @@ pump_compute() {
 # bars below, not repeated here. $1 = usage json blob (unused; kept for caller).
 pump_summary_line() {
     [[ -f "$PUMP_STATE" ]] || return 0
-    local uj="${1:-{}}" phases status reason open_ct ceiling
+    local uj="${1:-{}}" phases status reason open_ct
     # Read one field per line via mapfile — NOT `read -r a b c` on a @tsv line.
     # Tab is IFS-whitespace, so an empty middle field (paused_reason when not
-    # paused) would collapse and shift open_tasks/ceiling over by one. Newline-
+    # paused) would collapse and shift open_tasks over by one. Newline-
     # delimited + mapfile preserves empty fields.
     local _pf; mapfile -t _pf < <(jq -r \
-        '(.phases//"?"),(.status//"?"),(.paused_reason//""),((.open_tasks // "")|tostring),((.ceiling // "")|tostring)' \
+        '(.phases//"?"),(.status//"?"),(.paused_reason//""),((.open_tasks // "")|tostring)' \
         "$PUMP_STATE" 2>/dev/null || true)
     phases="${_pf[0]:-?}"; status="${_pf[1]:-?}"; reason="${_pf[2]:-}"
-    open_ct="${_pf[3]:-}"; ceiling="${_pf[4]:-}"
+    open_ct="${_pf[3]:-}"
     [[ -z "${phases:-}" ]] && phases="?"
     [[ -z "${status:-}" ]] && status="?"
 
@@ -1031,8 +1031,8 @@ sessions_lines() {  # $1 = width
         printf '%s(loading sessions…)%s\n' "$C_FAINT" "$ST_RST"
         return 0
     fi
-    local flagged="" rec a b c d e f g h i j n=0
-    while IFS=$'\t' read -r rec a b c d e f g h i j; do
+    local flagged="" rec a b c d e f g h i n=0
+    while IFS=$'\t' read -r rec a b c d e f g h i _; do
         case "$rec" in
             S) session_header "$a" "$b" "$c" "$d" "$e" "$f" "$g" "$n"; n=$(( n + 1 )) ;;
             # The log tails are the largest block of text in the UI and were the
@@ -1167,7 +1167,9 @@ render_top() {
     local uj='{}'
     [[ -x "$USAGE_BIN" ]] && uj="$("$USAGE_BIN" --json 2>/dev/null || echo '{}')"
     local -a L R
+    # shellcheck disable=SC2034  # L and R are read by name: compose_columns "$W" L R
     mapfile -t L < <(top_left_lines "$uj")
+    # shellcheck disable=SC2034
     mapfile -t R < <(notes_panel_lines)
     compose_columns "$W" L R
     printf '\n'
@@ -1325,7 +1327,7 @@ graph_move() {  # $1 = h|l|k|j|g|G|^|$
     local lay="${GLAY[$CURSOR]}" pos="${GORD[$CURSOR]}" id want
     case "$1" in
         h|l)
-            local -a arr=(${GLAYERS[$lay]})
+            local -a arr; read -r -a arr <<< "${GLAYERS[$lay]}"
             local t
             [[ "$1" == l ]] && t=$(( pos + 1 )) || t=$(( pos - 1 ))
             (( t >= 0 && t < ${#arr[@]} )) && CURSOR="${arr[t]}"
@@ -1334,11 +1336,11 @@ graph_move() {  # $1 = h|l|k|j|g|G|^|$
         # layer is the graph's horizontal axis, so ^ / $ mean its first and last
         # node. g/G stay vertical (first/last layer), matching the same split.
         '^')
-            local -a arr=(${GLAYERS[$lay]})
+            local -a arr; read -r -a arr <<< "${GLAYERS[$lay]}"
             (( ${#arr[@]} )) && CURSOR="${arr[0]}"
             ;;
         '$')
-            local -a arr=(${GLAYERS[$lay]})
+            local -a arr; read -r -a arr <<< "${GLAYERS[$lay]}"
             (( ${#arr[@]} )) && CURSOR="${arr[-1]}"
             ;;
         k)
@@ -1590,7 +1592,12 @@ demo_disk_subinfo() {
     printf '%s%s(updated 8s ago)%s\n' "$GAUGE_SUBINDENT" "$BAR_EMPTY" "$BAR_RST"
 }
 demo_sessions() {  # $1 = width — several sessions so scrolling is exercised
-    local width="$1" n l1 l2 cut=$(( width - 4 ))
+    # Two `local`s: the whole line expands before local assigns, so a one-line
+    # form computes cut from the CALLER's width, not $1 — it only ever worked
+    # because render_sessions happens to call this with its own `width` local
+    # in scope holding the same value.
+    local width="$1" n l1 l2
+    local cut=$(( width - 4 ))
     l1="⚙ Edit web/src/canvas/Node.tsx"
     l2="tsc is clean. Now run the full vitest suite to confirm no regressions."
     for n in 56 45 57 55 54 53; do

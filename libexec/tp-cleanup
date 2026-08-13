@@ -40,7 +40,7 @@
 set -uo pipefail
 
 # ── TaskPump config core ──────────────────────────────────────────────────────
-_tp_self_root="$(CDPATH= cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+_tp_self_root="$(CDPATH='' cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 # shellcheck source=../lib/config.sh
 . "$_tp_self_root/lib/config.sh"
 tp_load_config
@@ -49,7 +49,7 @@ tp_load_config
 
 # REPO_ROOT is normally the parent of this script's dir; overridable so the
 # target-reclaim sweep can be unit-tested against a fixture tree.
-_default_repo_root="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
+_default_repo_root="$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)"
 REPO_ROOT="${TASKPUMP_CLEANUP_REPO_ROOT:-$_default_repo_root}"
 # Shared with the pump: cleanup used to hardcode `.worktrees` while the pump had
 # it behind a knob, so a relocated worktrees base broke the rescue path only.
@@ -92,9 +92,11 @@ done
 [[ -z "$MODE" ]] && { usage; exit 2; }
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
+# Every caller passes ONE pre-quoted command string, so eval-as-string is the
+# honest form; "$@" only pretended this took a word vector.
 act() {
     if [[ "$DRY_RUN" -eq 1 ]]; then echo "  (dry-run) $*"
-    else echo "  $ $*"; eval "$@"
+    else echo "  $ $*"; eval "$*"
     fi
 }
 

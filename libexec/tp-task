@@ -29,7 +29,7 @@ set -euo pipefail
 # Loaded before any default below, so a taskpump.conf key reaches the `: "${X:=}"`
 # defaults, and so a legacy ARACHNE_* export still arrives under its canonical
 # TASKPUMP_* spelling.
-_tp_self_root="$(CDPATH= cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+_tp_self_root="$(CDPATH='' cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 # shellcheck source=../lib/config.sh
 . "$_tp_self_root/lib/config.sh"
 tp_load_config
@@ -65,7 +65,7 @@ _tp_script_root="$(cd "$_tp_script_dir/.." && pwd)"
 # where the config *is* is not saying where the ledger is.
 _tp_conf_root=""
 if [[ -z "${TASKPUMP_CONFIG:-}" && -n "${TP_CONFIG_FILE:-}" ]]; then
-  _tp_conf_root="$(CDPATH= cd -- "$(dirname "$TP_CONFIG_FILE")" 2>/dev/null && pwd || true)"
+  _tp_conf_root="$(CDPATH='' cd -- "$(dirname "$TP_CONFIG_FILE")" 2>/dev/null && pwd || true)"
 fi
 
 _tp_repo_root="$_tp_script_root"
@@ -1449,8 +1449,8 @@ cmd_blockers() {
   local id="" mode="" arg=""
   while (( $# )); do
     case $1 in
-      --set) mode=set; arg=$2; shift 2;;
-      --set=*) mode=set; arg=${1#--set=}; shift;;
+      --set) mode='set'; arg=$2; shift 2;;
+      --set=*) mode='set'; arg=${1#--set=}; shift;;
       --add) mode=add; arg=$2; shift 2;;
       --add=*) mode=add; arg=${1#--add=}; shift;;
       --remove) mode=remove; arg=$2; shift 2;;
