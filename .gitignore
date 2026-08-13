@@ -10,5 +10,6 @@
 .arachne-fsguard.notified
 .arachne-disk-watchdog.log
 .arachne-agent-watchdog.log
+.arachne-task.lock
 .auto-trunk.lock
 .auto-trunk-quarantine
