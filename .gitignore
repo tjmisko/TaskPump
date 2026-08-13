@@ -22,3 +22,4 @@
 .arachne-task.lock
 .auto-trunk.lock
 .auto-trunk-quarantine
+.worktrees/
