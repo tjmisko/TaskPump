@@ -44,20 +44,12 @@
 #
 # ── Legacy alias promotion ───────────────────────────────────────────────────
 #
-# The tools still read ARACHNE_* names; the config file speaks TASKPUMP_*. Until
-# the tools are migrated, `tp_load_config` bridges the two generically — there is
-# no hardcoded table of key names, so a name added to one side needs no change
-# here. It promotes in both directions:
-#
-#   ARACHNE_X (from the environment)  →  TASKPUMP_X   so an operator's existing
-#       exports keep working and still outrank the config file.
-#
-#   TASKPUMP_X (however it was set)   →  ARACHNE_X    so a TASKPUMP_*-only config
-#       file actually reaches the tools, which have not been migrated yet.
-#
-# When the environment carries *both* spellings of a key, the canonical
-# TASKPUMP_X wins: both are "environment", and between two equally-strong
-# sources the current name is authoritative.
+# `tp_load_config` bridges the legacy ARACHNE_* spellings and the canonical
+# TASKPUMP_* ones — generically (no hardcoded key table) and in both directions.
+# The policy — which spelling wins where, the ARACHNE_NO_CONF loading-order
+# exception, and the deprecation horizon (guaranteed through every 0.x release,
+# removed at 1.0.0) — lives in the "Legacy names" section of docs/CONFIG.md, not
+# here.
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   printf 'config.sh: this file must be sourced, not executed\n' >&2
