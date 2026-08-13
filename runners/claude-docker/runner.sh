@@ -207,7 +207,11 @@ do_launch() {
     -v "$claude_json":/tmp/claude-home-json/.claude.json:ro
   )
   if [[ "$ledger_repo" == "$repo_root" ]]; then
-    mount_args+=(-v "$repo_root":"$repo_root" -v "$wt":"$wt")
+    # Spelled as the LEDGER mount on purpose: in this shape the RW mount is the
+    # ledger's, it merely coincides with the root — and the static no-blanket-
+    # primary-mount guard in tests/test-tp-pump.sh keeps meaning "no source
+    # line mounts \$repo_root without :ro".
+    mount_args+=(-v "$ledger_repo":"$ledger_repo" -v "$wt":"$wt")
   else
     mount_args+=(
       -v "$repo_root":"$repo_root":ro
