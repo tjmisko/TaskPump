@@ -70,6 +70,9 @@ tools are installed, which is the wrong-ledger lesson made structural.
 Environment beats config beats each tool's baked-in default. Legacy `ARACHNE_*`
 and canonical `TASKPUMP_*` names are bridged generically in both directions, with
 no hardcoded key table, so a key added on either side needs no change here.
+The bridge is guaranteed through every 0.x release and removed at 1.0.0 — a
+MAJOR change under the contract's own versioning rules; see the "Legacy names"
+section of [docs/CONFIG.md](docs/CONFIG.md#legacy-names).
 
 **Documentation** — the contracts a consumer is allowed to depend on:
 

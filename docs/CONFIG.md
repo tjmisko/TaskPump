@@ -88,7 +88,7 @@ An exported variable always wins. This is what makes one-off overrides work:
 TASKPUMP_JOBS=1 tp pump --phases T1..T9 --dry-run
 ```
 
-### Legacy name promotion
+### Legacy names
 
 TaskPump was extracted from Arachne, where every key was spelled `ARACHNE_*`.
 Both spellings are honored during the transition, bridged generically — there is
@@ -98,7 +98,9 @@ the bridge.
 Promotion runs both directions:
 
 - **`ARACHNE_X` in the environment → `TASKPUMP_X`.** An operator's existing
-  exports keep working, and still outrank the config file.
+  exports keep working, and an `ARACHNE_X` exported in the environment still
+  outranks a `TASKPUMP_X` set by the config file — it is environment, and
+  environment beats the file regardless of spelling.
 - **`TASKPUMP_X`, however it was set → `ARACHNE_X`.** A config file written in
   canonical names reaches tools that still read the legacy ones.
 
@@ -106,8 +108,21 @@ When the environment carries **both** spellings of a key, `TASKPUMP_X` wins: bot
 are "environment", and between two equally strong sources the current name is
 authoritative.
 
-Write new configuration in `TASKPUMP_*`. The `ARACHNE_*` spellings are
-compatibility, not an alternative.
+One key is reconciled ahead of the bridge rather than by it: `TASKPUMP_NO_CONF`
+governs whether a config file loads at all, so the bridge — which runs as part of
+loading — cannot promote it in time. Its legacy spelling `ARACHNE_NO_CONF` is
+therefore honored inline where the loading decision is made, with the same
+outcome as everywhere else: either spelling turns discovery off, and the
+canonical one wins when both are set.
+
+**Deprecation horizon.** The bridge is guaranteed through **every 0.x release**
+and is **removed at 1.0.0**. Removal makes a consumer that was correct against
+0.x incorrect without changing a line of its own code, which is exactly the
+contract's test for a MAJOR change
+([LEDGER-CONTRACT.md §1](LEDGER-CONTRACT.md#1-versioning)) — so it happens at a
+MAJOR boundary and nowhere else. Plan migrations accordingly: write new
+configuration in `TASKPUMP_*`. The `ARACHNE_*` spellings are compatibility, not
+an alternative.
 
 ---
 
