@@ -30,8 +30,11 @@ PUMP="$TP_ROOT/libexec/tp-pump"
 TASK="$TP_ROOT/libexec/tp-task"
 
 # Every invocation below states its own TASKPUMP_NO_CONF explicitly (that IS
-# the subject under test); the export covers any incidental tool call.
-export TASKPUMP_NO_CONF=1
+# the subject under test); the shared prologue covers any incidental tool call
+# and scrubs the pump-exported TASKPUMP_*/TP_*/ARACHNE_* environment (issue
+# #18), which the poison-conf assertions below must not inherit.
+# shellcheck source=tests/suite-prologue.sh
+. "$SCRIPT_DIR/suite-prologue.sh"
 
 PASS=0; FAIL=0
 pass() { printf 'PASS: %s\n' "$*"; PASS=$((PASS + 1)); }
