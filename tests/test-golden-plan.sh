@@ -104,8 +104,12 @@ FLIP_CENSUS=(
   RO_PROBE_FILE MONITOR_NOTES_DIRNAME MONITOR_CACHE_BASE LOCK_NAME
   # G1.4 — identity strings
   COMMITTER_NAME COMMITTER_EMAIL PROG_NAME PUMP_PROG_NAME MONITOR_TASK_CLASS
-  # G1.5 — runner defaults
-  AGENT_PREFIX IMAGE ENTRYPOINT
+  # G1.5 — runner defaults. ENTRYPOINT left the census with issue #5: the
+  # historical /entrypoint-parallel.sh pin predated the pre-flight hook and
+  # silently disabled it, so the reference consumer now runs the shipped
+  # /entrypoint.sh default (its image bakes it per RUNNERS.md §4.0) and the
+  # conf deliberately carries no pin.
+  AGENT_PREFIX IMAGE
   # G1.6 — ledger shape
   LEDGER_PROBE ID_PATTERN PHASE_SIGIL TASK_CLI WORKSPACE_TASK_CLI
   # G1.7 — Rust and host-hardware defaults
@@ -200,9 +204,10 @@ PUMP="$REPO/libexec/tp-pump"
 # ones that already existed (a fixture ledger, a fixture worktrees base, the
 # three stubs) and they outrank the conf, exactly as lib/config.sh documents:
 # environment > taskpump.conf > baked defaults. TASKPUMP_JOBS is a seam too:
-# arachne.conf pins the host's proven ceiling (6), but the concurrency cap is a
-# host preference, not part of the equivalence promise, and the goldens were
-# captured at the pre-extraction cap of 4.
+# since issue #8 arachne.conf keeps the shipped default of 4 (the historical
+# drains widened per invocation with --jobs 6, never ambiently), which is also
+# the pre-extraction cap the goldens were captured at; the env pin stays so
+# this suite cannot drift if that decision is ever revisited.
 # TASKPUMP_HEALTH_PROBE_CMD is a hermeticity seam, not a pin: the arachne.conf
 # pin TASKPUMP_HEALTH_GATE=1 keeps net-health at the head of the pinned chain
 # (G1.7 ships it off bare), and the inert probe keeps this host's real kernel
