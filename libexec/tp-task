@@ -62,36 +62,32 @@ tp_load_config
 _tp_script_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 _tp_script_root="$(cd "$_tp_script_dir/.." && pwd)"
 
-# A DISCOVERED taskpump.conf marks a workspace of its own. The discovery walk
-# (lib/config.sh) runs upward from $PWD and never past the enclosing git
-# worktree, so a conf it found is always within the caller's worktree — and it
-# is the more specific marker: a directory carrying its own taskpump.conf (a
-# fixture, a vendored subproject) owns its own ledger even when the enclosing
-# worktree also answers the probe. An EXPLICIT TASKPUMP_CONFIG never anchors:
-# deliberate configuration may live anywhere (a suite's pins file), and saying
-# where the config *is* is not saying where the ledger is.
-_tp_conf_root=""
-if [[ -z "${TASKPUMP_CONFIG:-}" && -n "${TP_CONFIG_FILE:-}" ]]; then
-  _tp_conf_root="$(CDPATH='' cd -- "$(dirname "$TP_CONFIG_FILE")" 2>/dev/null && pwd || true)"
-fi
-
-# Was the tasks dir handed to us outright? Read BEFORE the default below fills
-# it in, because "the caller said where the ledger is" is the one answer that
-# needs no probing and no guard.
+# Was the tasks dir handed to us outright (environment, or a conf value the
+# config core already anchored)? Read BEFORE the default below fills it in,
+# because "the caller said where the ledger is" is the one answer that needs no
+# probing and no guard.
 _tp_tasks_dir_explicit=0
 [[ -n "${TASKPUMP_TASKS_DIR:-}" ]] && _tp_tasks_dir_explicit=1
 
-# _tp_resolved_via records WHICH probe answered, not just where it landed. The
-# install-root value is a fallback, not an answer — see the guard below.
-_tp_repo_root="$_tp_script_root"
-_tp_resolved_via="install-root"
-_tp_cwd_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
-if [[ -n "$_tp_conf_root" && -d "$_tp_conf_root/$TASKPUMP_LEDGER_PROBE" ]]; then
-  _tp_repo_root="$_tp_conf_root"
-  _tp_resolved_via="conf"
-elif [[ -n "$_tp_cwd_root" && -d "$_tp_cwd_root/$TASKPUMP_LEDGER_PROBE" ]]; then
-  _tp_repo_root="$_tp_cwd_root"
-  _tp_resolved_via="cwd"
+# The shared workspace resolution (lib/config.sh): a DISCOVERED conf's
+# directory when the probe answers there, else the caller's worktree, else the
+# install root — which is a fallback, not an answer (see the guard below).
+# tp-pump resolves through the same function, so the supervisor and the CLI
+# cannot disagree about whose ledger an invocation touches.
+tp_resolve_workspace
+_tp_conf_root="$TP_WS_CONF_ROOT"
+_tp_cwd_root="$TP_WS_CWD_ROOT"
+_tp_repo_root="$TP_WS_ROOT"
+_tp_resolved_via="$TP_WS_VIA"
+# When the tasks dir was handed to us outright, the workspace rung did not
+# decide it — the via diagnostic must name the rung that did, or it misleads
+# in exactly the misconfiguration case it exists for.
+if [[ "$_tp_tasks_dir_explicit" -eq 1 ]]; then
+  if tp_conf_supplied TASKS_DIR; then
+    _tp_resolved_via="conf-value"
+  else
+    _tp_resolved_via="env"
+  fi
 fi
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -383,7 +379,9 @@ acquire_state_lock() {
 
 # ── Subcommands ───────────────────────────────────────────────────────────────
 
-# List task files as newline-separated paths.
+# List task files as newline-separated paths. A nonexistent tasks dir never
+# reaches here: main() refuses it up front (tp_require_tasks_dir) — "the ledger
+# is not there" and "the ledger is there and empty" must not share an output.
 list_all_files() {
   [[ -d "$TASKPUMP_TASKS_DIR" ]] || return 0
   find "$TASKPUMP_TASKS_DIR" -maxdepth 1 -name '*.md' -type f | sort
@@ -1954,6 +1952,8 @@ cmd_resolve() {
       printf 'code_repo  %s\n' "$TASKPUMP_CODE_REPO"
       printf 'script     %s\n' "$_tp_script_root"
       printf 'cwd_root   %s\n' "${_tp_cwd_root:-<none>}"
+      printf 'via        %s\n' "$_tp_resolved_via"
+      printf 'conf       %s\n' "${TP_CONFIG_FILE:-<none>}"
       ;;
     *) die "usage: $TASKPUMP_PROG_NAME resolve [--tasks-dir|--code-repo|--all]";;
   esac
@@ -2091,8 +2091,12 @@ probe resolves there, else $PWD's git worktree when that worktree carries a
 ledger of its own (TASKPUMP_LEDGER_PROBE resolves there), otherwise the
 directory above this script. Since each worktree carries both its own copy of
 this CLI and its own ledger, preferring the caller's workspace keeps a claim
-made inside a worktree out of the primary checkout's ledger. The config above
-still overrides; `resolve` prints what a given invocation picked.
+made inside a worktree out of the primary checkout's ledger. A vendored
+TaskPump checkout inside a consumer never captures resolution: its own conf is
+skipped by discovery, and from inside a vendored submodule the workspace is the
+consumer's (docs/CONFIG.md, "Vendored TaskPump checkouts"). Relative paths in a
+conf anchor to the conf's workspace, never to $PWD. The config above still
+overrides; `resolve` prints what a given invocation picked.
 EOF
 }
 
@@ -2141,6 +2145,22 @@ tp_require_resolved_ledger() {
   \`$TASKPUMP_PROG_NAME resolve --tasks-dir\` keeps working and prints where resolution lands."
 }
 
+# ── A missing tasks directory is loud, never an empty frontier ────────────────
+# "The ledger is not there" and "the ledger is there and has no eligible work"
+# used to produce the same output: an empty listing, rc=0. The first one is how
+# a misresolved path (a $PWD-relative conf value, issue #1) became a pump that
+# reported a live range drained. A directory that does not exist is always
+# misconfiguration or misresolution, so every ledger-reading verb refuses it
+# with the diagnostic to run — except `resolve` itself, which is that
+# diagnostic and must keep answering.
+tp_require_tasks_dir() {
+  [[ -d "$TASKPUMP_TASKS_DIR" ]] && return 0
+  die "tasks directory does not exist: $TASKPUMP_TASKS_DIR
+  (resolved via $_tp_resolved_via). An empty frontier from a missing ledger
+  would be a silent wrong answer, so this is an error instead.
+  \`$TASKPUMP_PROG_NAME resolve --all\` prints how this invocation resolved."
+}
+
 main() {
   local cmd=${1:-}
   [[ -z "$cmd" ]] && { usage; exit 1; }
@@ -2154,6 +2174,12 @@ main() {
   case $cmd in
     create|claim|heartbeat|complete|block|needs-review|release|reopen|defer|undefer|resume-attempt|scrub|goal|title|blockers|fsck)
       tp_require_resolved_ledger;;
+  esac
+  # Every verb that reads or writes the ledger needs the directory to exist;
+  # `resolve` is the diagnostic the refusal points at and keeps working.
+  case $cmd in
+    next|ready|list|goal|title|blockers|create|claim|heartbeat|complete|block|needs-review|release|reopen|defer|undefer|deferred|resume-attempt|scrub)
+      tp_require_tasks_dir;;
   esac
   # Mutating subcommands serialize on the cross-agent state lock for their
   # whole read-modify-write + commit. Read-only commands (next/list) skip it.
