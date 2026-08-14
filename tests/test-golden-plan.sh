@@ -38,10 +38,14 @@ UPDATE="${UPDATE_GOLDEN:-0}"
 
 # Hermeticity: an AMBIENT conf discovered from whatever repo this suite happens
 # to run from must never leak in — the only configuration allowed here is the
-# reference pins file the fixture loads deliberately, via TASKPUMP_CONFIG, which
-# outranks this switch. run-all.sh exports the same switch; this one covers
-# standalone runs.
-export TASKPUMP_NO_CONF=1
+# reference pins file the fixture loads deliberately, via TASKPUMP_CONFIG,
+# which outranks the prologue's TASKPUMP_NO_CONF switch. The prologue also
+# scrubs the pump-exported TASKPUMP_*/TP_*/ARACHNE_* environment (issue #18:
+# an inherited ledger path would redirect the golden surfaces to the real
+# ledger). run-all.sh sources the same prologue; this one covers standalone
+# runs.
+# shellcheck source=tests/suite-prologue.sh
+. "$SCRIPT_DIR/suite-prologue.sh"
 
 PASS=0; FAIL=0
 pass() { printf 'PASS: %s\n' "$*"; PASS=$((PASS + 1)); }

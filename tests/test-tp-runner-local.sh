@@ -31,7 +31,11 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 TP_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 RUNNER="$TP_ROOT/runners/local/runner.sh"
 
-export TASKPUMP_NO_CONF=1
+# Hermeticity: scrub the pump-exported TASKPUMP_*/TP_*/ARACHNE_* environment
+# and ignore any ambient taskpump.conf (issue #18; run-all.sh sources the same
+# prologue — this covers standalone runs).
+# shellcheck source=tests/suite-prologue.sh
+. "$SCRIPT_DIR/suite-prologue.sh"
 
 WORK=$(mktemp -d)
 cleanup() {
