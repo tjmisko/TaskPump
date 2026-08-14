@@ -212,11 +212,27 @@ fi
 
 # Both single-sided fallbacks must exist, or a run with only one of the two files
 # silently launches with no settings.json at all.
-if grep -qF 'cp "$AUTO_JSON" /home/dev/.claude/settings.json' "$PF" \
-   && grep -qF 'cp "$MCP_JSON" /home/dev/.claude/settings.json' "$PF"; then
+if grep -qF 'cp "$AUTO_JSON" "$AGENT_SETTINGS"' "$PF" \
+   && grep -qF 'cp "$MCP_JSON" "$AGENT_SETTINGS"' "$PF"; then
   pass "pre-flight falls back to whichever config exists when only one is present"
 else
   fail "preflight-example.sh is missing a single-sided fallback for MCP-only / Auto-only"
+fi
+
+# The settings must land in the session user's home as the entrypoint exports it
+# (TASKPUMP_CONTAINER_HOME / TASKPUMP_CONTAINER_USER), never a hardcoded
+# /home/dev — a non-default image would lose its MCP config and allow rules
+# silently (issue #9). Behavioral coverage: tests/test-example-confs.sh runs the
+# hook against a fixture home.
+if grep -vE '^[[:space:]]*#' "$PF" | grep -q '/home/dev'; then
+  fail "an executable line of preflight-example.sh hardcodes /home/dev (must use TASKPUMP_CONTAINER_HOME)"
+else
+  pass "no executable line hardcodes /home/dev"
+fi
+if grep -q 'TASKPUMP_CONTAINER_HOME' "$PF" && grep -q 'TASKPUMP_CONTAINER_USER' "$PF"; then
+  pass "pre-flight resolves the settings path through TASKPUMP_CONTAINER_HOME/_USER"
+else
+  fail "preflight-example.sh never reads TASKPUMP_CONTAINER_HOME/_USER"
 fi
 
 # ── Smoke test is run before the session ───────────────────────────────────────
