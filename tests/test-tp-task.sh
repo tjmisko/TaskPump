@@ -22,13 +22,16 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 TP_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 CLI="$TP_ROOT/libexec/tp-task"
 
-# Hermeticity: ignore any taskpump.conf in the repo this suite happens to run
-# from — the tools discover config by walking up from $PWD, and a leaked conf
-# reconfigures every fixture invocation below. The dual-invocation section is
-# the one part of this suite that TESTS discovery, and it opts back in
-# per-invocation with TASKPUMP_NO_CONF=0. run-all.sh exports the same switch;
-# this one covers standalone runs.
-export TASKPUMP_NO_CONF=1
+# Hermeticity: the shared prologue ignores any taskpump.conf in the repo this
+# suite happens to run from (a leaked conf reconfigures every fixture
+# invocation below) and scrubs the pump-exported TASKPUMP_*/TP_*/ARACHNE_*
+# environment (issue #18 — this suite configures itself in the legacy
+# spellings, which an inherited canonical twin would silently outrank). The
+# dual-invocation section is the one part of this suite that TESTS discovery,
+# and it opts back in per-invocation with TASKPUMP_NO_CONF=0. run-all.sh
+# sources the same prologue; this one covers standalone runs.
+# shellcheck source=tests/suite-prologue.sh
+. "$SCRIPT_DIR/suite-prologue.sh"
 
 # ── Environment hermeticity ──────────────────────────────────────────────────
 # Every config key tp-task reads, by suffix. Both spellings of each are cleared

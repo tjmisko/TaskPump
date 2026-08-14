@@ -22,11 +22,11 @@ TP_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 TASK="$TP_ROOT/libexec/tp-task"
 PUMP="$TP_ROOT/libexec/tp-pump"
 
-# Hermeticity: no ambient conf from the repo this suite runs in. Cases that
-# test discovery itself opt back in per-invocation (TASKPUMP_NO_CONF=0 or an
-# explicit TASKPUMP_CONFIG).
-export TASKPUMP_NO_CONF=1
-export TASKPUMP_NOTIFY_CMD=true
+# Hermeticity: no ambient conf from the repo this suite runs in, and no
+# inherited pump env (issue #18). Cases that test discovery itself opt back in
+# per-invocation (TASKPUMP_NO_CONF=0 or an explicit TASKPUMP_CONFIG).
+# shellcheck source=tests/suite-prologue.sh
+. "$SCRIPT_DIR/suite-prologue.sh"
 
 # Both spellings of every key that could pre-answer a resolution question are
 # cleared, and TP_ENV_UNSET re-establishes the clean slate per subshell.
