@@ -1966,7 +1966,12 @@ def kindok($kind):
     ["resume_head_sha",               "string?", "a sha string or null",                                      "stamp"],
     ["wiring_deferred",               "bool",    "a boolean",                                                 "verb-added"],
     ["wiring_deferred_note",          "string?", "a string or null",                                          "verb-added"],
-    ["scrub_reason",                  "string?", "a string or null",                                          "verb-added"]
+    ["scrub_reason",                  "string?", "a string or null",                                          "verb-added"],
+    ["review_of",                     "string?", "a task-id string or null",                                  "verb-added"],
+    ["review_role",                   "string?", "a string or null",                                          "verb-added"],
+    ["review_prompt",                 "string?", "a path string or null",                                     "verb-added"],
+    ["review_round",                  "int?",    "an integer or null",                                        "verb-added"],
+    ["review_max_rounds",             "int?",    "an integer or null",                                        "verb-added"]
   ][]
 | . as [$key, $kind, $label, $class]
 | if $mode == "missing" then
@@ -1981,6 +1986,10 @@ def kindok($kind):
        and (["open", "in_progress", "done", "blocked", "needs-review", "stuck"]
             | index($fm[$key]) | not) then
     "status '\($fm[$key])' is not in the status vocabulary (open|in_progress|done|blocked|needs-review|stuck)"
+  elif $key == "review_role"
+       and ($fm[$key] != null)
+       and (["reviewer", "adjudicator"] | index($fm[$key]) | not) then
+    "review_role '\($fm[$key])' is not in the role vocabulary (reviewer|adjudicator)"
   else empty end
 JQ
 }
@@ -2020,6 +2029,13 @@ fsck_check_file() {
   # name, so the stem is the node other tasks actually reach.
   blockers=$(jq -r 'if (.blockers | type) == "array" then .blockers[] | select(type == "string") else empty end' <<<"$fm_json")
   [[ -n "$blockers" ]] && FSCK_ADJ[$stem]=$blockers
+
+  # Review-chain fact for the whole-ledger pass: `verdict` resolves the
+  # implementation through review_of by name, so a dangling one is a chain
+  # whose verdict can never land — and nothing per-file will ever say so.
+  local review_of
+  review_of=$(jq -r 'if (.review_of | type) == "string" then .review_of else "" end' <<<"$fm_json")
+  [[ -n "$review_of" ]] && FSCK_REVIEW_OF[$stem]=$review_of
   return 0
 }
 
@@ -2044,6 +2060,19 @@ fsck_graph_check() {
         FSCK_VIOLATIONS+=("$TASKPUMP_TASKS_DIR/$stem.md: blocker '$b' names no task in this ledger (unsatisfied forever — the task can never enter the frontier)")
       fi
     done <<<"${FSCK_ADJ[$stem]}"
+  done
+
+  # Review chains: review_of must resolve, and never to the task itself. The
+  # verb validates both on creation, but an imported ledger arrives with its
+  # chains already drawn — same reasoning as the blocker checks above.
+  for stem in "${stems_sorted[@]-}"; do
+    [[ -n "${FSCK_REVIEW_OF[$stem]:-}" ]] || continue
+    b="${FSCK_REVIEW_OF[$stem]}"
+    if [[ "$b" == "$stem" ]]; then
+      FSCK_VIOLATIONS+=("$TASKPUMP_TASKS_DIR/$stem.md: review_of names the task itself (a review cannot review its own verdict)")
+    elif [[ -z "${FSCK_STEMS[$b]:-}" ]]; then
+      FSCK_VIOLATIONS+=("$TASKPUMP_TASKS_DIR/$stem.md: review_of '$b' names no task in this ledger (the verdict verb has no implementation to act on)")
+    fi
   done
 
   # Cycle detection: depth-first walk over the blocker edges, sorted start
@@ -2164,7 +2193,7 @@ cmd_fsck() {
   # Report pass. In --fix mode it runs after the stamping, so what prints (and
   # what the exit code answers for) is what REMAINS wrong.
   local -a FSCK_VIOLATIONS=() FSCK_PATH=() FSCK_CYCLES=()
-  local -A FSCK_STEMS=() FSCK_ADJ=() FSCK_COLOR=()
+  local -A FSCK_STEMS=() FSCK_ADJ=() FSCK_COLOR=() FSCK_REVIEW_OF=()
   local file
   while IFS= read -r file; do
     [[ -z "$file" ]] && continue
@@ -2610,7 +2639,10 @@ Commands:
                                        the vocabulary, machine keys have
                                        contract-legal types, every blocker
                                        resolves, no self-blocks, no blocker
-                                       cycles. One line per violation
+                                       cycles, review_of resolves (never to
+                                       the task itself), review_role is
+                                       reviewer|adjudicator. One line per
+                                       violation
                                        (<file>: <what>); exit 3 when any
                                        exist, 0 clean, 1 = fsck itself failed.
                                        --fix stamps MISSING machine keys with
