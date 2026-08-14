@@ -27,7 +27,10 @@
 #                                 the --targets sweep touches nothing
 #   TASKPUMP_STUCK_THRESHOLD_MIN  log-stale cutoff, minutes (default 15)
 #   TASKPUMP_STOP_GRACE_SEC       stop grace period, seconds (default 30)
-#   TASKPUMP_MANIFEST             manifest mapping containers to tasks
+#   TASKPUMP_MANIFEST             OPT-IN v1 parallel-run manifest (no default;
+#                                 the ledger's live claim is the canonical
+#                                 container→task mapping, and a configured
+#                                 manifest that does not exist is an error)
 #   TASKPUMP_WORKTREES_DIR        base dir holding the agent worktrees
 #   TASKPUMP_AGENT_LOG_NAME       the agent log inside each worktree
 #   TASKPUMP_RECLAIM_PRIMARY      1 = same as --include-primary
@@ -54,7 +57,16 @@ REPO_ROOT="${TASKPUMP_CLEANUP_REPO_ROOT:-$_default_repo_root}"
 # Shared with the pump: cleanup used to hardcode `.worktrees` while the pump had
 # it behind a knob, so a relocated worktrees base broke the rescue path only.
 WORKTREES_DIR="${TASKPUMP_WORKTREES_DIR:-$REPO_ROOT/.worktrees}"
-MANIFEST="${TASKPUMP_MANIFEST:-${MANIFEST:-$REPO_ROOT/ops/task-loop/parallel-manifest.tsv}}"
+# Which task a container is on comes from the LEDGER's live claim
+# (claim_task_for below). TASKPUMP_MANIFEST is an opt-in fallback for a consumer
+# that still launches from a v1 parallel-run manifest — a TSV of
+# name<TAB>branch<TAB>brief<TAB>task rows. It has NO default path: TaskPump does
+# not generate the file, and the old Arachne-shaped default pointed every other
+# consumer at a path that cannot exist (issue #7). The bare MANIFEST spelling is
+# the pre-extraction name and is still honoured.
+MANIFEST_KEY="MANIFEST"
+[[ -n "${TASKPUMP_MANIFEST:-}" ]] && MANIFEST_KEY="TASKPUMP_MANIFEST"
+MANIFEST="${TASKPUMP_MANIFEST:-${MANIFEST:-}}"
 STUCK_THRESHOLD_MIN="${TASKPUMP_STUCK_THRESHOLD_MIN:-${STUCK_THRESHOLD_MIN:-15}}"
 DOCKER_GRACE_SEC="${TASKPUMP_STOP_GRACE_SEC:-${DOCKER_GRACE_SEC:-30}}"
 AGENT_LOG_NAME="${TASKPUMP_AGENT_LOG_NAME:-.taskpump-agent.log}"
@@ -91,6 +103,15 @@ done
 
 [[ -z "$MODE" ]] && { usage; exit 2; }
 
+# An explicitly configured manifest that does not exist is an ERROR, on the same
+# rule TASKPUMP_CONFIG follows: an explicit request for a specific file must not
+# silently fall back. Unconfigured is normal and reads nothing.
+if [[ -n "$MANIFEST" && ! -f "$MANIFEST" ]]; then
+    echo "ERROR: $MANIFEST_KEY names '$MANIFEST', which does not exist." >&2
+    echo "       Restore the file, or unset $MANIFEST_KEY — stuck-agent rescues map containers to tasks from the ledger's live claims without it." >&2
+    exit 2
+fi
+
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 # Every caller passes ONE pre-quoted command string, so eval-as-string is the
 # honest form; "$@" only pretended this took a word vector.
@@ -100,9 +121,40 @@ act() {
     fi
 }
 
+# ── ledger_claims -- "branch<TAB>task<TAB>turns<TAB>goal" rows, one per branch
+#    holding a live in_progress claim. Delegated to the renderer's --claims mode
+#    for the same reason the monitor delegates: it shares the ledger's
+#    frontmatter parser and newest-heartbeat election, so the rescue path cannot
+#    disagree with the dashboards about which claim is live.
+ledger_claims() {
+    local dag_bin="${TASKPUMP_DAG_BIN:-$TP_LIBEXEC_DIR/tp-dag-render}"
+    [[ -x "$dag_bin" ]] || return 0
+    "$dag_bin" --claims 2>/dev/null || true
+}
+
+# ── claim_task_for <container-name> -- echo the task whose live ledger claim
+#    is held by the branch this container name encodes (<prefix><branch slug>,
+#    '/' → '-'), or return 1. This is the CANONICAL mapping: it works for every
+#    consumer with a ledger, needs no manifest, and tracks the agent as it moves
+#    through a phase instead of freezing the launch-time assignment.
+claim_task_for() {
+    local cname="$1"
+    local prefix; prefix="$(apl_agent_prefix)"
+    local branch task _rest
+    while IFS=$'\t' read -r branch task _rest; do
+        [[ -z "$branch" || -z "$task" ]] && continue
+        if [[ "$prefix${branch//\//-}" == "$cname" ]]; then
+            echo "$task"; return 0
+        fi
+    done < <(ledger_claims)
+    return 1
+}
+
 # ── manifest_task_for <container-name> -- echo the epic task id for a
-#    running container, or empty if no match. Compares each manifest branch
-#    transliterated to a slug ('/' → '-') against <prefix><slug>.
+#    running container, or empty if no match. Opt-in fallback (see MANIFEST
+#    above): a manifest row is a launch-time constant, so it is consulted only
+#    when the ledger has no live claim for the branch. Compares each manifest
+#    branch transliterated to a slug ('/' → '-') against <prefix><slug>.
 manifest_task_for() {
     local cname="$1"
     [[ -f "$MANIFEST" ]] || return 1
@@ -173,12 +225,16 @@ do_stuck() {
         fi
         # 2) stop the container
         act "$(apl_docker) stop --time=$DOCKER_GRACE_SEC '$cname'"
-        # 3) release the task claim, if known
-        local task; task="$(manifest_task_for "$cname" || true)"
+        # 3) release the task claim, if known. The ledger's live claim is the
+        #    canonical mapping; the opt-in manifest is only a fallback, because
+        #    its row is a launch-time constant that goes stale the moment the
+        #    agent moves on to another task.
+        local task; task="$(claim_task_for "$cname" || true)"
+        [[ -z "$task" ]] && task="$(manifest_task_for "$cname" || true)"
         if [[ -n "$task" ]]; then
             act "'$TP_LIBEXEC_DIR/tp-task' release '$task' --reason 'tp-cleanup: stuck (log idle ${age}min)'"
         else
-            log "  $cname: no manifest task mapping; skipping the task release"
+            log "  $cname: no live ledger claim (and no manifest row) maps this container to a task; skipping the task release — check 'tp task list' and release it by hand"
         fi
     done < <(list_agent_containers)
     if (( found == 0 )); then
