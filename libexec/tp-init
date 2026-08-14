@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+# tp-init — scaffold a repository into a TaskPump consumer.
+#
+# The first command a new consumer runs. It writes a starter taskpump.conf at
+# the enclosing worktree root, creates the tasks directory, and prints the three
+# commands that continue the quickstart from the terminal.
+#
+# Usage:
+#   tp init                              # tasks/ + taskpump.conf at the worktree root
+#   tp init --tasks-dir planning/tasks   # a ledger somewhere else
+#
+# Scaffolding only. It makes no commit — when the conf enters history is the
+# consumer's decision — creates no tasks, and validates nothing (`tp task fsck`
+# is the tool for an existing ledger).
+#
+# ── Why the worktree root, and not $PWD ──────────────────────────────────────
+#
+# Every tool discovers configuration by walking up from $PWD and stopping at the
+# enclosing worktree root (docs/CONFIG.md §1), so the root is the one directory
+# from which a conf governs the whole repository. Running this from a
+# subdirectory therefore still writes at the root; a conf dropped in the
+# subdirectory would configure that subtree and nothing else, which is a
+# configuration a consumer should have to ask for by hand.
+#
+# ── Why it refuses rather than overwrites ────────────────────────────────────
+#
+# An existing taskpump.conf is an existing ledger's configuration. A second one
+# shadows it for part of the repository — the same split-brain the wrong-ledger
+# incident produced (docs/PUMP-MECHANISMS.md §6), except self-inflicted at setup
+# time, when nobody is yet watching for it. So a discoverable conf is a refusal
+# that names the file, and the refusal changes nothing.
+# HELP-END
+set -euo pipefail
+
+# ── TaskPump config core ──────────────────────────────────────────────────────
+# Loaded for its discovery: TP_CONFIG_FILE below is the tools' OWN answer to
+# "which conf governs an invocation from here", which is exactly what this
+# command must refuse to shadow.
+_tp_self_root="$(CDPATH='' cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+# shellcheck source=../lib/config.sh
+. "$_tp_self_root/lib/config.sh"
+tp_load_config
+# shellcheck source=../lib/pump-lib.sh
+. "$TP_LIB_DIR/pump-lib.sh"
+
+PROG_NAME=tp-init
+
+die() {
+  printf '%s: %s\n' "$PROG_NAME" "$*" >&2
+  exit 1
+}
+
+usage_die() {
+  printf '%s: %s\n' "$PROG_NAME" "$*" >&2
+  printf "run 'tp init --help' for usage\n" >&2
+  exit 2
+}
+
+# ── Arguments ─────────────────────────────────────────────────────────────────
+# The tasks directory is deliberately NOT seeded from an ambient
+# TASKPUMP_TASKS_DIR: what this writes into a file that outlives the shell is
+# decided by the command line, not by whatever happens to be exported.
+TASKS_DIR=tasks
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --tasks-dir)
+      [[ $# -ge 2 ]] || usage_die "--tasks-dir needs a value"
+      TASKS_DIR="$2"; shift 2 ;;
+    --tasks-dir=*)
+      TASKS_DIR="${1#--tasks-dir=}"; shift ;;
+    -h|--help)
+      apl_help "$0"; exit 0 ;;
+    *)
+      usage_die "unknown argument '$1'" ;;
+  esac
+done
+
+# Trailing slashes only make the printed paths ugly; strip them before anything
+# reads the value.
+while [[ "$TASKS_DIR" == */ && ${#TASKS_DIR} -gt 1 ]]; do TASKS_DIR="${TASKS_DIR%/}"; done
+
+[[ -n "$TASKS_DIR" ]] || usage_die "--tasks-dir needs a non-empty value"
+
+# The value is written into a file that bash sources, so it is restricted to a
+# charset that needs no quoting analysis to be safe there. A consumer wanting
+# something stranger writes the key by hand, where they can see what they are
+# doing.
+[[ "$TASKS_DIR" =~ ^/?[A-Za-z0-9._][A-Za-z0-9._/-]*$ ]] \
+  || usage_die "--tasks-dir must be a plain path of letters, digits, dot, dash, underscore and /, got: $TASKS_DIR"
+# A `..` segment escapes the repository the conf is being written for, which is
+# never what a scaffold means.
+if [[ "/$TASKS_DIR/" == *"/../"* ]]; then
+  usage_die "--tasks-dir must not contain a '..' segment, got: $TASKS_DIR"
+fi
+
+# ── Where this lands ──────────────────────────────────────────────────────────
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+[[ -n "$REPO_ROOT" ]] || die "not inside a git repository.
+
+  TaskPump's ledger is git — every state change is a commit — and configuration
+  is discovered by walking up to the enclosing worktree root, so outside a
+  repository there is no root to write to and no ledger to write about.
+
+  fix it with:
+    git init                     # then run tp init again"
+
+CONF_PATH="$REPO_ROOT/$TP_CONFIG_NAME"
+
+refuse_existing() {
+  local found=$1
+  die "a $TP_CONFIG_NAME already exists — refusing to shadow it:
+
+    $found
+
+  Configuration is discovered by walking up from \$PWD, so a second conf would
+  govern part of this repository and the file above would govern the rest. Edit
+  that file instead, or run tp init in a repository that has none.
+
+  \`tp task resolve --all\` prints what the existing configuration resolves to."
+}
+
+# The tools' own discovery answered first, so what init refuses to shadow is
+# exactly what a later `tp task ready` from here would read — including an
+# explicit TASKPUMP_CONFIG, which outranks the walk. The second check is the
+# floor: TASKPUMP_NO_CONF=1 turns discovery off (a hermeticity seam for test
+# suites), and "discovery is off" must never come to mean "clobber the file that
+# is already there".
+if [[ -n "${TP_CONFIG_FILE:-}" && -e "$TP_CONFIG_FILE" ]]; then
+  refuse_existing "$TP_CONFIG_FILE"
+elif [[ -e "$CONF_PATH" ]]; then
+  refuse_existing "$CONF_PATH"
+fi
+
+if [[ "$TASKS_DIR" == /* ]]; then
+  TASKS_PATH="$TASKS_DIR"
+else
+  TASKS_PATH="$REPO_ROOT/$TASKS_DIR"
+fi
+
+# ── The conf ──────────────────────────────────────────────────────────────────
+
+# SPEC_GAP: G4.1 fixes which keys the generated conf carries, not what the tasks
+# dir key is set TO. A bare `TASKPUMP_TASKS_DIR=tasks` resolves against $PWD, so
+# every invocation from a subdirectory reads an empty ledger and reports an
+# empty frontier at rc 0 (issue #1, live-reproduced in G5.2 as a silent false
+# drain) — a scaffold must not hand a new consumer that trap. So the relative
+# form is anchored to the conf's own directory, the construct this repository's
+# own dogfood conf uses; an absolute --tasks-dir is written verbatim.
+tasks_key_line() {
+  if [[ "$TASKS_DIR" == /* ]]; then
+    printf "TASKPUMP_TASKS_DIR='%s'\n" "$TASKS_DIR"
+    return 0
+  fi
+  printf "TASKPUMP_TASKS_DIR=\"\$(CDPATH='' cd -- \"\$(dirname \"\${TP_CONFIG_FILE:-\$PWD/%s}\")\" && pwd)/%s\"\n" \
+    "$TP_CONFIG_NAME" "$TASKS_DIR"
+}
+
+mkdir -p "$TASKS_PATH"
+
+{
+  cat <<HEADER
+# $TP_CONFIG_NAME — written by \`tp init\`.
+#
+# This file is discovered by walking up from \$PWD and stopping at this
+# directory, and every key in it is overridden by the matching environment
+# variable. Only the keys a new consumer actually decides are here; add more
+# when a default is wrong for you, not in anticipation.
+#
+# \`taskpump.conf.example\` is the annotated census of every key, and
+# docs/CONFIG.md explains discovery, precedence, and what each group is for.
+# The file is sourced by bash, so it is executable code: treat it as such.
+
+# Where the ledger lives. Anchored to this file's own directory so that every
+# tool finds the same ledger from any subdirectory; a bare relative path would
+# resolve against \$PWD instead.
+HEADER
+  tasks_key_line
+  cat <<'TAIL'
+
+# The id grammar. Ids are PHASE or PHASE.N — the sigil is yours, the shape is
+# the contract (docs/LEDGER-CONTRACT.md §7). Change the sigil here and set
+# TASKPUMP_PHASE_SIGIL to match.
+TASKPUMP_ID_PATTERN='^T[0-9]+(\.[0-9]+)?$'
+
+# What "is the tree broken?" means here: the command that must pass before work
+# is integrated. Uncomment it when you start running agents, and make it the
+# check you would not merge without.
+# TASKPUMP_BUILD_GATE='npm test'
+TAIL
+} >| "$CONF_PATH"
+
+# ── What just happened, and what to run next ──────────────────────────────────
+printf '%s: scaffolded %s\n\n' "$PROG_NAME" "$REPO_ROOT"
+printf '  %-14s %s\n' "$TP_CONFIG_NAME" "written"
+printf '  %-14s %s\n' "$TASKS_DIR/" "created"
+printf '\nNothing was committed — `git add %s` when you are ready.\n' "$TP_CONFIG_NAME"
+printf '\nNext:\n'
+printf '  tp task create T1 --title "First task" --goal "What done looks like."\n'
+printf '  tp task ready\n'
+printf '  tp pump --phases T1 --dry-run\n'
