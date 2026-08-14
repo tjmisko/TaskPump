@@ -67,6 +67,13 @@ WORKTREES_DIR="${TASKPUMP_WORKTREES_DIR:-$REPO_ROOT/.worktrees}"
 MANIFEST_KEY="MANIFEST"
 [[ -n "${TASKPUMP_MANIFEST:-}" ]] && MANIFEST_KEY="TASKPUMP_MANIFEST"
 MANIFEST="${TASKPUMP_MANIFEST:-${MANIFEST:-}}"
+# The repo-relative spelling, same precedence as the monitor (issue #7 review:
+# a spelling one tool honours and the other silently ignores is the
+# explicit-config-silently-ignored shape this change exists to eliminate).
+if [[ -z "$MANIFEST" && -n "${TASKPUMP_MANIFEST_SUBPATH:-}" ]]; then
+    MANIFEST_KEY="TASKPUMP_MANIFEST_SUBPATH"
+    MANIFEST="$REPO_ROOT/${TASKPUMP_MANIFEST_SUBPATH}"
+fi
 STUCK_THRESHOLD_MIN="${TASKPUMP_STUCK_THRESHOLD_MIN:-${STUCK_THRESHOLD_MIN:-15}}"
 DOCKER_GRACE_SEC="${TASKPUMP_STOP_GRACE_SEC:-${DOCKER_GRACE_SEC:-30}}"
 AGENT_LOG_NAME="${TASKPUMP_AGENT_LOG_NAME:-.taskpump-agent.log}"
@@ -127,9 +134,22 @@ act() {
 #    frontmatter parser and newest-heartbeat election, so the rescue path cannot
 #    disagree with the dashboards about which claim is live.
 ledger_claims() {
-    local dag_bin="${TASKPUMP_DAG_BIN:-$TP_LIBEXEC_DIR/tp-dag-render}"
-    [[ -x "$dag_bin" ]] || return 0
-    "$dag_bin" --claims 2>/dev/null || true
+    local dag_bin="${TASKPUMP_DAG_BIN:-$TP_LIBEXEC_DIR/tp-dag-render}" out rc=0
+    if [[ ! -x "$dag_bin" ]]; then
+        echo "WARN: ledger renderer not executable: $dag_bin — cannot read live claims, falling back to the manifest" >&2
+        return 0
+    fi
+    # Neutralize pump-state phase narrowing: the renderer scopes --claims to
+    # the pump state's phase range, but a stuck agent is typically exactly the
+    # one the range has moved past. -f /dev/null is false, so PHASES stays
+    # empty and every phase is scanned.
+    out="$(TASKPUMP_PUMP_STATE_FILE=/dev/null "$dag_bin" --claims)" || rc=$?
+    if (( rc != 0 )); then
+        echo "WARN: ledger claim renderer failed (rc=$rc) — falling back to the manifest; a 'no live ledger claim' below means unchecked, not absent" >&2
+        return 0
+    fi
+    [[ -n "$out" ]] && printf '%s\n' "$out"
+    return 0
 }
 
 # ── claim_task_for <container-name> -- echo the task whose live ledger claim
