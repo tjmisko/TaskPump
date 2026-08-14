@@ -324,6 +324,20 @@ have "$out" 'declares no .files:., so you are running alone' \
   && pass "it is told the true reason it was scheduled: exclusively" \
   || fail "the empty-footprint case is unexplained:\n$out"
 
+echo "--- 4d. --render-brief refuses a PHASE token at task grain ---"
+# A debug path that fabricates a task brief for a phase — "your job is one task:
+# G3", pointing at tasks/G3.md, which does not exist — is a plausible-looking
+# answer to a question nobody asked.
+rc=0; out=$(rb G3) || rc=$?
+[[ "$rc" -ne 0 ]] && pass "--render-brief G3 at task grain refuses (rc=$rc)" \
+  || fail "a task brief was rendered for a phase token:\n$out"
+have "$out" 'not a task in range' && pass "and says what is wrong with the argument" \
+  || fail "refusal is vague:\n$out"
+have "$out" 'grain task' && pass "and names the way out" || fail "no remedy in the refusal:\n$out"
+out=$(pump G3 --render-brief G3 2>&1)
+have "$out" 'phase G3' && pass "the same token at phase grain still renders the phase-drain brief" \
+  || fail "phase-grain --render-brief regressed:\n$out"
+
 # ── 5. Resume-with-context at task grain ──────────────────────────────────────
 echo "--- 5. a stranded claim on a task branch resumes, with its commits ---"
 # The F79 shape, one grain finer: an agent claimed G3.2, committed real work, and

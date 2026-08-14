@@ -2266,8 +2266,21 @@ validate_unit_names
 
 case "$MODE" in
   render)
-    # Print the phase-drain brief rendered for $PHASES to stdout (debug / test).
-    # Goes through render_brief_stream so {{DEPENDS_ON}} is expanded too (v1).
+    # Print the brief rendered for $PHASES to stdout (debug / test). Goes
+    # through render_brief_stream so {{DEPENDS_ON}} is expanded too (v1).
+    #
+    # At task grain the argument is a UNIT, and a unit is a task id. Handed a
+    # phase token it used to render a task brief around it — "your job is one
+    # task: G3", pointing the reader at tasks/G3.md, which does not exist. A
+    # debug path that fabricates a plausible-looking brief for a task that was
+    # never dispatched is the same silent wrong answer in miniature, so refuse
+    # and say what to pass instead.
+    if [[ "$GRAIN" == "task" && -z "${TSNAP_STATUS[$PHASES]:-}" ]]; then
+      die "--render-brief takes a TASK ID at --grain task; '$PHASES' is not a task in range.
+The task brief is rendered for one task and points its reader at
+$(tasks_dir_rel)/$PHASES.md. Pass a task id (e.g. $PHASES.1), or drop
+--grain task to render the phase-drain brief for phase $PHASES."
+    fi
     [[ -f "$BRIEF_TEMPLATE" ]] || die "$(missing_brief_template_msg)"
     render_brief_stream "$PHASES"
     exit 0
