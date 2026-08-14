@@ -547,6 +547,33 @@ apl_ensure_worktrees_visible "$EV" "$EV/.worktrees/feat/x" \
 git -C "$EV" check-ignore -q .worktrees/feat/x \
   && fail "still ignored with combined sources" || pass "visible after the combined heal"
 
+echo "--- ensure worktrees visible: a nonsense git-common-dir answer heals nothing ---"
+# Issue #20: a PATH-stubbed git in the pump suite answered --git-common-dir
+# with a HEAD sha, and the helper resolved it and manufactured
+# <sha>/info/exclude in the real repo the suite ran from. An answer that is
+# not an existing directory must return still-ignored and create NOTHING.
+NG="$TMP/nonsense/repo"; mkdir -p "$NG"
+NBIN="$TMP/nonsense-bin"; mkdir -p "$NBIN"
+cat >| "$NBIN/git" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  *--git-common-dir*) echo "9999aaa" ;;
+  *) : ;;
+esac
+exit 0
+EOF
+chmod +x "$NBIN/git"
+# Subshell so the PATH override cannot leak into later cases. The stub's
+# exit-0 check-ignore means "ignored", which forces the heal path.
+if (PATH="$NBIN:$PATH"; apl_ensure_worktrees_visible "$NG" "$NG/.worktrees/x"); then
+  fail "ensure claimed the path visible despite a nonsense common dir"
+else
+  pass "a nonsense common-dir answer returns still-ignored"
+fi
+[[ -e "$NG/9999aaa" ]] \
+  && fail "the nonsense answer was manufactured into a directory (issue #20 regression)" \
+  || pass "no git-dir-shaped tree is manufactured from the nonsense answer"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"

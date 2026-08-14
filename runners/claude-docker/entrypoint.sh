@@ -424,6 +424,15 @@ if [[ "$TEST_MODE" != "plan" ]]; then
     log "permission mode: $(jq -r '.permissions.defaultMode // "default"' "$AGENT_CLAUDE_DIR/settings.json" 2>/dev/null)"
 fi
 
+# ── Git HTTPS auth: the credential-helper text ───────────────────────────────
+# Configured for the unprivileged user below; reads the token from the calling
+# git process's environment AT USE TIME. The text itself contains no secret —
+# the single quotes survive into git's config, so $GITHUB_TOKEN is expanded by
+# the helper's shell when git invokes it, never on any command line. Never
+# interpolate the token's VALUE into this string, into git config, or into the
+# session script: argv is world-readable via /proc/<pid>/cmdline (issue #14).
+GIT_CRED_HELPER='!f() { echo username=x-access-token; echo "password=$GITHUB_TOKEN"; }; f'
+
 if [[ -z "$TEST_MODE" ]]; then
     # ── Background credential refresher ───────────────────────────────────────
     # Periodically re-copies credentials (and the agent config) from the live
@@ -440,9 +449,12 @@ if [[ -z "$TEST_MODE" ]]; then
     log "Credential refresher started (interval=${CRED_REFRESH_INTERVAL_S}s, pid=$!)"
 
     # ── Git HTTPS auth ────────────────────────────────────────────────────────
+    # A credential helper, not url.insteadOf: the insteadOf form embedded the
+    # token in this su's argv AND persisted it into ~/.gitconfig. The helper
+    # text is secret-free (see GIT_CRED_HELPER above), so this argv is safe.
     if [[ -n "${GITHUB_TOKEN:-}" ]]; then
-        su "$CONTAINER_USER" -c "git config --global url.'https://x-access-token:${GITHUB_TOKEN}@github.com/'.insteadOf 'https://github.com/'"
-        log "Git HTTPS auth configured"
+        su "$CONTAINER_USER" -c "git config --global credential.'https://github.com'.helper '$GIT_CRED_HELPER'"
+        log "Git HTTPS auth configured (helper reads GITHUB_TOKEN from the environment)"
     else
         log "WARNING: GITHUB_TOKEN not set; ledger fetch + gh will fail"
     fi
@@ -534,7 +546,7 @@ for part in "${PROMPT_PARTS[@]}"; do
     PROMPT_ARGS+="$(printf '%q' "$part") "
 done
 
-if [[ -n "$TEST_MODE" ]]; then
+if [[ -n "$TEST_MODE" && "$TEST_MODE" != "script" ]]; then
     # Deterministic, greppable report of everything resolution decided.
     echo "REPORT workspace=$WORKSPACE_PATH"
     echo "REPORT repo_root=$REPO_ROOT"
@@ -570,7 +582,11 @@ echo | tee -a "$LOG_FILE"
 DEV_SESSION_SCRIPT="
     cd '$WORKSPACE_PATH'
     export PATH=/usr/local/cargo/bin:\$PATH
-    export GITHUB_TOKEN='${GITHUB_TOKEN:-}'
+    # By NAME only: the value arrives through the environment (docker -e, then
+    # su's env passthrough). Interpolating it here put the secret in this
+    # script — the argv of a many-hour su process, world-readable in
+    # /proc/<pid>/cmdline (issue #14).
+    export GITHUB_TOKEN
     export CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1
     export DISABLE_TELEMETRY=1
     export DISABLE_ERROR_REPORTING=1
@@ -632,21 +648,53 @@ DEV_SESSION_SCRIPT="
     echo \"Agent finished at \$(date -u).\" | tee -a '$LOG_FILE'
 "
 
+# TASKPUMP_ENTRYPOINT_TEST_MODE=script: print the credential-helper text and
+# the assembled session script, then exit before the privilege drop. The suite
+# plants a canary token and asserts the secret appears in neither — by NAME
+# only (issue #14).
+if [[ "$TEST_MODE" == "script" ]]; then
+    echo "REPORT git_cred_helper=$GIT_CRED_HELPER"
+    printf '%s\n' "$DEV_SESSION_SCRIPT"
+    exit 0
+fi
+
+# ── The privilege drop: setpriv on a script file, never su -c ─────────────────
+# su(1) sets itself as a child subreaper, so every orphaned grandchild of the
+# many-hour session — tool subprocesses that outlive their immediate parent —
+# reparented to `su`, which sits blocked waiting on its one direct child and
+# never reaps them: zombies accumulated at the agent's tool-call rate for the
+# life of the session (issue #15). setpriv changes ids and EXECS — no
+# intermediary lingers — so orphans reparent to PID 1, the tini that
+# runner.sh's `--init` installs, and are reaped there.
+#
+# Two consequences of losing su, handled here:
+#   * su chose the target user's HOME/USER/LOGNAME/SHELL; setpriv touches ids
+#     only, so the session identity is set explicitly.
+#   * the script rides a root-owned FILE instead of -c argv — a session script
+#     in the argv of the longest-lived process in the container was always
+#     wrong (/proc/<pid>/cmdline is world-readable; issue #14's surface).
+SESSION_SCRIPT_FILE="${TMPDIR:-/tmp}/.taskpump-session.sh"
+printf '%s\n' "$DEV_SESSION_SCRIPT" > "$SESSION_SCRIPT_FILE"
+chmod 0644 "$SESSION_SCRIPT_FILE"
+SESSION_LAUNCH=(
+    env HOME="$CONTAINER_HOME" USER="$CONTAINER_USER" LOGNAME="$CONTAINER_USER" SHELL=/bin/bash
+    setpriv --reuid "$CONTAINER_USER" --regid "$(id -g "$CONTAINER_USER")" --init-groups
+    bash "$SESSION_SCRIPT_FILE"
+)
+
 # ── Launch the session: optional wall-clock backstop, else exec ────────────────
 # The wall-clock cap is opt-in (unset = the plain exec path) and acts as a
 # last-resort guard below the token TTL. `timeout` needs a child to signal, so we
-# cannot `exec` in that branch — a desirable side effect is that the end-heartbeat
-# and ledger push inside the script run on a wall-clock kill, whereas `exec`
-# silently drops them when the process is replaced. `|| WALL_RC=$?` keeps `set -e`
-# from aborting before we capture rc.
+# cannot `exec` in that branch. `|| WALL_RC=$?` keeps `set -e` from aborting
+# before we capture rc.
 if [[ -n "$AGENT_WALL_TIMEOUT_S" ]]; then
     log "Wall-clock cap: ${AGENT_WALL_TIMEOUT_S}s"
     WALL_RC=0
-    timeout "$AGENT_WALL_TIMEOUT_S" su "$CONTAINER_USER" -c "$DEV_SESSION_SCRIPT" || WALL_RC=$?
+    timeout "$AGENT_WALL_TIMEOUT_S" "${SESSION_LAUNCH[@]}" || WALL_RC=$?
     if [[ "$WALL_RC" -eq 124 ]]; then
         echo "$(date -u) [wall-cap] session killed by wall-clock timeout (${AGENT_WALL_TIMEOUT_S}s)" | tee -a "$LOG_FILE"
     fi
     exit "$WALL_RC"
 else
-    exec su "$CONTAINER_USER" -c "$DEV_SESSION_SCRIPT"
+    exec "${SESSION_LAUNCH[@]}"
 fi

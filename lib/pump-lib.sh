@@ -188,6 +188,11 @@ apl_ensure_worktrees_visible() {
   local common
   common="$(git -C "$repo_root" rev-parse --git-common-dir 2>/dev/null)" || return 1
   [[ "$common" == /* ]] || common="$repo_root/$common"
+  # A git that answers --git-common-dir with nonsense (observed: a PATH-stubbed
+  # git in the pump suite echoing a HEAD sha, issue #20) must not make this
+  # helper manufacture a git-dir-shaped tree wherever the answer resolves.
+  # No existing directory ⇒ no heal; the caller owns the refusal.
+  [[ -d "$common" ]] || return 1
   local excl="$common/info/exclude"
   if ! grep -qxF -- "!$base/**" "$excl" 2>/dev/null; then
     mkdir -p "${excl%/*}"
