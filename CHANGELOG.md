@@ -30,6 +30,41 @@ in [docs/LEDGER-CONTRACT.md §1](docs/LEDGER-CONTRACT.md#1-versioning).
 
 ### Added
 
+- **`tp init` scaffolds a new consumer.** The first command a repository runs:
+  it writes a starter `taskpump.conf` and creates the tasks directory, and from
+  there `tp task create` and `tp task ready` work with no further configuration.
+  `--tasks-dir <d>` puts the ledger somewhere other than `tasks`. MINOR:
+  additive, and nothing existing behaves differently.
+
+  The conf carries only the keys a starter actually decides — where the ledger
+  lives, the id grammar, and a commented-out `TASKPUMP_BUILD_GATE` — with a
+  pointer to `taskpump.conf.example` for the census. A scaffold that restates
+  every default produces a file nobody reads and a consumer who cannot tell
+  which lines are their decisions.
+
+  Two behaviours are the point of the command rather than details of it. It
+  writes at the **worktree root** even when run from a subdirectory, because the
+  discovery walk stops there: a conf anywhere else governs one subtree and
+  silently leaves the rest of the repository on the defaults. And it **refuses**,
+  naming the file, when a `taskpump.conf` is already discoverable from where it
+  is standing — including one named by `TASKPUMP_CONFIG`, which outranks the
+  walk, and one already sitting at the root when `TASKPUMP_NO_CONF=1` has turned
+  discovery off. A second conf shadows an existing ledger's configuration for
+  part of a repository, which is the wrong-ledger split-brain
+  ([PUMP-MECHANISMS.md §6](docs/PUMP-MECHANISMS.md#6-resolution-starts-from-the-callers-workspace))
+  self-inflicted at setup time, when nobody is yet watching for it. A refusal
+  changes nothing on disk, so re-running after one is a no-op rather than an
+  escalation.
+
+  The generated tasks-dir key is anchored to the conf's own directory rather
+  than written as a bare relative path: a relative ledger resolves against `$PWD`,
+  so every invocation from a subdirectory reads an empty ledger and reports an
+  empty frontier at exit 0 (#1) — a silent false drain, and not a trap to hand
+  somebody in their first five minutes.
+
+  Scaffolding only: no commit (when the conf enters history is the consumer's
+  decision), no tasks, no ledger validation.
+
 - **Runner contract v2: `runner.sh list`.** A runner can now be *asked* which of
   its agents are alive, instead of the supervisor inferring it by scraping
   container names. `list` is a fleet verb — one call, one snapshot, no
