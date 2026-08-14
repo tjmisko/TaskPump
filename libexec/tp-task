@@ -1357,6 +1357,303 @@ cmd_scrub() {
   return 0
 }
 
+# ── fsck: whole-ledger conformance check (docs/LEDGER-CONTRACT.md §11.1) ──────
+# The import path for a repository that already carries a directory of markdown
+# task files: check every file against the ledger contract, one line per
+# violation (`<file>: <what>`), exit 3 when any exist — the same actionable-vs-
+# crash split scrub keeps (1 means fsck itself could not run). `--fix` stamps
+# MISSING machine keys with their documented defaults and never rewrites a
+# present-but-wrong value: guessing intent is how ledgers get corrupted.
+#
+# scrub reports the two invisibility classes it can see on its per-tick sweep
+# (UNPARSEABLE, NO-ID); fsck is the full audit, including the one check no
+# single-file tool can do — a blocker cycle, which silently removes every one
+# of its members from the frontier forever.
+
+# Parse <file>'s frontmatter to compact JSON on stdout. The return code
+# classifies the ways a file can fail to even reach the schema checks:
+#   0 mapping parsed    1 no opening ---     2 no closing ---
+#   3 not valid YAML    4 parses, but is not a mapping
+# The delimiter checks are load-bearing, not pedantry: yq's front-matter mode
+# happily "parses" a file with no frontmatter at all (the whole body reads as a
+# YAML scalar) and treats everything after an unclosed `---` as frontmatter, so
+# without them a README.md in the tasks dir would type-check instead of being
+# named for what it is.
+fsck_read_frontmatter() {
+  local file=$1 first="" fm_json
+  IFS= read -r first < "$file" || true
+  [[ "$first" == "---" ]] || return 1
+  awk 'NR > 1 && $0 == "---" { found = 1; exit } END { exit (found ? 0 : 1) }' "$file" || return 2
+  fm_json=$(yq --front-matter=extract -o=json -I=0 '.' "$file" 2>/dev/null) || return 3
+  [[ "$(jq -r 'type' <<<"$fm_json")" == "object" ]] || return 4
+  printf '%s' "$fm_json"
+}
+
+# The frontmatter schema of LEDGER-CONTRACT §3 as one jq program, so the check
+# pass and the --fix pass read the same table and cannot drift. $mode selects:
+#   check    emit one violation message per missing/mistyped key
+#   missing  emit the names of absent keys whose class is "stamp" — the ones
+#            --fix may repair (required keys have no default; verb-added keys
+#            are legal to omit)
+# Defined once per fsck run (inside cmd_fsck), reaching the helpers by bash's
+# dynamic scoping, so no other verb pays for it.
+fsck_schema_jq() {
+  cat <<'JQ'
+def is_int: type == "number" and (. == (. | floor));
+def is_ts:  type == "string"
+            and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$");
+def kindok($kind):
+  if   $kind == "string"  then type == "string"
+  elif $kind == "string?" then . == null or type == "string"
+  elif $kind == "int"     then is_int
+  elif $kind == "int?"    then . == null or is_int
+  elif $kind == "strlist" then type == "array" and all(.[]; type == "string")
+  elif $kind == "ts?"     then . == null or is_ts
+  elif $kind == "bool"    then type == "boolean"
+  else false end;
+. as $fm
+| [
+    ["id",                            "string",  "a string",                                                  "required"],
+    ["title",                         "string",  "a string",                                                  "required"],
+    ["phase",                         "string",  "a string",                                                  "stamp"],
+    ["status",                        "string",  "a string",                                                  "stamp"],
+    ["goal",                          "string?", "a string or null",                                          "stamp"],
+    ["milestone",                     "string?", "a string or null",                                          "stamp"],
+    ["blockers",                      "strlist", "a list of task-id strings",                                 "stamp"],
+    ["files",                         "strlist", "a list of path strings",                                    "stamp"],
+    ["claimed_by",                    "string?", "a string or null",                                          "stamp"],
+    ["claimed_at",                    "ts?",     "an ISO-8601 UTC timestamp (YYYY-MM-DDTHH:MM:SSZ) or null",  "stamp"],
+    ["turn_budget_remaining",         "int?",    "an integer or null",                                        "stamp"],
+    ["consecutive_failed_iterations", "int",     "an integer",                                                "stamp"],
+    ["last_heartbeat_head_sha",       "string?", "a sha string or null",                                      "stamp"],
+    ["last_heartbeat_ts",             "ts?",     "an ISO-8601 UTC timestamp (YYYY-MM-DDTHH:MM:SSZ) or null",  "stamp"],
+    ["completed_at",                  "ts?",     "an ISO-8601 UTC timestamp (YYYY-MM-DDTHH:MM:SSZ) or null",  "stamp"],
+    ["completed_by_commits",          "strlist", "a list of sha strings",                                     "stamp"],
+    ["blocked_at",                    "ts?",     "an ISO-8601 UTC timestamp (YYYY-MM-DDTHH:MM:SSZ) or null",  "stamp"],
+    ["blocked_reason",                "string?", "a string or null",                                          "stamp"],
+    ["resume_attempts",               "int",     "an integer",                                                "stamp"],
+    ["resume_head_sha",               "string?", "a sha string or null",                                      "stamp"],
+    ["wiring_deferred",               "bool",    "a boolean",                                                 "verb-added"],
+    ["wiring_deferred_note",          "string?", "a string or null",                                          "verb-added"],
+    ["scrub_reason",                  "string?", "a string or null",                                          "verb-added"]
+  ][]
+| . as [$key, $kind, $label, $class]
+| if $mode == "missing" then
+    if $class == "stamp" and (($fm | has($key)) | not) then $key else empty end
+  elif ($fm | has($key)) | not then
+    if   $class == "required" then "missing required key '\($key)' (no defined default; --fix cannot invent one)"
+    elif $class == "stamp"    then "missing machine key '\($key)' (--fix stamps its documented default)"
+    else empty end
+  elif ($fm[$key] | kindok($kind)) | not then
+    "\($key): expected \($label), got \($fm[$key] | tojson)"
+  elif $key == "status"
+       and (["open", "in_progress", "done", "blocked", "needs-review", "stuck"]
+            | index($fm[$key]) | not) then
+    "status '\($fm[$key])' is not in the status vocabulary (open|in_progress|done|blocked|needs-review|stuck)"
+  else empty end
+JQ
+}
+
+# Check one task file. Violations append to FSCK_VIOLATIONS; the blockers
+# adjacency lands in FSCK_ADJ for the whole-ledger pass. Both are locals of
+# cmd_fsck, reached by dynamic scoping — appending from inside a $(...) capture
+# would mutate a subshell's copy and silently report nothing.
+fsck_check_file() {
+  local file=$1 stem fm_json parse_rc=0 line id blockers
+  stem=$(basename "$file" .md)
+  fm_json=$(fsck_read_frontmatter "$file") || parse_rc=$?
+  case $parse_rc in
+    1) FSCK_VIOLATIONS+=("$file: no YAML frontmatter (the first line must be exactly \"---\")"); return 0;;
+    2) FSCK_VIOLATIONS+=("$file: frontmatter has no closing \"---\" delimiter"); return 0;;
+    3) FSCK_VIOLATIONS+=("$file: frontmatter is not valid YAML between the --- delimiters"); return 0;;
+    4) FSCK_VIOLATIONS+=("$file: frontmatter is not a YAML mapping of machine keys"); return 0;;
+  esac
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    FSCK_VIOLATIONS+=("$file: $line")
+  done < <(jq -r --arg mode check "$FSCK_SCHEMA_JQ" <<<"$fm_json")
+
+  # Identity: the tools resolve a task to a path by name and read the id back
+  # out of the frontmatter, so a file whose name and id disagree is reachable
+  # by one and invisible to the other (contract §2).
+  id=$(jq -r 'if (.id | type) == "string" then .id else "" end' <<<"$fm_json")
+  if [[ -n "$id" ]]; then
+    [[ "$id" == "$stem" ]] \
+      || FSCK_VIOLATIONS+=("$file: id '$id' does not match the filename stem '$stem' (reachable by one name, invisible under the other)")
+    [[ "$id" =~ $TASKPUMP_ID_PATTERN ]] \
+      || FSCK_VIOLATIONS+=("$file: id '$id' does not match TASKPUMP_ID_PATTERN $TASKPUMP_ID_PATTERN")
+  fi
+
+  # Graph facts, keyed by stem: blockers resolve to <tasks-dir>/<id>.md by
+  # name, so the stem is the node other tasks actually reach.
+  blockers=$(jq -r 'if (.blockers | type) == "array" then .blockers[] | select(type == "string") else empty end' <<<"$fm_json")
+  [[ -n "$blockers" ]] && FSCK_ADJ[$stem]=$blockers
+  return 0
+}
+
+# The whole-ledger checks: dangling blockers, self-blocks, and blocker cycles.
+# Each is a way a task leaves the frontier forever with no diagnostic from any
+# per-file read — the eligibility predicate (§6) just keeps answering "not yet".
+fsck_graph_check() {
+  local stem b cyc
+  local -a stems_sorted=()
+  if (( ${#FSCK_STEMS[@]} > 0 )); then
+    while IFS= read -r stem; do stems_sorted+=("$stem"); done \
+      < <(printf '%s\n' "${!FSCK_STEMS[@]}" | sort)
+  fi
+
+  for stem in "${stems_sorted[@]-}"; do
+    [[ -n "${FSCK_ADJ[$stem]:-}" ]] || continue
+    while IFS= read -r b; do
+      [[ -z "$b" ]] && continue
+      if [[ "$b" == "$stem" ]]; then
+        FSCK_VIOLATIONS+=("$TASKPUMP_TASKS_DIR/$stem.md: task blocks itself ('$b' is in its own blockers)")
+      elif [[ -z "${FSCK_STEMS[$b]:-}" ]]; then
+        FSCK_VIOLATIONS+=("$TASKPUMP_TASKS_DIR/$stem.md: blocker '$b' names no task in this ledger (unsatisfied forever — the task can never enter the frontier)")
+      fi
+    done <<<"${FSCK_ADJ[$stem]}"
+  done
+
+  # Cycle detection: depth-first walk over the blocker edges, sorted start
+  # order for deterministic output. A back edge to a node still on the current
+  # path closes a cycle; its members are the path suffix from that node.
+  for stem in "${stems_sorted[@]-}"; do
+    [[ -z "$stem" ]] && continue
+    [[ -n "${FSCK_COLOR[$stem]:-}" ]] && continue
+    fsck_cycle_dfs "$stem"
+  done
+  for cyc in "${FSCK_CYCLES[@]-}"; do
+    [[ -z "$cyc" ]] && continue
+    FSCK_VIOLATIONS+=("$TASKPUMP_TASKS_DIR/${cyc%%|*}.md: blocker cycle ${cyc#*|} (a cycle removes every one of its members from the frontier forever)")
+  done
+}
+
+fsck_cycle_dfs() {
+  local node=$1 b i
+  FSCK_COLOR[$node]=gray
+  FSCK_PATH+=("$node")
+  while IFS= read -r b; do
+    [[ -z "$b" || "$b" == "$node" ]] && continue    # self-block: reported above
+    [[ -n "${FSCK_STEMS[$b]:-}" ]] || continue      # dangling: reported above
+    case "${FSCK_COLOR[$b]:-white}" in
+      gray)
+        local start=0 members
+        for (( i = 0; i < ${#FSCK_PATH[@]}; i++ )); do
+          if [[ "${FSCK_PATH[$i]}" == "$b" ]]; then start=$i; break; fi
+        done
+        members="${FSCK_PATH[*]:$start}"
+        FSCK_CYCLES+=("$b|${members// / -> } -> $b")
+        ;;
+      black) : ;;
+      *) fsck_cycle_dfs "$b";;
+    esac
+  done <<<"${FSCK_ADJ[$node]:-}"
+  FSCK_COLOR[$node]=black
+  unset "FSCK_PATH[$(( ${#FSCK_PATH[@]} - 1 ))]"
+}
+
+# The documented default for each stampable machine key, as a yq assignment.
+# phase is derived from id per contract §7.2 — mechanical, not a guess.
+fsck_default_expr() {
+  local key=$1 id=$2
+  case $key in
+    phase)                                          printf '.phase = %s' "$(yaml_scalar "${id%%.*}")";;
+    status)                                         printf '.status = "open"';;
+    consecutive_failed_iterations|resume_attempts)  printf '.%s = 0' "$key";;
+    blockers|files|completed_by_commits)            printf '.%s = []' "$key";;
+    *)                                              printf '.%s = null' "$key";;
+  esac
+}
+
+# --fix: stamp MISSING machine keys with their documented defaults. Only files
+# whose identity is sound are written — parseable mapping, id a string equal to
+# the filename stem and matching the pattern; anything less is a file whose
+# identity is in question, and writing to it would launder a broken file into a
+# half-plausible one. Present-but-wrong values are never rewritten; the report
+# pass that follows still names them. One ledger commit covers the repair.
+fsck_apply_fixes() {
+  local file stem id fm_json parse_rc key
+  local stamped_keys=0 stamped_files=0
+  while IFS= read -r file; do
+    [[ -z "$file" ]] && continue
+    parse_rc=0
+    fm_json=$(fsck_read_frontmatter "$file") || parse_rc=$?
+    (( parse_rc != 0 )) && continue
+    stem=$(basename "$file" .md)
+    id=$(jq -r 'if (.id | type) == "string" then .id else "" end' <<<"$fm_json")
+    [[ -n "$id" && "$id" == "$stem" ]] || continue
+    [[ "$id" =~ $TASKPUMP_ID_PATTERN ]] || continue
+
+    local -a missing_keys=() exprs=()
+    while IFS= read -r key; do
+      [[ -z "$key" ]] && continue
+      missing_keys+=("$key")
+      exprs+=("$(fsck_default_expr "$key" "$id")")
+    done < <(jq -r --arg mode missing "$FSCK_SCHEMA_JQ" <<<"$fm_json")
+    (( ${#missing_keys[@]} == 0 )) && continue
+
+    local joined names
+    joined=$(printf '%s | ' "${exprs[@]}")
+    fm_set "$file" "${joined% | }"
+    names="${missing_keys[*]}"
+    printf '%s: stamped missing machine key(s): %s\n' "$file" "${names// /, }"
+    stamped_keys=$((stamped_keys + ${#missing_keys[@]}))
+    stamped_files=$((stamped_files + 1))
+  done < <(list_all_files)
+  if (( stamped_files > 0 )); then
+    git_commit_state "fsck --fix: stamped $stamped_keys missing machine key(s) in $stamped_files task file(s)"
+  fi
+}
+
+cmd_fsck() {
+  local fix=0
+  while (( $# )); do
+    case $1 in
+      --fix) fix=1; shift;;
+      *) die "unknown arg to fsck: $1 (usage: $TASKPUMP_PROG_NAME fsck [--fix])";;
+    esac
+  done
+
+  # A missing tasks directory is an error, not an empty (and therefore clean)
+  # ledger: exit 0 here would be a verdict about a ledger that does not exist.
+  # die exits 1, not 3 — "fsck could not run" vs "violations found", the same
+  # split scrub keeps.
+  [[ -d "$TASKPUMP_TASKS_DIR" ]] \
+    || die "no tasks directory at $TASKPUMP_TASKS_DIR — nothing to check ('$TASKPUMP_PROG_NAME resolve' prints how this path was chosen)"
+
+  local FSCK_SCHEMA_JQ
+  FSCK_SCHEMA_JQ=$(fsck_schema_jq)
+
+  if (( fix )); then
+    acquire_state_lock
+    fsck_apply_fixes
+  fi
+
+  # Report pass. In --fix mode it runs after the stamping, so what prints (and
+  # what the exit code answers for) is what REMAINS wrong.
+  local -a FSCK_VIOLATIONS=() FSCK_PATH=() FSCK_CYCLES=()
+  local -A FSCK_STEMS=() FSCK_ADJ=() FSCK_COLOR=()
+  local file
+  while IFS= read -r file; do
+    [[ -z "$file" ]] && continue
+    FSCK_STEMS[$(basename "$file" .md)]=1
+  done < <(list_all_files)
+  while IFS= read -r file; do
+    [[ -z "$file" ]] && continue
+    fsck_check_file "$file"
+  done < <(list_all_files)
+  fsck_graph_check
+
+  if (( ${#FSCK_VIOLATIONS[@]} > 0 )); then
+    printf '%s\n' "${FSCK_VIOLATIONS[@]}"
+    printf '%s: %d contract violation(s) in %s (docs/LEDGER-CONTRACT.md is the contract)\n' \
+      "$TASKPUMP_PROG_NAME" "${#FSCK_VIOLATIONS[@]}" "$TASKPUMP_TASKS_DIR" >&2
+    return 3
+  fi
+  return 0
+}
+
 # ── goal: read / set / list-missing the one-line outcome goal ──────────────────
 # The `goal` frontmatter field is a single crisp sentence stating what success
 # looks like for the task. This CLI is its sole writer (per the no-hand-edit
@@ -1728,6 +2025,22 @@ Commands:
                                        NO-ID — which have no other diagnostic.
                                        Exit 3 if any are found (1 = scrub
                                        itself failed).
+  fsck [--fix]                       Whole-ledger conformance check against
+                                       docs/LEDGER-CONTRACT.md — the import
+                                       path for a pre-existing markdown task
+                                       DAG. Checks: frontmatter parses between
+                                       --- delimiters, id matches the filename
+                                       and TASKPUMP_ID_PATTERN, status is in
+                                       the vocabulary, machine keys have
+                                       contract-legal types, every blocker
+                                       resolves, no self-blocks, no blocker
+                                       cycles. One line per violation
+                                       (<file>: <what>); exit 3 when any
+                                       exist, 0 clean, 1 = fsck itself failed.
+                                       --fix stamps MISSING machine keys with
+                                       their documented defaults as one ledger
+                                       commit; a present-but-wrong value is
+                                       reported, never rewritten.
   resolve [--tasks-dir|--code-repo|--all]
                                      Print which workspace's ledger this
                                        invocation resolves to. Use it when a
@@ -1854,9 +2167,12 @@ main() {
   shift
   # Every command that writes to the ledger, which is a superset of the ones
   # that take the state lock below (create/goal/title/blockers mutate files
-  # without needing cross-agent exclusion).
+  # without needing cross-agent exclusion). fsck is here even though its report
+  # mode only reads: its output is a verdict about a ledger, and a verdict
+  # about the install-root fallback's ledger is a wrong answer about the
+  # caller's — `resolve` stays available to diagnose.
   case $cmd in
-    create|claim|heartbeat|complete|block|needs-review|release|reopen|defer|undefer|resume-attempt|scrub|goal|title|blockers)
+    create|claim|heartbeat|complete|block|needs-review|release|reopen|defer|undefer|resume-attempt|scrub|goal|title|blockers|fsck)
       tp_require_resolved_ledger;;
   esac
   # Every verb that reads or writes the ledger needs the directory to exist;
@@ -1890,6 +2206,7 @@ main() {
     deferred) cmd_deferred "$@";;
     resume-attempt) cmd_resume_attempt "$@";;
     scrub) cmd_scrub "$@";;
+    fsck) cmd_fsck "$@";;
     resolve) cmd_resolve "$@";;
     -h|--help|help) usage;;
     *) die "unknown command: $cmd";;

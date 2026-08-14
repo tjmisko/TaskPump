@@ -528,6 +528,7 @@ one is a MAJOR change, and a consumer may key on them.
 | Code | Producer | Meaning | Consumer |
 |---|---|---|---|
 | **3** | `tp task scrub` | ≥1 task file is invisible to the frontier (`UNPARSEABLE` or `NO-ID`). Actionable, not a crash. | The pump's per-tick preflight, which re-emits each offending path as a warning instead of logging a generic failure. |
+| **3** | `tp task fsck` | ≥1 contract violation in the ledger — report mode, or what `--fix` could not repair (§11.1). Actionable, not a crash. | Import tooling and CI, which key on "violations found" (3) vs "fsck could not run" (1). |
 | **3** | `tp pump` | Deadlock: nothing live, launchable, or resumable for N consecutive ticks. | `systemd`'s `Restart=on-failure`, and a human reading `systemctl --user status`. |
 | **10** | any gate, `tp task resume-attempt` | Pause / escalate. From a gate: stop *launching* (§[GATES.md](GATES.md)). From `resume-attempt`: the no-progress budget is spent. | The pump's feed gate and resume path. |
 | **1** | `tp task next` | Empty frontier — no eligible task. Also the generic error exit. | Agent loops, which read it as "nothing to do". |
@@ -566,3 +567,47 @@ An alternative implementation is conformant when it:
 
 Everything else — the language, the storage of the lock, whether git is involved,
 which verbs exist beyond the state machine — is free.
+
+### 11.1 Checking a ledger — `tp task fsck`
+
+`tp task fsck` is the executable form of this contract: it checks every file in
+the ledger and prints one line per violation, `<file>: <what>`. It is the
+import path for a repository that already carries a directory of markdown task
+files — run it (and `--fix`) before pointing any tool at a pre-existing DAG.
+
+Checked per file:
+
+- the file begins with a `---` line and the frontmatter closes with one (§2.1),
+  and what lies between them parses as a YAML mapping;
+- `id` equals the filename stem (§2) and matches the configured id pattern (§7);
+- `status` is one of the six values of §4;
+- every machine key of §3 that is present has its contract type, and timestamps
+  have the exact shape of §3 ("Timestamps"). A machine key absent from the file
+  is reported too — a reader treats it as its default, but a writer should emit
+  the full set, and stamping is what `--fix` is for. The *(verb-added)* keys
+  are legal to omit, and unknown extension keys pass (§3 "Extension").
+
+Checked whole-ledger — what no single-file tool can do:
+
+- every blocker names an existing task file (§6 treats a missing one as
+  unsatisfied forever);
+- no task blocks itself;
+- no blocker cycles. A cycle silently removes every one of its members from
+  the frontier forever — each waits on the next, the eligibility predicate
+  keeps answering "not yet", and no per-file read ever produces a diagnostic.
+  The mutating blocker verbs validate each edge as it is written, but a cycle
+  is made of individually valid edges — and an imported ledger arrives with
+  all of its edges already drawn. fsck is the check that sees the whole graph.
+
+Exit codes follow scrub's convention (§10): **3** when violations were found
+(actionable — one line names each), **0** on a clean ledger with no output, and
+**1** when fsck itself could not run. A missing tasks directory is an error,
+not a clean ledger.
+
+`--fix` stamps **missing** machine keys with their documented §3 defaults
+(`status: open`, empty lists, null claim fields, zero counters; `phase` derived
+from `id` per §7.2), and records the whole repair as one ledger commit through
+the standard commit path (§9). It never touches the body, never invents `id` or
+`title` (they have no defined default), and never rewrites a present-but-wrong
+value — those are reported and left alone, because guessing intent is how
+ledgers get corrupted.
