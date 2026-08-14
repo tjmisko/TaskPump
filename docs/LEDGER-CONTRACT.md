@@ -145,7 +145,21 @@ set.
 |---|---|---|
 | `status` | enum, required | One of the six values in §4. |
 | `blockers` | list of task ids | Tasks that must reach `done` before this one is eligible (§6). Validated on write: each id must exist, and a task may not block itself. Default `[]`. |
-| `files` | list of paths | Repo-relative paths this task is expected to touch. Used by the heartbeat productivity check (§5.3) to attribute commits. Advisory — an empty list means "any commit counts". Default `[]`. |
+| `files` | list of paths | Repo-relative paths this task is expected to touch. Default `[]`. **Two consumers read it, and an empty list means the opposite thing to each — see below.** |
+
+`files:` has two readers, and a writer has to know which one it is writing for:
+
+| Consumer | What it does with `files` | What an **empty** list means |
+|---|---|---|
+| The heartbeat productivity check (§5.3) | Attributes commits to the task to decide whether a heartbeat cycle was productive. | **Advisory, permissive** — any commit counts. |
+| A supervisor scheduling at **task grain** (`tp pump --grain task`) | Two tasks may run concurrently only when their `files:` sets are disjoint; an overlap is a hold. | **Load-bearing, exclusive** — an undeclared footprint is *unknown*, and scheduling unknown as "touches nothing" would put two agents on one file while reporting a clean plan. Such a task runs alone. |
+
+Both readings are deliberate. The productivity check is looking backwards at
+work that already happened, where guessing wrong costs a false stall warning;
+the scheduler is looking forwards at work about to start concurrently, where
+guessing wrong costs two agents on one file. Neither reader is authoritative
+over the other, and a task dispatched at task grain should declare its footprint
+rather than rely on either default.
 
 ### Claim
 
