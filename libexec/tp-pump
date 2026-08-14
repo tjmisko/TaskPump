@@ -369,14 +369,20 @@ trunk_worktree()  { printf '%s/%s' "$WORKTREES_DIR" "$(branch_slug "$INTEGRATION
 # the CONFIGURATION, not of any one launch: it should fail the run at tick zero
 # naming the key to fix, rather than fail per-launch — or worse, launch fine and
 # go invisible to liveness later, which is the failure this closes.
-_pump_probe_branch="$(phase_branch "$(pump_expand_phases "$PHASES" | head -1)")"
+# The whole expansion is drained before the first line is taken: `| head -1`
+# closed the pipe after one line while the expansion was still printing the
+# rest of the range, and when the scheduler let head exit first the writer's
+# next printf died EPIPE — a nondeterministic "printf: write error: Broken
+# pipe" on stderr that the golden-plan captures diffed as drift.
+_pump_probe_phases="$(pump_expand_phases "$PHASES")"
+_pump_probe_branch="$(phase_branch "${_pump_probe_phases%%$'\n'*}")"
 if ! _pump_branch_problem="$(apl_branch_slug_reject_reason "$_pump_probe_branch")"; then
   die "$_pump_branch_problem
 this run constructs that branch from TASKPUMP_BRANCH_PREFIX='$BRANCH_PREFIX'
 (--branch-prefix). The agent name is the branch with \"/\" replaced by \"-\", and
 that mapping has to be reversible — see docs/RUNNERS.md section 2."
 fi
-unset _pump_probe_branch _pump_branch_problem
+unset _pump_probe_phases _pump_probe_branch _pump_branch_problem
 # pump_in_list <needle> <space-separated-haystack> — membership test for the
 # dry-run integration stubs (STUB_INTEGRATE_*).
 pump_in_list() {
