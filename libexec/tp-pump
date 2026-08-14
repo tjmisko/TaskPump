@@ -60,8 +60,32 @@ _tp_self_root="$(CDPATH='' cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")"
 . "$_tp_self_root/lib/config.sh"
 tp_load_config
 
-SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
-REPO_ROOT="$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd)"
+# ── The two roots (issue #32) ─────────────────────────────────────────────────
+# TaskPump's INSTALL and the consumer's WORKSPACE are different directories in
+# every vendored layout and the same directory only in dogfooding. The install
+# root — lib/, libexec/, gates/, runners/, templates/, hooks/ — is
+# script-relative: TP_ROOT and friends, set above by lib/config.sh. The
+# workspace — the repository this pump DRIVES: the image-build context, the
+# phase branches and agent worktrees, every `git -C` below, the state-dir
+# default — is a property of the CALLER, resolved exactly as tp-task resolves
+# the ledger. REPO_ROOT used to be script-relative too, which pointed every one
+# of those surfaces at the vendored taskpump/ checkout for a submodule/subtree
+# consumer: branches cut in the wrong object store, agent worktrees inside the
+# vendored copy, right-looking git answers against the wrong repository.
+# TASKPUMP_WORKSPACE_ROOT pins it explicitly (env > conf; a conf-relative value
+# anchors to the conf's workspace); unset, the config anchor decides — which
+# for the dogfood layout is the same directory the script-relative derivation
+# always produced.
+tp_resolve_workspace
+if [[ -n "${TASKPUMP_WORKSPACE_ROOT:-}" ]]; then
+  if ! REPO_ROOT="$(CDPATH='' cd -- "$TASKPUMP_WORKSPACE_ROOT" 2>/dev/null && pwd)"; then
+    printf '%s: TASKPUMP_WORKSPACE_ROOT names a missing directory: %s\n' \
+      "${TASKPUMP_PUMP_PROG_NAME:-tp-pump}" "$TASKPUMP_WORKSPACE_ROOT" >&2
+    exit 1
+  fi
+else
+  REPO_ROOT="$TP_WS_ROOT"
+fi
 # shellcheck source=../lib/pump-lib.sh
 source "$TP_LIB_DIR/pump-lib.sh"
 
@@ -83,16 +107,24 @@ CLAUDE_JSON="${TASKPUMP_AGENT_CONFIG:-$HOME/.claude.json}"
 OPS_DIR="${TASKPUMP_PUMP_OPS_DIR:-${TASKPUMP_LEDGER_REPO:-$REPO_ROOT/ops}}"
 # Tasks dir — overridable independently of OPS_DIR so phase_dependencies / brief
 # rendering can be unit-tested against a flat fixture dir. The default derives
-# from the ledger probe against the WORKSPACE, exactly as tp-task and
-# tp-monitor derive theirs (issue #2): the pump is the tool that tells a
-# launched agent where the ledger is, so it must not keep a private opinion.
-# It anchors to the workspace root rather than OPS_DIR on purpose — the
-# ledger-repo and the ledger-directory are separate questions, and coupling
+# from the ledger probe against the WORKSPACE (REPO_ROOT above), exactly as
+# tp-task and tp-monitor derive theirs (issue #2): the pump is the tool that
+# tells a launched agent where the ledger is, so it must not keep a private
+# opinion. It anchors to the workspace root rather than OPS_DIR on purpose —
+# the ledger-repo and the ledger-directory are separate questions, and coupling
 # them is what baked Arachne's ops/task-loop/ shape in. A consumer whose ledger
 # lives under a separate ledger repo names it via TASKPUMP_LEDGER_PROBE.
-tp_resolve_workspace
 TASKS_SUBDIR="${TASKPUMP_LEDGER_PROBE:-${TASKPUMP_TASKS_SUBDIR:-tasks}}"
-TASKS_DIR="${TASKPUMP_PUMP_TASKS_DIR:-${TASKPUMP_TASKS_DIR:-$TP_WS_ROOT/$TASKS_SUBDIR}}"
+TASKS_DIR="${TASKPUMP_PUMP_TASKS_DIR:-${TASKPUMP_TASKS_DIR:-$REPO_ROOT/$TASKS_SUBDIR}}"
+# Under an explicit workspace pin, the ledger CLI this pump spawns still
+# anchors to its own $PWD — a different workspace entirely when a mismatch is
+# the reason the pin was set. The pump's answer and its children's answer must
+# not diverge (that split is a silent wrong ledger), so hand the children the
+# pinned derivation — unless the caller (env or conf) already named a ledger,
+# which both sides honor identically.
+if [[ -n "${TASKPUMP_WORKSPACE_ROOT:-}" && -z "${TASKPUMP_TASKS_DIR:-}" ]]; then
+  export TASKPUMP_TASKS_DIR="$REPO_ROOT/$TASKS_SUBDIR"
+fi
 # The file that proves the ledger submodule is populated in a fresh worktree.
 # NO default (issue #3): the old one, ops/planning/STATUS.md, was Arachne's —
 # for anyone else it either never exists (init runs every time, wasteful but
