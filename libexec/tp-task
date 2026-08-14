@@ -79,6 +79,16 @@ _tp_conf_root="$TP_WS_CONF_ROOT"
 _tp_cwd_root="$TP_WS_CWD_ROOT"
 _tp_repo_root="$TP_WS_ROOT"
 _tp_resolved_via="$TP_WS_VIA"
+# When the tasks dir was handed to us outright, the workspace rung did not
+# decide it — the via diagnostic must name the rung that did, or it misleads
+# in exactly the misconfiguration case it exists for.
+if [[ "$_tp_tasks_dir_explicit" -eq 1 ]]; then
+  if tp_conf_supplied TASKS_DIR; then
+    _tp_resolved_via="conf-value"
+  else
+    _tp_resolved_via="env"
+  fi
+fi
 
 # ── Config ────────────────────────────────────────────────────────────────────
 : "${TASKPUMP_TASKS_DIR:=$_tp_repo_root/$TASKPUMP_LEDGER_PROBE}"
