@@ -25,24 +25,8 @@
 set -uo pipefail
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
-if [[ -f "$SCRIPT_DIR/suite-prologue.sh" ]]; then
-  # shellcheck source=tests/suite-prologue.sh
-  . "$SCRIPT_DIR/suite-prologue.sh"
-else
-  # The shared prologue arrives with the suite-env work; until it lands, this
-  # reproduces its baseline so a standalone run is hermetic either way. Both
-  # halves close the same hole: the pump exports TASKPUMP_*/TP_* pointing at the
-  # REAL ledger into every agent session, and lib/config.sh gives a canonical
-  # spelling the win over its legacy twin — so an inherited variable silently
-  # outranks what a fixture sets.
-  while IFS= read -r _tp_scrub_var; do
-    unset "$_tp_scrub_var"
-  done < <(compgen -e TASKPUMP_; compgen -e TP_; compgen -e ARACHNE_; true)
-  unset _tp_scrub_var
-  export TASKPUMP_NO_CONF=1
-  export TASKPUMP_NOTIFY_CMD=true
-  export ARACHNE_NOTIFY_CMD=true
-fi
+# shellcheck source=tests/suite-prologue.sh
+. "$SCRIPT_DIR/suite-prologue.sh"
 
 TP_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 PUMP="$TP_ROOT/libexec/tp-pump"
