@@ -489,9 +489,18 @@ echo "--- Test 17: liveness-based reclaim of orphaned claims (A1, D3 eligibility
 # PATH-injected git stub makes the commits-ahead check hermetic; F95 has no real
 # branch so nothing here touches the working repo. Staleness reclaim is disabled
 # (ARACHNE_CLAIM_STALE_HOURS huge) so this isolates reclaim_orphaned_claims.
+#
+# Every stub that a tick can reach MUST answer --git-common-dir with a real
+# directory inside the fixture, matched before any catch-all: the worktree
+# visibility guard resolves the answer and heals that git dir's info/exclude,
+# so a fallthrough answer (a HEAD sha, or nothing) once made it manufacture
+# <answer>/info/exclude trees in the REAL repo the suite ran from (issue #20).
+STUB_GIT_COMMON="$TMP/stub-git-common"; mkdir -p "$STUB_GIT_COMMON"
+export STUB_GIT_COMMON
 cat >| "$BIN/git" <<'EOF'
 #!/usr/bin/env bash
 case "$*" in
+  *--git-common-dir*) echo "${STUB_GIT_COMMON:?}";;
   *rev-list*--count*) echo "${STUB_AHEAD:-0}";;
   *) : ;;
 esac
@@ -603,11 +612,14 @@ echo "--- Test 19: auto-resume of a stalled orphaned claim (2026-08-05 F79 stall
 #
 # The git stub answers rev-parse (branch head, for progress detection),
 # rev-parse --verify (branch exists), rev-list --count (commits ahead) and
-# log --oneline (the resume note's commit list). Order matters: --verify must
-# be matched before the bare rev-parse arm.
+# log --oneline (the resume note's commit list). Order matters: --verify and
+# --git-common-dir must be matched before the bare rev-parse arm — the bare
+# arm's sha answer once became a directory the visibility guard manufactured
+# in the real repo the suite ran from (issue #20).
 cat >| "$BIN/git" <<'EOF'
 #!/usr/bin/env bash
 case "$*" in
+  *--git-common-dir*)   echo "${STUB_GIT_COMMON:?}" ;;
   *rev-parse*--verify*) exit 0 ;;
   *rev-parse*)          echo "${STUB_HEAD:-aaaaaaa1111}" ;;
   *rev-list*--count*)   echo "${STUB_AHEAD:-0}" ;;
