@@ -140,20 +140,12 @@ fi
 
 # ── The conf ──────────────────────────────────────────────────────────────────
 
-# SPEC_GAP: G4.1 fixes which keys the generated conf carries, not what the tasks
-# dir key is set TO. A bare `TASKPUMP_TASKS_DIR=tasks` resolves against $PWD, so
-# every invocation from a subdirectory reads an empty ledger and reports an
-# empty frontier at rc 0 (issue #1, live-reproduced in G5.2 as a silent false
-# drain) — a scaffold must not hand a new consumer that trap. So the relative
-# form is anchored to the conf's own directory, the construct this repository's
-# own dogfood conf uses; an absolute --tasks-dir is written verbatim.
+# The conf loader anchors a conf-supplied relative path to the conf's own
+# directory (issue #1), so the scaffold writes the documented relative form
+# verbatim — the first conf a consumer reads should look like the one the
+# docs describe. An absolute --tasks-dir is likewise written verbatim.
 tasks_key_line() {
-  if [[ "$TASKS_DIR" == /* ]]; then
-    printf "TASKPUMP_TASKS_DIR='%s'\n" "$TASKS_DIR"
-    return 0
-  fi
-  printf "TASKPUMP_TASKS_DIR=\"\$(CDPATH='' cd -- \"\$(dirname \"\${TP_CONFIG_FILE:-\$PWD/%s}\")\" && pwd)/%s\"\n" \
-    "$TP_CONFIG_NAME" "$TASKS_DIR"
+  printf "TASKPUMP_TASKS_DIR='%s'\n" "$TASKS_DIR"
 }
 
 mkdir -p "$TASKS_PATH"

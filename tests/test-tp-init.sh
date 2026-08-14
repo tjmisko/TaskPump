@@ -97,6 +97,14 @@ have "$out" '--dry-run'      && pass "it prints the pump dry-run command" || fai
 # Only the keys a starter decides, and the pointer to the census for the rest.
 conf=$(cat "$REPO/taskpump.conf")
 have "$conf" 'TASKPUMP_TASKS_DIR='  && pass "the conf sets the tasks dir" || fail "no TASKPUMP_TASKS_DIR:\n$conf"
+# The loader anchors conf-relative paths (issue #1), so the scaffold writes the
+# documented relative form — not an embedded cd workaround.
+grep -qE "^TASKPUMP_TASKS_DIR='tasks'\$" "$REPO/taskpump.conf" \
+  && pass "the tasks dir is the documented relative form" \
+  || fail "the tasks-dir line is not the documented relative form:\n$conf"
+have "$conf" 'CDPATH' \
+  && fail "the conf still embeds the issue-#1 cd workaround:\n$conf" \
+  || pass "no embedded cd workaround: the conf loader owns anchoring"
 have "$conf" 'TASKPUMP_ID_PATTERN=' && pass "the conf sets the id pattern" || fail "no TASKPUMP_ID_PATTERN:\n$conf"
 have "$conf" '# TASKPUMP_BUILD_GATE=' && pass "the build gate is present but commented out" \
   || fail "TASKPUMP_BUILD_GATE is not a commented key:\n$conf"
