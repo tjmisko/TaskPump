@@ -217,6 +217,50 @@ assert_has "the live ledger claim outranks the manifest row" "$out" "release 'T1
 assert_no  "the stale manifest row for feat/a is not used"   "$out" "T9.8"
 assert_has "the manifest still rescues a claim-less branch"  "$out" "release 'T9.9'"
 
+echo "--- Test 12: the rescue sees claims OUTSIDE the pump state's phase range ---"
+# The renderer narrows --claims to the pump state's phases, but a stuck agent
+# is typically exactly the one the range moved past — ledger_claims must
+# neutralize the narrowing or the release silently skips at rc=0.
+mkclaim_ph() {  # $1 = id, $2 = phase, $3 = claimed_by branch
+  printf -- '---\nid: "%s"\nphase: "%s"\nstatus: in_progress\nclaimed_by: %s\nclaimed_at: "2026-08-13T10:00:00Z"\nlast_heartbeat_ts: "2026-08-13T10:30:00Z"\nturn_budget_remaining: 4\ngoal: "the %s outcome"\nblockers: []\n---\nbody\n' \
+    "$1" "$2" "$3" "$1" >| "$CT/$1.md"
+}
+mkclaim_ph T5.1 T5 feat/c
+mkdir -p "$FIX/.worktrees/feat/c"
+touch -d '2 hours ago' "$FIX/.worktrees/feat/c/.taskpump-agent.log"
+printf '{"phases":"T1"}\n' >| "$FIX/pump.state"
+out="$(TASKPUMP_CLEANUP_REPO_ROOT="$FIX" TASKPUMP_TASKS_DIR="$CT" \
+       TASKPUMP_PUMP_STATE_FILE="$FIX/pump.state" \
+       STUB_LIVE="arachne-agent-feat-c" "$CLEANUP" --stuck --dry-run 2>&1)"
+assert_has "the out-of-range claim is still released"   "$out" "release 'T5.1'"
+assert_no  "no silent skip for the out-of-range claim"  "$out" "no live ledger claim"
+
+echo "--- Test 13: TASKPUMP_MANIFEST_SUBPATH reaches tp-cleanup (monitor parity) ---"
+# The repo-relative spelling the monitor honours must not be silently inert
+# here — that is the explicit-config-silently-ignored shape issue #7 closes.
+serr="$(TASKPUMP_MANIFEST_SUBPATH="missing/nope.tsv" TASKPUMP_CLEANUP_REPO_ROOT="$FIX" \
+        "$CLEANUP" --stuck --dry-run 2>&1)"; src=$?
+[[ "$src" -ne 0 ]] && pass "a missing SUBPATH manifest exits non-zero" \
+                   || fail "a missing SUBPATH manifest exited 0"
+assert_has "the error names the SUBPATH key" "$serr" "TASKPUMP_MANIFEST_SUBPATH names"
+printf 'mnamed\tfeat/d\tbrief\tT9.7\n' >| "$FIX/sub-manifest.tsv"
+mkdir -p "$FIX/.worktrees/feat/d"
+touch -d '2 hours ago' "$FIX/.worktrees/feat/d/.taskpump-agent.log"
+out="$(TASKPUMP_MANIFEST_SUBPATH="sub-manifest.tsv" TASKPUMP_CLEANUP_REPO_ROOT="$FIX" \
+       TASKPUMP_TASKS_DIR="$CT" TASKPUMP_PUMP_STATE_FILE="$FIX/no-pump-state" \
+       STUB_LIVE="arachne-agent-feat-d" "$CLEANUP" --stuck --dry-run 2>&1)"
+assert_has "a SUBPATH manifest rescues a claim-less branch" "$out" "release 'T9.7'"
+
+echo "--- Test 14: a broken claim renderer is loud, never a fake 'no claim' ---"
+out="$(TASKPUMP_DAG_BIN=/bin/false TASKPUMP_CLEANUP_REPO_ROOT="$FIX" \
+       TASKPUMP_TASKS_DIR="$CT" TASKPUMP_PUMP_STATE_FILE="$FIX/no-pump-state" \
+       STUB_LIVE="arachne-agent-feat-b" "$CLEANUP" --stuck --dry-run 2>&1)"
+assert_has "a failing renderer is named"      "$out" "ledger claim renderer failed"
+out="$(TASKPUMP_DAG_BIN="$FIX/no-such-renderer" TASKPUMP_CLEANUP_REPO_ROOT="$FIX" \
+       TASKPUMP_TASKS_DIR="$CT" TASKPUMP_PUMP_STATE_FILE="$FIX/no-pump-state" \
+       STUB_LIVE="arachne-agent-feat-b" "$CLEANUP" --stuck --dry-run 2>&1)"
+assert_has "a missing renderer is named"      "$out" "renderer not executable"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"
