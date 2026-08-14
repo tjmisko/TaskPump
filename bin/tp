@@ -14,6 +14,9 @@ usage() {
   cat <<EOF
 usage: tp <command> [args]
 
+Getting started
+  init              scaffold taskpump.conf and a tasks directory in this repo
+
 Task ledger
   task              read and write task state (next, claim, complete, ...)
 
@@ -46,7 +49,7 @@ cmd=$1
 shift
 
 case "$cmd" in
-  task|pump|cleanup|monitor|dag-render|stream-fmt|agent-watchdog|disk-watchdog)
+  init|task|pump|cleanup|monitor|dag-render|stream-fmt|agent-watchdog|disk-watchdog)
     exec "$TP_ROOT/libexec/tp-$cmd" "$@"
     ;;
   usage)

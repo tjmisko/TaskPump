@@ -8,6 +8,27 @@ to describe a project, not to make the tools work.
 `taskpump.conf.example` is the annotated census of every key. This document
 explains how they are found, which one wins, and what each group is for.
 
+**`tp init` writes the first one for you, and is the recommended starting
+point.** Run it in the repository you want driven: it scaffolds a
+`taskpump.conf` carrying only the keys a new consumer actually decides — where
+the ledger lives and the id grammar, plus a commented-out build gate — and
+creates the tasks directory beside it.
+
+```bash
+cd ~/code/my-project
+tp init                              # tasks/ + taskpump.conf at the worktree root
+tp init --tasks-dir planning/tasks   # ...or a ledger somewhere else
+```
+
+It writes at the **worktree root** even when you run it from a subdirectory,
+because that is the only directory a conf governs the whole repository from
+(§1). It **refuses**, naming the file it found, when a `taskpump.conf` is
+already discoverable from where you are standing — a second conf would shadow an
+existing ledger's configuration for part of the repository, and that refusal
+changes nothing on disk. It also commits nothing and creates no tasks: `tp init`
+prepares a repository, it does not start using it. From there, `tp task create`
+and `tp task ready` work with no further configuration.
+
 ---
 
 ## 1. Discovery
@@ -41,6 +62,85 @@ home directory would quietly configure every repository beneath it.
 Installation paths are a different question and *are* resolved from the tools'
 own location, through their realpath, so a symlink on `PATH` still finds its own
 installation.
+
+### Vendored TaskPump checkouts
+
+One conf is deliberately **skipped** by the walk: a vendored TaskPump
+checkout's own tracked `taskpump.conf`. A consumer that vendors TaskPump — as
+a submodule, a subtree, or a plain nested copy — gets a conf inside its own
+tree that describes TaskPump's dogfood ledger, and honoring it would silently
+point any invocation whose `$PWD` is inside the vendored checkout at that
+ledger instead of the consumer's. So a discovered conf whose directory is a
+TaskPump install (it carries `lib/config.sh` and `libexec/tp-task`) sitting
+inside an enclosing repository — or checked out as a submodule of one — is
+passed over, and the walk continues toward the consumer's own conf. For the
+submodule shape the walk's ceiling extends to the superproject's root, and the
+caller's-workspace anchor looks through to the superproject the same way: the
+consumer's conf and ledger win from anywhere inside its tree.
+
+A standalone TaskPump checkout that is nobody's vendored copy (the dogfood
+repo itself, and each of its worktrees) matches neither condition and keeps
+its own conf.
+
+Two shapes remain ambiguous by construction and keep the nested behavior: a
+plain nested *clone* (its own `.git`, no superproject) is indistinguishable
+from the dogfood repo, and a non-install directory carrying a conf (a fixture,
+a subproject) still owns its own ledger. A vendoring consumer that wants
+deterministic resolution regardless sets `TASKPUMP_CONFIG` explicitly in its
+shims — an explicit config never anchors to its own directory, so it is immune
+to the hazard entirely.
+
+### Relative paths in the conf
+
+A relative path in `taskpump.conf` means **relative to the workspace the conf
+describes**, never relative to wherever the caller happens to stand. After the
+file loads, every relative value of the ledger-locating keys —
+`TASKPUMP_TASKS_DIR`, `TASKPUMP_TASK_OUT`, `TASKPUMP_CODE_REPO`,
+`TASKPUMP_LEDGER_REPO`, `TASKPUMP_PUMP_TASKS_DIR`, `TASKPUMP_PUMP_OPS_DIR`,
+`TASKPUMP_BRIEF_TEMPLATE`, `TASKPUMP_PHASE_BRIEF_TEMPLATE`,
+`TASKPUMP_RESUME_TEMPLATE` — is anchored to a fixed root: a *discovered*
+conf's own directory; for an explicit `TASKPUMP_CONFIG` (which may live
+anywhere), the caller's worktree root. Unanchored, `tp task ready` run from a
+subdirectory returned an **empty frontier with rc=0** over live work, and the
+pump reported the range drained.
+
+Three deliberate edges:
+
+- **Environment values are not rewritten.** `TASKPUMP_TASKS_DIR=tasks tp task
+  ready` keeps the shell's own convention — the caller typed the path where
+  they stood.
+- **State-file names are not workspace paths.** Keys like
+  `TASKPUMP_PUMP_LOG` and `TASKPUMP_POOL_CAP_FILE` are relative to the *state
+  dir* by contract, and `TASKPUMP_LEDGER_PROBE` is relative to a candidate
+  workspace by definition; none of them anchor.
+- **The unanchorable case is an error.** An explicit `TASKPUMP_CONFIG` with a
+  relative path, run from outside any git worktree, refuses loudly and names
+  the key — resolving it against `$PWD` would pick a different ledger per
+  directory, silently.
+
+A missing ledger is equally loud: a tasks directory that does not **exist**
+fails every ledger-reading verb with a pointer to `tp task resolve`, instead
+of reading as an empty frontier. Only `resolve` itself keeps answering — it is
+the diagnostic the error names.
+
+### The final resolution order
+
+For where the ledger lives, strongest first:
+
+1. `TASKPUMP_TASKS_DIR` from the **environment** — used as given.
+2. `TASKPUMP_TASKS_DIR` from the **conf** — anchored to the conf's workspace
+   as above.
+3. The **discovered conf's directory**, when `TASKPUMP_LEDGER_PROBE` resolves
+   there (a directory carrying its own conf and ledger owns them, even inside
+   a larger repo — vendored TaskPump checkouts excepted, above).
+4. **`$PWD`'s worktree root**, when the probe resolves there (for a vendored
+   TaskPump submodule, the superproject's root).
+5. The **install root** — a fallback, not an answer: mutating verbs refuse it
+   unless the install root is the caller's own worktree (the vendored layout,
+   where it is simply correct).
+
+`tp task resolve --all` prints the answer, the rung that produced it (`via`),
+and the conf that loaded.
 
 ### Turning discovery off
 
@@ -227,7 +327,7 @@ toolchain:
 | `TASKPUMP_BRIEF_TEMPLATE` | The parameterized brief a launched agent is handed. |
 | `TASKPUMP_RESUME_TEMPLATE` | The resume preamble a stalled task's agent gets ahead of that brief. |
 | `TASKPUMP_TASK_CLI` | How an agent invokes the ledger CLI from inside its worktree. |
-| `TASKPUMP_SUBMODULE_PROBE` | A path that proves the ledger submodule is populated. |
+| `TASKPUMP_SUBMODULE_PROBE` | A path that proves the ledger submodule is populated in a fresh worktree, letting the pump skip its per-worktree `git submodule update --init --recursive`. **No default**: unset, the (idempotent, cheap) init always runs. The probe is a pure optimization — and a sharp one: a path that exists for the wrong reason skips the init some *other* submodule still needs, silently. Set it only to a path that proves everything you need populated. |
 | `TASKPUMP_GATES` | Ordered list of gates to consult before launching (§[GATES.md](GATES.md)). |
 | `TASKPUMP_PRE_TICK_HOOKS` | Commands run at the start of each tick — ledger refresh, repo hygiene, contamination checks. |
 | `TASKPUMP_NOTIFY_CMD` | The command that delivers notifications. Set it to `true` to silence them. |

@@ -146,10 +146,12 @@ out=$( unset TASKPUMP_NO_CONF ARACHNE_NO_CONF; itick F55..F55 2>&1 ); rc=$?
 have "$out" "bad phase range 'F55..F55'" && pass "the failure names the conf-rejected range" \
   || fail "no bad-phase-range diagnostic:\n$out"
 
+# The conf's relative value arrives ANCHORED to the conf's own directory
+# (issue #1: a conf-relative path must never resolve against $PWD).
 got=$( cd "$POISON" && env -u TASKPUMP_NO_CONF -u ARACHNE_NO_CONF \
         ARACHNE_TASK_NOCOMMIT=1 "$TASK" resolve --tasks-dir )
-[[ "$got" == "poison-tasks" ]] && pass "tasks dir resolves to the poison conf's value" \
-  || fail "resolve --tasks-dir got '$got' without the switch"
+[[ "$got" == "$POISON/poison-tasks" ]] && pass "tasks dir resolves to the poison conf's value, workspace-anchored" \
+  || fail "resolve --tasks-dir got '$got' without the switch, expected '$POISON/poison-tasks'"
 
 echo
 echo "--- the baseline hang path: the conf's build gate reaches a fixture tick ---"
@@ -175,13 +177,15 @@ echo "--- the opt-back-in seams ---"
 
 got=$( cd "$POISON" && env TASKPUMP_NO_CONF=0 ARACHNE_TASK_NOCOMMIT=1 \
         "$TASK" resolve --tasks-dir )
-[[ "$got" == "poison-tasks" ]] && pass "TASKPUMP_NO_CONF=0 re-enables discovery" \
-  || fail "NO_CONF=0 resolved to '$got', expected the conf's value"
+[[ "$got" == "$POISON/poison-tasks" ]] && pass "TASKPUMP_NO_CONF=0 re-enables discovery" \
+  || fail "NO_CONF=0 resolved to '$got', expected '$POISON/poison-tasks'"
 
+# An explicit config anchors its relative paths to the CALLER's worktree root
+# (the file itself may live anywhere); here that is the same poison repo.
 got=$( cd "$POISON" && env TASKPUMP_NO_CONF=1 TASKPUMP_CONFIG="$POISON/taskpump.conf" \
         ARACHNE_TASK_NOCOMMIT=1 "$TASK" resolve --tasks-dir )
-[[ "$got" == "poison-tasks" ]] && pass "an explicit TASKPUMP_CONFIG outranks the switch" \
-  || fail "TASKPUMP_CONFIG under NO_CONF=1 resolved to '$got'"
+[[ "$got" == "$POISON/poison-tasks" ]] && pass "an explicit TASKPUMP_CONFIG outranks the switch" \
+  || fail "TASKPUMP_CONFIG under NO_CONF=1 resolved to '$got', expected '$POISON/poison-tasks'"
 
 echo
 echo "=============================================="
