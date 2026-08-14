@@ -8,6 +8,23 @@ to describe a project, not to make the tools work.
 `taskpump.conf.example` is the annotated census of every key. This document
 explains how they are found, which one wins, and what each group is for.
 
+## Starting a new consumer
+
+`tp init`, run from anywhere inside the repository TaskPump should drive, is
+the recommended starting point. It writes a commented `taskpump.conf` at the
+enclosing worktree root, creates the tasks directory (`--tasks-dir <d>` puts
+the ledger somewhere other than the default `tasks`), and prints the next
+three commands so the quickstart continues from the terminal. The scaffolded
+conf sets only the keys a starter actually decides — `TASKPUMP_TASKS_DIR`,
+`TASKPUMP_ID_PATTERN`, and a commented `TASKPUMP_BUILD_GATE` — and points at
+`taskpump.conf.example` for everything else.
+
+It refuses, loudly and without changing anything, whenever the discovery walk
+below would already find a `taskpump.conf` (printing that path), and whenever
+the target tasks directory already contains files: initialization must never
+shadow an existing ledger's configuration, and re-running after a refusal
+changes nothing.
+
 ---
 
 ## 1. Discovery
