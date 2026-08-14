@@ -208,11 +208,13 @@ CLI's path in the workspace (the reference consumer pins
 an `-x` check — the startup probe covers presence, not what the shim reaches
 for.
 
-One grammar detail: the bare `tp` is invoked as `tp task <verb>` (tp keeps its
-ledger verbs under `tp task`), while a pinned CLI keeps the direct
-`<cli> <verb>` shim grammar. Without that expansion every safety-net call
-below would be `tp claim` — an unknown command swallowed by its `|| true`, a
-silent no-op exactly where the claim discipline matters.
+One grammar detail: any CLI whose **basename** is `tp` — the bare default and
+a pinned-by-path `/opt/taskpump/bin/tp` alike — is invoked as `<cli> task
+<verb>` (tp keeps its ledger verbs under `tp task`), while a pinned shim with
+any other name keeps the direct `<cli> <verb>` grammar. Without that
+expansion every safety-net call below would be `tp claim` — an unknown
+command swallowed by its `|| true`, a silent no-op exactly where the claim
+discipline matters.
 
 There are exactly three call sites, all in the session script:
 

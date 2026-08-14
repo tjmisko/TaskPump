@@ -417,9 +417,11 @@ PATH before resolving the task CLI, so the resolution order is:
    for custom runners that mount nothing.
 
 A workspace therefore no longer needs to vendor a task CLI. Two grammars, one
-seam: the bare mounted `tp` is invoked as `tp task <verb>` — that is where tp
-keeps its ledger verbs — while a pinned CLI keeps the direct `<cli> <verb>` shim
-grammar it always had.
+seam, keyed on the resolved CLI's **basename**: anything named `tp` — the bare
+mounted default and a pinned-by-path `/opt/taskpump/bin/tp` alike — is invoked
+as `<cli> task <verb>` (that is where tp keeps its ledger verbs), while a
+pinned shim with any other name keeps the direct `<cli> <verb>` grammar it
+always had.
 
 The mount is read-only, and the tools resolve their own siblings
 install-relative, so nothing ever writes into the installation; worktree and

@@ -47,7 +47,14 @@
 #                                                         fails loudly when absent)
 #   TASKPUMP_INSTALL_MOUNT           —                    /opt/taskpump (where the
 #                                                         runner mounts the TaskPump
-#                                                         installation, read-only)
+#                                                         installation, read-only.
+#                                                         NOT forwarded by the shipped
+#                                                         runner — test seam / custom-
+#                                                         runner override only: set it
+#                                                         via docker -e in a custom
+#                                                         runner, never in
+#                                                         taskpump.conf, where it is
+#                                                         silently inert)
 #   TASKPUMP_CONTAINER_USER          —                    dev
 #   TASKPUMP_CONTAINER_HOME          —                    /home/$CONTAINER_USER
 #   TASKPUMP_PRE_FLIGHT              —                    (none; see below)
@@ -182,14 +189,17 @@ esac
 
 # How the session invokes the ledger CLI. tp keeps its ledger verbs under
 # `tp task <verb>`; a consumer shim takes them directly (`<cli> claim …`).
-# The bare `tp` therefore expands to `tp task` — without this, every safety-net
-# call below would run `tp claim`, an unknown command swallowed by its
+# The grammar keys on the RESOLVED CLI's BASENAME, not on the literal string
+# 'tp': a tp pinned by path (TASKPUMP_WORKSPACE_TASK_CLI=/opt/taskpump/bin/tp,
+# a natural spelling once the mount exists) is still tp, and taking the
+# direct-verb branch for it would make every safety-net call below
+# `/opt/taskpump/bin/tp claim` — an unknown command swallowed by its
 # `|| true`: a silent no-op exactly where the claim discipline matters
-# (flagged in G1.6's completion notes). A pinned CLI keeps the direct-verb
-# shim grammar, so Arachne's scripts/arachne-task pin behaves exactly as
-# before the mount existed.
-if [[ "$TASK_CLI" == "tp" ]]; then
-    TASK_CLI_ARGV="tp task"
+# (flagged in G1.6's completion notes). A pinned shim with any other name
+# keeps the direct-verb grammar, so Arachne's scripts/arachne-task pin
+# behaves exactly as before the mount existed.
+if [[ "${TASK_CLI##*/}" == "tp" ]]; then
+    TASK_CLI_ARGV="$(printf '%q' "$TASK_CLI") task"
 else
     TASK_CLI_ARGV="$(printf '%q' "$TASK_CLI")"
 fi
@@ -651,8 +661,9 @@ DEV_SESSION_SCRIPT="
 
     # Safety-net claim of the lead task (the agent re-claims/sub-claims as the
     # brief directs). Harmless if already claimed by this branch (idempotent).
-    # \$TASK_CLI_ARGV is expanded at assembly time: 'tp task' for the bare
-    # mounted default, the %q-escaped path for a pinned consumer shim.
+    # \$TASK_CLI_ARGV is expanded at assembly time: '<cli> task' whenever the
+    # resolved CLI's basename is tp (the bare mounted default and a
+    # pinned-by-path tp alike), the %q-escaped path for a consumer shim.
     if [ -n '$TASK_ID' ]; then
         $TASK_CLI_ARGV claim '$TASK_ID' --branch \"\$CURRENT_BRANCH\" --turns $SAFETY_TURNS 2>&1 | tee -a '$LOG_FILE' || true
         $TASK_CLI_ARGV heartbeat '$TASK_ID' --start 2>&1 | tee -a '$LOG_FILE' || true

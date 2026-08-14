@@ -419,6 +419,14 @@ rep_cli=$(report "$(run_ep TASKPUMP_ENTRYPOINT_TEST_MODE=plan \
 grep -q '^task_cli=/usr/local/bin/tp$' <<<"$rep_cli" \
   && pass "an absolute TASKPUMP_WORKSPACE_TASK_CLI is used as given" \
   || fail "absolute task-CLI override wrong:\n$rep_cli"
+# The grammar keys on the resolved CLI's BASENAME, not the literal 'tp': a tp
+# pinned by absolute path is still tp and still keeps its verbs under `task`.
+# Keying on the literal would take the direct-verb branch and every safety-net
+# call would be `/usr/local/bin/tp claim` — the G1.6 silent no-op, reborn one
+# rung up the resolution order.
+grep -q '^task_cli_argv=/usr/local/bin/tp task$' <<<"$rep_cli" \
+  && pass "a tp pinned by path keeps the 'tp task' verb grammar (basename keying)" \
+  || fail "pinned-by-path tp invocation wrong:\n$rep_cli"
 # The arachne.conf-pinned spelling, literally: a consumer that vendors its shim
 # keeps exactly the pre-flip behaviour.
 rep_cli=$(report "$(run_ep TASKPUMP_ENTRYPOINT_TEST_MODE=plan \
@@ -522,6 +530,21 @@ grep -q "^task_cli=$R2/wt/scripts/arachne-task$" <<<"$rep_pinwin" \
 grep -q "^task_cli_argv=$R2/wt/scripts/arachne-task$" <<<"$rep_pinwin" \
   && pass "the winning pin keeps its direct-verb invocation" \
   || fail "pinned invocation wrong under the mount:\n$rep_pinwin"
+# The natural spelling once the mount exists: pinning the MOUNTED tp by path.
+# Basename keying must recognise it as tp and keep the `task` verb grammar —
+# the literal-'tp' comparison would have taken the direct-verb branch and
+# turned every safety-net call into a silent `... tp claim` no-op.
+out_pinmnt=$(run_ep TASKPUMP_ENTRYPOINT_TEST_MODE=plan PATH="$NOTP" \
+  TASKPUMP_INSTALL_MOUNT="$FAKEINSTALL" \
+  TP_WORKSPACE="$R2/wt" TP_REPO_ROOT="$R2" TP_BRIEF="$R2/brief.md" \
+  TASKPUMP_WORKSPACE_TASK_CLI="$FAKEINSTALL/bin/tp")
+rep_pinmnt=$(report "$out_pinmnt")
+grep -q "^task_cli=$FAKEINSTALL/bin/tp$" <<<"$rep_pinmnt" \
+  && pass "the mounted tp can be pinned by its absolute path" \
+  || fail "pinned mounted tp resolved wrong:\n$rep_pinmnt"
+grep -q "^task_cli_argv=$FAKEINSTALL/bin/tp task$" <<<"$rep_pinmnt" \
+  && pass "a pinned mounted tp is still invoked as '<path>/tp task <verb>'" \
+  || fail "pinned mounted tp lost the task-verb grammar:\n$rep_pinmnt"
 
 # The TP_ spelling must work for EVERY key, not just the headline ones. The pump
 # was exporting TP_TASKS_DIR / TP_AGENT_LOG_NAME / TP_GOAL_NOTE_NAME against an
