@@ -8,6 +8,27 @@ to describe a project, not to make the tools work.
 `taskpump.conf.example` is the annotated census of every key. This document
 explains how they are found, which one wins, and what each group is for.
 
+**`tp init` writes the first one for you, and is the recommended starting
+point.** Run it in the repository you want driven: it scaffolds a
+`taskpump.conf` carrying only the keys a new consumer actually decides — where
+the ledger lives and the id grammar, plus a commented-out build gate — and
+creates the tasks directory beside it.
+
+```bash
+cd ~/code/my-project
+tp init                              # tasks/ + taskpump.conf at the worktree root
+tp init --tasks-dir planning/tasks   # ...or a ledger somewhere else
+```
+
+It writes at the **worktree root** even when you run it from a subdirectory,
+because that is the only directory a conf governs the whole repository from
+(§1). It **refuses**, naming the file it found, when a `taskpump.conf` is
+already discoverable from where you are standing — a second conf would shadow an
+existing ledger's configuration for part of the repository, and that refusal
+changes nothing on disk. It also commits nothing and creates no tasks: `tp init`
+prepares a repository, it does not start using it. From there, `tp task create`
+and `tp task ready` work with no further configuration.
+
 ---
 
 ## 1. Discovery
