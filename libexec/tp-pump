@@ -82,11 +82,24 @@ CLAUDE_JSON="${TASKPUMP_AGENT_CONFIG:-$HOME/.claude.json}"
 # when the range drains, holding the task files.
 OPS_DIR="${TASKPUMP_PUMP_OPS_DIR:-${TASKPUMP_LEDGER_REPO:-$REPO_ROOT/ops}}"
 # Tasks dir — overridable independently of OPS_DIR so phase_dependencies / brief
-# rendering can be unit-tested against a flat fixture dir.
-TASKS_DIR="${TASKPUMP_PUMP_TASKS_DIR:-${TASKPUMP_TASKS_DIR:-$OPS_DIR/task-loop/tasks}}"
-# The file that tells us a submodule ledger has actually been checked out. Any
-# path inside the ledger that only exists once `submodule update` has run.
-SUBMODULE_PROBE="${TASKPUMP_SUBMODULE_PROBE:-ops/planning/STATUS.md}"
+# rendering can be unit-tested against a flat fixture dir. The default derives
+# from the ledger probe against the WORKSPACE, exactly as tp-task and
+# tp-monitor derive theirs (issue #2): the pump is the tool that tells a
+# launched agent where the ledger is, so it must not keep a private opinion.
+# It anchors to the workspace root rather than OPS_DIR on purpose — the
+# ledger-repo and the ledger-directory are separate questions, and coupling
+# them is what baked Arachne's ops/task-loop/ shape in. A consumer whose ledger
+# lives under a separate ledger repo names it via TASKPUMP_LEDGER_PROBE.
+tp_resolve_workspace
+TASKS_SUBDIR="${TASKPUMP_LEDGER_PROBE:-${TASKPUMP_TASKS_SUBDIR:-tasks}}"
+TASKS_DIR="${TASKPUMP_PUMP_TASKS_DIR:-${TASKPUMP_TASKS_DIR:-$TP_WS_ROOT/$TASKS_SUBDIR}}"
+# The file that proves the ledger submodule is populated in a fresh worktree.
+# NO default (issue #3): the old one, ops/planning/STATUS.md, was Arachne's —
+# for anyone else it either never exists (init runs every time, wasteful but
+# safe) or exists for the wrong reason and SKIPS the init that some other
+# submodule still needs, silently. Unset, the pump always runs the (idempotent,
+# cheap) submodule init; the probe is a pure optimization a consumer opts into.
+SUBMODULE_PROBE="${TASKPUMP_SUBMODULE_PROBE:-}"
 
 # Sibling tools.
 TASK_BIN="${TASKPUMP_TASK:-$TP_LIBEXEC_DIR/tp-task}"
@@ -293,6 +306,14 @@ usage() { apl_help "$0"; }
 [[ "$MODE" == "help" ]] && { usage; exit 0; }
 
 [[ -n "$PHASES" ]] || die "--phases is required (e.g. --phases F55..F63)"
+
+# A missing ledger must never read as a drained range: open_count and
+# frontier_phases mask tp-task's refusal into "0 open tasks" with their
+# 2>/dev/null fallbacks, which would render every phase DONE at rc=0 — the
+# false-drain shape this tool's incident history is about. Refuse up front.
+[[ -d "$TASKS_DIR" ]] || die "tasks directory does not exist: $TASKS_DIR
+  A drained range and a missing ledger must not look alike, so this is an
+  error instead. \`tp task resolve --all\` prints how resolution answered."
 case "$GRAIN" in
   phase) ;;
   task|chain) die "grain '$GRAIN' is not implemented yet; only --grain phase is supported (SPEC_GAP: D4 task/chain grains deferred)";;
@@ -369,20 +390,18 @@ trunk_worktree()  { printf '%s/%s' "$WORKTREES_DIR" "$(branch_slug "$INTEGRATION
 # the CONFIGURATION, not of any one launch: it should fail the run at tick zero
 # naming the key to fix, rather than fail per-launch — or worse, launch fine and
 # go invisible to liveness later, which is the failure this closes.
-# The whole expansion is drained before the first line is taken: `| head -1`
-# closed the pipe after one line while the expansion was still printing the
-# rest of the range, and when the scheduler let head exit first the writer's
-# next printf died EPIPE — a nondeterministic "printf: write error: Broken
-# pipe" on stderr that the golden-plan captures diffed as drift.
-_pump_probe_phases="$(pump_expand_phases "$PHASES")"
-_pump_probe_branch="$(phase_branch "${_pump_probe_phases%%$'\n'*}")"
+# First phase without a pipe: `| head -1` raced the expander's printf into
+# EPIPE noise ("printf: write error: Broken pipe") that polluted captured
+# plans and flaked the golden suite on CI.
+_pump_all_phases="$(pump_expand_phases "$PHASES")"
+_pump_probe_branch="$(phase_branch "${_pump_all_phases%%$'\n'*}")"
 if ! _pump_branch_problem="$(apl_branch_slug_reject_reason "$_pump_probe_branch")"; then
   die "$_pump_branch_problem
 this run constructs that branch from TASKPUMP_BRANCH_PREFIX='$BRANCH_PREFIX'
 (--branch-prefix). The agent name is the branch with \"/\" replaced by \"-\", and
 that mapping has to be reversible — see docs/RUNNERS.md section 2."
 fi
-unset _pump_probe_phases _pump_probe_branch _pump_branch_problem
+unset _pump_all_phases _pump_probe_branch _pump_branch_problem
 # pump_in_list <needle> <space-separated-haystack> — membership test for the
 # dry-run integration stubs (STUB_INTEGRATE_*).
 pump_in_list() {
@@ -999,7 +1018,9 @@ launch_phase() {
       git -C "$REPO_ROOT" worktree add "$wt" -b "$branch" "$BASE_REF" >/dev/null
     fi
   fi
-  [[ -f "$wt/$SUBMODULE_PROBE" ]] || git -C "$wt" submodule update --init --recursive 2>&1 | tail -1 || true
+  # No probe configured ⇒ always init (idempotent); a configured probe that
+  # answers skips it. See the SUBMODULE_PROBE note in the config block.
+  [[ -n "$SUBMODULE_PROBE" && -f "$wt/$SUBMODULE_PROBE" ]] || git -C "$wt" submodule update --init --recursive 2>&1 | tail -1 || true
   if ! apl_ensure_worktrees_visible "$REPO_ROOT" "$wt"; then
     # Name the deciding pattern and its file: "fix .gitignore" sent an operator
     # whose GLOBAL excludes caused this to the wrong file (G0.6).
@@ -1108,7 +1129,7 @@ ensure_trunk() {
       || die "cannot add trunk worktree $twt"
     log "integration trunk worktree at $twt"
   fi
-  [[ -f "$twt/$SUBMODULE_PROBE" ]] || git -C "$twt" submodule update --init --recursive 2>&1 | tail -1 || true
+  [[ -n "$SUBMODULE_PROBE" && -f "$twt/$SUBMODULE_PROBE" ]] || git -C "$twt" submodule update --init --recursive 2>&1 | tail -1 || true
   apl_ensure_worktrees_visible "$REPO_ROOT" "$twt" \
     || warn "trunk worktree is gitignored: $twt"
 }
