@@ -226,8 +226,13 @@ do_launch() {
   # usual cause is that there is nothing to remove.
   "$DOCKER" rm -f "$cname" >/dev/null 2>&1 || true
 
+  # --init puts tini at PID 1 to adopt and reap orphaned session subprocesses.
+  # Necessary but not sufficient on its own: an intermediary that subreaps
+  # below PID 1 (su did — issue #15) starves tini, so the entrypoint pairs
+  # this with a setpriv privilege drop that execs and leaves no intermediary.
   local cid rc=0
   cid=$("$DOCKER" run --rm -d \
+    --init \
     --name "$cname" \
     --cap-add NET_ADMIN \
     --memory "$mem_max" \
