@@ -32,11 +32,14 @@ TP_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 RUNNER="$TP_ROOT/runners/claude-docker/runner.sh"
 PUMP_LIB="$TP_ROOT/lib/pump-lib.sh"
 
-# Hermeticity: ignore any taskpump.conf in the repo this suite happens to run
-# from — TaskPump's own dogfood conf pins TASKPUMP_AGENT_PREFIX, which is the
-# single input this verb has. run-all.sh exports the same switch; this one
-# covers standalone runs.
-export TASKPUMP_NO_CONF=1
+# Hermeticity: the shared prologue ignores any taskpump.conf in the repo this
+# suite happens to run from — TaskPump's own dogfood conf pins
+# TASKPUMP_AGENT_PREFIX, which is the single input this verb has — and scrubs
+# the pump-exported TASKPUMP_*/TP_*/ARACHNE_* environment (issue #18), where
+# the same key arrives as an inherited export. run-all.sh sources the same
+# prologue; this one covers standalone runs.
+# shellcheck source=tests/suite-prologue.sh
+. "$SCRIPT_DIR/suite-prologue.sh"
 
 WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
 

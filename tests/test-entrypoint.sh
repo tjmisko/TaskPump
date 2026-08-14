@@ -28,11 +28,15 @@ EP="$TP_ROOT/runners/claude-docker/entrypoint.sh"
 PF="$TP_ROOT/runners/claude-docker/preflight-example.sh"
 RUNNER="$TP_ROOT/runners/claude-docker/runner.sh"
 
-# Hermeticity: ignore any taskpump.conf in the repo this suite happens to run
-# from — the tools discover config by walking up from $PWD, and a leaked conf
-# reconfigures every fixture invocation below. run-all.sh exports the same
-# switch; this one covers standalone runs.
-export TASKPUMP_NO_CONF=1
+# Hermeticity: the shared prologue ignores any taskpump.conf in the repo this
+# suite happens to run from (a leaked conf reconfigures every fixture
+# invocation below) and scrubs the pump-exported TASKPUMP_*/TP_*/ARACHNE_*
+# environment (issue #18). The startup scrub protects the fixtures built
+# OUTSIDE the run_ep-style wrappers; the per-case CONTRACT_VARS clearing below
+# keeps covering the wrapped ones. run-all.sh sources the same prologue; this
+# one covers standalone runs.
+# shellcheck source=tests/suite-prologue.sh
+. "$SCRIPT_DIR/suite-prologue.sh"
 
 WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
 

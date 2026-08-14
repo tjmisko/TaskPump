@@ -5,8 +5,10 @@
 # wrapper runs them in sequence, keeps going after a failure so one broken suite
 # does not hide the state of the rest, and prints a summary table at the end.
 #
-# Notifications are stubbed to `true` in both spellings: several suites drive
-# code paths that would otherwise fire a real desktop notification per tick.
+# Hermeticity is centralized in tests/suite-prologue.sh, sourced below:
+# notifications stubbed to `true` in both spellings, ambient taskpump.conf
+# discovery off, and the inherited TASKPUMP_*/TP_*/ARACHNE_* environment
+# scrubbed.
 #
 # Run: ./tests/run-all.sh          (all suites)
 #      ./tests/run-all.sh task     (only suites whose name contains "task")
@@ -14,18 +16,17 @@ set -uo pipefail
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 
-export ARACHNE_NOTIFY_CMD=true
-export TASKPUMP_NOTIFY_CMD=true
-
-# Hermeticity: the tools discover taskpump.conf by walking up from $PWD, so a
-# conf in whatever repo these suites happen to run from (TaskPump's own dogfood
-# conf included) would leak into every fixture invocation that does not override
-# a key — a foreign sigil failing range parses, and a TASKPUMP_BUILD_GATE of
-# './tests/run-all.sh' that once made the pump suite re-enter this very script
-# unboundedly. Each suite exports this itself for standalone runs; a suite that
-# tests conf discovery opts back in per-invocation (TASKPUMP_NO_CONF=0 or an
-# explicit TASKPUMP_CONFIG, which outranks the switch).
-export TASKPUMP_NO_CONF=1
+# Hermeticity, both halves, shared with every suite's own prologue: turn off
+# ambient taskpump.conf discovery (a leaked conf once made the pump suite
+# re-enter this very script unboundedly), and scrub the inherited
+# TASKPUMP_*/TP_*/ARACHNE_* environment (issue #18: the pump exports the real
+# ledger's TASKPUMP_TASKS_DIR into every agent session, and the canonical
+# spelling outranks the legacy one a fixture sets — 64 spurious failures
+# across three suites for the 2026-08-13 G3 drain agent). Each suite sources
+# the same prologue itself for standalone runs; sourcing it here as well
+# guards anything this wrapper does before a suite's own prologue runs.
+# shellcheck source=tests/suite-prologue.sh
+. "$SCRIPT_DIR/suite-prologue.sh"
 
 filter="${1:-}"
 
