@@ -323,6 +323,8 @@ The image a consumer names must satisfy this contract:
   `/home/dev`). The container starts as root and hands the session to that user
   with `setpriv`, never `su` — `su` subreaps and leaks the session's orphans as
   zombies (issue #15). See *Why root* in `runners/claude-docker/README.md`.
+  For the mounted `tp` to function the image additionally needs `bash` 4+ and
+  mikefarah's `yq` v4 — see §4.5.
 
 - **Everything project-shaped stays out of the image contract.** Toolchains,
   smoke tests, and the egress allowlist arrive through the pre-flight hook
@@ -401,7 +403,40 @@ merely not ready — the entrypoint exits before claiming anything, so no task
 records a failed iteration and nothing burns a tripwire. See
 [LEDGER-CONTRACT.md §10](LEDGER-CONTRACT.md#10-the-exit-code-protocol--frozen).
 
-### 4.5 What it hands the agent
+### 4.5 tp inside the container
+
+`launch` bind-mounts the TaskPump installation itself — resolved from the
+runner's own realpath, the same way `bin/tp` finds its libexec — **read-only at
+`/opt/taskpump`**. The entrypoint prepends `/opt/taskpump/bin` to the agent's
+PATH before resolving the task CLI, so the resolution order is:
+
+1. an explicit `TASKPUMP_WORKSPACE_TASK_CLI` — a consumer's pinned shim always
+   wins (Arachne's `scripts/arachne-task` pin keeps working unchanged);
+2. `tp` on PATH — guaranteed under the shipped runner by the mount;
+3. the loud startup error from G1.6 — unreachable with the shipped runner, kept
+   for custom runners that mount nothing.
+
+A workspace therefore no longer needs to vendor a task CLI. Two grammars, one
+seam: the bare mounted `tp` is invoked as `tp task <verb>` — that is where tp
+keeps its ledger verbs — while a pinned CLI keeps the direct `<cli> <verb>` shim
+grammar it always had.
+
+The mount is read-only, and the tools resolve their own siblings
+install-relative, so nothing ever writes into the installation; worktree and
+ledger resolution still follow the **caller's** cwd, per the wrong-ledger lesson
+([CONFIG.md](CONFIG.md)). Read-only is load-bearing in the other direction too:
+an agent that could write `/opt/taskpump` could edit the supervisor supervising
+it. For the same reason the runner refuses to launch when it cannot resolve its
+own installation (a `runner.sh` copied away from its tree) rather than mounting
+whatever happens to be two directories up.
+
+**What the image must provide for tp to function:** `bash` 4+, `git`, `jq`, and
+mikefarah's `yq` v4 (the ledger is read and written through yq's front-matter
+modes — the Python `yq` shares nothing but the name). The pre-flight hook
+(§4.4) is where a consumer asserts these before the session starts; a probe
+that fails there exits 75, before anything is claimed.
+
+### 4.6 What it hands the agent
 
 The agent starts with a **brief** on stdin: the rendered phase-drain template,
 naming the phase, its cross-phase dependencies and their integration state, and

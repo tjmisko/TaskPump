@@ -95,6 +95,7 @@ guess: an unreachable runtime is never reported as an empty fleet.
 ```
 -v $TP_CLAUDE_DIR:/tmp/claude-home:ro
 -v $TP_CLAUDE_JSON:/tmp/claude-home-json/.claude.json:ro
+-v <taskpump-install>:/opt/taskpump:ro     # this runner's own installation (G4.3)
 -v $TP_REPO_ROOT:$TP_REPO_ROOT:ro          # primary checkout, READ-ONLY
 -v $TP_REPO_ROOT/.git:$TP_REPO_ROOT/.git   # RW overlay
 -v $TP_WORKSPACE:$TP_WORKSPACE             # RW overlay
@@ -105,6 +106,15 @@ guess: an unreachable runtime is never reported as an empty fleet.
 Host and container paths are identical on purpose: a git worktree's `.git` file
 stores an **absolute** gitdir path, so matching paths let git resolve without a
 `git worktree repair` inside the container.
+
+The `/opt/taskpump` mount is the TaskPump installation this runner belongs to,
+resolved from its own realpath the same way `bin/tp` finds its libexec. The
+entrypoint prepends `/opt/taskpump/bin` to the agent's PATH, so the default
+task CLI (`tp`) resolves with nothing vendored into the workspace — see
+`docs/RUNNERS.md` §4.5. It is read-only for the same reason the primary is: an
+agent that could write it could edit the supervisor supervising it. A
+`runner.sh` copied away from its installation refuses to launch rather than
+mount a tp-less directory.
 
 The read-only primary with three read-write overlays is load-bearing. A blanket
 RW `$TP_REPO_ROOT` lets an agent edit the primary checkout out from under every
@@ -187,14 +197,22 @@ exist in the container falls back to `$WORKSPACE/.taskpump-resume.md`.
 The entrypoint invokes the task CLI named by `TASKPUMP_WORKSPACE_TASK_CLI`. An
 absolute value is used as given; a relative path containing a `/` resolves
 under the workspace; a bare command name (the default, `tp`) resolves on the
-container's `PATH`. The container can only see what is mounted, and until the
-agent image carries `tp` (G4.3) a bare default cannot resolve — so the
-entrypoint fails loudly at startup, before the session, naming both fixes: set
-`TASKPUMP_WORKSPACE_TASK_CLI` to the ledger CLI's path in the workspace (the
-reference consumer pins `scripts/arachne-task`), or provide `tp` in the agent
-image. A shim that `exec`s a path outside the mount set will still fail at
-runtime while passing an `-x` check — the startup probe covers presence, not
-what the shim reaches for.
+container's `PATH` — which the entrypoint has already prepended
+`/opt/taskpump/bin` to, so under this runner the default finds the mounted
+installation (G4.3). The loud startup error for a bare name that resolves
+nowhere is kept for custom runners that mount nothing: it fires before the
+session, naming both fixes — set `TASKPUMP_WORKSPACE_TASK_CLI` to the ledger
+CLI's path in the workspace (the reference consumer pins
+`scripts/arachne-task`), or provide `tp` in the agent image. A shim that
+`exec`s a path outside the mount set will still fail at runtime while passing
+an `-x` check — the startup probe covers presence, not what the shim reaches
+for.
+
+One grammar detail: the bare `tp` is invoked as `tp task <verb>` (tp keeps its
+ledger verbs under `tp task`), while a pinned CLI keeps the direct
+`<cli> <verb>` shim grammar. Without that expansion every safety-net call
+below would be `tp claim` — an unknown command swallowed by its `|| true`, a
+silent no-op exactly where the claim discipline matters.
 
 There are exactly three call sites, all in the session script:
 
