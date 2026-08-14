@@ -82,11 +82,24 @@ CLAUDE_JSON="${TASKPUMP_AGENT_CONFIG:-$HOME/.claude.json}"
 # when the range drains, holding the task files.
 OPS_DIR="${TASKPUMP_PUMP_OPS_DIR:-${TASKPUMP_LEDGER_REPO:-$REPO_ROOT/ops}}"
 # Tasks dir — overridable independently of OPS_DIR so phase_dependencies / brief
-# rendering can be unit-tested against a flat fixture dir.
-TASKS_DIR="${TASKPUMP_PUMP_TASKS_DIR:-${TASKPUMP_TASKS_DIR:-$OPS_DIR/task-loop/tasks}}"
-# The file that tells us a submodule ledger has actually been checked out. Any
-# path inside the ledger that only exists once `submodule update` has run.
-SUBMODULE_PROBE="${TASKPUMP_SUBMODULE_PROBE:-ops/planning/STATUS.md}"
+# rendering can be unit-tested against a flat fixture dir. The default derives
+# from the ledger probe against the WORKSPACE, exactly as tp-task and
+# tp-monitor derive theirs (issue #2): the pump is the tool that tells a
+# launched agent where the ledger is, so it must not keep a private opinion.
+# It anchors to the workspace root rather than OPS_DIR on purpose — the
+# ledger-repo and the ledger-directory are separate questions, and coupling
+# them is what baked Arachne's ops/task-loop/ shape in. A consumer whose ledger
+# lives under a separate ledger repo names it via TASKPUMP_LEDGER_PROBE.
+tp_resolve_workspace
+TASKS_SUBDIR="${TASKPUMP_LEDGER_PROBE:-${TASKPUMP_TASKS_SUBDIR:-tasks}}"
+TASKS_DIR="${TASKPUMP_PUMP_TASKS_DIR:-${TASKPUMP_TASKS_DIR:-$TP_WS_ROOT/$TASKS_SUBDIR}}"
+# The file that proves the ledger submodule is populated in a fresh worktree.
+# NO default (issue #3): the old one, ops/planning/STATUS.md, was Arachne's —
+# for anyone else it either never exists (init runs every time, wasteful but
+# safe) or exists for the wrong reason and SKIPS the init that some other
+# submodule still needs, silently. Unset, the pump always runs the (idempotent,
+# cheap) submodule init; the probe is a pure optimization a consumer opts into.
+SUBMODULE_PROBE="${TASKPUMP_SUBMODULE_PROBE:-}"
 
 # Sibling tools.
 TASK_BIN="${TASKPUMP_TASK:-$TP_LIBEXEC_DIR/tp-task}"
@@ -993,7 +1006,9 @@ launch_phase() {
       git -C "$REPO_ROOT" worktree add "$wt" -b "$branch" "$BASE_REF" >/dev/null
     fi
   fi
-  [[ -f "$wt/$SUBMODULE_PROBE" ]] || git -C "$wt" submodule update --init --recursive 2>&1 | tail -1 || true
+  # No probe configured ⇒ always init (idempotent); a configured probe that
+  # answers skips it. See the SUBMODULE_PROBE note in the config block.
+  [[ -n "$SUBMODULE_PROBE" && -f "$wt/$SUBMODULE_PROBE" ]] || git -C "$wt" submodule update --init --recursive 2>&1 | tail -1 || true
   if ! apl_ensure_worktrees_visible "$REPO_ROOT" "$wt"; then
     # Name the deciding pattern and its file: "fix .gitignore" sent an operator
     # whose GLOBAL excludes caused this to the wrong file (G0.6).
@@ -1102,7 +1117,7 @@ ensure_trunk() {
       || die "cannot add trunk worktree $twt"
     log "integration trunk worktree at $twt"
   fi
-  [[ -f "$twt/$SUBMODULE_PROBE" ]] || git -C "$twt" submodule update --init --recursive 2>&1 | tail -1 || true
+  [[ -n "$SUBMODULE_PROBE" && -f "$twt/$SUBMODULE_PROBE" ]] || git -C "$twt" submodule update --init --recursive 2>&1 | tail -1 || true
   apl_ensure_worktrees_visible "$REPO_ROOT" "$twt" \
     || warn "trunk worktree is gitignored: $twt"
 }
