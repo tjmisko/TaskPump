@@ -313,9 +313,14 @@ The image a consumer names must satisfy this contract:
   RUN chmod +x /entrypoint.sh
   ```
 
-  An image that bakes it elsewhere sets `TASKPUMP_ENTRYPOINT` to match — that is
-  how the reference consumer runs: `examples/arachne.conf` pins its historical
-  `/entrypoint-parallel.sh` layout.
+  An image that bakes it elsewhere sets `TASKPUMP_ENTRYPOINT` to match. Know
+  the trade before pinning it to anything that is not the shipped file: **only
+  the shipped entrypoint honors the pre-flight hook (§4.4)**, so pointing this
+  key at a pre-hook entrypoint leaves a configured `TASKPUMP_PRE_FLIGHT` read
+  by nothing, silently. The reference consumer's historical
+  `/entrypoint-parallel.sh` pin was exactly that state — the entrypoint predated
+  the hook — which is why `examples/arachne.conf` now shows the
+  shipped-entrypoint wiring instead (issue #5).
 
 - **What the entrypoint finds inside:** the `claude` CLI on `PATH`, `git`, `jq`,
   `setpriv` (util-linux — present in any Debian/Ubuntu base), and an
