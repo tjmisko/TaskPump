@@ -307,6 +307,17 @@ refresh period.
 a task file, with `TASKPUMP_MONITOR_TERM_ARGS` as its argv template (`%CLASS%`
 and `%CWD%` expand). It is not a `$TERM` override.
 
+One pair of keys is **opt-in and has no default**: `TASKPUMP_MANIFEST` (with
+`TASKPUMP_MANIFEST_SUBPATH` as a repo-relative spelling of the same file) names
+a consumer-supplied v1 parallel-run manifest — a TSV of
+`name<TAB>branch<TAB>brief<TAB>task` rows — that the monitor and `tp cleanup`
+consult for a session's launch-time display name and epic anchor. TaskPump does
+not generate that file; the ledger's live claim is the canonical source of what
+each agent is working on, and both tools are fully functional with the keys
+unset. Naming a manifest that does not exist is an error, on the same rule
+`TASKPUMP_CONFIG` follows: an explicit request for a specific file must not
+silently fall back.
+
 ### 3.6 DAG rendering — `tp dag-render`
 
 `TASKPUMP_DAG_BIN` (path to the renderer the monitor invokes),
@@ -322,7 +333,9 @@ each sweeps.
 **Cleanup** additionally reads `TASKPUMP_RECLAIM_PRIMARY` (`1` is the same as
 `--include-primary`), `TASKPUMP_EXTRA_BUSY_DIRS` (newline-separated workspace
 roots to skip — how the disk guard protects a workspace with a live compile), and
-`TASKPUMP_STOP_GRACE_SEC`.
+`TASKPUMP_STOP_GRACE_SEC`. Its stuck-agent rescue maps a container to the task it
+should release through the ledger's live claim; the opt-in `TASKPUMP_MANIFEST`
+(§3.5) is consulted only as a fallback when it is configured.
 
 **The disk watchdog** is both a gate and a standalone daemon, so it owns the
 threshold keys the gate reports on: `TASKPUMP_DISK_MOUNT`, `TASKPUMP_DISK_PROBE`,
