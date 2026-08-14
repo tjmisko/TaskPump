@@ -310,6 +310,17 @@ assert_mounts() {  # <launcher-path> <label>
   else
     pass "$label: no blanket RW primary mount"
   fi
+  # G4.3: the TaskPump installation rides into the container read-only at
+  # /opt/taskpump so tp is on the agent's PATH. Read-only is load-bearing —
+  # an agent that can write /opt/taskpump edits the supervisor supervising it.
+  grep -qE -- '-v +"?\$tp_install_root"?:/opt/taskpump:ro' "$f" \
+    && pass "$label: TaskPump installation mounted :ro at /opt/taskpump (G4.3)" \
+    || fail "$label: missing the :ro /opt/taskpump installation mount"
+  if grep -vE '^[[:space:]]*#' "$f" | grep -qE -- ':/opt/taskpump([[:space:]]|$)'; then
+    fail "$label: /opt/taskpump mounted read-write (must be :ro)"
+  else
+    pass "$label: no RW /opt/taskpump mount"
+  fi
 }
 if [[ -f "$RUNNER_SH" ]]; then
   assert_mounts "$RUNNER_SH" "claude-docker runner"

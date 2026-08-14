@@ -224,6 +224,19 @@ do_launch() {
     [[ -n "${!name-}" ]] && passthrough_args+=(-e "$name")
   done
 
+  # The TaskPump installation itself rides along READ-ONLY at /opt/taskpump, so
+  # the entrypoint can put `tp` on the agent's PATH and a workspace no longer
+  # needs to vendor a task CLI (G4.3). The source directory is resolved from
+  # this file's own realpath — the same way bin/tp finds its libexec — so a
+  # checkout, an install prefix, or a symlinked runner each mount their own
+  # installation. Validated before the launch: a runner copied away from its
+  # tree would otherwise mount a tp-less directory, and that failure would
+  # surface much later, inside the container, as a missing task CLI.
+  local tp_install_root
+  tp_install_root="$(CDPATH='' cd -- "$RUNNER_DIR/../.." && pwd)"
+  [[ -x "$tp_install_root/bin/tp" ]] \
+    || die "no tp at $tp_install_root/bin/tp — this runner mounts its own TaskPump installation at /opt/taskpump, so it must live at <taskpump>/runners/claude-docker (a relocated copy needs the full installation beside it)"
+
   # The mount set. Host and container paths are identical on purpose: a git
   # worktree's .git file stores an absolute gitdir path, so matching paths let
   # git resolve without a repair inside the container.
@@ -238,6 +251,7 @@ do_launch() {
   local mount_args=(
     -v "$claude_dir":/tmp/claude-home:ro
     -v "$claude_json":/tmp/claude-home-json/.claude.json:ro
+    -v "$tp_install_root":/opt/taskpump:ro
   )
   if [[ "$ledger_repo" == "$repo_root" ]]; then
     # Spelled as the LEDGER mount on purpose: in this shape the RW mount is the

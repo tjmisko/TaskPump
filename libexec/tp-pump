@@ -401,7 +401,7 @@ this run constructs that branch from TASKPUMP_BRANCH_PREFIX='$BRANCH_PREFIX'
 (--branch-prefix). The agent name is the branch with \"/\" replaced by \"-\", and
 that mapping has to be reversible — see docs/RUNNERS.md section 2."
 fi
-unset _pump_probe_branch _pump_branch_problem
+unset _pump_all_phases _pump_probe_branch _pump_branch_problem
 # pump_in_list <needle> <space-separated-haystack> — membership test for the
 # dry-run integration stubs (STUB_INTEGRATE_*).
 pump_in_list() {
