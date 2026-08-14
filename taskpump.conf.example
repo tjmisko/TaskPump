@@ -179,6 +179,15 @@
 #                           #   Resolution: this key (or TASKPUMP_PHASE_BRIEF_TEMPLATE),
 #                           #   then <ledger>/task-loop/briefs/_phase-drain-template.md,
 #                           #   then <install>/templates/phase-drain-brief.md
+# TASKPUMP_TASK_BRIEF_TEMPLATE=
+#                           # the brief a --grain task container is handed. A DIFFERENT
+#                           #   template, not a reworded phase brief: the phase brief's
+#                           #   working method is the in-context `next --phase` loop, and
+#                           #   an agent running that at task grain would claim the very
+#                           #   siblings the pump just dispatched elsewhere.
+#                           #   Resolution: this key, then
+#                           #   <ledger>/task-loop/briefs/_task-template.md,
+#                           #   then <install>/templates/task-brief.md
 # TASKPUMP_RESUME_TEMPLATE= # resume preamble a stalled task's agent gets ahead of that
 #                           #   brief; resolves the same three ways, ending at
 #                           #   <install>/templates/resume-note.md
@@ -299,7 +308,10 @@
 #                           #   distinctive on the host (default: tp-agent-;
 #                           #   the dashless TASKPUMP_AGENT_CONTAINER_PREFIX accepted)
 # TASKPUMP_AGENT_MODEL=     # model alias forwarded to each agent (default: opus)
-# TASKPUMP_MAX_TURNS=       # turn cap for a session (default: 600)
+# TASKPUMP_MAX_TURNS=       # turn cap for a phase-drain session (default: 600)
+# TASKPUMP_TASK_MAX_TURNS=  # turn cap for a --grain task session, which claims ONE task
+#                           #   and exits rather than draining a sub-tree for hours
+#                           #   (default: 120)
 # TASKPUMP_AGENT_HOME=      # host agent home copied into the container
 #                           #   (default: $HOME/.claude)
 # TASKPUMP_AGENT_CONFIG=    # host agent config file (default: $HOME/.claude.json)

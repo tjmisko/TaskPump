@@ -25,8 +25,8 @@ The pump is a loop. Each tick:
    frontier (see the contract §10) rather than reporting a generic failure.
 2. **Observe** — ask the runner which agents are alive (mechanism 2).
 3. **Plan** — recompute the eligible frontier from the ledger, and classify each
-   phase in range as `RUNNING`, `LAUNCH`, `RESUME`, `WAITING`, or `DONE`
-   (mechanisms 1 and 4).
+   dispatch unit in range — a phase, or a task at `--grain task` — as `RUNNING`,
+   `LAUNCH`, `RESUME`, `WAITING`, or `DONE` (mechanisms 1 and 4).
 4. **Gate** — ask each gate whether feeding is permitted (mechanism 3).
 5. **Act** — launch or resume up to the pool cap, staggered.
 6. **Settle** — persist supervisor state, reclaim disk from finished workspaces,
@@ -57,10 +57,38 @@ for the next task in its own phase, doing it, asking again. Phases fan out in
 parallel; cross-phase dependencies gate at the phase level. So there are two
 schedulers: the pump across phases, and the in-context loop within one.
 
-Phase grain is a deliberate compromise. Task grain would maximize parallelism and
-spend most of its time paying container startup for a five-minute task; chain
-grain would minimize startup and serialize too much. Phase is the unit that
-matches how work is actually authored.
+Phase grain is a deliberate compromise, and it is the **default**. Task grain
+maximizes parallelism and can spend most of its time paying container startup for
+a five-minute task; chain grain would minimize startup and serialize too much.
+Phase is the unit that matches how work is actually authored.
+
+**`--grain task` when the compromise stops paying.** Reach for it when a phase
+holds long, genuinely independent siblings, or when the range is a single phase —
+the cases where jobs headroom goes unused no matter the cap, because parallelism
+only exists *across* phases. It dispatches each eligible task as its own unit: one
+worktree, one branch, one agent name. Every mechanism in this document then
+applies per task rather than per phase — liveness, the orphan reclaim, the resume
+budget, the gates, the pool cap, the deadlock exit — because a *unit* is what the
+supervisor was always really scheduling. The two things phase grain got for free
+have to be paid for explicitly:
+
+- **Mutual exclusion.** One branch per phase meant siblings touching the same
+  files never collided. At task grain, two tasks may run concurrently only when
+  their declared `files:` sets are **disjoint**; an overlap is a hold, exactly
+  like a pending blocker, and the plan names both the task and the path. An
+  **empty `files:` is exclusive**: an undeclared footprint means *unknown*, and
+  scheduling unknown as "touches nothing" is the silent wrong answer this whole
+  document is about, so such a task runs alone. That makes `files:` load-bearing
+  rather than decorative.
+- **Accumulated context.** The phase agent carried what it learned from earlier
+  tasks in the phase. A task agent does not, so it gets a different brief: claim
+  this one task, do it, finish it, exit — and explicitly **do not run `next`**,
+  because at this grain acquisition is the pump's and `next` would hand it a
+  sibling another container is already working.
+
+The cost the operator accepts is N branches instead of one, and therefore N
+merges. The opt-in integration trunk absorbs that: it composes with task grain,
+merging each quiescent task branch under the same lock and build gate.
 
 **Why derived, not stored:** a stored queue is a second copy of the dependency
 graph, and the two drift. The drift is silent and always in the same direction —
@@ -79,10 +107,17 @@ runner reports) which workspaces have a live agent. It never infers liveness fro
 
 Two rules follow, and they are the same rule from opposite sides:
 
-- **A phase with a live agent is never launched again.** No double-dispatch, no
+- **A unit with a live agent is never launched again.** No double-dispatch, no
   two agents racing on one branch.
-- **A phase whose agent is gone is available again**, regardless of what the
+- **A unit whose agent is gone is available again**, regardless of what the
   ledger says. A claim left `in_progress` by a dead process is not a live claim.
+
+Both rules are read through the agent's **name**, which is the unit's branch with
+`/` replaced by `-` ([RUNNERS.md §2](RUNNERS.md#2-naming-and-identity)). That map has to
+round-trip, so a run whose units cannot be named — or two units that would be
+named the *same* — is refused before anything launches. A name collision is the
+worst failure this stack has: liveness would answer "running" for a unit that is
+not, and the pump would launch a second agent onto the first one's branch.
 
 What happens to that abandoned claim depends on whether it produced anything:
 
@@ -321,7 +356,7 @@ For a supervisor re-implementing these mechanisms against the same ledger:
 
 | Mechanism | Observable contract |
 |---|---|
-| 1. Frontier | Eligibility is `open ∧ blockers all done`, recomputed per query. `--count` (all open in range) vs `--count-eligible` (frontier size) are the drain test and the stall test respectively. |
+| 1. Frontier | Eligibility is `open ∧ blockers all done`, recomputed per query. `--count` (all open in range) vs `--count-eligible` (frontier size) are the drain test and the stall test respectively. At task grain, concurrency additionally requires disjoint declared `files:`; an empty list is exclusive. |
 | 2. Liveness | Never derived from task status. An orphan with no commits is released to `open`; an orphan with commits is not. |
 | 3. Gates | Exit 10 = pause launching. Exit 0 = feed. Anything else = fail open with a warning. Never kills a running agent. |
 | 4. Resume | Bounded by a no-progress counter in the ledger, reset by branch-head movement, exhausting to `needs-review`. Deadlock exits 3; drained exits 0. |
