@@ -1555,17 +1555,31 @@ is_drained() {
 # disturbs running containers and never double-launches — the state file just
 # makes the run observable (paused_reason) and lets a restart confirm it is
 # resuming the same range.
-write_state() {  # $1=status(running|paused|drained) $2=paused_reason
+# The file also carries the writer's pid + host (issue #22): status alone is a
+# claim a dead pump cannot retract — the G3 drain left `status: running` behind
+# with no supervisor process, and a reader trusting it gets the exact wrong
+# answer to "is a pump live?". The pid lets every reader verify liveness with
+# kill -0 instead of trusting the label; tp-monitor renders a running state
+# with a dead pid as STALE. The last status/reason written are remembered so
+# the exit trap below can tell an already-stamped terminal exit
+# (drained/stalled/stopped) from an abandoned running/paused claim.
+PUMP_LAST_STATUS=""
+PUMP_LAST_REASON=""
+write_state() {  # $1=status(running|paused|drained|stalled|stopped) $2=reason
   local status="${1:-running}" reason="${2:-}"
+  PUMP_LAST_STATUS="$status"
+  PUMP_LAST_REASON="$reason"
   jq -n \
     --arg phases "$PHASES" --argjson jobs "$JOBS" --argjson ceiling "$CEILING" \
     --arg grain "$GRAIN" --arg started "$PUMP_STARTED_AT" \
     --arg last_tick "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --argjson live "$(apl_count_live_agents)" --argjson open "$(open_count)" \
     --arg status "$status" --arg reason "$reason" \
+    --argjson pid "$$" --arg host "${HOSTNAME:-$(hostname 2>/dev/null || echo unknown)}" \
     '{phases:$phases, jobs:$jobs, ceiling:$ceiling, grain:$grain,
       started_at:$started, last_tick:$last_tick, live_agents:$live,
-      open_tasks:$open, status:$status, paused_reason:$reason}' \
+      open_tasks:$open, status:$status, paused_reason:$reason,
+      pid:$pid, host:$host}' \
     >| "$STATE_FILE" 2>/dev/null || true
 }
 
@@ -1728,8 +1742,52 @@ fi
 log "Pump: phases=$PHASES grain=$GRAIN cap=$JOBS (live via $CAP_FILE) ceiling=${CEILING}% tick=${TICK}s"
 log "Singular supervisor; Ctrl-C stops feeding but leaves running agents. Monitor: $MONITOR_BIN"
 
+# ── Exit honesty (issue #22) ───────────────────────────────────────────────────
+# From here on, every exit path stamps a terminal status into the state file.
+# The G3 incident: --once exited right after do_tick (whose last write is
+# `running`), and a killed loop died wherever it was — either way the file kept
+# claiming a live pump forever, and a reader trusting it burned a rescue
+# session. The EXIT trap catches normal exits and crashes (set -e, die);
+# INT/TERM/HUP get their own handlers because a fatal signal does not run the
+# EXIT trap in a non-interactive shell — each stamps `stopped` with the signal
+# as the reason, then re-raises so the exit status still reports the signal.
+# Installed only now, after the prerequisites: a pump that never ticked never
+# wrote state, and must not clobber a previous run's file on a startup abort.
+# SIGKILL cannot be trapped — that path is what the pid field in the state file
+# is for (the reader verifies liveness instead of trusting `status`).
+pump_stamp_exit() {   # EXIT trap; $? is the pump's exit status
+  local rc=$?
+  case "$PUMP_LAST_STATUS" in drained|stalled|stopped) return 0 ;; esac
+  local why="pump exited"
+  (( rc != 0 )) && why="pump exited (rc=$rc)"
+  write_state stopped "$why"
+}
+pump_signal_exit() {  # $1 = signal name (INT|TERM|HUP)
+  trap - EXIT
+  write_state stopped "received SIG$1"
+  log "SIG$1 — stopping the supervisor (running agents are left alive; state stamped stopped)"
+  # Reap the backgrounded tick sleep: the signal exit abandons the wait, and
+  # an orphaned `sleep $TICK` would outlive the pump by up to a full tick.
+  kill "${TICK_SLEEP_PID:-}" 2>/dev/null || true
+  trap - "$1"
+  kill -s "$1" $$
+}
+trap pump_stamp_exit EXIT
+trap 'pump_signal_exit INT'  INT
+trap 'pump_signal_exit TERM' TERM
+trap 'pump_signal_exit HUP'  HUP
+
 if [[ "$MODE" == "once" ]]; then
   do_tick
+  # Writer honesty (issue #22): do_tick's last write is `running` (or `paused`
+  # behind a tripped gate), and this process is about to not exist — leaving
+  # either behind is the lie the incident is about. Stamp the terminal state
+  # explicitly, carrying a gate pause forward so a gated single tick stays
+  # diagnosable from the file alone.
+  once_reason="single tick complete (--once)"
+  [[ "$PUMP_LAST_STATUS" == "paused" && -n "$PUMP_LAST_REASON" ]] \
+    && once_reason+="; feeding was paused — $PUMP_LAST_REASON"
+  write_state stopped "$once_reason"
   log "single tick complete (--once)"
   exit 0
 fi
@@ -1744,7 +1802,13 @@ while true; do
   if (( STALL_TICKS >= STALL_EXIT_TICKS )); then
     stall_exit
   fi
-  sleep "$TICK"
+  # Interruptible sleep: bash defers trap handlers until the foreground command
+  # returns, so a plain `sleep $TICK` would make `systemctl stop` wait out the
+  # rest of the tick — and its SIGKILL after the stop timeout would skip the
+  # stamp entirely. Backgrounding the sleep and waiting on it (a builtin, which
+  # signals interrupt immediately) lets the TERM trap run the moment it lands.
+  sleep "$TICK" & TICK_SLEEP_PID=$!
+  wait "$TICK_SLEEP_PID" || true
 done
 
 # Graduate the integration trunk as one auto/trunk → main PR (A3, no-op when
