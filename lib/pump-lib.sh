@@ -217,23 +217,210 @@ apl_agent_prefix() { printf '%s' "${TASKPUMP_AGENT_PREFIX:-tp-agent-}"; }
 # spelling; DOCKER is the legacy one every existing harness sets.
 apl_docker() { printf '%s' "${TASKPUMP_DOCKER:-${DOCKER:-docker}}"; }
 
+# apl_branch_slug_reject_reason <branch> — empty output and exit 0 when the
+# branch can carry an agent name; one line saying what is wrong and exit 1 when
+# it cannot.
+#
+# The slug is the branch with `/` → `-` (docs/RUNNERS.md §2), and that map is
+# the join key of the whole stack: the pump derives a name from a branch, both
+# watchdogs count by it, cleanup maps a name back to a worktree. The encoding is
+# frozen — container names already exist on operators' hosts — so a branch the
+# encoding cannot carry has to be refused at the door instead.
+#
+# Refused, and why each one is not pedantry:
+#
+#   more than one `/`   `feat/a/b` and `feat/a-b` produce the same slug, so the
+#                       reverse mapping cannot tell them apart. This is the case
+#                       the docs called "does not round-trip cleanly" and then
+#                       let through anyway: the branch launches, and the FAILURE
+#                       shows up much later somewhere else — an agent whose
+#                       container is invisible to liveness, so the pump launches
+#                       a second one on the same branch.
+#   leading `/`         yields a name starting with `-`, which is not a legal
+#                       container name (and reads as a flag to half the CLIs
+#                       that will be handed it).
+#   trailing `/`        yields a name ending in `-` and a slug that collides
+#                       with the branch without it.
+#   whitespace          a name that cannot survive being written to a
+#                       whitespace-delimited registry (runners/local) or read
+#                       back out of `docker ps --format`.
+#
+# One rule, one place: tp-task refuses the claim, the pump refuses the run at
+# startup, and neither gets to have its own opinion about what is legal.
+apl_branch_slug_reject_reason() {
+  local branch="$1"
+  if [[ -z "$branch" ]]; then
+    printf 'the branch name is empty\n'; return 1
+  fi
+  if [[ "$branch" =~ [[:space:]] ]]; then
+    printf 'branch %s contains whitespace, which an agent name cannot carry\n' "$branch"; return 1
+  fi
+  if [[ "$branch" == /* ]]; then
+    printf 'branch %s starts with "/", which would make the agent name start with "-"\n' "$branch"; return 1
+  fi
+  if [[ "$branch" == */ ]]; then
+    printf 'branch %s ends with "/", which would make the agent name end with "-"\n' "$branch"; return 1
+  fi
+  local slashes="${branch//[^\/]/}"
+  if (( ${#slashes} > 1 )); then
+    printf 'branch %s has %d "/" separators; the agent name maps "/" to "-", so %s cannot be mapped back to one branch\n' \
+      "$branch" "${#slashes}" "${branch//\//-}"
+    return 1
+  fi
+  return 0
+}
+
+# apl__runtime_ps_names <prefix> — the ONE `docker ps` filter expression in the
+# stack. Prints the runtime's answer verbatim, and leaves its exit status and its
+# stderr alone: the two callers below differ only in what they do with those.
+# `--filter name=` matches as a substring, so every caller still anchors the
+# prefix itself.
+apl__runtime_ps_names() {
+  "$(apl_docker)" ps --filter "name=$1" --format '{{.Names}}'
+}
+
 # apl_live_agent_names — the full name of every live agent container, one per
 # line. This is THE enumeration: five near-copies of it used to live in the
 # pump's lib, cleanup, and both watchdogs, and three of them called `docker`
 # literally — so a harness that stubbed the runtime still reached the real
 # daemon. Liveness comes from the container runtime, never from task status
 # (design D3).
+#
+# Deliberately tolerant: a runtime that cannot answer reads as "no agents are
+# live". That is the right shape for the pump's own tick — a supervisor that
+# guesses "none" launches something it will find already running next tick, and
+# a tick that died on a transient daemon hiccup would be worse.
 apl_live_agent_names() {
   local prefix; prefix="$(apl_agent_prefix)"
-  "$(apl_docker)" ps --filter "name=$prefix" --format '{{.Names}}' 2>/dev/null \
-    | grep "^$prefix" || true
+  apl__runtime_ps_names "$prefix" 2>/dev/null | grep "^$prefix" || true
+}
+
+# apl_live_agent_names_strict — the same set, with the runtime's failure kept
+# instead of flattened. Exits 0 with a possibly-empty list, or the runtime's own
+# non-zero status with its stderr untouched for the caller to word.
+#
+# The distinction the tolerant form throws away is the whole point of a runner's
+# `list` verb (docs/RUNNERS.md §1.3): its caller must be able to tell "nothing is
+# running" from "I could not look", because those two answers demand opposite
+# actions — launch, or fall back and do not launch.
+apl_live_agent_names_strict() {
+  local prefix; prefix="$(apl_agent_prefix)"
+  local out rc=0
+  out="$(apl__runtime_ps_names "$prefix")" || rc=$?
+  [[ $rc -eq 0 ]] || return "$rc"
+  [[ -n "$out" ]] || return 0
+  grep "^$prefix" <<<"$out" || true
+}
+
+# ── Liveness, from the runner when the caller opted into one ──────────────────
+# The mechanism is unchanged and non-negotiable: liveness comes from process
+# state, never from task status (design D3). What is pluggable now is only where
+# that process state is READ. A container runner's agents are visible to
+# `docker ps`; a runner that starts something else — a plain process, a VM, a
+# remote executor — has agents no `docker ps` will ever show, and the supervisor
+# would read them as dead and launch over them.
+#
+# Opt-in per caller, by variable rather than by config key. APL_LIVENESS_RUNNER
+# is set in-process by the supervisor that wants runner-backed liveness; it is
+# deliberately NOT derived from TASKPUMP_RUNNER, because every read-only observer
+# in this stack (the monitor, cleanup, both watchdogs) loads the same config file
+# and would silently switch with it. They keep scraping until each is migrated
+# on purpose.
+
+# Cache of the capability probe, for the life of the process:
+#   unset  not probed yet        1  runner answers `list`
+#   0      v1 runner (no verb)
+APL_RUNNER_LIST_CAP="${APL_RUNNER_LIST_CAP-}"
+
+# apl__runner_list <runner> — ask a runner for its live agents. Passes the fleet
+# prefix and the container runtime, which are the only inputs `list` may read
+# (docs/RUNNERS.md §1.3), and keeps the runner's exit status.
+apl__runner_list() {
+  TP_AGENT_PREFIX="$(apl_agent_prefix)" \
+  TASKPUMP_AGENT_PREFIX="$(apl_agent_prefix)" \
+  TASKPUMP_DOCKER="$(apl_docker)" \
+  DOCKER="$(apl_docker)" \
+  "$1" list
+}
+
+# apl_runner_list_supported <runner> — does this runner implement `list`? Probed
+# once and cached; a supervisor asks liveness every tick and must not pay a
+# capability probe each time.
+#
+# Exit 2 is the answer that means "I do not have that verb" — it is what a shell
+# CLI returns for a usage error, what the reference runner returns, and what a v1
+# runner written against the documented skeleton returns. Every OTHER non-zero
+# means the runner HAS the verb and could not answer it right now (its runtime is
+# unreachable), which is a transient condition, not a missing capability: the
+# probe reports supported, and the per-tick path below handles the failure. The
+# distinction matters because misreading "runtime blipped at pump start" as "v1
+# runner" would silently scrape for the rest of the run — which for a
+# non-container runner means every agent is invisible for the rest of the run.
+apl_runner_list_supported() {
+  local runner="$1"
+  [[ -n "${APL_RUNNER_LIST_CAP:-}" ]] && return $(( 1 - APL_RUNNER_LIST_CAP ))
+  [[ -n "$runner" && -x "$runner" ]] || { APL_RUNNER_LIST_CAP=0; return 1; }
+  local rc=0
+  apl__runner_list "$runner" >/dev/null 2>&1 || rc=$?
+  if [[ $rc -eq 2 ]]; then
+    APL_RUNNER_LIST_CAP=0
+    return 1
+  fi
+  APL_RUNNER_LIST_CAP=1
+  return 0
+}
+
+# The exit status that means "this list is the fallback scrape, because the
+# runner that should have answered could not". EX_TEMPFAIL, the same code the
+# pre-flight hook uses for "the environment was not ready" — the answer is not
+# wrong on purpose, it is merely not authoritative.
+#
+# A status, not a global: every liveness call site in this stack reads the answer
+# through `$( )` or `< <( )`, both of which run the function in a SUBSHELL, so a
+# variable it sets would never reach the caller. The one signal that does survive
+# a subshell is the exit status.
+APL_LIVENESS_DEGRADED_RC=75
+
+# apl_live_agents — the pluggable enumeration. The runner's answer when this
+# caller opted into a runner that supports `list`, the prefix scrape otherwise.
+#
+# Fail-open, and this is the important half: when a supporting runner errors, the
+# call still PRINTS the scrape rather than failing empty, because liveness going
+# dark must never wedge the supervisor. But it exits 75, because for a
+# non-container runner that fallback answer is not merely stale — it is empty,
+# and "everything died" is the most destructive wrong answer this function can
+# give. A caller that would only decline to launch can ignore the status; a
+# caller that would ACT on absence (reclaiming claims, tearing something down)
+# must not.
+apl_live_agents() {
+  local runner="${APL_LIVENESS_RUNNER:-}"
+  [[ -n "$runner" ]] || { apl_live_agent_names; return 0; }
+  apl_runner_list_supported "$runner" || { apl_live_agent_names; return 0; }
+
+  local prefix; prefix="$(apl_agent_prefix)"
+  local out rc=0
+  out="$(apl__runner_list "$runner" 2>/dev/null)" || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    apl_live_agent_names
+    return "$APL_LIVENESS_DEGRADED_RC"
+  fi
+  # The prefix filter is applied here as well as inside the runner: a
+  # third-party runner's `list` is not obliged to have been asked about only one
+  # fleet, and a name outside this pump's prefix cannot be mapped back to one of
+  # its branches anyway.
+  [[ -n "$out" ]] || return 0
+  grep "^$prefix" <<<"$out" || true
 }
 
 # apl_live_agent_slugs — the same set, each name reduced to its branch slug
-# (name minus the prefix; the slug is the branch with `/` → `-`).
+# (name minus the prefix; the slug is the branch with `/` → `-`). Propagates the
+# degraded status; a pipe would swallow it.
 apl_live_agent_slugs() {
   local prefix; prefix="$(apl_agent_prefix)"
-  apl_live_agent_names | sed "s|^$prefix||"
+  local out rc=0
+  out="$(apl_live_agents)" || rc=$?
+  [[ -n "$out" ]] && sed "s|^$prefix||" <<<"$out"
+  return "$rc"
 }
 
 # apl_count_live_agents — count of live agent containers (optionally only those
@@ -281,11 +468,45 @@ apl_disk_low() {
 # file / expiresAt can't be read — a meter we can't read never wedges the pump.
 # `expiresAt` is epoch MILLISECONDS in Claude Code's credentials file.
 # ARACHNE_NOW_S overrides "now" (epoch seconds) for tests.
+# apl_host_credentials_problem <path> — one line saying why the host's Claude
+# credentials cannot be read, or nothing at all when they can. Always exits 0:
+# this classifies, it does not decide.
+#
+# The two Claude-specific gates ship in the DEFAULT gate chain, so a consumer
+# driving some other agent runs them against a file that will never exist. That
+# has to be a deliberate skip with a reason, not an accident of error handling —
+# a gate that silently feeds looks exactly like a gate that checked and approved,
+# and the difference matters the day it does need to pause. One classifier, so
+# both gates skip for the same reasons and say the same thing.
+apl_host_credentials_problem() {
+  local cred="$1"
+  if [[ -z "$cred" ]]; then
+    printf 'no credentials path configured'; return 0
+  fi
+  # Existence first, and jq later: on a host with neither, "no credentials" is
+  # the fact the operator can act on, and "install jq" is a distraction.
+  if [[ ! -e "$cred" ]]; then
+    printf 'no claude credentials at %s' "$cred"; return 0
+  fi
+  if [[ ! -r "$cred" ]]; then
+    printf 'claude credentials at %s are not readable' "$cred"; return 0
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    printf 'jq is not installed, so %s cannot be read' "$cred"; return 0
+  fi
+  if ! jq -e . "$cred" >/dev/null 2>&1; then
+    printf 'claude credentials at %s are not valid JSON' "$cred"; return 0
+  fi
+  printf ''
+}
+
 apl_host_token_stale() {
   [[ "${TASKPUMP_TOKEN_GATE:-${ARACHNE_TOKEN_GATE:-1}}" -eq 1 ]] || return 0
-  command -v jq >/dev/null 2>&1 || return 0
   local cred="$1" margin="${2:-${TASKPUMP_TOKEN_MARGIN_S:-${ARACHNE_TOKEN_MARGIN_S:-600}}}"
-  [[ -f "$cred" ]] || return 0
+  # Silent fail-open for every caller that is not a gate: unreadable credentials
+  # are not a stale token. The gate above this asks the same classifier and says
+  # the reason out loud.
+  [[ -z "$(apl_host_credentials_problem "$cred")" ]] || return 0
   local exp_ms exp_s now left
   exp_ms="$(jq -r '.claudeAiOauth.expiresAt // empty' "$cred" 2>/dev/null || true)"
   [[ "$exp_ms" =~ ^[0-9]+$ ]] || return 0

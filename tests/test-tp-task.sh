@@ -811,7 +811,11 @@ for ws in "$WS_A" "$WS_B"; do
   mkdir -p "$ws/libexec" "$ws/lib" "$ws/ops/task-loop/tasks"
   git -C "$ws" init -q
   cp "$CLI" "$ws/libexec/tp-task"
-  cp "$TP_ROOT/lib/config.sh" "$ws/lib/config.sh"
+  # The whole lib, not a hand-picked file: "self-contained install" above is the
+  # claim these fixtures make, and a workspace that carries the CLI but only
+  # some of what it sources is not one. (Cherry-picking config.sh worked until
+  # the CLI also needed pump-lib.sh for the branch-naming rule.)
+  cp -R "$TP_ROOT/lib/." "$ws/lib/"
   chmod +x "$ws/libexec/tp-task"
   git -C "$ws" -c user.name=test -c user.email=t@e add -A
   git -C "$ws" -c user.name=test -c user.email=t@e commit -q -m "init $ws"
@@ -853,6 +857,81 @@ if [[ "$got" == "$WS_A/ops/task-loop/tasks" ]]; then
 else
   fail "non-repo fallback resolved to '$got', expected '$WS_A/ops/task-loop/tasks'"
 fi
+
+# ── The install-root fallback must not be a silent WRITE target ───────────────
+# The fallback above is correct for the vendored layout and a silent wrong answer
+# everywhere else, and it has produced one incident: `tp task create` in a fresh
+# repository with no ledger wrote the task into TaskPump's OWN ledger, with a
+# commit, and was caught only because that ledger happened to be under watch
+# (2026-08-12). Both sides look fine afterwards — the operator's repository never
+# learns it was ignored, and the installation's ledger silently grows a task from
+# a project it has never heard of.
+#
+# So resolution keeps falling back (the cases above still pass, and `resolve`
+# still answers), but a MUTATING command refuses when the fallback lands outside
+# the caller's repository.
+mutate_from() {  # mutate_from <cwd> <cli> <verb...> — a mutation with nothing pre-answered
+  local dir=$1 cli=$2; shift 2
+  ( cd "$dir" && env "${TP_ENV_UNSET[@]}" \
+      TASKPUMP_LEDGER_PROBE=ops/task-loop/tasks \
+      ARACHNE_TASK_NOCOMMIT=1 "$cli" "$@" 2>&1 )
+}
+
+# The incident shape exactly: a fresh git repo with no ledger, TaskPump installed
+# somewhere else entirely.
+INCIDENT="$TMPDIR_TEST/incident"
+mkdir -p "$INCIDENT"
+git -C "$INCIDENT" init -q
+before=$(ls "$WS_A/ops/task-loop/tasks" | wc -l)
+rc=0; out=$(mutate_from "$INCIDENT" "$WS_A/libexec/tp-task" create T99 --title "must not land") || rc=$?
+[[ $rc -ne 0 ]] && pass "create in a ledger-less repo is refused" \
+  || fail "create wrote somewhere on the incident shape (rc=$rc):\n$out"
+[[ "$(ls "$WS_A/ops/task-loop/tasks" | wc -l)" -eq "$before" ]] \
+  && pass "nothing was written to the installation's own ledger" \
+  || fail "the refusal still wrote into $WS_A's ledger"
+[[ ! -e "$INCIDENT/tasks" && ! -e "$INCIDENT/ops" ]] \
+  && pass "nothing was written to the caller's repo either" \
+  || fail "a ledger was invented in the caller's repo"
+
+# The error has to be actionable, so it names what was probed, where resolution
+# landed, and both fixes. An error that says only "no" sends the operator to the
+# source.
+grep -q "$INCIDENT" <<<"$out" && pass "the error names the repository it probed" \
+  || fail "the error does not name the caller's repo:\n$out"
+grep -q "$WS_A" <<<"$out" && pass "the error names where resolution landed" \
+  || fail "the error does not name the install ledger:\n$out"
+grep -q 'mkdir ops/task-loop/tasks' <<<"$out" && pass "the error offers the mkdir fix" \
+  || fail "the error does not offer the mkdir fix:\n$out"
+grep -q 'TASKPUMP_TASKS_DIR' <<<"$out" && pass "the error offers the explicit-dir fix" \
+  || fail "the error does not offer the env fix:\n$out"
+
+# Read-only commands keep working — `resolve` is the diagnostic the error points
+# at, and an error that disables the tool you need to diagnose it is worse.
+rc=0; got=$(mutate_from "$INCIDENT" "$WS_A/libexec/tp-task" resolve --tasks-dir) || rc=$?
+[[ $rc -eq 0 && "$got" == "$WS_A/ops/task-loop/tasks" ]] \
+  && pass "resolve still prints where resolution would land" \
+  || fail "resolve was blocked too (rc=$rc): '$got'"
+
+# The vendored layout is the reason the fallback exists, and it must stay silent:
+# standing in the workspace whose install this is, the install root IS the
+# caller's repo.
+rc=0; out=$(mutate_from "$WS_A" "$WS_A/libexec/tp-task" create T98 --title "vendored is fine") || rc=$?
+[[ $rc -eq 0 ]] && pass "the vendored layout still mutates without complaint" \
+  || fail "the guard broke the vendored layout (rc=$rc):\n$out"
+[[ -f "$WS_A/ops/task-loop/tasks/T98.md" ]] \
+  && pass "the vendored write landed in its own ledger" \
+  || fail "the vendored create wrote nowhere"
+rm -f "$WS_A/ops/task-loop/tasks/T98.md"
+
+# An explicit tasks dir is an answer, not a fallback: the caller said where the
+# ledger is, so there is nothing to guess and nothing to refuse.
+mkdir -p "$INCIDENT/elsewhere"
+rc=0; out=$( cd "$INCIDENT" && env "${TP_ENV_UNSET[@]}" ARACHNE_TASK_NOCOMMIT=1 \
+    TASKPUMP_TASKS_DIR="$INCIDENT/elsewhere" "$WS_A/libexec/tp-task" \
+    create T97 --title "explicit is fine" 2>&1 ) || rc=$?
+[[ $rc -eq 0 && -f "$INCIDENT/elsewhere/T97.md" ]] \
+  && pass "an explicit TASKPUMP_TASKS_DIR is honoured without complaint" \
+  || fail "the guard fired on an explicit tasks dir (rc=$rc):\n$out"
 
 # An explicit ARACHNE_TASKS_DIR still wins over both.
 got=$( cd "$WS_B" && ARACHNE_TASKS_DIR="$TASKS" ARACHNE_TASK_NOCOMMIT=1 \
@@ -1408,6 +1487,56 @@ got=$( cd "$DUAL_CONF_WS" && env "${TP_ENV_UNSET[@]}" TASKPUMP_NO_CONF=0 \
         TASKPUMP_TASKS_DIR="$ENV_OVER_CONF" "$CLI" resolve --tasks-dir )
 [[ "$got" == "$ENV_OVER_CONF" ]] && pass "a canonical env export outranks taskpump.conf" \
   || fail "env-over-conf resolved to '$got', expected '$ENV_OVER_CONF'"
+
+echo
+echo "--- a branch that cannot carry an agent name is refused at the claim ---"
+# The agent name is the branch with `/` → `-` (docs/RUNNERS.md §2), and the whole
+# stack joins on it. The encoding is frozen — names already exist on operators'
+# hosts — so a branch the encoding cannot carry has to be stopped at the door.
+# The claim is that door: it is where a branch enters the ledger.
+#
+# The cost of letting one through is not a bad error message later. `feat/a/b`
+# and `feat/a-b` produce the same slug, so liveness cannot map the name back to
+# one branch: the agent launches, the pump reads the phase as dead, and it
+# launches a second agent on the same branch. That is the one thing the
+# supervisor is supposed to never do.
+make_task "$TASKS" F90.1 F90 open "Slug round-trip fixture"
+
+# `rc=0; out=$(...) || rc=$?`, not `out=$(...); rc=$?` — this suite runs under
+# `set -e`, where a failing command substitution in a bare assignment kills the
+# script before the assertion below can read the status it is asserting on.
+rc=0; out=$("$CLI" claim F90.1 --branch feat/a/b 2>&1) || rc=$?
+[[ $rc -ne 0 ]] && pass "claim --branch feat/a/b is refused" \
+  || fail "a two-separator branch was accepted (rc=$rc):\n$out"
+grep -q 'feat-a-b' <<<"$out" \
+  && pass "the refusal shows the ambiguous name it would have produced" \
+  || fail "the message does not name the collision:\n$out"
+grep -qi 'at most one' <<<"$out" \
+  && pass "the refusal states the constraint" \
+  || fail "the message does not state the rule:\n$out"
+assert_fm "$TASKS/F90.1.md" '.status' 'open'
+assert_fm "$TASKS/F90.1.md" '.claimed_by' 'null'
+
+# The shape the pump actually produces, and the shape a human uses: both fine.
+# A fresh fixture per case — reusing one task would test `release` semantics
+# here rather than the rule under test.
+make_task "$TASKS" F90.2 F90 open "Slug round-trip fixture (accepted)"
+"$CLI" claim F90.2 --branch feat/a --turns 5 >/dev/null 2>&1 \
+  && pass "claim --branch feat/a is accepted" || fail "a one-separator branch was refused"
+assert_fm "$TASKS/F90.2.md" '.claimed_by' 'feat/a'
+
+make_task "$TASKS" F90.3 F90 open "Slug round-trip fixture (no separator)"
+"$CLI" claim F90.3 --branch main --turns 5 >/dev/null 2>&1 \
+  && pass "a branch with no separator at all is accepted" || fail "'main' was refused"
+
+# The other three shapes the encoding cannot carry. Each produces a name that is
+# either illegal (leading `-`) or collides with a different branch.
+for bad in "/leading" "trailing/" "has space"; do
+  rc=0; out=$("$CLI" claim F90.1 --branch "$bad" 2>&1) || rc=$?
+  [[ $rc -ne 0 ]] && pass "claim --branch '$bad' is refused" \
+    || fail "'$bad' was accepted (rc=$rc):\n$out"
+done
+assert_fm "$TASKS/F90.1.md" '.status' 'open'
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo

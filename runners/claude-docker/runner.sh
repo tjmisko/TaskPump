@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# runners/claude-docker/runner.sh — the claude-docker runner. RUNNER CONTRACT v1.
+# runners/claude-docker/runner.sh — the claude-docker runner. RUNNER CONTRACT v2.
 #
 # A runner is the seam between the supervisor (libexec/tp-pump) and whatever
 # actually executes an agent. The pump decides *what* should run — which phase,
@@ -20,6 +20,11 @@
 #                       the launch fails.
 #   runner.sh stop      Stop the named container. Idempotent: stopping something
 #                       that is not running succeeds.
+#   runner.sh list      Print the name of every live agent this runner knows
+#                       about, one per line. No agents is exit 0 and no output;
+#                       being unable to look is a non-zero exit and one line on
+#                       stderr. Asked about the fleet, not about one container,
+#                       so it takes no per-launch input.
 #
 # Inputs arrive as environment variables, never as arguments, so the set can grow
 # without breaking a caller. Each one is read as TP_<NAME> first and falls back
@@ -58,17 +63,36 @@
 #   GITHUB_TOKEN        —                   forwarded for ops fetch + gh
 #   DOCKER              —                   container binary override (test seam)
 #
-# ── Deliberately NOT in v1: liveness ─────────────────────────────────────────
+# `list` reads none of the above. Its only input is the name prefix the fleet
+# shares, which is configuration rather than a property of any one launch:
 #
-# "Is this phase still running?" stays in lib/pump-lib.sh (`apl_live_branches`),
-# which asks `docker ps` directly. Liveness is a *fleet* question — the pump asks
-# it once per tick about every phase at once — while launch and stop are asked
-# about one container at a time. Routing the fleet query through a per-container
-# CLI would mean N subprocesses per tick to answer a question one `docker ps`
-# already answers, and the pump's most important safety property (never
-# double-launch a live container) would then depend on a fan-out loop rather than
-# a single atomic snapshot. A second runner will need a liveness verb; v1 is
-# honest that it does not have one yet.
+#   TP_AGENT_PREFIX     TASKPUMP_AGENT_PREFIX / ARACHNE_AGENT_PREFIX
+#                                           container-name prefix to enumerate
+#                                           (default tp-agent-, via
+#                                           lib/pump-lib.sh's one accessor)
+#
+# ── Liveness, and why `list` is shaped the way it is ─────────────────────────
+#
+# v1 had no liveness verb: "is this phase still running?" lived in
+# lib/pump-lib.sh, which asked `docker ps` directly. The objection to moving it
+# was never that a runner should not answer it — it was the *shape*. Liveness is
+# a FLEET question, asked once per tick about every phase at once, while launch
+# and stop are asked about one container at a time. A per-container liveness verb
+# would mean N subprocesses per tick to answer what one `docker ps` answers, and
+# the pump's most important safety property (never double-launch a live
+# container) would rest on a fan-out loop rather than a single atomic snapshot.
+#
+# So `list` is a fleet verb: one call, one snapshot, every live agent. It takes
+# no per-launch input, reads the same configuration `stop` reads, and shares the
+# pump's own enumeration (lib/pump-lib.sh) rather than duplicating the filter, so
+# the names it prints are by construction the names `launch` created and the pump
+# would have scraped.
+#
+# It refuses to guess. An unreachable runtime is a non-zero exit, never an empty
+# list — the caller decides whether to fall back, because "nothing is running"
+# and "I could not look" demand opposite actions. The pump does not call this
+# yet (that is a separate change); the verb lands first so it is verifiable on
+# its own.
 #
 # ── Why root, and why no --user ──────────────────────────────────────────────
 #
@@ -82,7 +106,13 @@
 set -euo pipefail
 
 PROG="runner.sh"
-CONTRACT_VERSION=1
+CONTRACT_VERSION=2
+
+# Where the shared enumeration lives. Resolved from this file's own location so
+# the runner works from a checkout, an install prefix, or a symlink; TP_LIB_DIR
+# (exported by lib/config.sh) wins when the caller already resolved it.
+RUNNER_DIR="$(CDPATH='' cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+PUMP_LIB="${TP_LIB_DIR:-$RUNNER_DIR/../../lib}/pump-lib.sh"
 
 die()  { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
 warn() { printf '%s: %s\n' "$PROG" "$*" >&2; }
@@ -137,6 +167,7 @@ $PROG — claude-docker runner (contract v$CONTRACT_VERSION)
 
   $PROG launch    start the agent container detached; prints its id
   $PROG stop      stop the container named by TP_CONTAINER_NAME
+  $PROG list      print every live agent name, one per line
   $PROG contract  print the contract version
 
 All inputs are environment variables; see the header of this file for the table.
@@ -292,10 +323,47 @@ do_stop() {
   die "docker stop failed (rc=$rc) for container $cname"
 }
 
+do_list() {
+  # The enumeration itself is the pump's, sourced rather than re-spelled: the
+  # names `list` prints and the names the pump scrapes have to be the same set,
+  # and two copies of one `docker ps --filter` is exactly how they would stop
+  # being. A runner relocated away from its lib says so instead of quietly
+  # answering from a second implementation.
+  [[ -f "$PUMP_LIB" ]] || die "cannot list agents: no pump-lib.sh at $PUMP_LIB (set TP_LIB_DIR)"
+  # shellcheck source=../../lib/pump-lib.sh
+  . "$PUMP_LIB"
+
+  # The prefix is configuration, not per-launch input, so `list` accepts the
+  # runner's own TP_ spelling and both shared ones. Empty means unset here:
+  # apl_agent_prefix supplies the default.
+  local prefix; prefix="$(first_set TP_AGENT_PREFIX TASKPUMP_AGENT_PREFIX ARACHNE_AGENT_PREFIX)"
+
+  local errs; errs="$(mktemp)"
+  local names rc=0
+  names="$(TASKPUMP_AGENT_PREFIX="$prefix" apl_live_agent_names_strict 2>"$errs")" || rc=$?
+
+  if [[ $rc -ne 0 ]]; then
+    # One line, per the contract: the runtime's first line of complaint is the
+    # useful part, and a caller deciding whether to fall back should not have to
+    # parse a paragraph. The rest is dropped on purpose.
+    local why; why="$(head -n 1 "$errs" 2>/dev/null || true)"
+    rm -f "$errs"
+    die "cannot list agents (rc=$rc): ${why:-the container runtime did not answer}"
+  fi
+  rm -f "$errs"
+
+  # An empty fleet is a successful answer, not an absence of one — printf on an
+  # empty string would emit a spurious blank line, which a line-counting caller
+  # would read as one live agent.
+  [[ -n "$names" ]] && printf '%s\n' "$names"
+  return 0
+}
+
 verb="${1:-}"
 case "$verb" in
   launch)         shift; do_launch "$@" ;;
   stop)           shift; do_stop "$@" ;;
+  list)           shift; do_list "$@" ;;
   contract)       printf '%s\n' "$CONTRACT_VERSION" ;;
   -h|--help|help) usage ;;
   '')             usage >&2; exit 2 ;;

@@ -247,6 +247,209 @@ got=$(TASKPUMP_AGENT_PREFIX=tp-agent- DOCKER="$BIN/fake-runtime" STUB_NAMES="$re
   && pass "a custom prefix selects and strips consistently" \
   || fail "custom prefix enumeration: '$got'"
 
+# The tolerant form flattens "I could not look" into "nothing is live", which is
+# right for the pump's tick (guessing none costs one wasted launch decision) and
+# wrong for a runner answering `list`, whose caller must be able to tell the two
+# apart before deciding to fall back (docs/RUNNERS.md §1.3). Both forms exist for
+# that reason, over ONE filter expression — the drift these tests are for is a
+# second `docker ps --filter` growing next to the first.
+cat >| "$BIN/dead-runtime" <<'EOF'
+#!/usr/bin/env bash
+printf 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock.\n' >&2
+exit 1
+EOF
+chmod +x "$BIN/dead-runtime"
+
+got=$(DOCKER="$BIN/dead-runtime" apl_live_agent_names 2>/dev/null); rc=$?
+[[ $rc -eq 0 && -z "$got" ]] \
+  && pass "the tolerant enumeration reads an unreachable runtime as no agents" \
+  || fail "apl_live_agent_names should stay quiet and succeed; rc=$rc got='$got'"
+
+got=$(DOCKER="$BIN/dead-runtime" apl_live_agent_names_strict 2>/dev/null); rc=$?
+[[ $rc -ne 0 && -z "$got" ]] \
+  && pass "the strict enumeration propagates an unreachable runtime" \
+  || fail "apl_live_agent_names_strict swallowed a runtime failure; rc=$rc got='$got'"
+
+err=$(DOCKER="$BIN/dead-runtime" apl_live_agent_names_strict 2>&1 >/dev/null)
+[[ "$err" == *"Cannot connect to the Docker daemon"* ]] \
+  && pass "the strict enumeration leaves the runtime's stderr for its caller to word" \
+  || fail "the runtime's reason was swallowed: '$err'"
+
+got=$(TASKPUMP_AGENT_PREFIX=arachne-agent- DOCKER="$BIN/fake-runtime" STUB_NAMES="$mixed" apl_live_agent_names_strict | tr '\n' ' '); rc=$?
+[[ $rc -eq 0 && "$got" == "arachne-agent-feat-a arachne-agent-feat-b " ]] \
+  && pass "strict and tolerant select the same names when the runtime answers" \
+  || fail "strict enumeration diverged: rc=$rc '$got'"
+
+got=$(DOCKER="$BIN/fake-runtime" apl_live_agent_names_strict | wc -c); rc=$?
+[[ $rc -eq 0 && "$got" -eq 0 ]] \
+  && pass "an empty fleet is zero bytes, not a blank line" \
+  || fail "empty strict enumeration emitted $got bytes"
+
+echo "--- liveness delegates to the runner, and never lies when it cannot ---"
+# The point of the delegation: a runner that starts something other than a
+# container has agents no `docker ps` will ever show. Scraping reads them as
+# dead, and the supervisor launches over them. So these stubs deliberately make
+# the runner's answer and the runtime's answer DIFFERENT — a test where both say
+# the same thing cannot tell which one was asked.
+
+# A v2 runner: knows `list`, and reports an agent the container runtime does not.
+cat >| "$BIN/runner-v2" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  list) [[ -n "${STUB_RUNNER_NAMES:-}" ]] && printf '%s\n' "$STUB_RUNNER_NAMES"; exit 0 ;;
+  launch|stop) exit 0 ;;
+  *) echo "runner: unknown verb: ${1:-}" >&2; exit 2 ;;
+esac
+EOF
+# A v1 runner: the documented pre-v2 skeleton. An unknown verb is a usage error,
+# which is exit 2 — that is the code the capability probe reads as "no verb".
+cat >| "$BIN/runner-v1" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  launch|stop) exit 0 ;;
+  *) echo "runner: unknown verb: ${1:-}" >&2; exit 2 ;;
+esac
+EOF
+# A v2 runner whose runtime has gone away mid-run: it HAS the verb and cannot
+# answer it. Exit 1, not 2 — the distinction the probe rests on.
+cat >| "$BIN/runner-v2-broken" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  list) echo "runner.sh: cannot list agents (rc=1): daemon unreachable" >&2; exit 1 ;;
+  launch|stop) exit 0 ;;
+  *) echo "runner: unknown verb: ${1:-}" >&2; exit 2 ;;
+esac
+EOF
+chmod +x "$BIN/runner-v2" "$BIN/runner-v1" "$BIN/runner-v2-broken"
+
+# live_via <runner> [var=value]... — one liveness read, with the capability cache
+# cleared so each case probes for itself. Prints slugs; returns the status.
+live_via() {
+  local runner="$1"; shift
+  (
+    unset APL_RUNNER_LIST_CAP
+    local kv; for kv in "$@"; do export "$kv"; done
+    APL_LIVENESS_RUNNER="$runner" DOCKER="$BIN/fake-runtime" apl_live_agent_slugs
+  )
+}
+
+# Populated: the runner's fleet, not the runtime's.
+got=$(live_via "$BIN/runner-v2" STUB_RUNNER_NAMES=$'tp-agent-feat-a\ntp-agent-feat-b' STUB_NAMES=tp-agent-feat-zzz | tr '\n' ' '); rc=$?
+[[ $rc -eq 0 && "$got" == "feat-a feat-b " ]] \
+  && pass "liveness comes from the runner when it supports list" \
+  || fail "runner-backed liveness wrong (rc=$rc): '$got'"
+
+# Empty: the runner says nothing is live even though the runtime shows a
+# container. An empty answer from a runner that ANSWERED is authoritative.
+got=$(live_via "$BIN/runner-v2" STUB_NAMES=tp-agent-feat-zzz | tr '\n' ' '); rc=$?
+[[ $rc -eq 0 && -z "$got" ]] \
+  && pass "an empty runner answer is authoritative, not a reason to scrape" \
+  || fail "empty runner answer was overridden (rc=$rc): '$got'"
+
+# A name outside this pump's prefix cannot be mapped back to one of its
+# branches, so the prefix filter applies to the runner's answer too.
+got=$(live_via "$BIN/runner-v2" STUB_RUNNER_NAMES=$'tp-agent-feat-a\nsomeone-elses-agent' | tr '\n' ' ')
+[[ "$got" == "feat-a " ]] \
+  && pass "the prefix filter applies to the runner's answer as well" \
+  || fail "an unprefixed name survived: '$got'"
+
+# v1 runner: no verb, so the scrape stands. This is the compatibility promise —
+# an existing runner keeps working untouched.
+got=$(live_via "$BIN/runner-v1" STUB_NAMES=$'tp-agent-feat-a\ntp-agent-feat-b' | tr '\n' ' '); rc=$?
+[[ $rc -eq 0 && "$got" == "feat-a feat-b " ]] \
+  && pass "a v1 runner falls back to container-name enumeration" \
+  || fail "v1 fallback wrong (rc=$rc): '$got'"
+
+# Not executable / not there at all: same fallback, no crash.
+got=$(live_via "$TMP/no-such-runner" STUB_NAMES=tp-agent-feat-a | tr '\n' ' '); rc=$?
+[[ $rc -eq 0 && "$got" == "feat-a " ]] \
+  && pass "a missing runner falls back instead of failing the tick" \
+  || fail "missing-runner fallback wrong (rc=$rc): '$got'"
+
+# The mid-run failure. Two properties, and the second is the one that matters:
+# the answer is still the scrape (fail-open, the pump must not wedge), AND the
+# status says it is not authoritative (so an absence-driven pass can decline).
+got=$(live_via "$BIN/runner-v2-broken" STUB_NAMES=tp-agent-feat-a | tr '\n' ' '); rc=$?
+[[ "$got" == "feat-a " ]] \
+  && pass "a runner that errors mid-run falls back to the scrape rather than failing" \
+  || fail "degraded liveness returned nothing usable: '$got'"
+[[ $rc -eq "$APL_LIVENESS_DEGRADED_RC" ]] \
+  && pass "a degraded answer is flagged with exit $APL_LIVENESS_DEGRADED_RC" \
+  || fail "degraded liveness looked authoritative (rc=$rc)"
+
+# The whole reason the status exists. For a NON-container runner the fallback
+# scrape is not stale, it is EMPTY — "every agent died at once". A caller that
+# reclaims claims or resumes phases on absence must be able to see that this
+# answer is worthless, or one bad tick reclaims the entire fleet.
+got=$(live_via "$BIN/runner-v2-broken" | tr '\n' ' '); rc=$?
+[[ -z "$got" && $rc -eq "$APL_LIVENESS_DEGRADED_RC" ]] \
+  && pass "a blind answer that looks like 'everything died' is flagged, not silent" \
+  || fail "the everything-died answer was unflagged (rc=$rc): '$got'"
+
+# A supported runner that answers normally must NOT be flagged, or the guard
+# would skip reclaim forever and orphaned claims would never be freed.
+got=$(live_via "$BIN/runner-v2" | tr '\n' ' '); rc=$?
+[[ -z "$got" && $rc -eq 0 ]] \
+  && pass "a genuinely empty fleet is authoritative, so reclaim still runs" \
+  || fail "an empty-but-answered fleet was flagged degraded (rc=$rc)"
+
+echo "--- the capability probe: exit 2 means 'no such verb', anything else does not ---"
+
+# Probed once, then cached: a supervisor asks liveness every tick and must not
+# pay a probe each time.
+( unset APL_RUNNER_LIST_CAP
+  apl_runner_list_supported "$BIN/runner-v2" && [[ "$APL_RUNNER_LIST_CAP" == "1" ]] ) \
+  && pass "a v2 runner probes as supported and caches the answer" \
+  || fail "v2 capability probe failed"
+
+( unset APL_RUNNER_LIST_CAP
+  ! apl_runner_list_supported "$BIN/runner-v1" && [[ "$APL_RUNNER_LIST_CAP" == "0" ]] ) \
+  && pass "a v1 runner (exit 2) probes as unsupported and caches the answer" \
+  || fail "v1 capability probe failed"
+
+# The distinction that keeps a transient blip from disabling the runner for the
+# whole run: a runtime error is NOT a missing verb. Misreading it would mean a
+# non-container runner's agents stay invisible until the pump restarts.
+( unset APL_RUNNER_LIST_CAP
+  apl_runner_list_supported "$BIN/runner-v2-broken" ) \
+  && pass "a runner whose runtime is down still counts as supporting list" \
+  || fail "a transient runtime failure was misread as a v1 runner"
+
+# The cache is honoured, not re-derived: a probe result carried in from the
+# parent shell (which is how the pump caches across per-tick subshells) wins.
+got=$(APL_RUNNER_LIST_CAP=0 APL_LIVENESS_RUNNER="$BIN/runner-v2" DOCKER="$BIN/fake-runtime" \
+      STUB_RUNNER_NAMES=tp-agent-feat-a STUB_NAMES=tp-agent-feat-b apl_live_agent_slugs | tr '\n' ' ')
+[[ "$got" == "feat-b " ]] \
+  && pass "an inherited 'unsupported' verdict is reused, not re-probed" \
+  || fail "the cached capability was ignored: '$got'"
+
+echo "--- the branch-naming rule: one place, because two tools enforce it ---"
+# The slug map (`/` → `-`) is the join key of the whole stack, and it is FROZEN —
+# container names already exist on operators' hosts. So a branch the encoding
+# cannot carry is refused rather than re-encoded, and the rule lives here rather
+# than once in tp-task and once in the pump.
+for good in feat/g3 feat/f79-x main wip-thing a/b; do
+  apl_branch_slug_reject_reason "$good" >/dev/null \
+    && pass "branch '$good' is accepted" \
+    || fail "branch '$good' was rejected: $(apl_branch_slug_reject_reason "$good")"
+done
+
+# Two separators is the case the docs called "does not round-trip" and then let
+# through anyway. feat/a/b and feat/a-b both slug to feat-a-b.
+for bad in feat/a/b a/b/c/d /leading trailing/ "has space" ""; do
+  got=$(apl_branch_slug_reject_reason "$bad" 2>&1); rc=$?
+  [[ $rc -ne 0 && -n "$got" ]] \
+    && pass "branch '$bad' is rejected with a reason" \
+    || fail "branch '$bad' was accepted (rc=$rc)"
+done
+
+# The message has to carry the collision, not just say no: an operator looking
+# at "feat-a-b" understands immediately why two branches cannot both have it.
+got=$(apl_branch_slug_reject_reason "feat/a/b" 2>&1 || true)
+[[ "$got" == *"feat-a-b"* ]] \
+  && pass "the reason names the ambiguous slug it would have produced" \
+  || fail "the reason does not show the collision: '$got'"
+
 echo "--- pool cap: one shared fallback, not three private ones ---"
 CAP_FILE="$TMP/absent-cap"
 [[ "$(JOBS=4 apl_read_cap)" == "4" ]] && pass "caller's JOBS wins when no cap file exists" \

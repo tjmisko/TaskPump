@@ -10,17 +10,22 @@ without touching the scheduler.
 
 ---
 
-## 1. The runner contract, v1
+## 1. The runner contract, v2
 
 A runner is **an executable** taking a verb as its first argument.
 
 ```
 runner.sh launch      # start an agent; print its handle; exit non-zero on failure
 runner.sh stop        # stop the agent identified by the environment
+runner.sh list        # print every live agent's name; exit non-zero if it cannot look
 ```
 
 Everything else is passed through the environment, so the interface stays stable
 as inputs are added.
+
+`launch` and `stop` are asked about **one** agent, named by the environment.
+`list` is asked about the **fleet** and takes no per-agent input at all — the
+difference is what §1.3 is about.
 
 ### 1.1 `launch`
 
@@ -71,20 +76,63 @@ runtime is unreachable, the name is ambiguous — must still exit non-zero, or a
 teardown that silently did nothing is indistinguishable from one that worked.
 `tests/test-tp-runner-stop.sh` holds the reference runner to both halves.
 
-### 1.3 What v1 deliberately leaves out
+### 1.3 `list`
 
-**Liveness is not part of the runner contract in v1.** The pump discovers live
-agents by listing processes whose name carries the configured agent prefix, not
-by asking the runner. That is a real coupling, and it is deliberate: it is the
-mechanism the whole supervisor rests on
-([PUMP-MECHANISMS.md §2](PUMP-MECHANISMS.md#2-liveness-from-process-state-never-task-status)),
-it is proven, and moving it behind a plugin interface at the same time as
-everything else would put the load-bearing beam on new scaffolding.
+**Liveness is askable in v2.** A runner can be asked which of its agents are
+alive, instead of the supervisor inferring it by scraping container names.
 
-A `runner.sh list` verb is the obvious v2 addition. Until then, **a runner must
-name its agents `<prefix><branch-slug>`** and make them visible to the
-enumeration the pump performs. This is the sharpest constraint on writing a
-non-container runner, and the reason it is stated twice.
+```
+runner.sh list
+```
+
+**Inputs:** none per agent. `list` is called once per tick with no task, no
+workspace and no container name in hand, so it may read only what `stop` already
+reads from configuration — for the shipped runner, the agent-name prefix
+(`TP_AGENT_PREFIX`, or the shared `TASKPUMP_AGENT_PREFIX`). A runner that demands
+launch-shaped input is uncallable at exactly the moment it is needed.
+
+**Output:** the name of every live agent, one per line. These must be the names
+`launch` created (`<prefix><slug>`, §2), so the existing name→branch mapping
+keeps working.
+
+**Exit:**
+
+| Condition | Exit | Output |
+|---|---|---|
+| Agents are live | `0` | one name per line |
+| No agents are live | `0` | **nothing** — not a blank line |
+| Cannot enumerate (runtime unreachable) | non-zero | one line on stderr saying why |
+
+The last two rows are the contract. *"Nothing is running"* and *"I could not
+look"* are different answers that demand opposite actions, and a runner that
+reports the second as the first hands the supervisor a confident wrong answer —
+the pump's one non-negotiable safety property is that it never double-launches a
+live agent. **The runner never guesses the fallback; the caller decides.**
+
+The empty case is a real trap rather than a pedantic one: printing `"$names"`
+unconditionally emits a blank line when there are none, and a caller counting
+lines then sees one live agent where there are zero.
+
+#### The prefix scrape remains the fallback
+
+The pump still discovers live agents by listing processes whose name carries the
+configured agent prefix
+([PUMP-MECHANISMS.md §2](PUMP-MECHANISMS.md#2-liveness-from-process-state-never-task-status)).
+That path is the mechanism the whole supervisor rests on, it is proven, and it
+stays — `list` is the *preferred* source of liveness, not the only one, and a
+runner that does not implement it is still drivable.
+
+Which means **the naming contract is still mandatory**: a runner must name its
+agents `<prefix><branch-slug>` and make them visible to the pump's enumeration.
+This is the sharpest constraint on writing a non-container runner, and the reason
+it is stated twice. Implementing `list` does not buy you out of it — the fallback
+has to keep working, and the two answers have to be the same set.
+
+For a container runner that means `list` should share the pump's own enumeration
+rather than re-spelling the filter: two copies of one `docker ps --filter` is
+precisely how the two answers drift apart. The reference runner sources
+`lib/pump-lib.sh` for exactly this reason, and
+`tests/test-tp-runner-list.sh` asserts the two agree name for name.
 
 ---
 
@@ -101,44 +149,143 @@ Two consequences:
 
 - **The prefix must be distinctive.** Enumeration matches on it; a prefix that
   collides with other containers on the host will confuse liveness.
-- **Branch names with more than one `/` do not round-trip cleanly** back to a
-  branch. Keep branch names to one separator (`feat/t12`), which is what the
-  default branch prefix produces.
+- **A branch name may contain at most one `/`.** `feat/a/b` and `feat/a-b`
+  produce the same slug, so the name cannot be mapped back to one branch.
+
+### Enforced, not advisory
+
+The second rule used to be a recommendation, and a branch that broke it launched
+normally — the failure surfaced much later and somewhere else, as an agent whose
+name liveness could not map back, a phase the pump therefore read as dead, and a
+second agent launched on the same branch. That is the one thing the supervisor
+must never do, so the rule is now checked at both doors:
+
+| Where | What happens |
+|---|---|
+| `tp task claim --branch <b>` | Refused, naming the ambiguous slug it would have produced. Nothing is written. |
+| `tp pump` startup | The branch the run *would* construct is validated once, before any tick. A bad `TASKPUMP_BRANCH_PREFIX` (`--branch-prefix`) aborts the run naming the key. |
+
+Also refused: a leading `/` (the name would start with `-`, which is not a legal
+container name), a trailing `/`, and whitespace (a name that cannot survive a
+whitespace-delimited registry or `docker ps --format`).
+
+**The encoding itself is frozen.** Container names already exist on operators'
+hosts, so the fix for an unmappable branch is a different branch name, never a
+cleverer slug. One rule lives in `lib/pump-lib.sh`
+(`apl_branch_slug_reject_reason`) and both tools read it, so neither gets its own
+opinion about what is legal.
 
 ---
 
-## 3. Writing a runner
+## 3. `runners/local` — the process runner
 
-The minimum viable runner starts a local process:
+TaskPump ships two runners. This is the one with nothing underneath it: no image
+to build, no daemon to talk to, nothing to install. It starts the agent as a
+plain host process.
+
+```bash
+TASKPUMP_RUNNER=runners/local/runner.sh
+TASKPUMP_LOCAL_AGENT_CMD='my-agent --prompt-file .taskpump-phase-brief.md'
+```
+
+That is the whole configuration. `TASKPUMP_LOCAL_AGENT_CMD` is required and has
+no default — there is no sane guess at what agent you are driving, and a
+plausible-but-wrong one would fail somewhere far from here. The command runs
+through `bash -c`, in the workspace, with the run's environment exported
+(`TASKPUMP_BRIEF`, `TASKPUMP_PHASE`, `TASKPUMP_TASK_ID`, `TASKPUMP_BRANCH`,
+`TASKPUMP_MAX_TURNS`, … and each one's legacy `ARACHNE_*` twin).
+
+### 3.1 It does not sandbox anything
+
+**The agent runs as you, with your permissions, your filesystem, your network
+and your credentials.** There is no mount policy, no egress allowlist, no
+read-only primary checkout, no memory cap — nothing between the agent and your
+machine but the agent's own restraint. Every guarantee in §4 belongs to the
+`claude-docker` runner and **none of them apply here**.
+
+That is fine for a supervised experiment, for a repository you would hand a
+colleague, or for an agent that isolates itself. It is **not** fine for an
+unattended multi-day drain of an untrusted workload. If that is what you are
+doing, use a runner that sandboxes, and read §4 first.
+
+### 3.2 How it keeps track
+
+A container runtime remembers the name→process mapping for you. Nothing does
+that for a bare process, so this runner writes one itself — `<name> <pgid>` per
+line, in a registry file:
+
+| Knob | Default |
+|---|---|
+| `TASKPUMP_LOCAL_REGISTRY` | `$TASKPUMP_STATE_DIR/.taskpump-local-agents`, else `$XDG_STATE_HOME/taskpump/local-agents` |
+| `TASKPUMP_LOCAL_STOP_GRACE_S` | `10` — seconds between `TERM` and `KILL` |
+| `TASKPUMP_AGENT_LOG_NAME` | `.taskpump-agent.log`, inside the workspace |
+
+Two details there are load-bearing, and both look like implementation choices
+until they bite:
+
+- **The recorded id is a process GROUP, not a pid.** An agent spawns children — a
+  language server, a test run, a subagent. Killing only the leader leaves them
+  running and holding the workspace, so the agent starts under `setsid` and
+  `stop` signals the whole group.
+- **A finished agent is dead even while its process-table entry survives.**
+  `kill -0` succeeds on a zombie, and an agent whose parent (this short-lived
+  runner) has exited is reparented to PID 1 — which, in any minimal container,
+  never reaps anything. Liveness therefore reads process *state* and treats `Z`
+  as gone. The obvious `kill -0` implementation reports a long-dead agent as
+  live forever: `stop` never finishes, `list` never prunes, and the pump never
+  relaunches the phase.
+
+`list` prunes what it walks, so the registry holds the live set and does not
+accumulate. `launch` refuses to start a second agent under a live name — the one
+guarantee `docker run --name` gives the container runner for free, and the pump's
+never-double-launch property leans on it.
+
+### 3.3 What a consumer still has to set
+
+The supervisor's launch prerequisites are container-shaped, and a process runner
+does not escape them yet:
+
+```bash
+TASKPUMP_IMAGE=unused-by-a-process-runner   # required to be non-empty
+TASKPUMP_IMAGE_BUILD=                       # empty ⇒ skip the image build
+```
+
+`TASKPUMP_IMAGE` is checked before any launch and deliberately has no default
+(§4.0), and an *unset* `TASKPUMP_IMAGE_BUILD` means "docker build the repo root".
+Neither applies here, so both need saying out loud. Setting them is the whole
+adaptation: `tests/test-tp-runner-local.sh` drives a real `tp-pump --once` this
+way with the container runtime pointed at a path that does not exist, and both
+the launch and the next tick's liveness work.
+
+### 3.4 Writing your own
+
+The skeleton, if you are adapting to something else entirely:
 
 ```bash
 #!/usr/bin/env bash
-# runners/local/runner.sh — run an agent as a plain host process.
 set -euo pipefail
 
 case "${1:-}" in
-  launch)
+  launch)  # start it, name it, print the handle, detach
     cd "$TP_WORKSPACE"
-    setsid my-agent \
-        --prompt-file "$TP_WORKSPACE/.taskpump-brief.md" \
-        --max-turns "$TP_MAX_TURNS" \
+    setsid my-agent --session-name "$TP_CONTAINER_NAME" \
         > "$TP_WORKSPACE/.taskpump-agent.log" 2>&1 &
-    echo "$!"                      # the handle
+    echo "$TP_CONTAINER_NAME"
     ;;
-  stop)
-    pkill -f "$TP_CONTAINER_NAME" || true
+  stop)    # idempotent: already gone is success (§1.2)
+    kill -TERM -- "-$(recorded_pgid_of "$TP_CONTAINER_NAME")" || true
     ;;
-  *)
-    echo "runner: unknown verb: ${1:-}" >&2
-    exit 2
+  list)    # every live agent, one per line; empty is exit 0 and no output (§1.3)
+    live_names || true
     ;;
+  *) echo "runner: unknown verb: ${1:-}" >&2; exit 2 ;;
 esac
 ```
 
-This is enough to drive a real drain, and it is the right thing to build first
-when adapting TaskPump to a new agent. It provides no isolation whatsoever — the
-agent has your whole machine — which is fine for a supervised experiment and not
-fine for an unattended multi-day run.
+The two things that are easy to get wrong are both in §1.3: an empty fleet must
+print **nothing** (not a blank line), and a failure to enumerate must exit
+non-zero rather than look like an empty fleet. And whatever you start, **name it
+`<prefix><branch-slug>`** (§2) — the fallback enumeration still depends on it.
 
 ---
 

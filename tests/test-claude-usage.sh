@@ -147,6 +147,59 @@ seed "$SAMPLE77"
 out=$("$CLI" --json; "$CLI" --percent)
 printf '%s' "$out" | grep -qiE 'bearer|accessToken|sk-ant' && fail "secret-shaped text leaked into output" || pass "no secret-shaped text in output"
 
+echo "--- Test 11: absent host credentials are a deliberate skip, not a silent feed ---"
+# This gate ships in the DEFAULT chain, so a consumer driving a non-Claude agent
+# runs it against a file that will never exist. It must feed — the fail-open rule
+# in GATES.md — but it must also SAY so, and say which of the two things
+# happened: "no credentials here" is permanent and "the meter is unreachable" is
+# transient, and an operator who cannot tell them apart waits for a recovery that
+# is never coming.
+unseed
+rm -f "$RESET_FILE"
+NOCRED="$TMP/no-such-credentials.json"
+
+rc=0; err=$(ARACHNE_CREDENTIALS="$NOCRED" "$CLI" --gate --ceiling 95 2>&1 >/dev/null) || rc=$?
+[[ "$rc" -eq 0 ]] && pass "no credentials + no cache still feeds (exit 0)" \
+  || fail "the usage gate paused on a host with no credentials (rc=$rc): $err"
+[[ "$(wc -l <<<"$err")" -eq 1 ]] && pass "the skip is exactly one line" \
+  || fail "expected one line, got $(wc -l <<<"$err"):\n$err"
+grep -q 'no claude credentials' <<<"$err" \
+  && pass "the line names the missing credentials, not a generic meter failure" \
+  || fail "the skip reason is not specific:\n$err"
+
+# Nothing may be cached from a failed read — a cache entry is a usage READING,
+# and a reading invented from an absent meter would outlive the tick that
+# invented it.
+[[ ! -f "$CACHE" ]] && pass "a failed read caches nothing" \
+  || fail "the gate wrote a cache entry with no data:\n$(cat "$CACHE")"
+
+# Unreadable and malformed are the same class of absent input.
+BADCRED="$TMP/bad-credentials.json"
+printf 'not json at all\n' >| "$BADCRED"
+rc=0; err=$(ARACHNE_CREDENTIALS="$BADCRED" "$CLI" --gate --ceiling 95 2>&1 >/dev/null) || rc=$?
+[[ "$rc" -eq 0 ]] && grep -q 'not valid JSON' <<<"$err" \
+  && pass "malformed credentials skip with a reason" \
+  || fail "malformed credentials (rc=$rc):\n$err"
+
+if [[ "$(id -u)" -ne 0 ]]; then
+  chmod 000 "$BADCRED"
+  rc=0; err=$(ARACHNE_CREDENTIALS="$BADCRED" "$CLI" --gate --ceiling 95 2>&1 >/dev/null) || rc=$?
+  [[ "$rc" -eq 0 ]] && grep -q 'not readable' <<<"$err" \
+    && pass "unreadable credentials skip with a reason" \
+    || fail "unreadable credentials (rc=$rc):\n$err"
+  chmod 644 "$BADCRED"
+else
+  pass "SKIP unreadable-credentials case (running as root)"
+fi
+
+# And the gate still gates. A seeded over-ceiling reading pauses exactly as
+# before — the skip path must not have turned this into a gate that never fires.
+seed "$SAMPLE77"
+rc=0; ARACHNE_CREDENTIALS="$NOCRED" "$CLI" --gate --ceiling 50 >/dev/null 2>&1 || rc=$?
+[[ "$rc" -eq 10 ]] && pass "a real reading still pauses at the ceiling (exit 10)" \
+  || fail "over-ceiling gate expected 10 got $rc"
+unseed
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"

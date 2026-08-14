@@ -33,6 +33,13 @@ _tp_self_root="$(CDPATH='' cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")"
 # shellcheck source=../lib/config.sh
 . "$_tp_self_root/lib/config.sh"
 tp_load_config
+# The naming contract (docs/RUNNERS.md §2) is shared with the supervisor, and a
+# claim is where a branch enters the ledger — so the rule for what a branch name
+# may be lives in one place and both tools read it, rather than each keeping its
+# own opinion. A checkout without the lib is not a working install; nothing here
+# guesses a fallback.
+# shellcheck source=../lib/pump-lib.sh
+. "${TP_LIB_DIR:-$_tp_self_root/lib}/pump-lib.sh"
 
 # ── Workspace resolution ──────────────────────────────────────────────────────
 # Resolve the workspace whose ledger we operate on. Env vars still override.
@@ -68,12 +75,23 @@ if [[ -z "${TASKPUMP_CONFIG:-}" && -n "${TP_CONFIG_FILE:-}" ]]; then
   _tp_conf_root="$(CDPATH='' cd -- "$(dirname "$TP_CONFIG_FILE")" 2>/dev/null && pwd || true)"
 fi
 
+# Was the tasks dir handed to us outright? Read BEFORE the default below fills
+# it in, because "the caller said where the ledger is" is the one answer that
+# needs no probing and no guard.
+_tp_tasks_dir_explicit=0
+[[ -n "${TASKPUMP_TASKS_DIR:-}" ]] && _tp_tasks_dir_explicit=1
+
+# _tp_resolved_via records WHICH probe answered, not just where it landed. The
+# install-root value is a fallback, not an answer — see the guard below.
 _tp_repo_root="$_tp_script_root"
+_tp_resolved_via="install-root"
 _tp_cwd_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
 if [[ -n "$_tp_conf_root" && -d "$_tp_conf_root/$TASKPUMP_LEDGER_PROBE" ]]; then
   _tp_repo_root="$_tp_conf_root"
+  _tp_resolved_via="conf"
 elif [[ -n "$_tp_cwd_root" && -d "$_tp_cwd_root/$TASKPUMP_LEDGER_PROBE" ]]; then
   _tp_repo_root="$_tp_cwd_root"
+  _tp_resolved_via="cwd"
 fi
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -669,6 +687,17 @@ cmd_claim() {
   done
   [[ -z "$id" ]] && die "usage: $TASKPUMP_PROG_NAME claim <id> --branch <b> [--turns <n>]"
   [[ -z "$branch" ]] && die "--branch is required"
+  # The claim is where the branch enters the ledger, so it is where a branch that
+  # cannot carry an agent name has to be stopped. Letting it through costs
+  # nothing here and everything later: the agent launches under a name liveness
+  # cannot map back, the pump reads the phase as dead, and it launches a second
+  # agent on the same branch (docs/RUNNERS.md §2).
+  local branch_problem
+  if ! branch_problem="$(apl_branch_slug_reject_reason "$branch")"; then
+    die "$branch_problem
+the agent name is the branch with \"/\" replaced by \"-\", and that mapping has to
+be reversible; use a branch name with at most one \"/\" (for example feat/g3)"
+  fi
   local file; file=$(task_file_required "$id")
 
   local status; status=$(fm_get "$file" '.status')
@@ -1754,10 +1783,62 @@ still overrides; `resolve` prints what a given invocation picked.
 EOF
 }
 
+# ── The install-root fallback is not an answer ────────────────────────────────
+# When no explicit tasks dir, no discovered conf and no cwd git toplevel answers
+# the ledger probe, resolution falls back to the INSTALLATION's own root. That
+# fallback exists for the vendored layout, where each worktree carries both its
+# own copy of this CLI and its own ledger — there the install root IS the
+# workspace and the fallback is simply correct.
+#
+# Everywhere else it is a silent wrong answer, and it has already produced one:
+# `tp task create` run in a fresh repository that had no tasks/ directory wrote
+# the task into the TaskPump checkout's own ledger, with a git commit, and was
+# caught only because that ledger happened to be under watch (2026-08-12). The
+# repository the operator was standing in never learned about it and TaskPump's
+# did — the worst shape a wrong answer can take, because both sides look fine.
+#
+# So: a command that MUTATES the ledger refuses when resolution reached the
+# fallback AND the install root is outside the caller's worktree. Read-only
+# commands keep working, deliberately — `resolve` is the diagnostic this error
+# points at, and an error that disables the tool you need to diagnose it is a
+# worse error.
+tp_require_resolved_ledger() {
+  [[ "$_tp_tasks_dir_explicit" -eq 1 ]] && return 0
+  [[ "$_tp_resolved_via" != "install-root" ]] && return 0
+  # The vendored layout: the install root is the caller's worktree, or sits
+  # inside it. The fallback is the right answer there, and stays silent.
+  if [[ -n "$_tp_cwd_root" ]]; then
+    [[ "$_tp_script_root" == "$_tp_cwd_root" || "$_tp_script_root" == "$_tp_cwd_root"/* ]] && return 0
+  fi
+  die "refusing to touch a ledger this repository never asked for.
+
+  probed for '$TASKPUMP_LEDGER_PROBE/' in:
+    $(if [[ -n "$_tp_conf_root" ]]; then echo "$_tp_conf_root  (the taskpump.conf found above \$PWD)"; else echo "(no taskpump.conf discovered above \$PWD)"; fi)
+    $(if [[ -n "$_tp_cwd_root" ]]; then echo "$_tp_cwd_root  (this repository)"; else echo "(\$PWD is not inside a git repository)"; fi)
+
+  nothing answered, so resolution fell back to the TaskPump installation itself:
+    $TASKPUMP_TASKS_DIR
+  which is outside this repository. Writing there would put your task in
+  TaskPump's own ledger, silently.
+
+  fix it with either:
+    mkdir $TASKPUMP_LEDGER_PROBE                   # give this repository a ledger
+    TASKPUMP_TASKS_DIR=/path/to/tasks $TASKPUMP_PROG_NAME ...   # or point at an existing one
+
+  \`$TASKPUMP_PROG_NAME resolve --tasks-dir\` keeps working and prints where resolution lands."
+}
+
 main() {
   local cmd=${1:-}
   [[ -z "$cmd" ]] && { usage; exit 1; }
   shift
+  # Every command that writes to the ledger, which is a superset of the ones
+  # that take the state lock below (create/goal/title/blockers mutate files
+  # without needing cross-agent exclusion).
+  case $cmd in
+    create|claim|heartbeat|complete|block|needs-review|release|reopen|defer|undefer|resume-attempt|scrub|goal|title|blockers)
+      tp_require_resolved_ledger;;
+  esac
   # Mutating subcommands serialize on the cross-agent state lock for their
   # whole read-modify-write + commit. Read-only commands (next/list) skip it.
   case $cmd in

@@ -57,6 +57,11 @@ _tp_self_root="$(CDPATH='' cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")"
 # shellcheck source=../lib/config.sh
 . "$_tp_self_root/lib/config.sh"
 tp_load_config
+# For apl_host_credentials_problem: both Claude gates classify absent host
+# credentials the same way, from one place, so they skip for the same reasons
+# and say the same thing.
+# shellcheck source=../lib/pump-lib.sh
+. "${TP_LIB_DIR:-$_tp_self_root/lib}/pump-lib.sh"
 
 _script_dir="$(CDPATH='' cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 _repo_root="$(CDPATH='' cd -- "$_script_dir/.." && pwd)"
@@ -241,7 +246,21 @@ cmd_gate() {
 
   build_decision >/dev/null
   if [[ "$REPLY_BIND" == "unknown" ]]; then
-    warn "feed OK (bind_percent unknown — meter unreachable; failing open)"
+    # Fail open either way, but say WHICH of the two it is. A host driving a
+    # non-Claude agent has no credentials and never will: that gate line should
+    # read as "this meter does not apply here", not as "the meter is briefly
+    # unreachable, try again next tick". An operator who cannot tell them apart
+    # waits for a recovery that is never coming.
+    #
+    # Nothing is cached on this path — the cache is only ever written from a
+    # payload that parsed — so an unreadable meter can never later be mistaken
+    # for a usage reading.
+    local cred_problem; cred_problem="$(apl_host_credentials_problem "$TASKPUMP_CREDENTIALS")"
+    if [[ -n "$cred_problem" ]] && ! cache_valid; then
+      warn "skipped: $cred_problem (usage gate feeds; nothing to meter)"
+    else
+      warn "feed OK (bind_percent unknown — meter unreachable; failing open)"
+    fi
     return 0
   fi
   if (( REPLY_BIND >= ceiling )); then

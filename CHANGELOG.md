@@ -4,6 +4,118 @@ Notable changes to TaskPump. This project versions its **ledger contract**, not
 just its code: the rules for what constitutes a MAJOR, MINOR, or PATCH change are
 in [docs/LEDGER-CONTRACT.md §1](docs/LEDGER-CONTRACT.md#1-versioning).
 
+## Unreleased
+
+### Fixed
+
+- **A ledger-mutating command now refuses the install-root fallback** instead of
+  silently writing into TaskPump's own ledger. When no explicit tasks dir, no
+  discovered `taskpump.conf` and no cwd git toplevel answers the ledger probe,
+  resolution falls back to the installation's root — correct for the vendored
+  layout (the install root *is* the workspace), and a silent wrong answer
+  everywhere else.
+
+  It produced one: `tp task create` in a fresh repository with no `tasks/`
+  directory wrote the task into the TaskPump checkout's ledger, with a commit,
+  and was caught only because that ledger happened to be under watch
+  (2026-08-12). Both sides look fine afterwards, which is what makes it the worst
+  shape a wrong answer can take.
+
+  `create`, `claim`, `complete`, `block`, `scrub` and the rest now exit non-zero
+  naming what was probed, where resolution landed, and both fixes (`mkdir tasks`
+  or `TASKPUMP_TASKS_DIR=…`). Read-only commands keep working on purpose —
+  `resolve --tasks-dir` is the diagnostic the error points at. The vendored
+  layout is unaffected: when the install root is the caller's worktree, or sits
+  inside it, the fallback is correct and stays silent.
+
+### Added
+
+- **Runner contract v2: `runner.sh list`.** A runner can now be *asked* which of
+  its agents are alive, instead of the supervisor inferring it by scraping
+  container names. `list` is a fleet verb — one call, one snapshot, no
+  per-agent input — so answering it costs one process per tick rather than one
+  per agent. An empty fleet is exit 0 with no output; a runtime that cannot be
+  reached is a non-zero exit with one line on stderr, because *"nothing is
+  running"* and *"I could not look"* demand opposite actions and the runner does
+  not get to guess which. The reference `claude-docker` runner implements it over
+  the pump's own enumeration (`lib/pump-lib.sh`), not a second copy of the
+  filter, so the names it prints are by construction the names the prefix scrape
+  would find. MINOR: additive to the contract, and the prefix scrape remains the
+  documented fallback, so an existing v1 runner keeps working unchanged. See
+  [docs/RUNNERS.md §1.3](docs/RUNNERS.md#13-list).
+
+  The pump does not call `list` yet — it still scrapes — so this lands
+  verifiable on its own.
+
+- **The two Claude gates skip cleanly on a host with no Claude credentials.**
+  Both ship in the default chain, so a consumer driving a different agent was
+  running them against a file that will never exist. They now feed with one
+  explanatory line — `claude-token-fresh: skipped: no claude credentials at
+  <path>` — instead of failing open silently, and `claude-usage` distinguishes
+  "there is no meter here" (permanent) from "the meter is unreachable"
+  (transient). Missing, unreadable, malformed and expiry-less credentials are all
+  absent input; a credentials file that can be read is measured exactly as
+  before, and nothing is ever cached from a failed read.
+
+  A silent feed is indistinguishable from a gate that looked and approved, and
+  those are opposite facts about how protected a run is. `tp pump --dry-run` now
+  prints what a *feeding* gate had to say under the `GATE:` line; the tick loop
+  stays quiet, since a persistent condition would otherwise print every 30s for
+  days. See [docs/GATES.md §2](docs/GATES.md#2-the-shipped-gates).
+
+- **A branch that cannot carry an agent name is now refused**, at the claim
+  (`tp task claim --branch feat/a/b`) and at pump startup (a
+  `TASKPUMP_BRANCH_PREFIX` whose branches would be unmappable aborts the run
+  before tick zero, naming the key).
+
+  The agent name is the branch with `/` → `-`, so `feat/a/b` and `feat/a-b`
+  produce the same name. This was documented as advisory and **silently broken
+  in practice**: the branch launched, liveness could not map the name back, the
+  pump read the phase as dead, and it launched a second agent on the same branch
+  — the one thing the supervisor must never do. Also refused: a leading or
+  trailing `/`, and whitespace. The slug encoding is unchanged (existing
+  container names keep matching); one rule in `lib/pump-lib.sh` serves both
+  tools. See [docs/RUNNERS.md §2](docs/RUNNERS.md#2-naming-and-identity).
+
+- `apl_live_agent_names_strict` in `lib/pump-lib.sh`: the existing enumeration
+  with the runtime's failure propagated instead of flattened into an empty list.
+  Both forms now share one `docker ps --filter` expression.
+
+- **The pump's liveness now delegates to `runner.sh list`** when the configured
+  runner has it, and scrapes agent names when it does not — so a runner that
+  starts something other than a container becomes visible to the supervisor
+  instead of reading as permanently dead. The capability is probed once at
+  startup (exit 2 = "no such verb" = v1 runner; any other failure means the
+  runner *has* the verb and its runtime is merely unreachable, so a blip at
+  startup does not disable delegation for the whole run).
+
+  Mid-run, a liveness source that cannot answer falls back to the scrape and logs
+  one line per tick — but the two passes that act on *absence*, reclaiming
+  orphaned claims and detecting stalled phases, are skipped for that tick.
+  A blind tick reads as "every agent died at once", and acting on it would
+  release every claim in the range. See
+  [docs/PUMP-MECHANISMS.md §2](docs/PUMP-MECHANISMS.md#2-liveness-from-process-state-never-task-status).
+
+  The monitor, cleanup and both watchdogs are read-only observers and keep
+  scraping for now; delegation is opted into per caller, not per config key.
+
+- **`runners/local` — a shipped process runner.** Drives agents as plain host
+  processes: no image, no daemon, nothing to install. Two knobs
+  (`TASKPUMP_RUNNER`, `TASKPUMP_LOCAL_AGENT_CMD`) and a consumer with no
+  container runtime can run a drain. Implements all three verbs; `launch`
+  refuses to start a second agent under a live name.
+
+  **It sandboxes nothing** — the agent runs with your full host permissions.
+  Every guarantee in [RUNNERS.md §4](docs/RUNNERS.md#4-the-claude-docker-reference-runner)
+  belongs to the container runner and none of them apply. See
+  [RUNNERS.md §3](docs/RUNNERS.md#3-runnerslocal--the-process-runner).
+
+  Liveness is tracked through a registry of `<name> <pgid>` pairs, keyed on the
+  process *group* so an agent's children die with it, and read from process
+  *state* so a zombie is not mistaken for a live agent — `kill -0` succeeds on
+  one, and an orphaned agent under a container's non-reaping PID 1 stays a
+  zombie forever.
+
 ## 0.1.0 — 2026-08-13
 
 The extraction of TaskPump from Arachne, and its generalization into a tool any
@@ -222,7 +334,8 @@ these for finished:
 - Liveness enumeration matches on a container-name prefix rather than asking the
   runner, so a runner must name its agents `<prefix><branch-slug>`. A
   `runner.sh list` verb is the v2 fix (see
-  [docs/RUNNERS.md §1.3](docs/RUNNERS.md#13-what-v1-deliberately-leaves-out)).
+  [docs/RUNNERS.md §1.3](docs/RUNNERS.md#13-list); shipped in Unreleased, with
+  the prefix scrape kept as the fallback).
 - Branch-to-container-name slugging assumes a branch contains at most one `/`;
   a branch name that cannot round-trip the slug confuses liveness enumeration
   instead of being rejected at claim or launch time.

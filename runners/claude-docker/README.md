@@ -12,7 +12,7 @@ byte-identical container behaviour.
 
 | File | Runs | What it is |
 |---|---|---|
-| `runner.sh` | on the host | The pump-facing CLI: `launch`, `stop`. |
+| `runner.sh` | on the host | The pump-facing CLI: `launch`, `stop`, `list`. |
 | `entrypoint.sh` | in the container | The generic in-container half: environment contract, credentials, prompt assembly, the session. Baked into the image. |
 | `preflight-example.sh` | in the container | **Example, not wired.** The project-specific half — firewall, agent settings, smoke test — as a working reference. |
 
@@ -64,16 +64,31 @@ something that is already gone exits 0 with a note on stderr, so a supervisor
 tearing down does not have to race `docker ps` to find out whether it still has
 work to do. Any other `docker stop` failure exits non-zero.
 
-### Not in v1: liveness
+### `runner.sh list`
 
-"Is this phase still running?" stays in `lib/pump-lib.sh` (`apl_live_branches`),
-which asks `docker ps` once. Liveness is a *fleet* question — the pump asks it
-about every phase at once, every tick — while launch and stop are per-container.
-Routing the fleet query through a per-container CLI would mean N subprocesses per
-tick to answer what one `docker ps` already answers, and the pump's most
-important safety property (never double-launch a live container) would come to
-depend on a fan-out loop rather than a single atomic snapshot. A second runner
-will need a liveness verb; v1 is honest that it does not have one.
+Prints the name of every live agent container, one per line, exit 0. This is the
+v2 liveness verb ([docs/RUNNERS.md §1.3](../../docs/RUNNERS.md#13-list)).
+
+| Condition | Exit | Output |
+|---|---|---|
+| Agents are live | `0` | one name per line |
+| No agents are live | `0` | nothing — not a blank line |
+| `docker` unreachable | non-zero | one line on stderr |
+
+Its only input is the name prefix to enumerate: `TP_AGENT_PREFIX`, or the shared
+`TASKPUMP_AGENT_PREFIX` / `ARACHNE_AGENT_PREFIX`, default `tp-agent-`. Nothing
+launch-shaped — the pump calls this once per tick with no task in hand.
+
+Liveness is a *fleet* question — asked about every phase at once, every tick —
+while launch and stop are per-container. That is why `list` is one call
+returning the whole snapshot rather than a per-container `is-alive`: the latter
+would mean N subprocesses per tick to answer what one `docker ps` answers, and
+the pump's most important safety property (never double-launch a live container)
+would come to depend on a fan-out loop rather than a single atomic snapshot.
+
+The enumeration is sourced from `lib/pump-lib.sh`, not re-spelled here, so
+`list` and the pump's own prefix scrape cannot answer differently. It refuses to
+guess: an unreachable runtime is never reported as an empty fleet.
 
 ### The mount set
 
@@ -271,6 +286,10 @@ consumer that has not written one.
   launch line**, normalized for paths, plus separate assertions for each
   invariant the line encodes so a failure says which one broke. Recording stubs
   cover `stop` and the failure paths.
+- `tests/test-tp-runner-stop.sh` and `tests/test-tp-runner-list.sh` hold the two
+  fleet-facing verbs to their contracts against a stubbed runtime: `stop`'s
+  idempotence over both "already gone" conditions, and `list`'s three-way split
+  between a populated fleet, an empty one, and a runtime it cannot reach.
 - `entrypoint.sh` exposes two test seams. `TASKPUMP_ENTRYPOINT_TEST_MODE=plan`
   resolves the environment, assembles the prompt, prints a `REPORT` block and
   exits — no credentials, no firewall, no session. `=preflight` additionally
