@@ -143,6 +143,34 @@ tp pump --phases T1..T9 --jobs 2      # drain, staying under two concurrent agen
 it is the cheapest way to find out that a phase you expected to start is gated on
 something you forgot.
 
+The dispatch unit is the **phase** by default: one workspace per phase, whose
+agent drains that phase serially while phases fan out in parallel. When a phase
+holds long independent siblings — or when your range is a single phase — that
+serializes work the jobs cap had room for, and `--grain task` dispatches each
+eligible task on its own branch instead:
+
+```bash
+tp pump --phases T3 --grain task --jobs 3 --dry-run
+```
+
+The same plan, one line per task (`LAUNCH T3.4 -> feat/t3.4`). Two tasks run
+concurrently only when their declared `files:` sets are disjoint — an overlap
+waits and the plan names the path, and a task that declares no files at all runs
+alone, because an unknown footprint must not be scheduled as an empty one. So fill
+in `files:` before reaching for this grain. Everything else is unchanged: the same
+gates, the same jobs cap, the same resume and deadlock behaviour, one agent per
+branch. See [docs/PUMP-MECHANISMS.md §1](docs/PUMP-MECHANISMS.md).
+
+Pick the grain before you start, not during: a claim belongs to the branch that
+took it, and the two grains derive different branches (`feat/t3` vs `feat/t3.4`).
+Restarting a range at the other grain leaves any in-flight claim stranded, since
+neither the reclaim nor the resume pass will touch a branch this run's naming
+scheme does not own. The plan says so every tick — `WAITING T3.4 (claimed by
+feat/t3, no live container)` — and if other open work remains the run reaches its
+deadlock exit (3). But if that claim is the *last* thing in the range, `ready
+--count` sees no `open` task and the run reports the range **drained**. Finish or
+`tp task release` an in-flight claim before changing grain.
+
 ### 6. Watch
 
 ```bash

@@ -7,9 +7,13 @@
 #   * Queue = the live eligible frontier, recomputed every tick from `blockers:`
 #     via `tp task ready --phases A..B`. Newly-unblocked tasks enter
 #     automatically — this is "keep acquiring".
-#   * Dispatch grain = phase: each phase with eligible work gets a worktree that
-#     drains its own sub-tree serially via the in-context `tp task next --phase`
-#     loop; phases fan out in parallel.
+#   * Dispatch grain = phase by default: each phase with eligible work gets a
+#     worktree that drains its own sub-tree serially via the in-context
+#     `tp task next --phase` loop; phases fan out in parallel. --grain task
+#     dispatches each eligible TASK instead — one worktree, branch and agent per
+#     task — for long independent siblings or a single-phase range. Two tasks run
+#     concurrently only when their declared `files:` are disjoint; an undeclared
+#     footprint is exclusive, so it runs alone.
 #   * Liveness from the container runtime, never task status: a parked epic
 #     (in_progress, dead container) auto-resumes; a live one is never
 #     double-launched.
@@ -27,6 +31,7 @@
 #
 # Usage:
 #   tp pump --phases F55..F63 --jobs 4 --usage-ceiling 95 --grain phase
+#   tp pump --phases F55 --grain task --jobs 3   # one agent per eligible task
 #   tp pump --phases F55..F63 --dry-run     # print the plan, launch nothing
 #   tp pump --phases F64 --list             # one planning pass, then exit
 #   tp pump --phases F64 --once             # one REAL tick (scrub+gate+launch), exit
@@ -192,7 +197,7 @@ else
 fi
 
 # Worktrees base — overridable so the reclaim sweep / launcher can be unit-tested
-# against a fixture tree (single source for both launch_phase and reclaim).
+# against a fixture tree (single source for both launch_unit and reclaim).
 WORKTREES_DIR="${TASKPUMP_PUMP_WORKTREES_DIR:-${TASKPUMP_WORKTREES_DIR:-$REPO_ROOT/.worktrees}}"
 
 # What the templates say about this project. Arachne's wording survives through
@@ -269,6 +274,11 @@ QUARANTINE_FILE="${TASKPUMP_PUMP_QUARANTINE_FILE:-$STATE_DIR/.auto-trunk-quarant
 # there is no built-in fallback (G1.7 retired the cargo one).
 RECLAIM_CMD="${TASKPUMP_RECLAIM_CMD:-}"
 MAX_TURNS="${TASKPUMP_MAX_TURNS:-${MAX_TURNS:-600}}"
+# The turn budget a --grain task container gets. The phase default is sized for
+# a container that drains a whole sub-tree over hours; a session that claims one
+# task, finishes it and exits does not need it, and a budget far larger than the
+# work is a cost ceiling that never binds.
+TASK_MAX_TURNS="${TASKPUMP_TASK_MAX_TURNS:-120}"
 AGENT_MODEL="${TASKPUMP_AGENT_MODEL:-${AGENT_MODEL:-opus}}"
 # ── Stalled-claim auto-resume (2026-08-05) ───────────────────────────────────
 # A phase starved solely by its own orphaned-but-committed claim is relaunched
@@ -371,8 +381,8 @@ usage() { apl_help "$0"; }
   A drained range and a missing ledger must not look alike, so this is an
   error instead. \`tp task resolve --all\` prints how resolution answered."
 case "$GRAIN" in
-  phase) ;;
-  task|chain) die "grain '$GRAIN' is not implemented yet; only --grain phase is supported (SPEC_GAP: D4 task/chain grains deferred)";;
+  phase|task) ;;
+  chain) die "grain '$GRAIN' is not implemented yet; only --grain phase and --grain task are supported (SPEC_GAP: D4 chain grain deferred)";;
   *) die "unknown grain '$GRAIN' (phase|task|chain)";;
 esac
 
@@ -436,6 +446,31 @@ tasks_dir_rel() {
 phase_branch()    { printf '%s%s' "$BRANCH_PREFIX" "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"; }
 branch_slug()     { printf '%s' "${1//\//-}"; }
 phase_container() { printf '%s%s' "$(apl_agent_prefix)" "$(branch_slug "$(phase_branch "$1")")"; }
+
+# ── The dispatch UNIT (issue #11) ─────────────────────────────────────────────
+# A unit is what this run launches: a PHASE at --grain phase, a TASK at --grain
+# task. Everything downstream — the plan arrays, the launcher, the resume path,
+# the trunk reconciler — is written in units, so the two grains share one set of
+# mechanisms rather than growing a second, quietly-divergent code path.
+#
+# The branch map is the SAME map at either grain: prefix + the lowercased token,
+# so "G3" → feat/g3 and "G3.4" → feat/g3.4. That matters more than it looks. The
+# agent name is the branch with "/" → "-" (docs/RUNNERS.md §2), and liveness is
+# read back out of those names — so a unit token whose branch cannot round-trip
+# is an agent the pump cannot see, which is how you get two agents on one branch.
+# `.` is legal in both a git ref and a container name, so a task id rides through
+# unchanged; validate_unit_names below refuses at tick zero anything that does
+# not, INCLUDING two units whose branches slug to the same name.
+unit_branch()    { phase_branch "$1"; }
+unit_container() { phase_container "$1"; }
+# The phase a unit belongs to: itself at phase grain, the id's phase at task
+# grain. What the brief, the goal note, and the runner hand-off call TP_PHASE.
+unit_phase()     { [[ "$GRAIN" == "task" ]] && printf '%s' "${1%%.*}" || printf '%s' "$1"; }
+# The branch a claim on <task id> would carry if THIS pump owned it. The
+# ownership test every absence-driven pass makes before it touches a claim.
+task_owner_branch() {
+  if [[ "$GRAIN" == "task" ]]; then unit_branch "$1"; else phase_branch "${1%%.*}"; fi
+}
 # Host worktree the integration trunk is checked out into (A3): auto/trunk →
 # <worktrees>/auto-trunk, sharing the configurable worktrees base with phases.
 trunk_worktree()  { printf '%s/%s' "$WORKTREES_DIR" "$(branch_slug "$INTEGRATION_TRUNK")"; }
@@ -458,6 +493,10 @@ this run constructs that branch from TASKPUMP_BRANCH_PREFIX='$BRANCH_PREFIX'
 that mapping has to be reversible — see docs/RUNNERS.md section 2."
 fi
 unset _pump_all_phases _pump_probe_branch _pump_branch_problem
+# The task-grain half of the same check runs later (validate_unit_names), once
+# the ledger readers below are defined: at task grain the units are task IDS, so
+# what has to be reversible is a property of the ledger's contents, not of the
+# prefix alone.
 # pump_in_list <needle> <space-separated-haystack> — membership test for the
 # dry-run integration stubs (STUB_INTEGRATE_*).
 pump_in_list() {
@@ -496,6 +535,10 @@ phase_live() {
   done < <(apl_live_agents)
   return 1
 }
+# The same question about a dispatch unit. Identical at phase grain; at task
+# grain it asks about the task's own branch container, which is what makes
+# "never double-launch" (mechanism 2) hold per task instead of per phase.
+unit_live() { phase_live "$1"; }
 
 # ── Liveness that is safe to act on ───────────────────────────────────────────
 # Two passes below do something IRREVERSIBLE on the strength of an agent being
@@ -530,6 +573,200 @@ phase_lead_task() {
   "$TASK_BIN" ready --phase "$1" --json 2>/dev/null | jq -r '.[0].id // empty' 2>/dev/null
 }
 
+# The task a unit's container is pointed at: the phase's lead task at phase
+# grain, the unit itself at task grain (a task unit IS its own lead).
+unit_lead_task() {
+  if [[ "$GRAIN" == "task" ]]; then printf '%s' "$1"; return 0; fi
+  phase_lead_task "$1"
+}
+
+# ── The task-grain ledger snapshot (issue #11) ────────────────────────────────
+# At task grain the pump classifies every TASK in range, which needs per-task
+# status, claimant, blockers and declared `files:` footprint — for tasks the
+# eligible frontier deliberately excludes (a claimed one, a blocked one) as much
+# as for the ones it includes. `list --json` is the one read that answers all of
+# it; `ready --json` answers eligibility, because the eligibility predicate is
+# the ledger's to own and must never be re-implemented here.
+#
+# Refreshed once per planning pass, in the MAIN shell — associative arrays set
+# inside a `$( )` or a pipeline would not survive.
+declare -A TSNAP_STATUS TSNAP_CLAIMED TSNAP_FILES TSNAP_BLOCKERS TSNAP_ELIGIBLE
+declare -a TSNAP_IDS
+TSNAP_LOADED=0
+load_task_snapshot() {
+  TSNAP_STATUS=(); TSNAP_CLAIMED=(); TSNAP_FILES=(); TSNAP_BLOCKERS=()
+  TSNAP_ELIGIBLE=(); TSNAP_IDS=()
+  local -A in_range=()
+  local p
+  while IFS= read -r p; do [[ -n "$p" ]] && in_range["$p"]=1; done < <(pump_expand_phases "$PHASES")
+
+  # One record per line: id, status, claimant, the files list, the blockers
+  # list — fields separated by ASCII RS, the files list packed with ASCII US.
+  #
+  # Neither separator is a tab, and that is not fussiness. Tab is IFS
+  # WHITESPACE, so `read` collapses a run of them into one delimiter: a task
+  # with no claimant emits two adjacent tabs, and every field after it shifts
+  # left — the files of the NEXT task read as this one's claimant. A control
+  # character that is not whitespace preserves empty fields, and neither can
+  # appear in an id, a status, a branch name or a path.
+  local id status claimed files blockers
+  while IFS=$'\x1e' read -r id status claimed files blockers; do
+    [[ -z "$id" ]] && continue
+    [[ -n "${in_range[${id%%.*}]:-}" ]] || continue
+    TSNAP_STATUS["$id"]="$status"
+    TSNAP_CLAIMED["$id"]="$claimed"
+    TSNAP_FILES["$id"]="$files"
+    TSNAP_BLOCKERS["$id"]="$blockers"
+    TSNAP_IDS+=("$id")
+  done < <("$TASK_BIN" list --json 2>/dev/null \
+           | jq -r '.[] | [.id, .status, (.claimed_by // ""),
+                           (.files | join("\u001f")), (.blockers | join(" "))]
+                 | join("\u001e")' 2>/dev/null)
+
+  while IFS= read -r id; do
+    [[ -n "$id" ]] && TSNAP_ELIGIBLE["$id"]=1
+  done < <("$TASK_BIN" ready --phases "$PHASES" --json 2>/dev/null | jq -r '.[].id' 2>/dev/null)
+  TSNAP_LOADED=1
+}
+
+# task_files <id> — the task's declared footprint, one path per line.
+task_files() {
+  local blob="${TSNAP_FILES[$1]:-}"
+  [[ -n "$blob" ]] && printf '%s\n' "${blob//$'\x1f'/$'\n'}"
+  return 0
+}
+
+# task_files_inline <id> — the same footprint as one backticked, comma-separated
+# phrase for the brief. Empty when the task declares nothing, which is what the
+# template's undeclared section keys off.
+task_files_inline() {
+  local out="" f
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    out+="${out:+, }\`$f\`"
+  done < <(task_files "$1")
+  printf '%s' "$out"
+}
+
+# ── Conflict scheduling at task grain (issue #11) ─────────────────────────────
+# Phase grain buys mutual exclusion for free: one branch per phase means sibling
+# tasks that rewrite the same file never collide, because one agent does them in
+# sequence. Task grain gives that up, so the exclusion has to become an explicit,
+# inspectable RULE instead of a side effect — otherwise the grain's whole benefit
+# is paid straight back as merge conflicts nobody predicted.
+#
+# The rule: two tasks may run concurrently only when their declared `files:` sets
+# are disjoint. Overlap is a hold, exactly like a pending blocker, and the plan
+# names the task and the path so the operator can see the schedule before it runs.
+#
+# An EMPTY `files:` is exclusive, not permissive (operator decision, 2026-08-13).
+# An empty footprint means "unknown", and treating unknown as "touches nothing"
+# is precisely the silent-wrong-answer shape this project exists to refuse: it
+# would schedule two agents onto the same files and report a clean plan. So an
+# undeclared task runs alone, and the dry-run says so in as many words. That also
+# makes `files:` load-bearing rather than decorative.
+#
+# unit_files_conflict <candidate> <holder> — the reason the candidate may not run
+# beside the holder, or nothing at all when the two are disjoint.
+unit_files_conflict() {
+  local cand="$1" holder="$2"
+  local fc fh
+  fc="$(task_files "$cand")"
+  fh="$(task_files "$holder")"
+  if [[ -z "$fc" ]]; then
+    printf 'files: empty — exclusive; %s holds the tree' "$holder"; return 0
+  fi
+  if [[ -z "$fh" ]]; then
+    printf '%s declares no files: — exclusive; it holds the tree' "$holder"; return 0
+  fi
+  local overlap
+  overlap="$(comm -12 <(printf '%s\n' "$fc" | sort -u) <(printf '%s\n' "$fh" | sort -u) 2>/dev/null | head -1)"
+  [[ -n "$overlap" ]] && printf 'files overlap with %s: %s' "$holder" "$overlap"
+  return 0
+}
+
+# The units already holding the tree in the tick being planned, in admission
+# order. A module-scope array rather than a `local` one because both admission
+# passes below consult it through hold_reason, and bash has no clean way to pass
+# an array to a function. compute_plan_task resets it.
+declare -a PLAN_HOLDERS=()
+
+# hold_reason <candidate> — the first reason the candidate may not be dispatched
+# beside what already holds the tree, or nothing when it is free to go. Every
+# unit the pump will START this tick must pass this, RESUME included: a resumed
+# container is as real as a launched one.
+hold_reason() {
+  local cand="$1" h reason
+  for h in "${PLAN_HOLDERS[@]:-}"; do
+    [[ -z "$h" ]] && continue
+    reason="$(unit_files_conflict "$cand" "$h")"
+    [[ -n "$reason" ]] && { printf '%s' "$reason"; return 0; }
+  done
+  return 0
+}
+
+# The units a task-grain run dispatches: every task whose phase is in range, in
+# the range's own phase order, numerically within each phase (the ledger's
+# ordering — LEDGER-CONTRACT §6.1 — so the plan reads like `next` would hand the
+# work out).
+tasks_in_range() {
+  (( TSNAP_LOADED )) || load_task_snapshot
+  local p id
+  while IFS= read -r p; do
+    [[ -z "$p" ]] && continue
+    for id in "${TSNAP_IDS[@]:-}"; do
+      [[ -n "$id" && "${id%%.*}" == "$p" ]] && printf '%s\n' "$id"
+    done | sort -V
+  done < <(pump_expand_phases "$PHASES")
+}
+
+# The units this run dispatches, at whatever grain it runs.
+units_in_range() {
+  [[ "$GRAIN" == "task" ]] && { tasks_in_range; return 0; }
+  pump_expand_phases "$PHASES"
+}
+
+# ── Unit-name validation at tick zero (issue #11) ─────────────────────────────
+# The prefix check above proves the CONFIGURATION can name a branch. At task
+# grain the unit tokens come from the ledger, so two more things have to be true
+# of the run's actual contents, and both have to be true BEFORE anything
+# launches:
+#
+#   * every unit branch can carry an agent name (apl_branch_slug_reject_reason);
+#   * no two units slug to the SAME agent name. That is the cardinal failure of
+#     this grain: two tasks whose branches collide means one container name for
+#     two units, so liveness answers "running" for a unit that is not, the pump
+#     launches a second agent onto the first one's branch, and the two overwrite
+#     each other's commits. Phase grain gets this for free (phases are distinct
+#     tokens by construction); task grain has to check, and refuse.
+validate_unit_names() {
+  [[ "$GRAIN" == "task" ]] || return 0
+  (( TSNAP_LOADED )) || load_task_snapshot
+  local -A slug_owner=()
+  local unit branch slug problem
+  while IFS= read -r unit; do
+    [[ -z "$unit" ]] && continue
+    branch="$(unit_branch "$unit")"
+    if ! problem="$(apl_branch_slug_reject_reason "$branch")"; then
+      die "$problem
+task $unit would be dispatched on that branch (TASKPUMP_BRANCH_PREFIX='$BRANCH_PREFIX'
+plus the task id, at --grain task). The agent name is the branch with \"/\"
+replaced by \"-\", and that mapping has to be reversible — see docs/RUNNERS.md
+section 2."
+    fi
+    slug="$(branch_slug "$branch")"
+    if [[ -n "${slug_owner[$slug]:-}" ]]; then
+      die "tasks ${slug_owner[$slug]} and $unit both map to the agent name $(apl_agent_prefix)$slug.
+At --grain task each task is its own branch and its own agent, and liveness is
+read back out of agent names — so two tasks sharing a name means the pump cannot
+tell their containers apart, and would launch a second agent onto a branch that
+already has one. Rename one of the tasks, or run this range at --grain phase."
+    fi
+    slug_owner["$slug"]="$unit"
+  done < <(units_in_range)
+  return 0
+}
+
 # ── Liveness-based reclaim (D3 applied to the eligibility path) ─────────────────
 # A task left `in_progress` by a DEAD container (no live `arachne-agent` for its
 # claimed branch) silently starves the frontier: `ready` excludes claimed tasks,
@@ -558,9 +795,10 @@ reclaim_orphaned_claims() {
     [[ "$id" == "ID" || "$status" != "in_progress" ]] && continue
     [[ -z "$branch" || "$branch" == "-" ]] && continue
     # Only touch claims on a branch this pump's naming scheme owns; skip human
-    # branches and any other claimant.
-    local phase="${id%%.*}"
-    [[ "$branch" == "$(phase_branch "$phase")" ]] || continue
+    # branches and any other claimant. At task grain the owning branch is the
+    # TASK's own (feat/g3.4), so a task-grain claim is recognized as this pump's
+    # and a phase-grain claim keeps working unchanged.
+    [[ "$branch" == "$(task_owner_branch "$id")" ]] || continue
     # Live container for this branch ⇒ a legitimate, in-flight claim. Leave it.
     [[ -n "${live["$(branch_slug "$branch")"]:-}" ]] && continue
     # Orphaned claim. Preserve committed work; only auto-reopen clean orphans.
@@ -624,26 +862,29 @@ detect_stalled_orphans() {
   # "everything died" would put every running phase on the resume path.
   slugs="$(live_slugs)" || return 0
   local s; while IFS= read -r s; do [[ -n "$s" ]] && live["$s"]=1; done <<<"$slugs"
-  local id status branch _rest phase pbranch ahead
+  local id status branch _rest unit pbranch ahead
   while read -r id status branch _rest; do
     [[ "$id" == "ID" ]] && continue
     case "$status" in in_progress|needs-review|stuck) : ;; *) continue;; esac
-    phase="${id%%.*}"
-    pbranch="$(phase_branch "$phase")"
-    # Already handed to a human this run. Without this the phase would re-enter
+    # The UNIT the stalled task belongs to: its phase at phase grain, itself at
+    # task grain. Everything below is unchanged — the resume mechanism is the
+    # same mechanism, asked about a smaller thing.
+    if [[ "$GRAIN" == "task" ]]; then unit="$id"; else unit="${id%%.*}"; fi
+    pbranch="$(unit_branch "$unit")"
+    # Already handed to a human this run. Without this the unit would re-enter
     # PLAN_RESUME every tick, re-run resume-attempt (which returns `escalate`
     # forever once the budget is spent), and re-notify every 30s. Dropping it
     # here is also what lets the deadlock detector below accumulate and exit.
-    [[ -n "${ESCALATED[$phase]:-}" ]] && continue
-    # First (lowest) match per phase wins; one container drains one phase.
-    [[ -n "${STALL_TASK[$phase]:-}" ]] && continue
+    [[ -n "${ESCALATED[$unit]:-}" ]] && continue
+    # First (lowest) match per unit wins; one container drains one unit.
+    [[ -n "${STALL_TASK[$unit]:-}" ]] && continue
     [[ "$status" == "in_progress" && "$branch" != "$pbranch" ]] && continue
     [[ -n "${live["$(branch_slug "$pbranch")"]:-}" ]] && continue
     git -C "$REPO_ROOT" rev-parse --verify "refs/heads/$pbranch" >/dev/null 2>&1 || continue
     ahead="$(git -C "$REPO_ROOT" rev-list --count "$BASE_REF..$pbranch" 2>/dev/null || echo 0)"
     [[ "$ahead" -gt 0 ]] || continue
-    STALL_TASK["$phase"]="$id"
-    STALL_STATUS["$phase"]="$status"
+    STALL_TASK["$unit"]="$id"
+    STALL_STATUS["$unit"]="$status"
   done < <("$TASK_BIN" list 2>/dev/null)
   return 0
 }
@@ -818,6 +1059,44 @@ phase_deps_integrated() {
   return 0
 }
 
+# ── The same two questions, asked about a unit ────────────────────────────────
+# unit_cross_blockers <unit> — the upstream units whose code this one is built
+# on. At phase grain that is phase_cross_blockers (in-phase edges are the
+# in-context loop's serial concern). At task grain EVERY blocker is a different
+# unit — the free serialization inside a phase is exactly what this grain gives
+# up — so all of them count, and each maps to its own branch.
+unit_cross_blockers() {
+  if [[ "$GRAIN" != "task" ]]; then phase_cross_blockers "$1"; return; fi
+  (( TSNAP_LOADED )) || load_task_snapshot
+  local b
+  for b in ${TSNAP_BLOCKERS[$1]:-}; do
+    [[ -n "$b" ]] && printf '%s\n' "$b"
+  done
+}
+
+# unit_deps_integrated <unit> — is every upstream unit's CODE already on the
+# trunk this one would be cut from? A blocker with NO branch in this repository
+# is treated as integrated: at task grain the blocker set reaches back to work
+# that landed long before this run (and never had a pump branch), and holding a
+# unit forever behind a branch that will never exist is a stall, not a safeguard.
+unit_deps_integrated() {
+  # `return`, not `return 0`: this is a PREDICATE, and swallowing the delegate's
+  # answer would report every phase's dependencies integrated.
+  if [[ "$GRAIN" != "task" ]]; then phase_deps_integrated "$1"; return; fi
+  local unit="$1" dp dbranch
+  while IFS= read -r dp; do
+    [[ -z "$dp" ]] && continue
+    dbranch="$(unit_branch "$dp")"
+    if [[ -n "${STUB_INTEGRATED+x}" ]]; then
+      pump_in_list "$dp" "$STUB_INTEGRATED" || return 1
+    else
+      git -C "$REPO_ROOT" rev-parse --verify "refs/heads/$dbranch" >/dev/null 2>&1 || continue
+      apl_phase_integrated "$REPO_ROOT" "$dbranch" "$INTEGRATION_TRUNK" || return 1
+    fi
+  done < <(unit_cross_blockers "$unit")
+  return 0
+}
+
 # phase_dependencies <FN> — emit a markdown "Depends on / builds upon" block
 # naming this phase's CROSS-PHASE blockers, each resolved to branch / integration
 # state / draft PR, so the launched agent learns its lineage instead of
@@ -827,18 +1106,27 @@ phase_deps_integrated() {
 phase_dependencies() {
   local phase="$1"
   local deps=() dp
-  while IFS= read -r dp; do [[ -n "$dp" ]] && deps+=("$dp"); done < <(phase_cross_blockers "$phase")
+  while IFS= read -r dp; do [[ -n "$dp" ]] && deps+=("$dp"); done < <(unit_cross_blockers "$phase")
 
   if (( ${#deps[@]} == 0 )); then
-    printf 'No cross-phase dependencies.\n'
+    if [[ "$GRAIN" == "task" ]]; then
+      printf 'No blockers — nothing upstream is pending for this task.\n'
+    else
+      printf 'No cross-phase dependencies.\n'
+    fi
     return 0
   fi
 
-  printf 'This phase builds upon work from other phases. Their code is integrated\n'
-  printf 'into the `%s` branch you are based on — do not re-derive it:\n\n' "$INTEGRATION_TRUNK"
+  if [[ "$GRAIN" == "task" ]]; then
+    printf 'This task builds upon work from other tasks. Their code is integrated\n'
+    printf 'into the `%s` branch you are based on — do not re-derive it:\n\n' "$INTEGRATION_TRUNK"
+  else
+    printf 'This phase builds upon work from other phases. Their code is integrated\n'
+    printf 'into the `%s` branch you are based on — do not re-derive it:\n\n' "$INTEGRATION_TRUNK"
+  fi
   local dp dbranch dstate dpr
   for dp in "${deps[@]}"; do
-    dbranch="$(phase_branch "$dp")"
+    dbranch="$(unit_branch "$dp")"
     if apl_phase_integrated "$REPO_ROOT" "$dbranch" "$INTEGRATION_TRUNK"; then
       dstate="integrated @ $(git -C "$REPO_ROOT" rev-parse --short "$dbranch" 2>/dev/null || echo '?')"
     elif git -C "$REPO_ROOT" rev-parse --verify "refs/heads/$dbranch" >/dev/null 2>&1; then
@@ -865,7 +1153,26 @@ resolve_brief_template() {
   [[ -f "$consumer" ]] && { printf '%s' "$consumer"; return 0; }
   printf '%s' "$TP_ROOT/templates/phase-drain-brief.md"
 }
-BRIEF_TEMPLATE="$(resolve_brief_template)"
+
+# The task-grain brief resolves the same three ways. It is a DIFFERENT template,
+# not a re-parameterized phase brief, and the difference is load-bearing: the
+# phase brief's whole working method is the in-context `next --phase` loop, and
+# an agent running that at task grain would claim its siblings — the very tasks
+# the pump has just dispatched to other containers. Two agents, one task. So the
+# task brief claims exactly the one task it was launched for, finishes it, and
+# exits; acquisition belongs to the pump at this grain.
+resolve_task_brief_template() {
+  local explicit="${TASKPUMP_TASK_BRIEF_TEMPLATE:-}"
+  [[ -n "$explicit" ]] && { printf '%s' "$explicit"; return 0; }
+  local consumer="$OPS_DIR/task-loop/briefs/_task-template.md"
+  [[ -f "$consumer" ]] && { printf '%s' "$consumer"; return 0; }
+  printf '%s' "$TP_ROOT/templates/task-brief.md"
+}
+if [[ "$GRAIN" == "task" ]]; then
+  BRIEF_TEMPLATE="$(resolve_task_brief_template)"
+else
+  BRIEF_TEMPLATE="$(resolve_brief_template)"
+fi
 
 # The resume note resolves the same three ways, for the same reason: a consumer
 # whose agents depend on particular wording keeps it in its own ledger, while
@@ -883,6 +1190,12 @@ RESUME_TEMPLATE="$(resolve_resume_template)"
 # Only reachable when the resolved template is genuinely absent — an explicit
 # TASKPUMP_BRIEF_TEMPLATE pointing nowhere, or a broken install.
 missing_brief_template_msg() {
+  if [[ "$GRAIN" == "task" ]]; then
+    printf 'task brief template not found: %s\n' "$BRIEF_TEMPLATE"
+    printf '  looked at: $TASKPUMP_TASK_BRIEF_TEMPLATE, then %s/task-loop/briefs/_task-template.md,\n' "$OPS_DIR"
+    printf '  then the one shipped at %s/templates/task-brief.md\n' "$TP_ROOT"
+    return 0
+  fi
   printf 'phase-drain brief template not found: %s\n' "$BRIEF_TEMPLATE"
   printf '  looked at: $TASKPUMP_BRIEF_TEMPLATE, then %s/task-loop/briefs/_phase-drain-template.md,\n' "$OPS_DIR"
   printf '  then the one shipped at %s/templates/phase-drain-brief.md\n' "$TP_ROOT"
@@ -896,12 +1209,31 @@ missing_brief_template_msg() {
 # block (awk by literal `index()` — avoids multi-line inline sed and the awk
 # brace-interval pitfall).
 render_brief_stream() {
-  local phase="$1"
+  local unit="$1"
+  local phase; phase="$(unit_phase "$unit")"
+  # Empty at phase grain, where the container acquires its own tasks; the task
+  # brief's every mention of "your task" resolves through this.
+  local task_id=""
+  [[ "$GRAIN" == "task" ]] && task_id="$unit"
+  # The declared footprint, and its absence, as two mutually-exclusive template
+  # conditions. The brief cannot say one thing about both: "the pump scheduled
+  # you concurrently BECAUSE those sets are disjoint" is false for a task with
+  # `files: []`, which was scheduled EXCLUSIVELY, precisely because it declared
+  # nothing. Empty at phase grain, where neither section exists in the template.
+  local task_files_line="" task_files_undeclared=""
+  if [[ "$GRAIN" == "task" ]]; then
+    (( TSNAP_LOADED )) || load_task_snapshot
+    task_files_line="$(task_files_inline "$unit")"
+    [[ -z "$task_files_line" ]] && task_files_undeclared="yes"
+  fi
   local depfile; depfile="$(mktemp)"
-  phase_dependencies "$phase" >| "$depfile"
+  phase_dependencies "$unit" >| "$depfile"
   local -A TPL_VARS TPL_BLOCKS
   TPL_VARS=(
     [PHASE]="$phase"
+    [TASK_ID]="$task_id"
+    [TASK_FILES]="$task_files_line"
+    [TASK_FILES_UNDECLARED]="$task_files_undeclared"
     [BASE]="$BASE_REF"
     [TASK_CLI]="$TASK_CLI"
     [TASK_CLI_NAME]="$TASK_CLI_NAME"
@@ -915,15 +1247,15 @@ render_brief_stream() {
   rm -f "$depfile" 2>/dev/null || true
 }
 
-# render_brief <phase> — write the rendered brief to a transient per-phase file
+# render_brief <unit> — write the rendered brief to a transient per-unit file
 # and echo its path (the launcher passes the path to the container).
 render_brief() {
-  local phase="$1"
+  local unit="$1"
   [[ -f "$BRIEF_TEMPLATE" ]] || die "$(missing_brief_template_msg)"
   local out
-  out="$WORKTREES_DIR/$(phase_branch "$phase")/$BRIEF_OUT_NAME"
+  out="$WORKTREES_DIR/$(unit_branch "$unit")/$BRIEF_OUT_NAME"
   mkdir -p "$(dirname "$out")" 2>/dev/null || true
-  render_brief_stream "$phase" >| "$out"
+  render_brief_stream "$unit" >| "$out"
   printf '%s' "$out"
 }
 
@@ -987,73 +1319,76 @@ write_resume_note() {
 }
 
 # Give up on a stalled task and hand it to a human. Uses `needs-review` (the
-# sanctioned quarantine status, same as quarantine_phase) rather than `block`,
+# sanctioned quarantine status, same as quarantine_unit) rather than `block`,
 # which means "external dependency". `reopen` now accepts needs-review, so this
 # is a door the operator can walk back through.
 escalate_stalled() {
-  local phase="$1" id="$2" verdict="$3"
-  ESCALATED["$phase"]=1
+  local unit="$1" id="$2" verdict="$3"
+  ESCALATED["$unit"]=1
   "$TASK_BIN" needs-review "$id" \
-    --reason "Pump auto-resume exhausted: $RESUME_MAX resume attempts made no new commits on $(phase_branch "$phase"). Needs a human to finish, split, or block it." \
+    --reason "Pump auto-resume exhausted: $RESUME_MAX resume attempts made no new commits on $(unit_branch "$unit"). Needs a human to finish, split, or block it." \
     >/dev/null 2>&1 \
     || warn "escalate $id: needs-review failed"
-  pump_notify "$phase STALLED on $id — $verdict, no progress across $RESUME_MAX auto-resumes. Marked needs-review; finish, split, or block it by hand."
+  pump_notify "$unit STALLED on $id — $verdict, no progress across $RESUME_MAX auto-resumes. Marked needs-review; finish, split, or block it by hand."
 }
 
-# Relaunch a starved phase to continue its orphaned task.
-resume_phase() {
-  local phase="$1"
-  local id="${STALL_TASK[$phase]:-}"
+# Relaunch a starved unit to continue its orphaned task. Identical at either
+# grain: the bound, the reopen, the note and the relaunch are one mechanism
+# (docs/PUMP-MECHANISMS.md §4) asked about a phase or about a single task.
+resume_unit() {
+  local unit="$1"
+  local id="${STALL_TASK[$unit]:-}"
   [[ -n "$id" ]] || return 1
-  local branch; branch="$(phase_branch "$phase")"
+  local branch; branch="$(unit_branch "$unit")"
   local head; head="$(git -C "$REPO_ROOT" rev-parse "$branch" 2>/dev/null || true)"
-  [[ -n "$head" ]] || { warn "resume $phase: cannot resolve head of $branch"; return 1; }
+  [[ -n "$head" ]] || { warn "resume $unit: cannot resolve head of $branch"; return 1; }
 
-  # Bookkeep the attempt HERE rather than inside launch_phase: a phase that is
+  # Bookkeep the attempt HERE rather than inside launch_unit: a unit that is
   # detected but not launched — pool cap reached, feed gate shut — must not burn
   # an attempt it never got to use.
   local verdict rc=0
   verdict="$("$TASK_BIN" resume-attempt "$id" --head "$head" --max "$RESUME_MAX" 2>/dev/null)" || rc=$?
   if (( rc == 10 )); then
-    escalate_stalled "$phase" "$id" "$verdict"
+    escalate_stalled "$unit" "$id" "$verdict"
     return 1
   fi
-  (( rc == 0 )) || { warn "resume $phase: resume-attempt $id failed (rc=$rc)"; return 1; }
+  (( rc == 0 )) || { warn "resume $unit: resume-attempt $id failed (rc=$rc)"; return 1; }
 
   # A scrub-parked task has to come back to `open` before the container's
   # safety-net claim can take it (claim accepts open, or in_progress on the same
   # branch — never needs-review/stuck).
-  local status="${STALL_STATUS[$phase]:-}"
+  local status="${STALL_STATUS[$unit]:-}"
   if [[ "$status" == "needs-review" || "$status" == "stuck" ]]; then
     "$TASK_BIN" reopen "$id" \
       --reason "Pump auto-resume ($verdict): committed work on $branch, container dead; relaunching to continue." \
-      >/dev/null 2>&1 || { warn "resume $phase: reopen $id failed"; return 1; }
+      >/dev/null 2>&1 || { warn "resume $unit: reopen $id failed"; return 1; }
   fi
 
-  log "resuming $phase task $id ($verdict, was $status, head $(printf '%s' "$head" | cut -c1-12))"
+  log "resuming $unit task $id ($verdict, was $status, head $(printf '%s' "$head" | cut -c1-12))"
   RESUME_TASK_ID="$id"
   local lrc=0
-  launch_phase "$phase" || lrc=$?
+  launch_unit "$unit" || lrc=$?
   RESUME_TASK_ID=""
   return "$lrc"
 }
 
-launch_phase() {
-  local phase="$1"
+launch_unit() {
+  local unit="$1"
+  local phase; phase="$(unit_phase "$unit")"
   # Test/maintenance hook: tick through the gate + plan + state logic without
   # materialising worktrees or containers.
   if [[ "${TASKPUMP_PUMP_NO_LAUNCH:-0}" -eq 1 ]]; then
     if [[ -n "$RESUME_TASK_ID" ]]; then
-      log "would launch $phase -> $(phase_branch "$phase") (NO_LAUNCH, resume $RESUME_TASK_ID)"
+      log "would launch $unit -> $(unit_branch "$unit") (NO_LAUNCH, resume $RESUME_TASK_ID)"
     else
-      log "would launch $phase -> $(phase_branch "$phase") (NO_LAUNCH)"
+      log "would launch $unit -> $(unit_branch "$unit") (NO_LAUNCH)"
     fi
     return 0
   fi
-  local branch; branch="$(phase_branch "$phase")"
+  local branch; branch="$(unit_branch "$unit")"
   local wt="$WORKTREES_DIR/$branch"
-  local cname; cname="$(phase_container "$phase")"
-  # A resumed phase names its own task. phase_lead_task reads the *eligible*
+  local cname; cname="$(unit_container "$unit")"
+  # A resumed unit names its own task. unit_lead_task reads the *eligible*
   # frontier, which by definition excludes the claimed task that stalled us, so
   # it would hand back an empty id — and the entrypoint skips its safety-net
   # claim + heartbeat entirely when ARACHNE_TASK_ID is empty. That empty-lead
@@ -1063,8 +1398,13 @@ launch_phase() {
   if [[ -n "$RESUME_TASK_ID" ]]; then
     lead="$RESUME_TASK_ID"
   else
-    lead="$(phase_lead_task "$phase")"
+    lead="$(unit_lead_task "$unit")"
   fi
+  # A task-grain session is one task, not a multi-task phase drain, so it gets
+  # its own (much smaller) turn budget: the phase default exists to let one
+  # container work a whole sub-tree for hours.
+  local turns="$MAX_TURNS"
+  [[ "$GRAIN" == "task" ]] && turns="$TASK_MAX_TURNS"
 
   # Materialise the worktree (idempotent). Create the branch from BASE_REF if new.
   if [[ ! -d "$wt" ]]; then
@@ -1085,7 +1425,7 @@ launch_phase() {
     # greps this file for the volume-flag-then-quoted-path spelling and cannot
     # tell git's verbose flag from a docker mount without it.
     ign_src="$(git -C "$REPO_ROOT" check-ignore -v -- "$wt" 2>/dev/null | head -1)"
-    warn "worktree still gitignored: $wt (deciding pattern: ${ign_src:-unknown}) — skipping $phase"
+    warn "worktree still gitignored: $wt (deciding pattern: ${ign_src:-unknown}) — skipping $unit"
     return 1
   fi
 
@@ -1098,13 +1438,13 @@ launch_phase() {
   if [[ "$INTEGRATION" -eq 1 ]] && git -C "$REPO_ROOT" rev-parse --verify "refs/heads/$INTEGRATION_TRUNK" >/dev/null 2>&1; then
     if ! git -C "$wt" merge --no-ff --no-edit "$INTEGRATION_TRUNK" >/dev/null 2>&1; then
       git -C "$wt" merge --abort >/dev/null 2>&1 || true
-      warn "worktree $wt conflicts with $INTEGRATION_TRUNK; skipping launch of $phase"
-      quarantine_phase "$phase" "$(git -C "$wt" rev-parse HEAD 2>/dev/null)" "worktree merge conflict"
+      warn "worktree $wt conflicts with $INTEGRATION_TRUNK; skipping launch of $unit"
+      quarantine_unit "$unit" "$(git -C "$wt" rev-parse HEAD 2>/dev/null)" "worktree merge conflict"
       return 1
     fi
   fi
 
-  local brief; brief="$(render_brief "$phase")"
+  local brief; brief="$(render_brief "$unit")"
   # Resume preamble, prepended by the entrypoint ahead of the brief. A normal
   # launch actively clears a stale note so a later fresh drain of this worktree
   # cannot inherit a previous resume's instructions.
@@ -1143,7 +1483,7 @@ launch_phase() {
     TP_TASK_ID="$lead"                 ARACHNE_TASK_ID="$lead" \
     TP_PHASE="$phase"                  ARACHNE_PHASE="$phase" \
     TP_MODEL="$AGENT_MODEL"            AGENT_MODEL="$AGENT_MODEL" \
-    TP_MAX_TURNS="$MAX_TURNS"          MAX_TURNS="$MAX_TURNS" \
+    TP_MAX_TURNS="$turns"              MAX_TURNS="$turns" \
     TP_REPO_ROOT="$REPO_ROOT"          REPO_ROOT="$REPO_ROOT" \
     TP_BRIEF="$brief"                  ARACHNE_BRIEF="$brief" \
     TP_RESUME_NOTE="$resume_note"      ARACHNE_RESUME_NOTE="$resume_note" \
@@ -1160,10 +1500,10 @@ launch_phase() {
     "$RUNNER" launch
   ) || rc=$?
   if (( rc != 0 )); then
-    warn "runner failed to launch $phase (rc=$rc): $RUNNER"
+    warn "runner failed to launch $unit (rc=$rc): $RUNNER"
     return 1
   fi
-  log "launched $phase -> $cname ($(printf '%s' "$cid" | cut -c1-12))  lead=$lead${RESUME_TASK_ID:+ (RESUME)}  log: $wt/$AGENT_LOG_NAME"
+  log "launched $unit -> $cname ($(printf '%s' "$cid" | cut -c1-12))  lead=$lead${RESUME_TASK_ID:+ (RESUME)}  log: $wt/$AGENT_LOG_NAME"
   return 0
 }
 
@@ -1215,39 +1555,71 @@ run_build_gate_dry() {
   ( eval "$BUILD_GATE_CMD" ) >/dev/null 2>&1
 }
 
-# quarantine_phase <phase> <pre-sha> <reason> — a conflicting or build-red merge
-# does NOT advance the trunk; the phase is flagged needs-review (real run) and a
-# host quarantine marker is appended so a human can reconcile feat/fN later. The
-# un-integrated branch simply stops propagating. Honors the dry-run seam.
-quarantine_phase() {
-  local phase="$1" sha="$2" reason="$3"
-  local lead; lead="$(phase_lead_task "$phase")"
-  [[ -z "$lead" ]] && lead="$phase.0"
-  if [[ "${TASKPUMP_PUMP_INTEGRATE_DRYRUN:-0}" -eq 1 ]]; then
-    log "would quarantine $phase: $reason"
-    log "would needs-review $lead: $reason"
-  else
-    log "quarantine $phase: $reason — not advancing $INTEGRATION_TRUNK; $lead → needs-review"
-    "$TASK_BIN" needs-review "$lead" --reason "auto/trunk integration $reason ($phase)" >/dev/null 2>&1 \
-      || warn "needs-review $lead failed"
-    pump_notify "auto/trunk: quarantined $phase ($reason); $lead flagged needs-review"
-  fi
-  printf '%s %s %s\n' "$phase" "${sha:-?}" "$reason" >> "$QUARANTINE_FILE" 2>/dev/null || true
+# ledger_status <id> — the ledger's current status for one task, or empty when
+# it does not exist. Asked of the CLI rather than of TSNAP because the
+# integration pass runs BEFORE compute_plan (and at phase grain the snapshot is
+# never loaded at all), so the snapshot is either stale by a tick or absent.
+ledger_status() {
+  "$TASK_BIN" list --json 2>/dev/null \
+    | jq -r --arg id "$1" 'map(select(.id == $id)) | .[0].status // ""' 2>/dev/null
 }
 
-# integrate_one_phase <phase> — merge a single quiescent phase branch into the
-# trunk under the merge lock + build gate. Returns 0 always (fail-open).
-integrate_one_phase() {
-  local phase="$1" branch; branch="$(phase_branch "$phase")"
+# quarantine_unit <unit> <pre-sha> <reason> — a conflicting or build-red merge
+# does NOT advance the trunk; the unit is flagged needs-review (real run) and a
+# host quarantine marker is appended so a human can reconcile feat/fN later. The
+# un-integrated branch simply stops propagating. Honors the dry-run seam.
+#
+# A broken MERGE is not broken WORK, and a task that is already `done` is never
+# un-completed here. At task grain unit_lead_task returns the unit ITSELF, so a
+# finished task whose branch conflicts with the trunk used to be flipped to
+# needs-review — whereupon detect_stalled_orphans saw needs-review with commits
+# ahead, resume_unit `reopen`ed it back to `open`, and the pump relaunched an
+# agent onto finished work. That is a silent wrong answer twice over: the ledger
+# claims the work is unfinished, and an agent is told to redo it. The quarantine
+# marker, the log line and the operator page already say what is actually broken
+# — the merge — so the status stays `done`. (adversarial review, 2026-08-14)
+quarantine_unit() {
+  local unit="$1" sha="$2" reason="$3"
+  local lead; lead="$(unit_lead_task "$unit")"
+  [[ -z "$lead" ]] && lead="$unit.0"
+  local lead_status; lead_status="$(ledger_status "$lead")"
+  local dry=0
+  [[ "${TASKPUMP_PUMP_INTEGRATE_DRYRUN:-0}" -eq 1 ]] && dry=1
+  if [[ "$lead_status" == "done" ]]; then
+    if (( dry )); then
+      log "would quarantine $unit: $reason"
+      log "would leave $lead done: the merge is broken, not the work"
+    else
+      log "quarantine $unit: $reason — not advancing $INTEGRATION_TRUNK; $lead stays done (the merge is broken, not the work)"
+      pump_notify "auto/trunk: quarantined $unit ($reason); $lead left done — reconcile the merge by hand"
+    fi
+  elif (( dry )); then
+    log "would quarantine $unit: $reason"
+    log "would needs-review $lead: $reason"
+  else
+    log "quarantine $unit: $reason — not advancing $INTEGRATION_TRUNK; $lead → needs-review"
+    "$TASK_BIN" needs-review "$lead" --reason "auto/trunk integration $reason ($unit)" >/dev/null 2>&1 \
+      || warn "needs-review $lead failed"
+    pump_notify "auto/trunk: quarantined $unit ($reason); $lead flagged needs-review"
+  fi
+  printf '%s %s %s\n' "$unit" "${sha:-?}" "$reason" >> "$QUARANTINE_FILE" 2>/dev/null || true
+}
+
+# integrate_one_unit <unit> — merge a single quiescent unit branch into the
+# trunk under the merge lock + build gate. At task grain that is one task branch
+# per merge, which is the point of the trunk: it absorbs the N-branch merge cost
+# the finer grain creates. Returns 0 always (fail-open).
+integrate_one_unit() {
+  local unit="$1" branch; branch="$(unit_branch "$unit")"
   # Never merge a tree an agent is mid-edit on (decision 3, quiescence proxy).
-  if phase_live "$phase"; then
-    dbg_log "skip integrate $phase: live container (not quiescent)"
+  if unit_live "$unit"; then
+    dbg_log "skip integrate $unit: live container (not quiescent)"
     return 0
   fi
   if [[ "${TASKPUMP_PUMP_INTEGRATE_DRYRUN:-0}" -eq 1 ]]; then
-    integrate_one_phase_dryrun "$phase" "$branch"
+    integrate_one_unit_dryrun "$unit" "$branch"
   else
-    integrate_one_phase_real "$phase" "$branch"
+    integrate_one_unit_real "$unit" "$branch"
   fi
   return 0
 }
@@ -1256,50 +1628,50 @@ integrate_one_phase() {
 # _CONFLICT (space-separated phase lists) drive branch-exists / already-integrated
 # / merge-conflict; BUILD_GATE_CMD drives the gate. Logs would-integrate /
 # would-quarantine lines for the harness to assert.
-integrate_one_phase_dryrun() {
-  local phase="$1"
-  if pump_in_list "$phase" "${STUB_INTEGRATE_NOBRANCH:-}"; then
-    dbg_log "skip integrate $phase: branch absent (stub)"; return 0
+integrate_one_unit_dryrun() {
+  local unit="$1"
+  if pump_in_list "$unit" "${STUB_INTEGRATE_NOBRANCH:-}"; then
+    dbg_log "skip integrate $unit: branch absent (stub)"; return 0
   fi
-  if pump_in_list "$phase" "${STUB_INTEGRATE_ANCESTOR:-}"; then
-    dbg_log "skip integrate $phase: already an ancestor of $INTEGRATION_TRUNK (stub)"; return 0
+  if pump_in_list "$unit" "${STUB_INTEGRATE_ANCESTOR:-}"; then
+    dbg_log "skip integrate $unit: already an ancestor of $INTEGRATION_TRUNK (stub)"; return 0
   fi
-  if pump_in_list "$phase" "${STUB_INTEGRATE_CONFLICT:-}"; then
-    quarantine_phase "$phase" "stub" "conflict"; return 0
+  if pump_in_list "$unit" "${STUB_INTEGRATE_CONFLICT:-}"; then
+    quarantine_unit "$unit" "stub" "conflict"; return 0
   fi
   if ! run_build_gate_dry; then
-    quarantine_phase "$phase" "stub" "build red"; return 0
+    quarantine_unit "$unit" "stub" "build red"; return 0
   fi
-  log "would integrate $phase"
+  log "would integrate $unit"
 }
 
 # Real integration: under the trunk flock, merge feat/fN --no-ff into the trunk
 # worktree; conflict → abort + quarantine; build-red → reset --hard + quarantine;
 # green → keep, log, optionally push.
-integrate_one_phase_real() {
-  local phase="$1" branch="$2"
+integrate_one_unit_real() {
+  local unit="$1" branch="$2"
   git -C "$REPO_ROOT" rev-parse --verify "refs/heads/$branch" >/dev/null 2>&1 \
-    || { dbg_log "skip integrate $phase: no branch $branch"; return 0; }
+    || { dbg_log "skip integrate $unit: no branch $branch"; return 0; }
   if apl_phase_integrated "$REPO_ROOT" "$branch" "$INTEGRATION_TRUNK"; then
-    dbg_log "skip integrate $phase: $branch already an ancestor of $INTEGRATION_TRUNK"; return 0
+    dbg_log "skip integrate $unit: $branch already an ancestor of $INTEGRATION_TRUNK"; return 0
   fi
   local twt; twt="$(trunk_worktree)"
-  [[ -d "$twt" ]] || { warn "trunk worktree missing ($twt); skipping $phase"; return 0; }
+  [[ -d "$twt" ]] || { warn "trunk worktree missing ($twt); skipping $unit"; return 0; }
   (
-    apl_acquire_trunk_lock "$TRUNK_LOCK_FILE" || { warn "trunk lock busy; deferring $phase to next tick"; exit 0; }
+    apl_acquire_trunk_lock "$TRUNK_LOCK_FILE" || { warn "trunk lock busy; deferring $unit to next tick"; exit 0; }
     local pre; pre="$(git -C "$twt" rev-parse HEAD 2>/dev/null)"
     if ! git -C "$twt" merge --no-ff --no-edit "$branch" >/dev/null 2>&1; then
       git -C "$twt" merge --abort >/dev/null 2>&1 || true
-      quarantine_phase "$phase" "$pre" "conflict"
+      quarantine_unit "$unit" "$pre" "conflict"
       exit 0
     fi
     if ! run_build_gate "$twt"; then
       git -C "$twt" reset --hard "$pre" >/dev/null 2>&1 || true
-      quarantine_phase "$phase" "$pre" "build red"
+      quarantine_unit "$unit" "$pre" "build red"
       exit 0
     fi
     local post; post="$(git -C "$twt" rev-parse HEAD 2>/dev/null)"
-    log "integrated $phase @ $(printf '%s' "$post" | cut -c1-12)"
+    log "integrated $unit @ $(printf '%s' "$post" | cut -c1-12)"
     [[ "${TASKPUMP_PUMP_TRUNK_PUSH:-0}" -eq 1 ]] && git -C "$twt" push >/dev/null 2>&1 || true
     exit 0
   ) || true
@@ -1316,8 +1688,8 @@ reconcile_trunk() {
   local p
   while IFS= read -r p; do
     [[ -z "$p" ]] && continue
-    integrate_one_phase "$p" || true
-  done < <(pump_expand_phases "$PHASES")
+    integrate_one_unit "$p" || true
+  done < <(units_in_range)
   return 0
 }
 
@@ -1360,6 +1732,7 @@ declare -a PLAN_LAUNCH PLAN_RUNNING PLAN_WAITING PLAN_DONE PLAN_RESUME
 declare -A PLAN_WAIT_REASON
 compute_plan() {
   PLAN_LAUNCH=(); PLAN_RUNNING=(); PLAN_WAITING=(); PLAN_DONE=(); PLAN_RESUME=(); PLAN_WAIT_REASON=()
+  if [[ "$GRAIN" == "task" ]]; then compute_plan_task; return 0; fi
   detect_stalled_orphans
   local -A in_frontier=()
   local p
@@ -1370,7 +1743,7 @@ compute_plan() {
     if [[ -n "${in_frontier[$p]:-}" ]]; then
       if phase_live "$p"; then
         PLAN_RUNNING+=("$p")
-      elif [[ "$INTEGRATION" -eq 1 ]] && ! phase_deps_integrated "$p"; then
+      elif [[ "$INTEGRATION" -eq 1 ]] && ! unit_deps_integrated "$p"; then
         # v2: ledger says ready, but a cross-phase dep's CODE is not yet on the
         # trunk this phase would be cut from. Hold until the merge lands so the
         # worktree physically contains its dependencies (RC-3 closure).
@@ -1402,6 +1775,145 @@ compute_plan() {
   done < <(pump_expand_phases "$PHASES")
 }
 
+# ── Planning pass at task grain (issue #11) ───────────────────────────────────
+# Same five classifications, same order of precedence, asked about a TASK. What
+# changes is only what a unit is; every mechanism keeps its shape:
+#
+#   RUNNING  a live container on this task's own branch — never double-launched.
+#   RESUME   an orphaned claim with committed work on this task's own branch,
+#            and no file conflict with anything already holding the tree.
+#   LAUNCH   eligible per the ledger, deps physically integrated (when the trunk
+#            is on), and no file conflict with anything already holding the tree.
+#   WAITING  everything else that is not finished, WITH THE REASON — blockers
+#            pending, a conflict and the path it is on, a foreign claim, or a
+#            status that needs a human.
+#   DONE     done.
+#
+# The RESUME-before-open ordering is the F79 stall's lesson at the finer grain: a
+# task whose only remaining state is its own committed-but-claimed work must not
+# be able to read as finished.
+#
+# Three passes, and the split is the disjoint-files rule's: everything the tick
+# will START — RUNNING already has, RESUME and LAUNCH will — becomes a holder,
+# and a holder has to bind candidates planned BEFORE it as well as after. So
+# each dispatch class is admitted in its own full pass over the range rather
+# than inline in one loop.
+compute_plan_task() {
+  load_task_snapshot
+  detect_stalled_orphans
+  # Liveness read ONCE per pass, then answered from a map. phase_live asks the
+  # runtime per unit, which is fine for a handful of phases and is a process
+  # spawn per TASK per tick here. Same answer, same fail-open semantics (the
+  # launch path may use a degraded enumeration — mechanism 2's asymmetry), one
+  # read.
+  local -A live_name=()
+  local nm
+  while IFS= read -r nm; do [[ -n "$nm" ]] && live_name["$nm"]=1; done < <(apl_live_agents)
+
+  # Units already holding the tree this tick, in admission order: the live ones
+  # first (they are running whatever the plan says), then the resumed ones, then
+  # each task admitted to LAUNCH. A candidate is checked against all of them.
+  PLAN_HOLDERS=()
+  local -A classified=()
+  local unit status claimed reason b pending
+  # Pass 1 — live containers. Done as its own pass so a running task's footprint
+  # is held against every candidate, not just the ones planned after it.
+  while IFS= read -r unit; do
+    [[ -z "$unit" ]] && continue
+    if [[ -n "${live_name[$(unit_container "$unit")]:-}" ]]; then
+      PLAN_RUNNING+=("$unit")
+      PLAN_HOLDERS+=("$unit")
+      classified["$unit"]=1
+    fi
+  done < <(tasks_in_range)
+
+  # Pass 2 — resumable orphans, for exactly the reason pass 1 is its own pass.
+  # do_tick dispatches PLAN_RESUME in the SAME tick as PLAN_LAUNCH, so a resumed
+  # unit starts a container and its footprint has to be held against every
+  # candidate — including the ones that sort ahead of it. Classifying RESUME
+  # inline in the admission loop below (and appending to the holder list there)
+  # bound only the candidates planned after it: an eligible task with the
+  # IDENTICAL files: of a stranded one planned as RESUME + LAUNCH with "0
+  # waiting", and a real tick started both containers on one file — the plan
+  # looking clean while scheduling the collision this rule exists to refuse.
+  # (adversarial review, 2026-08-14)
+  #
+  # A resume is itself checked against what already holds the tree, and can only
+  # be held by a LIVE container (nothing else has been admitted yet). That is
+  # safe for the deadlock detector: a live holder means have > 0, so a held
+  # resume can never be mistaken for an idle tick.
+  while IFS= read -r unit; do
+    [[ -z "$unit" ]] && continue
+    [[ -n "${classified[$unit]:-}" ]] && continue
+    [[ -n "${STALL_TASK[$unit]:-}" ]] || continue
+    # Classified ahead of eligibility and ahead of `done`: the claim IS the
+    # reason this task is not in the frontier, and classifying it any other way
+    # is how committed, unfinished work reads as finished.
+    classified["$unit"]=1
+    reason="$(hold_reason "$unit")"
+    if [[ -n "$reason" ]]; then
+      PLAN_WAITING+=("$unit")
+      PLAN_WAIT_REASON["$unit"]="stalled on ${STALL_TASK[$unit]} (${STALL_STATUS[$unit]:-?}) but held: $reason"
+      continue
+    fi
+    PLAN_RESUME+=("$unit")
+    PLAN_HOLDERS+=("$unit")
+  done < <(tasks_in_range)
+
+  while IFS= read -r unit; do
+    [[ -z "$unit" ]] && continue
+    # Already classified RUNNING, RESUME, or held above.
+    [[ -n "${classified[$unit]:-}" ]] && continue
+    status="${TSNAP_STATUS[$unit]:-}"
+    claimed="${TSNAP_CLAIMED[$unit]:-}"
+
+    if [[ -n "${TSNAP_ELIGIBLE[$unit]:-}" ]]; then
+      if [[ "$INTEGRATION" -eq 1 ]] && ! unit_deps_integrated "$unit"; then
+        PLAN_WAITING+=("$unit")
+        PLAN_WAIT_REASON["$unit"]="blockers done but not yet integrated into $INTEGRATION_TRUNK"
+        continue
+      fi
+      reason="$(hold_reason "$unit")"
+      if [[ -n "$reason" ]]; then
+        PLAN_WAITING+=("$unit")
+        PLAN_WAIT_REASON["$unit"]="$reason"
+        continue
+      fi
+      PLAN_LAUNCH+=("$unit")
+      PLAN_HOLDERS+=("$unit")
+      continue
+    fi
+
+    case "$status" in
+      done)
+        PLAN_DONE+=("$unit")
+        ;;
+      open)
+        pending=""
+        for b in ${TSNAP_BLOCKERS[$unit]:-}; do
+          [[ -z "$b" ]] && continue
+          [[ "${TSNAP_STATUS[$b]:-}" == "done" ]] && continue
+          pending+="${pending:+, }$b"
+        done
+        PLAN_WAITING+=("$unit")
+        PLAN_WAIT_REASON["$unit"]="blockers pending: ${pending:-unresolved}"
+        ;;
+      in_progress)
+        # Claimed, no live container, and not resumable (no commits on its
+        # branch, or the claim is somebody else's). reclaim_orphaned_claims owns
+        # the first case; the second is a human's branch and not ours to touch.
+        PLAN_WAITING+=("$unit")
+        PLAN_WAIT_REASON["$unit"]="claimed by ${claimed:-?}, no live container"
+        ;;
+      *)
+        PLAN_WAITING+=("$unit")
+        PLAN_WAIT_REASON["$unit"]="status: ${status:-unknown} — needs a human"
+        ;;
+    esac
+  done < <(tasks_in_range)
+  return 0
+}
+
 print_plan() {
   compute_plan
   local gate_line; if feed_gate; then gate_line="GATE: feed-ok"; else gate_line="GATE: PAUSED — $GATE_REASON"; fi
@@ -1415,13 +1927,18 @@ print_plan() {
   while IFS= read -r note; do
     [[ -n "$note" ]] && printf '  %s\n' "$note"
   done <<<"$GATE_NOTES"
-  local p
-  for p in "${PLAN_LAUNCH[@]:-}";  do [[ -n "$p" ]] && printf '  LAUNCH   %-6s -> %s\n' "$p" "$(phase_branch "$p")"; done
-  for p in "${PLAN_RUNNING[@]:-}"; do [[ -n "$p" ]] && printf '  RUNNING  %-6s -> %s (live container)\n' "$p" "$(phase_branch "$p")"; done
-  for p in "${PLAN_RESUME[@]:-}";  do [[ -n "$p" ]] && printf '  RESUME   %-6s -> %s (stalled on %s, %s; container dead, work committed)\n' \
-      "$p" "$(phase_branch "$p")" "${STALL_TASK[$p]}" "${STALL_STATUS[$p]}"; done
-  for p in "${PLAN_WAITING[@]:-}"; do [[ -n "$p" ]] && printf '  WAITING  %-6s (%s)\n' "$p" "${PLAN_WAIT_REASON[$p]:-cross-phase blockers pending}"; done
-  for p in "${PLAN_DONE[@]:-}";    do [[ -n "$p" ]] && printf '  DONE     %-6s (no open tasks)\n' "$p"; done
+  # One plan grammar at both grains — the same five verbs, the same columns,
+  # with unit tokens where phases stand. Only the column width and the DONE
+  # gloss differ, because a task id is longer than a phase token and "no open
+  # tasks" is not what DONE means about a single task.
+  local p w=6 done_note="no open tasks"
+  if [[ "$GRAIN" == "task" ]]; then w=9; done_note="complete"; fi
+  for p in "${PLAN_LAUNCH[@]:-}";  do [[ -n "$p" ]] && printf "  LAUNCH   %-${w}s -> %s\n" "$p" "$(unit_branch "$p")"; done
+  for p in "${PLAN_RUNNING[@]:-}"; do [[ -n "$p" ]] && printf "  RUNNING  %-${w}s -> %s (live container)\n" "$p" "$(unit_branch "$p")"; done
+  for p in "${PLAN_RESUME[@]:-}";  do [[ -n "$p" ]] && printf "  RESUME   %-${w}s -> %s (stalled on %s, %s; container dead, work committed)\n" \
+      "$p" "$(unit_branch "$p")" "${STALL_TASK[$p]}" "${STALL_STATUS[$p]}"; done
+  for p in "${PLAN_WAITING[@]:-}"; do [[ -n "$p" ]] && printf "  WAITING  %-${w}s (%s)\n" "$p" "${PLAN_WAIT_REASON[$p]:-cross-phase blockers pending}"; done
+  for p in "${PLAN_DONE[@]:-}";    do [[ -n "$p" ]] && printf "  DONE     %-${w}s (%s)\n" "$p" "$done_note"; done
   echo "frontier: ${#PLAN_LAUNCH[@]} launchable, ${#PLAN_RUNNING[@]} running, ${#PLAN_RESUME[@]} resumable, ${#PLAN_WAITING[@]} waiting | open tasks in range: $(open_count)"
 }
 
@@ -1452,9 +1969,9 @@ reclaim_done_targets() {
   local p wt sz
   for p in "${PLAN_DONE[@]:-}"; do
     [[ -z "$p" ]] && continue
-    wt="$WORKTREES_DIR/$(phase_branch "$p")"
+    wt="$WORKTREES_DIR/$(unit_branch "$p")"
     [[ -d "$wt/target" ]] || continue
-    phase_live "$p" && continue
+    unit_live "$p" && continue
     sz="$(du -sh "$wt/target" 2>/dev/null | cut -f1)"
     if ( cd "$wt" && eval "$RECLAIM_CMD" ) >/dev/null 2>&1; then
       log "reclaimed $p target/ (${sz:-?}) via TASKPUMP_RECLAIM_CMD"
@@ -1555,7 +2072,7 @@ do_tick() {
   for p in "${PLAN_LAUNCH[@]:-}"; do
     [[ -z "$p" ]] && continue
     (( have >= cap )) && break
-    if launch_phase "$p"; then
+    if launch_unit "$p"; then
       have=$((have + 1)); launched=$((launched + 1)); sleep "$STAGGER"
     fi
   done
@@ -1566,7 +2083,7 @@ do_tick() {
   for p in "${PLAN_RESUME[@]:-}"; do
     [[ -z "$p" ]] && continue
     (( have >= cap )) && break
-    if resume_phase "$p"; then
+    if resume_unit "$p"; then
       have=$((have + 1)); launched=$((launched + 1)); sleep "$STAGGER"
     fi
   done
@@ -1741,10 +2258,29 @@ exec_monitor() {
 }
 
 # ── Modes ──────────────────────────────────────────────────────────────────────
+# Refuse an unnameable or colliding unit before ANY mode runs, --dry-run
+# included: a plan that shows two tasks launching onto one agent name is a
+# wrong plan, and finding that out only at launch time is finding it out too
+# late. No-op at phase grain, where the prefix probe above already answered.
+validate_unit_names
+
 case "$MODE" in
   render)
-    # Print the phase-drain brief rendered for $PHASES to stdout (debug / test).
-    # Goes through render_brief_stream so {{DEPENDS_ON}} is expanded too (v1).
+    # Print the brief rendered for $PHASES to stdout (debug / test). Goes
+    # through render_brief_stream so {{DEPENDS_ON}} is expanded too (v1).
+    #
+    # At task grain the argument is a UNIT, and a unit is a task id. Handed a
+    # phase token it used to render a task brief around it — "your job is one
+    # task: G3", pointing the reader at tasks/G3.md, which does not exist. A
+    # debug path that fabricates a plausible-looking brief for a task that was
+    # never dispatched is the same silent wrong answer in miniature, so refuse
+    # and say what to pass instead.
+    if [[ "$GRAIN" == "task" && -z "${TSNAP_STATUS[$PHASES]:-}" ]]; then
+      die "--render-brief takes a TASK ID at --grain task; '$PHASES' is not a task in range.
+The task brief is rendered for one task and points its reader at
+$(tasks_dir_rel)/$PHASES.md. Pass a task id (e.g. $PHASES.1), or drop
+--grain task to render the phase-drain brief for phase $PHASES."
+    fi
     [[ -f "$BRIEF_TEMPLATE" ]] || die "$(missing_brief_template_msg)"
     render_brief_stream "$PHASES"
     exit 0
@@ -1755,7 +2291,7 @@ case "$MODE" in
     detect_stalled_orphans
     id="${STALL_TASK[$PHASES]:-}"
     [[ -n "$id" ]] || die "no stalled orphan detected for phase $PHASES (nothing to resume)"
-    render_resume_note_stream "$WORKTREES_DIR/$(phase_branch "$PHASES")" "$(phase_branch "$PHASES")" "$id"
+    render_resume_note_stream "$WORKTREES_DIR/$(unit_branch "$PHASES")" "$(unit_branch "$PHASES")" "$id"
     exit 0
     ;;
   dry)

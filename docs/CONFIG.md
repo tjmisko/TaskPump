@@ -103,7 +103,8 @@ file loads, every relative value of the ledger-locating keys —
 `TASKPUMP_TASKS_DIR`, `TASKPUMP_TASK_OUT`, `TASKPUMP_CODE_REPO`,
 `TASKPUMP_LEDGER_REPO`, `TASKPUMP_PUMP_TASKS_DIR`, `TASKPUMP_PUMP_OPS_DIR`,
 `TASKPUMP_WORKSPACE_ROOT`, `TASKPUMP_BRIEF_TEMPLATE`,
-`TASKPUMP_PHASE_BRIEF_TEMPLATE`, `TASKPUMP_RESUME_TEMPLATE` — is anchored to a
+`TASKPUMP_PHASE_BRIEF_TEMPLATE`, `TASKPUMP_TASK_BRIEF_TEMPLATE`,
+`TASKPUMP_RESUME_TEMPLATE` — is anchored to a
 fixed root: a *discovered*
 conf's own directory; for an explicit `TASKPUMP_CONFIG` (which may live
 anywhere), the caller's worktree root. Unanchored, `tp task ready` run from a
@@ -331,7 +332,8 @@ toolchain:
 | `TASKPUMP_VERIFY_CMDS` | Newline-separated commands a task must leave green, quoted into the brief. Empty by default — the templates' verify sections drop out until a consumer names its own bar. |
 | `TASKPUMP_PROJECT_BRIEF` | One paragraph pointing an agent at the project's own contributor documentation. |
 | `TASKPUMP_RECLAIM_CMD` | How to reclaim build output from a finished workspace, so a multi-day run's disk footprint stays bounded. Empty by default: unconfigured, the per-tick reclaim pass and the `tp cleanup --targets` sweep touch nothing and log themselves unconfigured. |
-| `TASKPUMP_BRIEF_TEMPLATE` | The parameterized brief a launched agent is handed. |
+| `TASKPUMP_BRIEF_TEMPLATE` | The parameterized brief a launched agent is handed at `--grain phase`. `TASKPUMP_PHASE_BRIEF_TEMPLATE` is the explicit spelling of the same thing. |
+| `TASKPUMP_TASK_BRIEF_TEMPLATE` | The brief a `--grain task` container is handed. A separate template on purpose: the phase brief's working method *is* the in-context `next --phase` loop, which at task grain would claim the siblings the pump has already dispatched elsewhere. |
 | `TASKPUMP_RESUME_TEMPLATE` | The resume preamble a stalled task's agent gets ahead of that brief. |
 | `TASKPUMP_TASK_CLI` | How an agent invokes the ledger CLI from inside its worktree. |
 | `TASKPUMP_SUBMODULE_PROBE` | A path that proves the ledger submodule is populated in a fresh worktree, letting the pump skip its per-worktree `git submodule update --init --recursive`. **No default**: unset, the (idempotent, cheap) init always runs. The probe is a pure optimization — and a sharp one: a path that exists for the wrong reason skips the init some *other* submodule still needs, silently. Set it only to a path that proves everything you need populated. |
@@ -371,7 +373,7 @@ Which runner launches agents, and how. See [RUNNERS.md](RUNNERS.md).
 | `TASKPUMP_IMAGE`, `TASKPUMP_IMAGE_BUILD` | The image to run, and the command that builds it before the first launch. The image has **no default**: a real run (never `--dry-run`) aborts before any launch when it is unset. See [RUNNERS.md §4.0](RUNNERS.md#40-the-image-contract). |
 | `TASKPUMP_AGENT_PREFIX` | Container-name prefix, **including its trailing dash**. The liveness probe of [PUMP-MECHANISMS.md §2](PUMP-MECHANISMS.md#2-liveness-from-process-state-never-task-status) matches on it, so it must be distinctive. `TASKPUMP_AGENT_CONTAINER_PREFIX` is accepted as a fallback spelling. |
 | `TASKPUMP_ENTRYPOINT` | In-image entrypoint path. |
-| `TASKPUMP_MAX_TURNS`, `TASKPUMP_AGENT_MODEL` | Forwarded to each launched agent. |
+| `TASKPUMP_MAX_TURNS`, `TASKPUMP_AGENT_MODEL` | Forwarded to each launched agent. `TASKPUMP_MAX_TURNS` is the phase-drain budget (600); `TASKPUMP_TASK_MAX_TURNS` (120) is what a `--grain task` session gets, since it claims one task and exits. |
 | `TASKPUMP_AGENT_HOME`, `TASKPUMP_AGENT_CONFIG` | The host agent home and config file the container copies from. |
 | `TASKPUMP_PRE_FLIGHT` | A consumer-supplied hook the runner executes before handing control to the agent — toolchain setup, smoke tests, anything project-shaped. |
 | `TASKPUMP_CREDENTIALS` | The credentials file the runner copies from. |

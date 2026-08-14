@@ -33,7 +33,8 @@ PUMP="$TP_ROOT/libexec/tp-pump"
 TP_CONFIG_SUFFIXES=(
   TASKS_DIR TASK_OUT CODE_REPO LEDGER_PROBE LEDGER_REPO TASKS_SUBDIR
   PUMP_TASKS_DIR PUMP_OPS_DIR SUBMODULE_PROBE ID_PATTERN PHASE_SIGIL
-  BRIEF_TEMPLATE PHASE_BRIEF_TEMPLATE RESUME_TEMPLATE TASK_NOCOMMIT CONFIG
+  BRIEF_TEMPLATE PHASE_BRIEF_TEMPLATE TASK_BRIEF_TEMPLATE RESUME_TEMPLATE
+  TASK_NOCOMMIT CONFIG
 )
 TP_ENV_UNSET=()
 for _suffix in "${TP_CONFIG_SUFFIXES[@]}"; do
@@ -199,6 +200,44 @@ out=$( cd "$NOREPO" && env "${TP_ENV_UNSET[@]}" TASKPUMP_TASK_NOCOMMIT=1 \
   || fail "unanchorable conf path was accepted:\n$out"
 have "$out" 'TASKPUMP_TASKS_DIR' && pass "the refusal names the key" \
   || fail "the refusal does not name the key:\n$out"
+
+echo "--- #1: EVERY documented anchored key anchors, from a subdirectory ---"
+
+# The keys CONFIG.md promises to anchor are a list, and a list is exactly the
+# kind of thing that goes one entry short: TASKPUMP_TASK_BRIEF_TEMPLATE was
+# documented as anchored and was missing from TP_ANCHORED_PATH_KEYS, so a
+# conf-relative task brief resolved from the workspace root and died "task brief
+# template not found" from a subdirectory — while its phase-grain sibling on the
+# same conf resolved fine. Both grains, both directories, one conf.
+CT="$TMP/consumer-templates"
+mkdir -p "$CT/planning/tasks" "$CT/briefs" "$CT/crates"
+git -C "$CT" init -q
+cat >| "$CT/taskpump.conf" <<'CONF'
+TASKPUMP_TASKS_DIR=planning/tasks
+TASKPUMP_PHASE_BRIEF_TEMPLATE=briefs/phase.md
+TASKPUMP_TASK_BRIEF_TEMPLATE=briefs/task.md
+CONF
+printf 'ANCHORED phase brief for {{PHASE}}\n' >| "$CT/briefs/phase.md"
+printf 'ANCHORED task brief for {{TASK_ID}}\n' >| "$CT/briefs/task.md"
+mk "$CT/planning/tasks" T1.1
+
+render_at() {  # render_at <dir> [pump flags...] — --render-brief from <dir>
+  ( cd "$1" && env "${TP_ENV_UNSET[@]}" TASKPUMP_NO_CONF=0 \
+      TASKPUMP_TASK_NOCOMMIT=1 TASKPUMP_TASK="$TASK" "$PUMP" "${@:2}" 2>&1 )
+}
+
+for where in "$CT" "$CT/crates"; do
+  label="the workspace root"; [[ "$where" == */crates ]] && label="a subdirectory"
+  out=$(render_at "$where" --render-brief T1); rc=$?
+  [[ $rc -eq 0 ]] && have "$out" 'ANCHORED phase brief for T1' \
+    && pass "a conf-relative phase brief resolves from $label" \
+    || fail "phase brief from $label (rc=$rc):\n$out"
+  out=$(render_at "$where" --grain task --render-brief T1.1); rc=$?
+  [[ $rc -eq 0 ]] && have "$out" 'ANCHORED task brief for T1\.1' \
+    && pass "a conf-relative task brief resolves from $label" \
+    || fail "task brief from $label (rc=$rc):\n$out"
+done
+unset where label
 
 # ══ Issue #2 — tp-pump derives its tasks dir from the probe, like tp-task ═════
 echo "--- #2: a zero-conf consumer's pump brief points at ITS ledger ---"
