@@ -1342,6 +1342,70 @@ gfail=$(TASKPUMP_DAG_BIN="$TMP/badrender" TASKPUMP_PUMP_STATE_FILE="$GPS" \
 grep -q '(dag render failed)' <<<"$gfail" \
     && pass "a failing renderer degrades to one line" || fail "render failure not reported:\n$gfail"
 
+# ── Test 36: the manifest is opt-in, with no Arachne default (#7) ────────────
+# tp-monitor used to default TASKPUMP_MANIFEST to
+# <repo>/ops/task-loop/parallel-manifest.tsv — the roster of the v1 launcher
+# TaskPump does not ship. Retired: unconfigured, nothing reads that path (a
+# decoy planted there must NOT surface, and the session still resolves its task
+# from the ledger's live claim); configured-but-missing is a loud error on the
+# TASKPUMP_CONFIG rule; the opt-in spellings still work for the one consumer
+# that has such a file.
+echo "--- Test 36: manifest opt-in / retired default (#7) ---"
+MR="$TMP/manroot"; mkdir -p "$MR/.worktrees/feat/f97" "$MR/ops/task-loop"
+printf '%s\n' '{"type":"assistant","message":{"content":[{"text":"gamma log"}]}}' \
+    >| "$MR/.worktrees/feat/f97/.arachne-agent.log"
+printf 'fossilname\tfeat/f97\tbrief.md\tF97.9\n' >| "$MR/ops/task-loop/parallel-manifest.tsv"
+cat >| "$BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+for a in "$@"; do
+  case "$a" in
+    '{{.Names}}|{{.State}}|{{.Status}}') echo 'arachne-agent-feat-f97|running|Up 3 minutes'; exit 0 ;;
+    '{{.Names}}') echo 'arachne-agent-feat-f97'; exit 0 ;;
+  esac
+done
+exit 0
+EOF
+chmod +x "$BIN/docker"
+MRC="$TMP/man-sess.tsv"
+mrun() { env -u TASKPUMP_MANIFEST -u MANIFEST \
+         TASKPUMP_MONITOR_REPO_ROOT="$MR" TASKPUMP_TASKS_DIR="$CTD" \
+         TASKPUMP_MONITOR_SESS_CACHE="$MRC" TASKPUMP_MONITOR_COLS=140 \
+         "$CLI" 2>/dev/null | strip_ansi; }
+mrun >/dev/null; sleep 2; mout=$(mrun)
+grep -q 'fossilname' <<<"$mout" \
+    && fail "the retired ops/task-loop default was read:\n$mout" \
+    || pass "no manifest configured: the retired Arachne default path is not read"
+grep -qE 'feat-f97 .*F97\.3' <<<"$mout" \
+    && pass "...and the session still resolves its task from the ledger claim" \
+    || fail "session row broken without a manifest:\n$mout"
+# Configured-but-missing is an error naming the key, never a silent fallback.
+merr=$(env TASKPUMP_MANIFEST="$TMP/no-such-manifest.tsv" TASKPUMP_MONITOR_COLS=100 \
+       "$CLI" 2>&1 >/dev/null); mrc=$?
+[[ "$mrc" -ne 0 ]] && pass "an explicit missing manifest exits non-zero" \
+                   || fail "explicit missing manifest exited 0"
+grep -q 'TASKPUMP_MANIFEST names' <<<"$merr" \
+    && pass "the error names the key that was set" || fail "error does not name the key:\n$merr"
+serr=$(env -u TASKPUMP_MANIFEST -u MANIFEST TASKPUMP_MANIFEST_SUBPATH=missing/m.tsv \
+       TASKPUMP_MONITOR_REPO_ROOT="$MR" TASKPUMP_MONITOR_COLS=100 \
+       "$CLI" 2>&1 >/dev/null); src=$?
+[[ "$src" -ne 0 ]] && grep -q 'TASKPUMP_MANIFEST_SUBPATH names' <<<"$serr" \
+    && pass "a missing SUBPATH manifest errors and names its key" \
+    || fail "SUBPATH missing file not loud (rc=$src):\n$serr"
+# The opt-in spelling still works: a repo-relative manifest supplies the
+# launch-time display name, exactly as the Arachne consumer expects.
+mkdir -p "$MR/custom"
+printf 'subname\tfeat/f97\tbrief.md\tF97.8\n' >| "$MR/custom/m.tsv"
+MSC="$TMP/man-sub-sess.tsv"
+msub() { env -u TASKPUMP_MANIFEST -u MANIFEST TASKPUMP_MANIFEST_SUBPATH=custom/m.tsv \
+         TASKPUMP_MONITOR_REPO_ROOT="$MR" TASKPUMP_TASKS_DIR="$CTD" \
+         TASKPUMP_MONITOR_SESS_CACHE="$MSC" TASKPUMP_MONITOR_COLS=140 \
+         "$CLI" 2>/dev/null | strip_ansi; }
+msub >/dev/null; sleep 2; sout=$(msub)
+grep -q 'subname' <<<"$sout" \
+    && pass "TASKPUMP_MANIFEST_SUBPATH opts a repo-relative manifest in" \
+    || fail "opt-in SUBPATH manifest ignored:\n$sout"
+printf '#!/usr/bin/env bash\nexit 0\n' >| "$BIN/docker"; chmod +x "$BIN/docker"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"
