@@ -29,6 +29,12 @@ export TASKPUMP_NO_CONF=1
 
 filter="${1:-}"
 
+# Suites must not litter the repo they run from (issue #20: a git stub's
+# fallthrough answer to --git-common-dir once manufactured <sha>/info/exclude
+# trees in the repo root on every run). Snapshot the tree's status up front;
+# any delta after the suites ran is itself a failure.
+REPO_STATUS_BEFORE="$(git -C "$SCRIPT_DIR/.." status --porcelain 2>/dev/null)"
+
 suites=()
 while IFS= read -r f; do
   [[ "$(basename "$f")" == "run-all.sh" ]] && continue
@@ -68,6 +74,16 @@ for suite in "${suites[@]}"; do
     failed=$((failed + 1))
   fi
 done
+
+REPO_STATUS_AFTER="$(git -C "$SCRIPT_DIR/.." status --porcelain 2>/dev/null)"
+if [[ "$REPO_STATUS_AFTER" != "$REPO_STATUS_BEFORE" ]]; then
+  printf '\nFAIL: the suites changed this repo'\''s git status (hermeticity, issue #20):\n' >&2
+  diff <(printf '%s\n' "$REPO_STATUS_BEFORE") <(printf '%s\n' "$REPO_STATUS_AFTER") >&2
+  names+=("(repo hermeticity)")
+  results+=("FAILED (littered)")
+  counts+=("the run added or removed working-tree entries")
+  failed=$((failed + 1))
+fi
 
 printf '\n\n==============================================\n'
 printf 'Suite summary\n'
