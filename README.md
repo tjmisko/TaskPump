@@ -178,6 +178,257 @@ rescheduled.
 
 ---
 
+## Adopt in an existing repo
+
+The quickstart works bottom-up from an empty directory. This is the same arc
+for a repository that already exists — yours — from scaffold to a first
+supervised tick, with something to read at every step. Nothing here asks you to
+trust an agent yet: the first launch is a stub you watch.
+
+### 1. Scaffold
+
+From anywhere inside the repository you want driven:
+
+```bash
+tp init
+```
+
+It writes a starter `taskpump.conf` at the worktree root — only the keys a new
+consumer actually decides, id grammar spelled out — and creates `tasks/` beside
+it (`--tasks-dir planning/tasks` puts the ledger elsewhere). It refuses, naming
+the file, if a conf is already discoverable from where you stand: a second conf
+would shadow the first for part of the repository. It commits nothing.
+
+Two lines of repository hygiene before anything writes state. The conf belongs
+in history; the runtime droppings do not — ignore them the way TaskPump's own
+repository does. (Do **not** ignore `.worktrees/`: the pump refuses to launch
+into a gitignored worktree.)
+
+```bash
+cat >> .gitignore <<'EOF'
+.taskpump-task.lock
+.taskpump-pump.state
+.taskpump-pump.log
+.taskpump-pool-cap
+.taskpump-usage-reset
+.taskpump-fsguard.notified
+.taskpump-disk-watchdog.log
+EOF
+git add taskpump.conf .gitignore && git commit -m "chore: adopt TaskPump"
+```
+
+Then run `tp task resolve --all`. It prints which ledger every invocation from
+here will touch and how it decided — it is the diagnostic every error message
+points at, and thirty seconds now beats reading it for the first time
+mid-incident.
+
+### 2. Author tasks — or import the ones you already have
+
+Authoring from scratch is quickstart §2, unchanged: `tp task create`, blockers
+validated on creation, a one-sentence goal that is worth writing properly.
+
+If the repository already keeps a directory of markdown task files, point
+`TASKPUMP_TASKS_DIR` (and `TASKPUMP_ID_PATTERN` plus `TASKPUMP_PHASE_SIGIL`, if
+your ids are not `T`-shaped) at what you have — the scaffold leaves an existing
+tasks directory untouched — and let `fsck` run the import:
+
+```bash
+tp task fsck          # every contract violation, one line each; exit 3
+tp task fsck --fix    # stamp the MISSING machine keys with their defaults
+tp task fsck          # clean; exit 0
+```
+
+`--fix` stamps only what is absent — `status: open`, empty blockers, the null
+claim fields — and never rewrites a value that is present but wrong: guessing
+intent is how ledgers get corrupted. What it cannot invent (a missing `id` or
+`title`, frontmatter that does not parse, ids outside the grammar, a blocker
+cycle) stays on the report for you to resolve by hand. The fix pass is itself a
+ledger commit, so the import diffs and reviews like any other change. A stamped
+goal is `null`; `tp task goal --missing` lists the tasks still owing one, and
+that debt is worth paying before an agent reads them.
+
+### 3. Inspect the frontier
+
+Quickstart §3, plus the DAG:
+
+```bash
+tp task ready                    # every eligible task
+tp task ready --count            # all open work in range
+tp task ready --count-eligible   # what can start right now
+tp dag-render --phases T1..T2    # the graph, statuses inline
+```
+
+Work remaining with nothing eligible means something is stalling the queue —
+that difference is the whole diagnostic, and
+[docs/LEDGER-CONTRACT.md §6](docs/LEDGER-CONTRACT.md#6-the-eligibility-predicate)
+is how to read it.
+
+### 4. Choose a runner
+
+**`runners/claude-docker`** is the hardened reference: agents run in a
+container, behind an egress allowlist, with the primary checkout mounted
+read-only and credentials installed access-token-only, so a container can
+authenticate but never rotate the host's tokens. The price of those guarantees
+is an image: TaskPump ships the runner, not the image, and a real run aborts
+loudly until `TASKPUMP_IMAGE` names one satisfying the contract in
+[docs/RUNNERS.md §4.0](docs/RUNNERS.md#40-the-image-contract). This is the
+runner for unattended work.
+
+**`runners/local`** has nothing underneath it — no image to build, no daemon to
+talk to. It starts the agent as a plain host process, and **it does not sandbox
+anything**: the agent runs as you, with your permissions, your filesystem, your
+network and your credentials, and nothing between it and your machine but its
+own restraint. That is fine for a supervised experiment and wrong for an
+unattended drain of an untrusted workload — [docs/RUNNERS.md §3](docs/RUNNERS.md#3-runnerslocal--the-process-runner)
+says this at greater length, and it bears repeating. It is also the runner that
+lets you rehearse the whole loop with a stub before any real agent exists,
+which is exactly what the next two steps do.
+
+### 5. Where the tools live
+
+Nothing so far cared where TaskPump itself is installed, and neither does the
+pump. The workspace it drives — the phase branches it cuts, the agent worktrees
+it materialises, the state file it writes — is a property of the **caller**,
+resolved exactly as the ledger is: the discovered `taskpump.conf`'s directory,
+else the worktree you are standing in. One checkout on `PATH` drives any number
+of repositories, and its own directory stays out of their runs.
+
+Vendoring a copy inside the repository is therefore a choice, with its own good
+reasons — a tool version pinned alongside the project, and collaborators or CI
+who need nothing on `PATH` — rather than a workaround:
+
+```bash
+mkdir taskpump
+git -C ~/code/TaskPump archive HEAD | tar -x -C taskpump
+git add taskpump && git commit -m "chore: vendor TaskPump"
+```
+
+Either layout launches into your repository. What decides that is where you run
+from, so when neither a conf nor `$PWD` can answer — a container, a CI job, a
+unit started somewhere neutral — the pump refuses instead of guessing:
+
+```
+$ cd /tmp/scratch && tp pump --phases T1..T2 --dry-run
+tp-pump: refusing to run against the TaskPump installation itself.
+  No taskpump.conf above $PWD, $PWD is not inside a consumer repository, and no pin was given — so resolution fell back to the install root:
+    /home/you/code/TaskPump
+  A drain planned there would target the install, not your project.
+  fix: run from your project root, or set TASKPUMP_WORKSPACE_ROOT=/path/to/project
+```
+
+`TASKPUMP_WORKSPACE_ROOT=/path/to/project` is that pin, for the layouts where
+`$PWD` proves nothing; a pin naming a missing directory is a loud error, never a
+fallback. It pins the **pump's** workspace only — ledger verbs still answer from
+where you stand, so run `tp task …` from inside the project (or name
+`TASKPUMP_TASKS_DIR` alongside it).
+
+### 6. One supervised tick
+
+Add the runner block to `taskpump.conf`:
+
+```bash
+# The local process runner, with a stub agent while the plumbing is on trial.
+# TASKPUMP_RUNNER names an executable and nothing searches for it: a path to
+# the install's runner, or one relative to where you run pump verbs (vendored,
+# that is taskpump/runners/local/runner.sh from the repository root).
+TASKPUMP_RUNNER=~/code/TaskPump/runners/local/runner.sh
+TASKPUMP_LOCAL_AGENT_CMD='cat .taskpump-phase-brief.md; sleep 600'
+
+# The launch prerequisites are container-shaped and a process runner does not
+# escape them yet (docs/RUNNERS.md §3.3): the image key must be non-empty, and
+# an EMPTY build command means "skip the image build".
+TASKPUMP_IMAGE=unused-by-a-process-runner
+TASKPUMP_IMAGE_BUILD=
+
+# Agent names are this prefix plus the branch, and the local runner's registry
+# is shared across the host — make the prefix this project's own, or two
+# repositories launching the same branch name will mistake each other's agents
+# for theirs.
+TASKPUMP_AGENT_PREFIX=myproject-agent-
+```
+
+Commit that edit before the tick. The pump runs a pre-tick guard that reports
+anything dirty in the primary checkout outside `.worktrees/` and the ledger, and
+an uncommitted `taskpump.conf` is exactly that — a first tick that opens with
+`FS-GUARD: primary checkout dirty` is usually just this.
+
+The stub prints its brief into the agent log and stays alive ten minutes — long
+enough to watch liveness work. Plan first, then run exactly one tick:
+
+```bash
+tp pump --phases T1..T2 --dry-run   # LAUNCH T1, and why feeding is permitted
+tp pump --phases T1..T2 --once
+```
+
+The tick prints the launch — agent name, lead task, and the log path under
+`.worktrees/feat/t1/` — and one warning worth decoding: `ops pull --ff-only
+failed (continuing)` is the pump trying to refresh a separate ledger checkout you
+have not configured, and is noise here. Now look at what exists:
+
+```bash
+tp pump --phases T1..T2 --dry-run                  # T1 is RUNNING now, not LAUNCH
+~/code/TaskPump/runners/local/runner.sh list       # the agent, by name
+head -4 .worktrees/feat/t1/.taskpump-agent.log     # the brief it was handed
+git branch --list                                  # feat/t1, cut in YOUR repository
+```
+
+That second dry-run is the point of the exercise: the pump sees the live agent
+and will not launch it twice, which is the one property everything else rests
+on.
+
+### 7. The loop, watched
+
+```bash
+tp pump --phases T1..T2 --jobs 1
+```
+
+runs the real loop — recomputing the frontier each tick, launching nothing while
+the pool is full — with `tp monitor` open in a second terminal. The monitor reads
+the state file the pump writes at your repository root, so its header tracks the
+run (`pump[T1..T2]: running  |  1 ready · 2 open`) and the `GRAPH` tab scopes
+itself to the range. Two honest caveats with the local runner and a stub: the
+`SESSIONS` table enumerates containers, so a process agent never appears there —
+the agent's own log and the pump log are your view into it — and a stub does not
+claim its task, so the ledger keeps T1 `○ ready` while the pump counts the phase
+RUNNING. A real agent claims as its first act.
+
+One knob is worth knowing before it surprises you: `--jobs` seeds
+`.taskpump-pool-cap` and every tick then *reads* it, which is what lets
+`echo 1 >| .taskpump-pool-cap` retune a live pump. The file outlives the run that
+wrote it, so a number left by an earlier run wins over the `--jobs` you just
+passed; delete it or overwrite it when the cap looks wrong.
+
+Ctrl-C stops feeding and leaves running agents alive — and stamps the state file
+on the way out, so the next reader is not misled:
+
+```
+$ tp pump --phases T1..T2 --jobs 1
+[09:23:16] SIGINT — stopping the supervisor (running agents are left alive; state stamped stopped)
+$ jq -r '.status, .paused_reason' .taskpump-pump.state
+stopped
+received SIGINT
+```
+
+A pump that dies without that courtesy — `SIGKILL`, a lost machine — leaves
+`running` in the file forever, so no reader takes it at face value: the monitor
+verifies the recorded pid before presenting a pump as live, and renders
+`pump[T1..T2]: STALE (was running, pid 896404 dead) — since 2026-08-14T16:23:34Z`
+when it cannot. The stub stops through the runner:
+
+```bash
+TP_CONTAINER_NAME=myproject-agent-feat-t1 ~/code/TaskPump/runners/local/runner.sh stop
+```
+
+When the plumbing has earned it, graduation is one key at a time: point
+`TASKPUMP_LOCAL_AGENT_CMD` at a real agent reading
+`.taskpump-phase-brief.md`, or configure the sandboxed runner and its image
+([docs/RUNNERS.md §4](docs/RUNNERS.md#4-the-claude-docker-reference-runner)),
+set `TASKPUMP_BUILD_GATE` to the check you would not merge without, and read
+[docs/PUMP-MECHANISMS.md](docs/PUMP-MECHANISMS.md) before leaving a drain
+unattended.
+
+---
+
 ## Layout
 
 | Path | What lives there |

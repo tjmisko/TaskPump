@@ -29,6 +29,11 @@ changes nothing on disk. It also commits nothing and creates no tasks: `tp init`
 prepares a repository, it does not start using it. From there, `tp task create`
 and `tp task ready` work with no further configuration.
 
+The full arc — `tp init`, importing an existing markdown task directory with
+`tp task fsck --fix`, and a first supervised pump tick — is the README's
+[Adopt in an existing repo](../README.md#adopt-in-an-existing-repo)
+walkthrough.
+
 ---
 
 ## 1. Discovery
