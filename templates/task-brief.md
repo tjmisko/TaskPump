@@ -37,11 +37,11 @@ rule that the phase-drain brief does not:
 4. Implement it in small, committed increments. Conventional commits:
    `feat(<area>): {{TASK_ID}} <summary>`.
 {{#VERIFY_CMDS}}
-5. Verify with {{VERIFY_CMDS}}. A red gate is a **failed task**; fix it, never
-   bypass it.
+   - Verify with {{VERIFY_CMDS}}. A red gate is a **failed task**; fix it, never
+     bypass it.
 {{/VERIFY_CMDS}}
-6. Run the task's tests.
-7. Finish with exactly one of these — never by simply stopping:
+5. Run the task's tests.
+6. Finish with exactly one of these — never by simply stopping:
    - `{{TASK_CLI}} complete {{TASK_ID}} --commits <shas>`, completion notes on
      stdin; or
    - `{{TASK_CLI}} block {{TASK_ID}} --reason "..."` if it needs something you
@@ -49,7 +49,7 @@ rule that the phase-drain brief does not:
 
    Leaving the task claimed and unfinished is the one ending that strands
    everything waiting behind it.
-8. Open/refresh a **DRAFT** PR against `{{BASE}}` (`gh pr create -d`, or push to
+7. Open/refresh a **DRAFT** PR against `{{BASE}}` (`gh pr create -d`, or push to
    the existing draft). **NEVER merge, and NEVER commit or push to `{{BASE}}`.**
 
 ## Boundaries
@@ -57,9 +57,20 @@ rule that the phase-drain brief does not:
 - **Only {{TASK_ID}}.** Never claim or implement another task — not a sibling in
   {{PHASE}}, not anything else. If you find work that has to happen and is not
   yours, file it: `{{TASK_CLI}} create <id> --title "..." --blockers {{TASK_ID}}`.
-- **Stay inside your declared `files:`.** Your task file lists the paths it owns,
-  and the pump scheduled you concurrently with your siblings *because* those sets
-  are disjoint. Editing a path outside your list is how two agents collide.
+{{#TASK_FILES}}
+- **Stay inside your declared `files:`** — {{TASK_FILES}}. The pump scheduled you
+  concurrently with your siblings *because* those sets are disjoint. Editing a
+  path outside your list is how two agents collide: nothing enforces the list but
+  you, and the scheduler already promised the others you would keep to it.
+{{/TASK_FILES}}
+{{#TASK_FILES_UNDECLARED}}
+- **Your task declares no `files:`, so you are running alone.** An undeclared
+  footprint means *unknown*, and the pump refuses to schedule unknown beside
+  anything else — no sibling of yours is running right now, and none can start
+  until you finish. Keep your footprint tight anyway, and say which paths you
+  actually touched in your completion notes: a task that declares its files is
+  one the next run can parallelize instead of serializing behind.
+{{/TASK_FILES_UNDECLARED}}
 - **Never touch `{{BASE}}`.** All work lands on this worktree's branch; the only
   way it reaches `{{BASE}}` is a human merging your draft PR.
 - **Never edit files by absolute path.** You work *inside* this worktree. The

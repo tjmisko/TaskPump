@@ -294,6 +294,36 @@ out=$(tpump G3)
 have "$out" 'LAUNCH   G3\.2' && pass "the failed task is still eligible on the next plan" \
   || fail "a failed launch consumed the task:\n$out"
 
+# ── 4c. What the shipped task brief actually says ─────────────────────────────
+echo "--- 4c. the shipped task brief renders correctly for both footprint shapes ---"
+rb() { "$PUMP" --no-health-gate --no-usage-gate --grain task --render-brief "$1" 2>&1; }
+
+rm -f "$TASKS"/*.md
+mk G3.1 open "" "libexec/tp-pump,docs/RUNNERS.md"
+mk G3.2 open "" ""
+out=$(rb G3.1)
+# TASKPUMP_VERIFY_CMDS is unset here, which is the SHIPPED default — and the
+# optional verify step used to be its own numbered item inside the conditional
+# section, so the default render counted 1,2,3,4,6,7,8. A brief that cannot
+# count is a brief an agent is entitled to distrust.
+steps=$(grep -oE '^[0-9]+\.' <<<"$out" | tr -d '.' | tr '\n' ' ')
+[[ "$steps" == "1 2 3 4 5 6 7 " ]] \
+  && pass "the working-method list numbers 1-7 with no gap when VERIFY_CMDS is unset" \
+  || fail "numbered steps render as: $steps"
+have "$out" 'sets are disjoint' \
+  && pass "a task WITH a declared footprint is told why it may run beside its siblings" \
+  || fail "the disjointness sentence is missing for a declared task:\n$out"
+have "$out" 'libexec/tp-pump' && pass "and the brief names the paths it declared" \
+  || fail "the brief does not name the declared files:\n$out"
+
+out=$(rb G3.2)
+have "$out" 'sets are disjoint' \
+  && fail "a task with files: [] was told it runs concurrently BECAUSE its set is disjoint:\n$out" \
+  || pass "an undeclared task is not told the disjointness story that does not apply to it"
+have "$out" 'declares no .files:., so you are running alone' \
+  && pass "it is told the true reason it was scheduled: exclusively" \
+  || fail "the empty-footprint case is unexplained:\n$out"
+
 # ── 5. Resume-with-context at task grain ──────────────────────────────────────
 echo "--- 5. a stranded claim on a task branch resumes, with its commits ---"
 # The F79 shape, one grain finer: an agent claimed G3.2, committed real work, and

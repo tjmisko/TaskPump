@@ -636,6 +636,18 @@ task_files() {
   return 0
 }
 
+# task_files_inline <id> — the same footprint as one backticked, comma-separated
+# phrase for the brief. Empty when the task declares nothing, which is what the
+# template's undeclared section keys off.
+task_files_inline() {
+  local out="" f
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    out+="${out:+, }\`$f\`"
+  done < <(task_files "$1")
+  printf '%s' "$out"
+}
+
 # ── Conflict scheduling at task grain (issue #11) ─────────────────────────────
 # Phase grain buys mutual exclusion for free: one branch per phase means sibling
 # tasks that rewrite the same file never collide, because one agent does them in
@@ -1203,12 +1215,25 @@ render_brief_stream() {
   # brief's every mention of "your task" resolves through this.
   local task_id=""
   [[ "$GRAIN" == "task" ]] && task_id="$unit"
+  # The declared footprint, and its absence, as two mutually-exclusive template
+  # conditions. The brief cannot say one thing about both: "the pump scheduled
+  # you concurrently BECAUSE those sets are disjoint" is false for a task with
+  # `files: []`, which was scheduled EXCLUSIVELY, precisely because it declared
+  # nothing. Empty at phase grain, where neither section exists in the template.
+  local task_files_line="" task_files_undeclared=""
+  if [[ "$GRAIN" == "task" ]]; then
+    (( TSNAP_LOADED )) || load_task_snapshot
+    task_files_line="$(task_files_inline "$unit")"
+    [[ -z "$task_files_line" ]] && task_files_undeclared="yes"
+  fi
   local depfile; depfile="$(mktemp)"
   phase_dependencies "$unit" >| "$depfile"
   local -A TPL_VARS TPL_BLOCKS
   TPL_VARS=(
     [PHASE]="$phase"
     [TASK_ID]="$task_id"
+    [TASK_FILES]="$task_files_line"
+    [TASK_FILES_UNDECLARED]="$task_files_undeclared"
     [BASE]="$BASE_REF"
     [TASK_CLI]="$TASK_CLI"
     [TASK_CLI_NAME]="$TASK_CLI_NAME"
