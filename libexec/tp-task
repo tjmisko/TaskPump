@@ -409,13 +409,14 @@ blockers_satisfied() {
 }
 
 cmd_next() {
-  local branch="" phase=""
+  local branch="" phase="" include_reviews=0
   while (( $# )); do
     case $1 in
       --branch) branch=$2; shift 2;;
       --branch=*) branch=${1#--branch=}; shift;;
       --phase) phase=$2; shift 2;;
       --phase=*) phase=${1#--phase=}; shift;;
+      --include-reviews) include_reviews=1; shift;;
       *) die "unknown arg to next: $1";;
     esac
   done
@@ -444,6 +445,16 @@ cmd_next() {
     status=$(fm_get "$file" '.status')
     if [[ "$status" != "open" ]]; then
       dbg "skip $id: status=$status"
+      continue
+    fi
+    # Review tasks are surfaced only on request. A phase-scoped agent loop
+    # running `next --phase` after completing its own task would otherwise
+    # claim the review of its own work in its own session — a self-review,
+    # which looks like independent scrutiny and is not. Query scoping only:
+    # the eligibility predicate (§6) is untouched, and `claim` still works
+    # on a review task directly.
+    if (( ! include_reviews )) && [[ -n "$(fm_get "$file" '.review_role')" ]]; then
+      dbg "skip $id: review task (pass --include-reviews to surface review units)"
       continue
     fi
     claimed_by=$(fm_get "$file" '.claimed_by')
@@ -510,7 +521,7 @@ cmd_next() {
 # The two diverge exactly when a cross-phase blocker or orphaned claim stalls the
 # queue (open > 0 while eligible == 0); only then does the drain count mislead.
 cmd_ready() {
-  local branch="" phases="" json=0 count=0 count_eligible=0
+  local branch="" phases="" json=0 count=0 count_eligible=0 include_reviews=0
   while (( $# )); do
     case $1 in
       --branch) branch=$2; shift 2;;
@@ -521,6 +532,7 @@ cmd_ready() {
       --json) json=1; shift;;
       --count) count=1; shift;;
       --count-eligible) count_eligible=1; shift;;
+      --include-reviews) include_reviews=1; shift;;
       *) die "unknown arg to ready: $1";;
     esac
   done
@@ -566,6 +578,15 @@ cmd_ready() {
     fi
     status=$(fm_get "$file" '.status')
     [[ "$status" != "open" ]] && { dbg "skip $id: status=$status"; continue; }
+    # Same review-task scoping as cmd_next: the eligible frontier hides review
+    # units unless --include-reviews asks for them. Deliberately NOT applied to
+    # --count above — a pending review is open work, and a drain test that
+    # stopped counting it would let a supervisor exit "drained" over an
+    # unrendered verdict.
+    if (( ! include_reviews )) && [[ -n "$(fm_get "$file" '.review_role')" ]]; then
+      dbg "skip $id: review task (pass --include-reviews to surface review units)"
+      continue
+    fi
     claimed_by=$(fm_get "$file" '.claimed_by')
     if [[ -n "$claimed_by" && "$claimed_by" != "$branch" ]]; then
       dbg "skip $id: claimed by '$claimed_by' (branch: '$branch')"
@@ -1071,6 +1092,279 @@ cmd_reopen() {
   printf '\n## Reopened (%s, from %s)\n\n%s\n' "$now" "$status" "$note" >> "$file"
   git_commit_state "reopen $id: $reason"
   echo "reopened $id (was $status)"
+}
+
+# ── Review gates (issue #12) ──────────────────────────────────────────────────
+# A review is an ordinary task the CLI synthesizes: reviewer tasks blocked by
+# the implementation task, an adjudicator blocked by the reviewers when a panel
+# exists, and every task downstream of the implementation gains the chain's
+# GATE task (adjudicator, or the lone reviewer) as an additional blocker. The
+# eligibility predicate then does the gating with zero new predicate logic, and
+# the DAG renderer draws the chain because it is nodes with edges. See
+# docs/design/review-gates.md for the shape and the rejected alternatives.
+
+# Collect the review chain of <impl-id> into globals (dynamic scoping; results
+# on stdout would die inside $(...) without killing the caller — the same trap
+# normalize_blockers documents):
+#   REVIEW_CHAIN_IDS / REVIEW_CHAIN_FILES  every task whose review_of == impl
+#   REVIEW_REVIEWER_IDS                    the reviewer members
+#   REVIEW_ADJ_ID                          the adjudicator, if any
+#   REVIEW_GATE_ID                         adjudicator, else the lone reviewer,
+#                                          else "" (a panel with no adjudicator
+#                                          has no gate — hand-built only)
+review_chain_scan() {
+  local impl_id=$1 f rid role
+  REVIEW_CHAIN_IDS=(); REVIEW_CHAIN_FILES=(); REVIEW_REVIEWER_IDS=()
+  REVIEW_ADJ_ID=""; REVIEW_GATE_ID=""
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    [[ "$(fm_get "$f" '.review_of')" == "$impl_id" ]] || continue
+    rid=$(fm_get "$f" '.id')
+    [[ -z "$rid" ]] && continue
+    role=$(fm_get "$f" '.review_role')
+    REVIEW_CHAIN_IDS+=("$rid"); REVIEW_CHAIN_FILES+=("$f")
+    if [[ "$role" == "adjudicator" ]]; then
+      REVIEW_ADJ_ID="$rid"
+    else
+      REVIEW_REVIEWER_IDS+=("$rid")
+    fi
+  done < <(list_all_files)
+  if [[ -n "$REVIEW_ADJ_ID" ]]; then
+    REVIEW_GATE_ID="$REVIEW_ADJ_ID"
+  elif (( ${#REVIEW_CHAIN_IDS[@]} == 1 )); then
+    REVIEW_GATE_ID="${REVIEW_CHAIN_IDS[0]}"
+  fi
+  return 0
+}
+
+# Write one synthesized review task file. Emits the full machine-key set of
+# LEDGER-CONTRACT §3 (a writer should emit the full set) plus the review
+# fields, through yaml_scalar so no generated title can break the frontmatter.
+# Usage: review_write_task <file> <id> <role> <is_gate> <impl-id> <impl-title> <prompt> <blocker...>
+review_write_task() {
+  local file=$1 id=$2 role=$3 is_gate=$4 impl_id=$5 impl_title=$6 prompt=$7
+  shift 7
+  local -a blist=("$@")
+  local title goal b
+  if [[ "$role" == "adjudicator" ]]; then
+    title="Adjudicate the review of $impl_id: $impl_title"
+    goal="The reviewer findings for $impl_id are adjudicated and the gate verdict is rendered."
+  else
+    title="Adversarial review of $impl_id: $impl_title"
+    goal="The work of $impl_id is adversarially reviewed against its stated goal and a verdict is recorded."
+  fi
+  {
+    printf -- '---\n'
+    printf 'id: %s\n' "$(yaml_scalar "$id")"
+    printf 'phase: %s\n' "$(yaml_scalar "${id%%.*}")"
+    printf 'title: %s\n' "$(yaml_scalar "$title")"
+    printf 'status: open\n'
+    printf 'claimed_by: null\n'
+    printf 'claimed_at: null\n'
+    printf 'turn_budget_remaining: null\n'
+    printf 'consecutive_failed_iterations: 0\n'
+    printf 'blockers:\n'
+    for b in "${blist[@]}"; do
+      printf -- '  - %s\n' "$(yaml_scalar "$b")"
+    done
+    printf 'completed_by_commits: []\n'
+    printf 'milestone: null\n'
+    printf 'files: []\n'
+    printf 'last_heartbeat_head_sha: null\n'
+    printf 'completed_at: null\n'
+    printf 'goal: %s\n' "$(yaml_scalar "$goal")"
+    printf 'last_heartbeat_ts: null\n'
+    printf 'blocked_at: null\n'
+    printf 'blocked_reason: null\n'
+    printf 'resume_attempts: 0\n'
+    printf 'resume_head_sha: null\n'
+    printf 'review_of: %s\n' "$(yaml_scalar "$impl_id")"
+    printf 'review_role: %s\n' "$role"
+    if [[ -n "$prompt" ]]; then
+      printf 'review_prompt: %s\n' "$(yaml_scalar "$prompt")"
+    else
+      printf 'review_prompt: null\n'
+    fi
+    printf -- '---\n\n'
+    printf '# %s — %s\n\n' "$id" "$title"
+    printf '## Subject\n\n'
+    if [[ "$role" == "adjudicator" ]]; then
+      printf 'Adjudicate the review of %s ("%s"). Read every reviewer task'\''s findings\n' "$impl_id" "$impl_title"
+      printf 'AND the delivered work — an adjudicator that cannot read the code cannot\n'
+      printf 'break ties. The change-request path is yours alone; you may approve over a\n'
+      printf 'lone objection.\n\n'
+    else
+      printf 'Adversarial review of %s ("%s"). Read its task file'\''s goal and\n' "$impl_id" "$impl_title"
+      printf 'acceptance, read the work it delivered, run the tests. Your deliverable is\n'
+      printf 'the verdict in the ledger, not code commits.\n\n'
+    fi
+    printf '## Verdict\n\n'
+    if [[ "$is_gate" == "1" ]]; then
+      printf '    %s verdict %s --approve [--findings -]\n' "$TASKPUMP_PROG_NAME" "$id"
+      printf '    %s verdict %s --request-changes --findings -\n\n' "$TASKPUMP_PROG_NAME" "$id"
+      printf 'This task is the gate: downstream work stays blocked until it completes, and\n'
+      printf 'a change-request reopens %s with your findings.\n' "$impl_id"
+    else
+      printf '    %s verdict %s --approve --findings -\n\n' "$TASKPUMP_PROG_NAME" "$id"
+      printf 'You are one voice on a panel: only the adjudicator renders the gate verdict,\n'
+      printf 'and your findings must not be shaped by the other reviewers'\'' — independence\n'
+      printf 'is what makes the panel adversarial rather than an echo.\n'
+    fi
+  } >"$file"
+}
+
+# Synthesize a review chain for an implementation task, atomically under the
+# state lock: reviewers, adjudicator, and the downstream rewiring, in one
+# ledger commit. Refuses a second chain for the same task — one subject, one
+# chain — and warns (does not die) when the subject is already done, because
+# reviewing landed work is legitimate and the chain is simply eligible at once.
+cmd_review() {
+  local impl_id="" panel=1 prompt="" max_rounds=3
+  while (( $# )); do
+    case $1 in
+      --panel) panel=$2; shift 2;;
+      --panel=*) panel=${1#--panel=}; shift;;
+      --prompt) prompt=$2; shift 2;;
+      --prompt=*) prompt=${1#--prompt=}; shift;;
+      --max-rounds) max_rounds=$2; shift 2;;
+      --max-rounds=*) max_rounds=${1#--max-rounds=}; shift;;
+      -*) die "unknown flag to review: $1";;
+      *) [[ -z "$impl_id" ]] && impl_id=$1 || die "too many positional args to review"; shift;;
+    esac
+  done
+  [[ -z "$impl_id" ]] && die "usage: $TASKPUMP_PROG_NAME review <impl-id> [--panel N] [--prompt <file>] [--max-rounds N]"
+  [[ "$panel" =~ ^[0-9]+$ ]] && (( panel >= 1 )) \
+    || die "--panel must be a positive integer, got: $panel"
+  [[ "$max_rounds" =~ ^[0-9]+$ ]] && (( max_rounds >= 1 )) \
+    || die "--max-rounds must be a positive integer, got: $max_rounds"
+
+  local impl_file; impl_file=$(task_file_required "$impl_id")
+  [[ -n "$(fm_get "$impl_file" '.review_role')" ]] \
+    && die "cannot review $impl_id: it is itself a review task (the adjudicator is the review of the reviews)"
+
+  review_chain_scan "$impl_id"
+  (( ${#REVIEW_CHAIN_IDS[@]} > 0 )) \
+    && die "a review chain for $impl_id already exists (${REVIEW_CHAIN_IDS[*]}); one subject, one chain — reopen its tasks to re-review"
+
+  # The prompt is validated now, at creation time, so a typo'd path fails here
+  # and not in whatever dispatches the reviewer weeks later. Stored relative to
+  # the code repo when it lies inside it, so the recorded path survives the
+  # ledger being read from another checkout.
+  if [[ -n "$prompt" ]]; then
+    [[ -f "$prompt" ]] || die "review prompt file does not exist: $prompt"
+    local prompt_abs code_root
+    prompt_abs=$(readlink -f "$prompt")
+    code_root=$(git -C "$TASKPUMP_CODE_REPO" rev-parse --show-toplevel 2>/dev/null || true)
+    [[ -z "$code_root" ]] && code_root="$TASKPUMP_CODE_REPO"
+    if [[ "$prompt_abs" == "$code_root"/* ]]; then
+      prompt=${prompt_abs#"$code_root"/}
+    else
+      prompt="$prompt_abs"
+    fi
+  fi
+
+  local impl_status impl_title
+  impl_status=$(fm_get "$impl_file" '.status')
+  [[ "$impl_status" == "done" ]] \
+    && warn "reviewing already-done work: $impl_id is done, so the chain is eligible immediately"
+  impl_title=$(fm_get "$impl_file" '.title')
+
+  # Allocate the next free .N ids in the implementation's phase namespace —
+  # the id grammar (§7) is contract-frozen, so review tasks live in the same
+  # namespace as every other task. The bare-phase file, if any, counts as 0.
+  local idphase=${impl_id%%.*} max_n=0 f stem n
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    stem=$(basename "$f" .md)
+    [[ "$stem" == "$idphase".* ]] || continue
+    n=${stem#"$idphase".}
+    [[ "$n" =~ ^[0-9]+$ ]] || continue
+    (( n > max_n )) && max_n=$n
+  done < <(list_all_files)
+
+  # Downstream snapshot BEFORE any new file exists, so the chain's own members
+  # (whose blockers name the implementation) can never be rewired onto the
+  # gate they are part of.
+  local -a downstream_files=() downstream_ids=()
+  local blk hit did
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    hit=0
+    while IFS= read -r blk; do
+      [[ "$blk" == "$impl_id" ]] && { hit=1; break; }
+    done < <(yq --front-matter=extract '.blockers[]?' "$f" 2>/dev/null || true)
+    (( hit )) || continue
+    did=$(fm_get "$f" '.id')
+    downstream_files+=("$f"); downstream_ids+=("$did")
+  done < <(list_all_files)
+
+  # Reserve the ids: reviewers first, then the adjudicator.
+  local -a reviewer_ids=()
+  local i new_id adj_id="" gate_id
+  for (( i = 1; i <= panel; i++ )); do
+    new_id="$idphase.$((max_n + i))"
+    [[ "$new_id" =~ $TASKPUMP_ID_PATTERN ]] \
+      || die "generated review id '$new_id' does not match TASKPUMP_ID_PATTERN $TASKPUMP_ID_PATTERN"
+    reviewer_ids+=("$new_id")
+  done
+  if (( panel > 1 )); then
+    adj_id="$idphase.$((max_n + panel + 1))"
+    [[ "$adj_id" =~ $TASKPUMP_ID_PATTERN ]] \
+      || die "generated adjudicator id '$adj_id' does not match TASKPUMP_ID_PATTERN $TASKPUMP_ID_PATTERN"
+    gate_id="$adj_id"
+  else
+    gate_id="${reviewer_ids[0]}"
+  fi
+
+  # Write the chain. A lone reviewer is the gate; panel reviewers are not.
+  local rid is_gate
+  for rid in "${reviewer_ids[@]}"; do
+    is_gate=0; [[ "$rid" == "$gate_id" ]] && is_gate=1
+    review_write_task "$TASKPUMP_TASKS_DIR/$rid.md" "$rid" reviewer "$is_gate" \
+      "$impl_id" "$impl_title" "$prompt" "$impl_id"
+  done
+  if [[ -n "$adj_id" ]]; then
+    review_write_task "$TASKPUMP_TASKS_DIR/$adj_id.md" "$adj_id" adjudicator 1 \
+      "$impl_id" "$impl_title" "" "${reviewer_ids[@]}"
+  fi
+
+  # Rewire downstream: the gate is ADDED to existing blockers, never a
+  # replacement for the implementation edge — a later reopen of the
+  # implementation must still hold downstream shut on its own.
+  local df
+  for df in "${downstream_files[@]}"; do
+    local -a cur=()
+    local seen=0 e
+    while IFS= read -r blk; do
+      [[ -z "$blk" ]] && continue
+      cur+=("$blk")
+      [[ "$blk" == "$gate_id" ]] && seen=1
+    done < <(yq --front-matter=extract '.blockers[]?' "$df" 2>/dev/null || true)
+    (( seen )) && continue
+    cur+=("$gate_id")
+    local json; json=$(printf '%s\n' "${cur[@]}" | jq -R . | jq -s -c .)
+    BLOCKERS="$json" yq -i --front-matter=process '.blockers = (strenv(BLOCKERS) | from_json)' "$df"
+  done
+
+  # Round bookkeeping lives on the implementation task: one home for the
+  # counter and its bound, whichever chain member renders the verdict.
+  local now; now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  fm_set "$impl_file" ".review_round = 1 | .review_max_rounds = $max_rounds"
+  {
+    printf '\n## Review chain created (%s)\n\n' "$now"
+    printf 'Reviewers: %s.' "${reviewer_ids[*]}"
+    [[ -n "$adj_id" ]] && printf ' Adjudicator: %s.' "$adj_id"
+    printf ' Gate: %s. Rounds: 1/%s.\n' "$gate_id" "$max_rounds"
+  } >> "$impl_file"
+
+  git_commit_state "review $impl_id: ${#reviewer_ids[@]} reviewer(s), gate=$gate_id (max_rounds=$max_rounds)"
+  echo "review chain for $impl_id: reviewer(s) ${reviewer_ids[*]}${adj_id:+, adjudicator $adj_id} (gate: $gate_id)"
+  if (( ${#downstream_ids[@]} > 0 )); then
+    echo "downstream rewired onto the gate: ${downstream_ids[*]}"
+  else
+    echo "no downstream tasks listed $impl_id as a blocker; the gate blocks nothing yet"
+  fi
+  return 0
 }
 
 # Record that the pump is about to auto-resume a stalled task, and rule on
@@ -1965,6 +2259,10 @@ usage() {
 Commands:
   next [--branch <b>] [--phase <FN>] Emit next ready task as JSON (incl. goal).
                                      --phase scopes to one epic (e.g. F51).
+                                     Review tasks are skipped unless
+                                       --include-reviews: an in-context agent
+                                       loop must never claim the review of its
+                                       own work.
   ready [--phases A..B] [--branch <b>] [--json|--count|--count-eligible]
                                      --json/default: the WHOLE eligible frontier
                                        (open + blockers done + unclaimed or own
@@ -1977,6 +2275,12 @@ Commands:
                                        --count > 0 signals a stall (work, none
                                        ready). --count wins if both are given.
                                      --phases accepts TN, TN..TM, and comma lists.
+                                     The eligible walks (--json/default/
+                                       --count-eligible) skip review tasks
+                                       unless --include-reviews; --count still
+                                       counts them — a pending review is open
+                                       work, and a range gated on one is
+                                       stalled, not drained.
   list [--status <s>]                Human-readable listing (flags missing goals).
   goal <id> [--set "text"]           Read or set a task's one-line outcome goal.
   goal --missing                     List open/in_progress tasks with no goal.
@@ -2006,6 +2310,19 @@ Commands:
                                        task to status=open (done → sheds completion
                                        markers: falsely-done; needs-review/stuck →
                                        clears the failure streak + scrub_reason).
+  review <impl-id> [--panel N] [--prompt <file>] [--max-rounds N]
+                                     Synthesize a review chain in the DAG: N
+                                       reviewer tasks blocked by <impl-id> (default
+                                       1), an adjudicator blocked by all reviewers
+                                       when N > 1, and the gate task (adjudicator,
+                                       or the lone reviewer) ADDED to the blockers
+                                       of every task downstream of <impl-id>.
+                                       Blockers do the gating; no new predicate.
+                                       Refuses a second chain for the same task.
+                                       --prompt records a review lens (validated
+                                       now, read by whatever dispatches the
+                                       reviewer); --max-rounds bounds the
+                                       change-request loop (default 3).
   resume-attempt <id> --head <sha> [--max N]
                                      Pump-only: record an auto-resume of a stalled
                                        task and rule on whether it may proceed.
@@ -2172,19 +2489,19 @@ main() {
   # about the install-root fallback's ledger is a wrong answer about the
   # caller's — `resolve` stays available to diagnose.
   case $cmd in
-    create|claim|heartbeat|complete|block|needs-review|release|reopen|defer|undefer|resume-attempt|scrub|goal|title|blockers|fsck)
+    create|claim|heartbeat|complete|block|needs-review|release|reopen|review|defer|undefer|resume-attempt|scrub|goal|title|blockers|fsck)
       tp_require_resolved_ledger;;
   esac
   # Every verb that reads or writes the ledger needs the directory to exist;
   # `resolve` is the diagnostic the refusal points at and keeps working.
   case $cmd in
-    next|ready|list|goal|title|blockers|create|claim|heartbeat|complete|block|needs-review|release|reopen|defer|undefer|deferred|resume-attempt|scrub)
+    next|ready|list|goal|title|blockers|create|claim|heartbeat|complete|block|needs-review|release|reopen|review|defer|undefer|deferred|resume-attempt|scrub)
       tp_require_tasks_dir;;
   esac
   # Mutating subcommands serialize on the cross-agent state lock for their
   # whole read-modify-write + commit. Read-only commands (next/list) skip it.
   case $cmd in
-    claim|heartbeat|complete|block|needs-review|release|reopen|defer|undefer|resume-attempt|scrub) acquire_state_lock;;
+    claim|heartbeat|complete|block|needs-review|release|reopen|review|defer|undefer|resume-attempt|scrub) acquire_state_lock;;
   esac
   case $cmd in
     next) cmd_next "$@";;
@@ -2201,6 +2518,7 @@ main() {
     needs-review) cmd_needs_review "$@";;
     release) cmd_release "$@";;
     reopen) cmd_reopen "$@";;
+    review) cmd_review "$@";;
     defer) cmd_defer "$@";;
     undefer) cmd_undefer "$@";;
     deferred) cmd_deferred "$@";;
