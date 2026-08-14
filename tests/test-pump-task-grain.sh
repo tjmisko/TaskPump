@@ -17,6 +17,7 @@
 #   6. naming          — an unnameable or COLLIDING unit is refused at tick zero
 #   7. deadlock        — nothing live/launchable/resumable still exits 3, loudly
 #   8. phase grain     — untouched: same range, same plan, phases not tasks
+#   9. integration     — a quarantined MERGE never un-completes the WORK
 #
 # Hermetic throughout: a throwaway ledger, a throwaway git repo, a stub runner
 # and a stub container runtime. Nothing here touches a real ledger or a real
@@ -518,6 +519,82 @@ rc=0; out=$(pump G3 --grain chain 2>&1) || rc=$?
 have "$out" 'task' && pass "and the message no longer claims task is unimplemented" || fail "stale chain message:\n$out"
 rc=0; out=$(pump G3 --grain herd 2>&1) || rc=$?
 [[ "$rc" -ne 0 ]] && have "$out" 'unknown grain' && pass "an unknown grain is refused" || fail "unknown grain: rc=$rc\n$out"
+
+# ── 9. --integration-trunk at task grain ──────────────────────────────────────
+echo "--- 9. a conflicting merge quarantines the MERGE, never un-completes the WORK ---"
+# The second blocking defect of the 2026-08-14 adversarial review. quarantine_unit
+# flags the unit's lead task needs-review — and at task grain unit_lead_task
+# returns the unit ITSELF, so a DONE task whose branch conflicts with the trunk
+# was flipped to needs-review; detect_stalled_orphans then saw needs-review with
+# commits ahead, resume_unit reopened it to `open`, and the pump relaunched an
+# agent onto finished work. All inside a single tick, because reconcile_trunk
+# runs before compute_plan. The merge is what is broken; the work is not.
+REPO3="$TMP/project-trunk"
+git init -q -b main "$REPO3"
+git -C "$REPO3" config user.name  'taskpump-fixture'
+git -C "$REPO3" config user.email 'fixture@taskpump.test'
+printf 'base\n' >| "$REPO3/shared.txt"
+git -C "$REPO3" add -A
+git -C "$REPO3" commit -qm 'seed'
+# A trunk and a task branch that rewrote the same line: a real merge conflict,
+# not a stub.
+git -C "$REPO3" switch -qc auto/trunk main
+printf 'trunk\n' >| "$REPO3/shared.txt"
+git -C "$REPO3" commit -qam 'trunk edit'
+for b in g3.3 g3.4; do
+  git -C "$REPO3" switch -qc "feat/$b" main
+  printf 'task %s\n' "$b" >| "$REPO3/shared.txt"
+  git -C "$REPO3" commit -qam "feat($b): conflicting edit"
+done
+git -C "$REPO3" switch -q main
+git -C "$REPO3" worktree add -q "$REPO3/.worktrees/auto-trunk" auto/trunk
+
+QFILE="$TMP/quarantine"
+ttick() {  # a real --once tick with the integration trunk on (no containers)
+  TASKPUMP_WORKSPACE_ROOT="$REPO3" \
+  TASKPUMP_PUMP_WORKTREES_DIR="$REPO3/.worktrees" \
+  TASKPUMP_PUMP_OPS_DIR="$OPS" \
+  TASKPUMP_PUMP_STATE_FILE="$TMP/trunk.state" \
+  TASKPUMP_POOL_CAP_FILE="$TMP/trunk.cap" \
+  TASKPUMP_PUMP_LOG="$TMP/trunk.log" \
+  TASKPUMP_PUMP_QUARANTINE_FILE="$QFILE" \
+  TASKPUMP_PUMP_BUILD_CMD='true' \
+  TASKPUMP_PUMP_NO_LAUNCH=1 \
+  TASKPUMP_PUMP_NO_GH=1 \
+  STUB_LIVE="" \
+  "$PUMP" --no-health-gate --no-usage-gate --once --phases G3 --grain task \
+    --integration-trunk 2>&1
+}
+
+rm -f "$TASKS"/*.md "$TMP/trunk.cap"
+: >| "$QFILE"
+mk G3.3 done "" "shared.txt"
+out=$(ttick)
+have "$out" 'quarantine G3\.3: conflict' && pass "a conflicting task branch is still quarantined" \
+  || fail "no quarantine at task grain:\n$out"
+grep -qE '^G3\.3 .*conflict$' "$QFILE" && pass "the quarantine marker names the unit and the reason" \
+  || fail "no marker:\n$(cat "$QFILE" 2>/dev/null)"
+have "$out" 'G3\.3 → needs-review' && fail "a done task was flipped to needs-review by a bad MERGE:\n$out" \
+  || pass "a done task is never flipped to needs-review"
+grep -q '^status: done$' "$TASKS/G3.3.md" \
+  && pass "the ledger still says done — the work was never un-completed" \
+  || fail "G3.3 status: $(grep '^status:' "$TASKS/G3.3.md")"
+have "$out" 'resuming G3\.3' && fail "finished work was resumed:\n$out" || pass "and nothing resumes it"
+have "$out" 'would launch G3\.3' && fail "an agent was dispatched onto finished work:\n$out" \
+  || pass "no agent is dispatched onto finished work"
+have "$out" 'the merge is broken, not the work' \
+  && pass "the log says what is actually broken" || fail "no explanation logged:\n$out"
+
+# The positive control, so this is a narrowing and not a disabling: UNFINISHED
+# work whose merge conflicts is still flagged for a human, and still resumable.
+rm -f "$TASKS"/*.md "$TMP/trunk.cap"
+: >| "$QFILE"
+mk G3.4 open "" "shared.txt"
+out=$(ttick)
+have "$out" 'quarantine G3\.4: conflict' && pass "an open task's conflicting merge is quarantined too" \
+  || fail "no quarantine for G3.4:\n$out"
+have "$out" 'G3\.4 → needs-review' && pass "and unfinished work IS flagged needs-review" \
+  || fail "open task not flagged:\n$out"
 
 echo
 echo "=============================================="

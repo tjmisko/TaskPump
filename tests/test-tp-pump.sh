@@ -435,6 +435,27 @@ have "$out" 'would quarantine F55: conflict' && pass "conflict → would quarant
 have "$out" 'would integrate F55' && fail "trunk advanced despite conflict:\n$out" || pass "trunk not advanced on conflict"
 grep -qE '^F55 .*conflict$' "$QFILE" && pass "quarantine marker written for conflict" || fail "no conflict marker:\n$(cat "$QFILE")"
 
+# 13g: a DONE lead is never un-completed by a bad merge. The quarantine flag
+# says "reconcile feat/fN by hand", and a phase whose last task already
+# completed has no eligible lead — phase_lead_task returns nothing and the
+# fallback names <phase>.0, which by then is done. Flipping it to needs-review
+# tells the ledger that finished work is unfinished, and (with the resume path
+# armed) hands a fresh agent a task that has nothing left to do. The broken
+# thing is the merge.
+# Its own phase, so the drained state is the fixture's and not a leftover.
+: >| "$QFILE"
+mk F59.0 done
+out=$(STUB_GATE_RC=0 STUB_INTEGRATE_CONFLICT="F59" itick F59 2>&1)
+have "$out" 'would quarantine F59: conflict' && pass "a drained phase's conflict still quarantines" \
+  || fail "no quarantine for a drained phase:\n$out"
+have "$out" 'would needs-review F59\.0' && fail "a done lead was flipped to needs-review:\n$out" \
+  || pass "a done lead is never flipped to needs-review"
+have "$out" 'would leave F59\.0 done' && pass "and the log says the merge is what is broken" \
+  || fail "no explanation:\n$out"
+grep -qE '^F59 .*conflict$' "$QFILE" && pass "the marker is still written for the human" \
+  || fail "no marker:\n$(cat "$QFILE")"
+rm -f "$TASKS/F59.0.md"
+
 # 13f: --integration-trunk OFF ⇒ no integration whatsoever (opt-out regression).
 : >| "$QFILE"
 out=$(STUB_GATE_RC=0 ARACHNE_PUMP_BUILD_CMD='false' \

@@ -1530,15 +1530,45 @@ run_build_gate_dry() {
   ( eval "$BUILD_GATE_CMD" ) >/dev/null 2>&1
 }
 
+# ledger_status <id> — the ledger's current status for one task, or empty when
+# it does not exist. Asked of the CLI rather than of TSNAP because the
+# integration pass runs BEFORE compute_plan (and at phase grain the snapshot is
+# never loaded at all), so the snapshot is either stale by a tick or absent.
+ledger_status() {
+  "$TASK_BIN" list --json 2>/dev/null \
+    | jq -r --arg id "$1" 'map(select(.id == $id)) | .[0].status // ""' 2>/dev/null
+}
+
 # quarantine_unit <unit> <pre-sha> <reason> — a conflicting or build-red merge
 # does NOT advance the trunk; the unit is flagged needs-review (real run) and a
 # host quarantine marker is appended so a human can reconcile feat/fN later. The
 # un-integrated branch simply stops propagating. Honors the dry-run seam.
+#
+# A broken MERGE is not broken WORK, and a task that is already `done` is never
+# un-completed here. At task grain unit_lead_task returns the unit ITSELF, so a
+# finished task whose branch conflicts with the trunk used to be flipped to
+# needs-review — whereupon detect_stalled_orphans saw needs-review with commits
+# ahead, resume_unit `reopen`ed it back to `open`, and the pump relaunched an
+# agent onto finished work. That is a silent wrong answer twice over: the ledger
+# claims the work is unfinished, and an agent is told to redo it. The quarantine
+# marker, the log line and the operator page already say what is actually broken
+# — the merge — so the status stays `done`. (adversarial review, 2026-08-14)
 quarantine_unit() {
   local unit="$1" sha="$2" reason="$3"
   local lead; lead="$(unit_lead_task "$unit")"
   [[ -z "$lead" ]] && lead="$unit.0"
-  if [[ "${TASKPUMP_PUMP_INTEGRATE_DRYRUN:-0}" -eq 1 ]]; then
+  local lead_status; lead_status="$(ledger_status "$lead")"
+  local dry=0
+  [[ "${TASKPUMP_PUMP_INTEGRATE_DRYRUN:-0}" -eq 1 ]] && dry=1
+  if [[ "$lead_status" == "done" ]]; then
+    if (( dry )); then
+      log "would quarantine $unit: $reason"
+      log "would leave $lead done: the merge is broken, not the work"
+    else
+      log "quarantine $unit: $reason — not advancing $INTEGRATION_TRUNK; $lead stays done (the merge is broken, not the work)"
+      pump_notify "auto/trunk: quarantined $unit ($reason); $lead left done — reconcile the merge by hand"
+    fi
+  elif (( dry )); then
     log "would quarantine $unit: $reason"
     log "would needs-review $lead: $reason"
   else
