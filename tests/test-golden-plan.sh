@@ -81,6 +81,17 @@ exit 0
 EOF
 chmod +x "$BIN/docker" "$BIN/claude-usage" "$BIN/disk-watchdog"
 
+# Fixture host credentials, for the claude-token-fresh gate. Without this pin
+# the gate reads the HOST's ~/.claude/.credentials.json: on a dev machine it
+# passes silently, on a credential-less host (CI) it prints its G3.5 skip line
+# into the captured plan — the same golden green here and red in CI. The
+# fixture token expires far beyond the pinned clock, so the gate passes
+# silently EVERYWHERE, which is what the goldens were captured recording.
+# expiresAt is milliseconds; TASKPUMP_NOW_S pins the clock the margin check
+# subtracts from, so no wall clock can age this fixture into a pause.
+CRED_FIXTURE="$TMP/credentials.json"
+printf '{"claudeAiOauth":{"expiresAt":2000000000000}}\n' >| "$CRED_FIXTURE"
+
 # ── Reference pins ────────────────────────────────────────────────────────────
 # The flip census: every shipped default the v0.1.0 flips (G1.3–G1.7) change,
 # by config-key suffix. examples/arachne.conf pins each one to its historical
@@ -210,6 +221,8 @@ pump() {
     ARACHNE_TOKEN_GATE=0 \
     ARACHNE_PUMP_NO_GH=1 \
     TASKPUMP_HEALTH_PROBE_CMD=true \
+    TASKPUMP_CREDENTIALS="$CRED_FIXTURE" \
+    TASKPUMP_NOW_S=1755000000 \
     DOCKER="$BIN/docker" \
     "$PUMP" "$@" 2>&1 )
 }

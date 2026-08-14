@@ -102,6 +102,7 @@ DOCKER="${TASKPUMP_DOCKER:-${DOCKER:-docker}}"
 # opts THIS process in; the read-only observers that share pump-lib (the monitor,
 # cleanup, both watchdogs) load the same config and deliberately do not, so they
 # keep scraping container names until each is migrated on purpose.
+# shellcheck disable=SC2034  # read by apl_live_agents (lib/pump-lib.sh)
 APL_LIVENESS_RUNNER="$RUNNER"
 # No default image on purpose (G1.5): a wrong-but-plausible default launches the
 # wrong agent silently, so a real run fails loudly below when this is empty.
@@ -621,7 +622,11 @@ export_gate_env() {
   export TASKPUMP_HEALTH_WINDOW="$HEALTH_WINDOW"
   export TASKPUMP_USAGE_CEILING="$CEILING"
   export TASKPUMP_USAGE_RESET_FILE="$RESET_FILE"
-  export TASKPUMP_CREDENTIALS="$CLAUDE_DIR/.credentials.json"
+  # Derived only when unset: TASKPUMP_CREDENTIALS is a documented key of both
+  # claude gates (their file override, and the golden suite's hermeticity
+  # seam), and a documented key the operator set must never be clobbered by a
+  # derivation of itself.
+  export TASKPUMP_CREDENTIALS="${TASKPUMP_CREDENTIALS:-$CLAUDE_DIR/.credentials.json}"
   export TASKPUMP_DISK_WATCHDOG="$DISK_WATCHDOG_BIN"
   # The legacy spellings the un-migrated tools still read.
   export HEALTH_GATE HEALTH_WINDOW
