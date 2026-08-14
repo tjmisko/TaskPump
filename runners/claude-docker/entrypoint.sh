@@ -41,8 +41,13 @@
 #   TASKPUMP_MAX_TURNS               MAX_TURNS            600
 #   TASKPUMP_AGENT_MODEL             AGENT_MODEL          opus
 #   TASKPUMP_SAFETY_TURNS            —                    3
-#   TASKPUMP_WORKSPACE_TASK_CLI      —                    tp (on PATH; startup fails
-#                                                         loudly when it is absent)
+#   TASKPUMP_WORKSPACE_TASK_CLI      —                    tp (on PATH — guaranteed by
+#                                                         the /opt/taskpump mount under
+#                                                         the shipped runner; startup
+#                                                         fails loudly when absent)
+#   TASKPUMP_INSTALL_MOUNT           —                    /opt/taskpump (where the
+#                                                         runner mounts the TaskPump
+#                                                         installation, read-only)
 #   TASKPUMP_CONTAINER_USER          —                    dev
 #   TASKPUMP_CONTAINER_HOME          —                    /home/$CONTAINER_USER
 #   TASKPUMP_PRE_FLIGHT              —                    (none; see below)
@@ -134,25 +139,60 @@ AGENT_MODEL="$(ep_first TASKPUMP_AGENT_MODEL TP_MODEL AGENT_MODEL)"
 SAFETY_TURNS="$(ep_first TASKPUMP_SAFETY_TURNS TP_SAFETY_TURNS)"
 : "${SAFETY_TURNS:=3}"
 
+# The shipped runner bind-mounts the TaskPump installation READ-ONLY at
+# /opt/taskpump (G4.3). Its bin goes on PATH BEFORE the task CLI resolves, so
+# the resolution order is: explicit TASKPUMP_WORKSPACE_TASK_CLI, then tp on
+# PATH (guaranteed under the shipped runner by this very prepend), then the
+# loud error below — reachable only under a custom runner that mounts no
+# installation. The mount destination is fixed by runner.sh and deliberately
+# NOT in its passthrough set (a host variable moving this probe away from
+# where the runner actually mounts would be a silent wrong answer); the
+# variable exists so the hermetic suite can point resolution at a fixture
+# installation.
+INSTALL_MOUNT="$(ep_first TASKPUMP_INSTALL_MOUNT TP_INSTALL_MOUNT)"
+: "${INSTALL_MOUNT:=/opt/taskpump}"
+if [[ -d "$INSTALL_MOUNT/bin" ]]; then
+    PATH="$INSTALL_MOUNT/bin:$PATH"
+    export PATH
+fi
+
 WORKSPACE_TASK_CLI="$(ep_first TASKPUMP_WORKSPACE_TASK_CLI TP_WORKSPACE_TASK_CLI)"
 : "${WORKSPACE_TASK_CLI:=tp}"
 TASK_CLI="$WORKSPACE_TASK_CLI"
+TASK_CLI_PATH=""
 case "$TASK_CLI" in
     /*) ;;                                      # absolute: used as given
     */*) TASK_CLI="$WORKSPACE_PATH/$TASK_CLI";; # relative path: under the workspace
     *)
-        # A bare command name resolves on PATH inside the container. Until the
-        # agent image actually carries tp (G4.3), a bare run must fail HERE —
+        # A bare command name resolves on PATH inside the container — under the
+        # shipped runner that means the /opt/taskpump mount just prepended
+        # above. A bare run in a container with no tp anywhere must fail HERE —
         # at startup, before the session — rather than let the agent discover a
         # missing ledger CLI mid-session and burn the iteration on it. The
-        # error names both fixes.
+        # error names both fixes; with the shipped runner it is unreachable,
+        # and it is kept for custom runners.
         if ! command -v "$TASK_CLI" >/dev/null 2>&1; then
             echo "ERROR: task CLI '$TASK_CLI' is not on PATH in this container." >&2
             echo "Fix one of: set TASKPUMP_WORKSPACE_TASK_CLI to the ledger CLI's path in the workspace, or provide 'tp' in the agent image." >&2
             exit 1
         fi
+        TASK_CLI_PATH="$(command -v "$TASK_CLI")"
         ;;
 esac
+
+# How the session invokes the ledger CLI. tp keeps its ledger verbs under
+# `tp task <verb>`; a consumer shim takes them directly (`<cli> claim …`).
+# The bare `tp` therefore expands to `tp task` — without this, every safety-net
+# call below would run `tp claim`, an unknown command swallowed by its
+# `|| true`: a silent no-op exactly where the claim discipline matters
+# (flagged in G1.6's completion notes). A pinned CLI keeps the direct-verb
+# shim grammar, so Arachne's scripts/arachne-task pin behaves exactly as
+# before the mount existed.
+if [[ "$TASK_CLI" == "tp" ]]; then
+    TASK_CLI_ARGV="tp task"
+else
+    TASK_CLI_ARGV="$(printf '%q' "$TASK_CLI")"
+fi
 
 CONTAINER_USER="$(ep_first TASKPUMP_CONTAINER_USER TP_CONTAINER_USER)"
 : "${CONTAINER_USER:=dev}"
@@ -528,7 +568,7 @@ if [[ -n "$TASK_ID" ]]; then
         chmod 666 "$GOAL_NOTE" 2>/dev/null || true
         log "Goal: $GOAL_TEXT"
     else
-        log "WARNING: lead task ${TASK_ID} has no goal — set one with '$WORKSPACE_TASK_CLI goal ${TASK_ID} --set \"...\"'"
+        log "WARNING: lead task ${TASK_ID} has no goal — set one with '$TASK_CLI_ARGV goal ${TASK_ID} --set \"...\"'"
     fi
 fi
 
@@ -558,6 +598,8 @@ if [[ -n "$TEST_MODE" && "$TEST_MODE" != "script" ]]; then
     echo "REPORT max_turns=$MAX_TURNS"
     echo "REPORT safety_turns=$SAFETY_TURNS"
     echo "REPORT task_cli=$TASK_CLI"
+    echo "REPORT task_cli_argv=$TASK_CLI_ARGV"
+    echo "REPORT task_cli_path=$TASK_CLI_PATH"
     echo "REPORT container_user=$CONTAINER_USER"
     echo "REPORT container_home=$CONTAINER_HOME"
     echo "REPORT pre_flight=$PRE_FLIGHT_PLAN"
@@ -609,9 +651,11 @@ DEV_SESSION_SCRIPT="
 
     # Safety-net claim of the lead task (the agent re-claims/sub-claims as the
     # brief directs). Harmless if already claimed by this branch (idempotent).
+    # \$TASK_CLI_ARGV is expanded at assembly time: 'tp task' for the bare
+    # mounted default, the %q-escaped path for a pinned consumer shim.
     if [ -n '$TASK_ID' ]; then
-        '$TASK_CLI' claim '$TASK_ID' --branch \"\$CURRENT_BRANCH\" --turns $SAFETY_TURNS 2>&1 | tee -a '$LOG_FILE' || true
-        '$TASK_CLI' heartbeat '$TASK_ID' --start 2>&1 | tee -a '$LOG_FILE' || true
+        $TASK_CLI_ARGV claim '$TASK_ID' --branch \"\$CURRENT_BRANCH\" --turns $SAFETY_TURNS 2>&1 | tee -a '$LOG_FILE' || true
+        $TASK_CLI_ARGV heartbeat '$TASK_ID' --start 2>&1 | tee -a '$LOG_FILE' || true
     fi
 
     # ── The single long session ──────────────────────────────────────────────
@@ -636,7 +680,7 @@ DEV_SESSION_SCRIPT="
         TASK_FILE='$TASKS_DIR/$TASK_ID$TASK_FILE_EXT'
         TASK_STATUS=\$(yq --front-matter=extract '.status' \"\$TASK_FILE\" 2>/dev/null || echo '')
         if [ \"\$TASK_STATUS\" = 'in_progress' ]; then
-            '$TASK_CLI' heartbeat '$TASK_ID' --end 2>&1 | tee -a '$LOG_FILE' || true
+            $TASK_CLI_ARGV heartbeat '$TASK_ID' --end 2>&1 | tee -a '$LOG_FILE' || true
             echo \"Lead task $TASK_ID left in_progress — parked for review.\" | tee -a '$LOG_FILE'
         else
             echo \"Lead task $TASK_ID final status: \$TASK_STATUS\" | tee -a '$LOG_FILE'
