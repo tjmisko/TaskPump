@@ -15,6 +15,7 @@ usage() {
 usage: tp <command> [args]
 
 Task ledger
+  init              scaffold taskpump.conf and the tasks directory for a new consumer
   task              read and write task state (next, claim, complete, ...)
 
 Running work
@@ -46,7 +47,7 @@ cmd=$1
 shift
 
 case "$cmd" in
-  task|pump|cleanup|monitor|dag-render|stream-fmt|agent-watchdog|disk-watchdog)
+  init|task|pump|cleanup|monitor|dag-render|stream-fmt|agent-watchdog|disk-watchdog)
     exec "$TP_ROOT/libexec/tp-$cmd" "$@"
     ;;
   usage)

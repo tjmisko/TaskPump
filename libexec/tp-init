@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+# tp init — scaffold a new TaskPump consumer: a commented taskpump.conf and an
+# empty tasks directory at the enclosing git worktree root.
+#
+# The first command a new consumer runs. The scaffolded conf records only the
+# decisions a starter actually makes — where the ledger lives and what task
+# ids look like — and points at taskpump.conf.example for the full key census.
+# Every other key keeps its baked default, because a missing key is normal
+# (docs/CONFIG.md).
+#
+# Refusals are loud, name the fix, and change nothing:
+#   * a taskpump.conf anywhere the discovery walk would find one — init must
+#     never shadow an existing ledger's configuration;
+#   * a tasks directory that already contains anything — init scaffolds a
+#     fresh ledger, it never adopts one;
+#   * a --tasks-dir that would sit beside an existing default ledger.
+#
+# Usage:
+#   tp init                            # taskpump.conf + tasks/ at the root
+#   tp init --tasks-dir planning/tasks # ledger elsewhere, relative to the root
+#
+# Exit codes: 0 scaffolded; 1 refused (existing state, not a repository);
+# 2 usage error.
+# HELP-END
+set -euo pipefail
+
+# ── TaskPump config core ──────────────────────────────────────────────────────
+# Sourced for TP_ROOT and the discovery-walk helper, but tp_load_config is
+# deliberately NOT called: init runs before configuration exists, decides
+# nothing from config keys, and must not source (execute) a conf it is about
+# to refuse over. The walk itself is consulted directly — the refusal below is
+# "would the tools discover a conf here?", a question about files on disk, so
+# the TASKPUMP_NO_CONF loading switch does not apply to it.
+_tp_self_root="$(CDPATH='' cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+# shellcheck source=../lib/config.sh
+. "$_tp_self_root/lib/config.sh"
+
+print_help() { awk 'NR==1 {next} /^# HELP-END/ {exit} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$0"; }
+
+die_usage() {
+  printf 'tp-init: %s\n' "$1" >&2
+  printf "run 'tp init --help' for usage\n" >&2
+  exit 2
+}
+
+refuse() {
+  # A refusal changes nothing, says so, and names the fix. Exit 1, distinct
+  # from usage errors (2), so "existing state" is machine-distinguishable.
+  printf 'tp-init: %s\n' "$1" >&2
+  printf 'tp-init: nothing was changed. %s\n' "$2" >&2
+  exit 1
+}
+
+TASKS_DIR_REL="tasks"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --tasks-dir)   [[ $# -ge 2 ]] || die_usage "--tasks-dir needs a value"
+                   TASKS_DIR_REL="${2}"; shift ;;
+    --tasks-dir=*) TASKS_DIR_REL="${1#--tasks-dir=}" ;;
+    -h|--help)     print_help; exit 0 ;;
+    *)             die_usage "unknown arg '$1'" ;;
+  esac
+  shift
+done
+
+# The tasks dir is written into the conf verbatim, so it must stay a plain
+# root-relative path: an absolute path would follow the primary checkout into
+# every worktree (the wrong-ledger incident), and quoting-sensitive characters
+# would change meaning when the conf is sourced.
+TASKS_DIR_REL="${TASKS_DIR_REL%/}"
+[[ -n "$TASKS_DIR_REL" ]] || die_usage "--tasks-dir needs a non-empty value"
+[[ "$TASKS_DIR_REL" == /* ]] && die_usage \
+  "--tasks-dir must be relative to the repository root, got absolute '$TASKS_DIR_REL' (an absolute path in taskpump.conf follows the primary checkout into every worktree; for a ledger outside the repo see TASKPUMP_LEDGER_REPO in taskpump.conf.example)"
+case "/$TASKS_DIR_REL/" in
+  */../*|*/./*) die_usage "--tasks-dir must stay inside the repository: '$TASKS_DIR_REL'" ;;
+esac
+case "$TASKS_DIR_REL" in
+  *[[:space:]]* | *"'"* | *'"'* | *'\'* | *'$'* | *'`'*)
+    die_usage "--tasks-dir must not contain whitespace, quotes, or shell metacharacters: '$TASKS_DIR_REL'" ;;
+esac
+
+# ── Where does the scaffold go? ───────────────────────────────────────────────
+# The enclosing worktree root, never $PWD: configuration is a property of a
+# workspace, and the discovery walk (docs/CONFIG.md §1) stops there — a conf
+# written anywhere else would be found from some directories and not others.
+ROOT="$(tp__git_toplevel)"
+[[ -n "$ROOT" ]] || refuse \
+  "not inside a git repository, so there is no worktree root to scaffold at" \
+  "Run tp init from inside the repository TaskPump should drive (git init first for a brand-new project)."
+
+CONF="$ROOT/$TP_CONFIG_NAME"
+TASKS_DIR="$ROOT/$TASKS_DIR_REL"
+
+# ── Refusal 1: a conf the discovery walk would find ───────────────────────────
+# The exact walk the tools use (lib/config.sh), consulted directly: anywhere it
+# finds a taskpump.conf, writing another would shadow an existing ledger's
+# configuration. Re-running after a refusal changes nothing — idempotent failure.
+existing_conf="$(tp__discover_config)"
+if [[ -n "$existing_conf" ]]; then
+  if [[ "$existing_conf" == "$CONF" ]]; then
+    refuse "already initialized — $existing_conf exists" \
+      "Edit that file to reconfigure; taskpump.conf.example is the full key census."
+  fi
+  refuse "the discovery walk already finds $existing_conf, and a conf at $CONF would shadow it" \
+    "Edit that conf instead, or move it if it should not configure this directory."
+fi
+
+# ── Refusal 2: an existing ledger in the way ──────────────────────────────────
+# A non-empty target directory means this repository already carries task
+# state; adopting it silently is how a wrong-ledger incident starts. And a
+# default-location ledger (tasks/) next to a --tasks-dir pointed elsewhere
+# would be shadowed by the conf this writes — same refusal, other direction.
+if [[ -e "$TASKS_DIR" && ! -d "$TASKS_DIR" ]]; then
+  refuse "$TASKS_DIR exists and is not a directory" \
+    "Move it aside, or pick another location with --tasks-dir."
+fi
+if [[ -d "$TASKS_DIR" ]] && [[ -n "$(ls -A -- "$TASKS_DIR" 2>/dev/null)" ]]; then
+  refuse "$TASKS_DIR already contains files — init scaffolds a fresh ledger, it never adopts one" \
+    "This repository already works bare (docs/CONFIG.md); to add a conf beside an existing ledger, write taskpump.conf by hand from taskpump.conf.example."
+fi
+DEFAULT_LEDGER="$ROOT/tasks"
+if [[ "$TASKS_DIR" != "$DEFAULT_LEDGER" && -d "$DEFAULT_LEDGER" ]]; then
+  refuse "this repository already carries a ledger directory at $DEFAULT_LEDGER, and a conf pointing at $TASKS_DIR_REL would shadow it" \
+    "Keep the default location, or move $DEFAULT_LEDGER aside first."
+fi
+
+# ── Scaffold ──────────────────────────────────────────────────────────────────
+# Directory first: if its creation fails nothing has been written, and a
+# leftover empty directory from a failed conf write is harmless — the re-run
+# sails past both checks above and finishes the job.
+mkdir -p -- "$TASKS_DIR"
+
+{
+  cat <<'CONF_HEAD'
+# taskpump.conf — this repository's TaskPump configuration.
+#
+# Scaffolded by `tp init`. Sourced by bash with allexport: one KEY=value per
+# line, quoted when the value contains spaces. Precedence, strongest first:
+#
+#   environment  >  this file  >  the default baked into each tool
+#
+# Only the keys a new consumer actually decides are set here. Every other key
+# has a working default — the full annotated census is taskpump.conf.example
+# in the TaskPump install, and docs/CONFIG.md explains discovery, precedence,
+# and what each key group is for.
+
+# Where the task ledger lives, relative to this repository's root.
+CONF_HEAD
+  printf 'TASKPUMP_TASKS_DIR=%s\n' "$TASKS_DIR_REL"
+  cat <<'CONF_TAIL'
+
+# The shape of a task id: PHASE or PHASE.N (T1, T2.1). Changing the sigil?
+# Keep the dot, and set TASKPUMP_PHASE_SIGIL to the new letter as well
+# (docs/LEDGER-CONTRACT.md §7).
+TASKPUMP_ID_PATTERN='^T[0-9]+(\.[0-9]+)?$'
+
+# What "is the tree broken?" means in this project — the command that must be
+# green before work is integrated (`cargo check`, `npm test`, ...). Uncomment
+# and set it when you start running agents:
+# TASKPUMP_BUILD_GATE='npm test'
+CONF_TAIL
+} >"$CONF"
+
+printf 'initialized TaskPump at %s\n' "$ROOT"
+printf '  conf    %s\n' "$CONF"
+printf '  ledger  %s\n' "$TASKS_DIR"
+printf '\nnext:\n'
+printf '  tp task create T1 --title "First task" --goal "One sentence: the outcome."\n'
+printf '  tp task ready\n'
+printf '  tp pump --phases T1..T1 --dry-run\n'
