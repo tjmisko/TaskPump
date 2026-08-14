@@ -394,6 +394,13 @@ Queries add scoping on top of the predicate, never replacing it:
   ignoring blockers and claims. This is the *drain test* — "is any open work
   left?" — not "what can run now?".
 - `ready --count-eligible` is the narrower companion: the size of the frontier.
+- `ready --json` and `list --json` both carry each task's declared `files:` as an
+  array — `[]` when the task declares nothing, never `null`. A supervisor
+  dispatching at task grain has to know what two eligible siblings would each
+  touch before it may run them side by side, and "declares nothing" and "the
+  field is missing" must not be distinguishable to a reader. `list --json` adds
+  status, claimant and blockers for **every** task, not just the frontier: what a
+  *running* task is touching is exactly what a candidate must not collide with.
 
 The two counts diverge exactly when something is stalling the queue: work
 remains open but nothing can start. `--count > 0` with `--count-eligible == 0` is
