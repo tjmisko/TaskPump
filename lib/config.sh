@@ -96,22 +96,75 @@ tp__git_toplevel() {
   git rev-parse --show-toplevel 2>/dev/null || true
 }
 
+# tp__is_taskpump_install <dir>
+# True when <dir> is the root of a TaskPump installation — the structural
+# marker, independent of which copy of the tools is actually running, so a
+# vendored checkout is recognized even when the invoked `tp` is a global one.
+tp__is_taskpump_install() {
+  [[ -f "$1/lib/config.sh" && -f "$1/libexec/tp-task" ]]
+}
+
+# tp__superproject_root <dir>
+# The working-tree root of the repository that carries <dir>'s repo as a git
+# SUBMODULE, or empty when there is none.
+tp__superproject_root() {
+  git -C "$1" rev-parse --show-superproject-working-tree 2>/dev/null || true
+}
+
+# tp__conf_is_vendored_install <dir> <ceiling>
+# True when a taskpump.conf found at <dir> is a vendored TaskPump checkout's
+# OWN tracked conf sitting inside an enclosing consumer — never the consumer's
+# configuration. Two vendoring shapes are recognizable:
+#   * a subtree / plain directory copy: <dir> is a TaskPump install strictly
+#     inside someone else's worktree (<dir> != the walk's ceiling);
+#   * a submodule: <dir> is its own worktree root but a superproject encloses
+#     it.
+# A TaskPump checkout that is nobody's vendored copy (the dogfood repo, its
+# worktrees) matches neither and keeps its conf.
+tp__conf_is_vendored_install() {
+  local dir=$1 ceiling=$2
+  tp__is_taskpump_install "$dir" || return 1
+  [[ -n "$ceiling" && "$dir" != "$ceiling" ]] && return 0
+  [[ -n "$(tp__superproject_root "$dir")" ]]
+}
+
 # tp__discover_config
 # Print the path of the first `taskpump.conf` found walking up from $PWD. The
 # walk stops at the enclosing git worktree root when there is one (config is a
 # property of a workspace, so it should not leak in from a parent directory),
 # and at / otherwise. Prints nothing when none is found — not an error.
+#
+# One class of conf is skipped: a vendored TaskPump checkout's own tracked
+# taskpump.conf (issue #6). That file describes TaskPump's dogfood ledger, and
+# letting it capture resolution for a consumer that vendors TaskPump (submodule,
+# subtree, or directory copy) silently points the consumer's tooling at the
+# vendored G ledger. The consumer's conf must win, so the walk passes over a
+# vendored install's conf — and, when the vendored checkout is a submodule,
+# continues past its worktree boundary into the superproject.
 tp__discover_config() {
-  local dir ceiling
+  local dir ceiling super
   dir="$(CDPATH='' cd -- "$PWD" 2>/dev/null && pwd)" || return 0
   ceiling="$(tp__git_toplevel)"
 
   while true; do
     if [[ -f "$dir/$TP_CONFIG_NAME" ]]; then
-      printf '%s\n' "$dir/$TP_CONFIG_NAME"
-      return 0
+      if ! tp__conf_is_vendored_install "$dir" "$ceiling"; then
+        printf '%s\n' "$dir/$TP_CONFIG_NAME"
+        return 0
+      fi
+      # else: a vendored TaskPump's own conf — keep walking toward the consumer.
     fi
-    [[ -n "$ceiling" && "$dir" == "$ceiling" ]] && return 0
+    if [[ -n "$ceiling" && "$dir" == "$ceiling" ]]; then
+      # At a submodule boundary of a vendored TaskPump checkout the walk does
+      # not stop: the workspace the caller means is the consumer's, so the
+      # ceiling extends to the superproject's worktree root.
+      super="$(tp__superproject_root "$dir")"
+      if [[ -n "$super" ]] && tp__is_taskpump_install "$dir"; then
+        ceiling="$super"
+      else
+        return 0
+      fi
+    fi
     [[ "$dir" == "/" ]] && return 0
     dir="$(dirname "$dir")"
   done
@@ -127,6 +180,132 @@ tp__source_config() {
   # shellcheck disable=SC1090  # path is discovered at runtime by design
   . "$path"
   [[ $had_allexport -eq 1 ]] || set +a
+  return 0
+}
+
+# ── Workspace resolution ─────────────────────────────────────────────────────
+
+# tp_workspace_cwd_root
+# The caller's workspace root: $PWD's git worktree — except when that worktree
+# is itself a vendored TaskPump checkout inside a consumer (a submodule), in
+# which case the consumer's root is the workspace the caller means. Empty when
+# $PWD is not inside a repo.
+tp_workspace_cwd_root() {
+  local root super
+  root="$(tp__git_toplevel)"
+  [[ -z "$root" ]] && return 0
+  if tp__is_taskpump_install "$root"; then
+    super="$(tp__superproject_root "$root")"
+    [[ -n "$super" ]] && root="$super"
+  fi
+  printf '%s\n' "$root"
+}
+
+# tp_resolve_workspace
+# Resolve the workspace whose ledger an invocation operates on, one rule for
+# every tool that needs it (tp-task and tp-pump must agree, or the supervisor
+# hands its agents a different ledger than the CLI reads). Sets:
+#   TP_WS_CONF_ROOT  the discovered conf's directory ("" when none / explicit)
+#   TP_WS_CWD_ROOT   the caller's workspace root ("" outside any repo)
+#   TP_WS_ROOT       the resolved workspace root
+#   TP_WS_VIA        which rung answered: conf | cwd | install-root
+# Precedence: a DISCOVERED conf's directory when the ledger probe answers
+# there, else the caller's worktree when it answers, else the install root —
+# which is a fallback, not an answer (tp-task's mutating verbs guard it).
+# An EXPLICIT TASKPUMP_CONFIG never anchors: deliberate configuration may live
+# anywhere, and saying where the config is is not saying where the ledger is.
+# shellcheck disable=SC2034  # the TP_WS_* results are read by the tools that
+# source this file (tp-task, tp-pump), not in this file itself.
+tp_resolve_workspace() {
+  local probe="${TASKPUMP_LEDGER_PROBE:-${TASKPUMP_TASKS_SUBDIR:-tasks}}"
+  TP_WS_CONF_ROOT=""
+  if [[ -z "${TASKPUMP_CONFIG:-}" && -n "${TP_CONFIG_FILE:-}" ]]; then
+    TP_WS_CONF_ROOT="$(CDPATH='' cd -- "$(dirname "$TP_CONFIG_FILE")" 2>/dev/null && pwd || true)"
+  fi
+  TP_WS_CWD_ROOT="$(tp_workspace_cwd_root)"
+  TP_WS_ROOT="$TP_ROOT"
+  TP_WS_VIA="install-root"
+  if [[ -n "$TP_WS_CONF_ROOT" && -d "$TP_WS_CONF_ROOT/$probe" ]]; then
+    TP_WS_ROOT="$TP_WS_CONF_ROOT"
+    TP_WS_VIA="conf"
+  elif [[ -n "$TP_WS_CWD_ROOT" && -d "$TP_WS_CWD_ROOT/$probe" ]]; then
+    TP_WS_ROOT="$TP_WS_CWD_ROOT"
+    TP_WS_VIA="cwd"
+  fi
+}
+
+# ── Conf-relative path anchoring ─────────────────────────────────────────────
+# A relative path in taskpump.conf means "relative to the workspace the conf
+# describes" — never "relative to wherever the caller happens to stand". Left
+# unanchored, TASKPUMP_TASKS_DIR=ops/task-loop/tasks read from a subdirectory
+# yields an EMPTY frontier with rc=0: the silent wrong answer of issue #1.
+#
+# Only values the CONF supplied are anchored. An environment value keeps the
+# shell's own convention ($PWD-relative), because the caller typed it where
+# they stood; a conf file is checked in and read from anywhere.
+
+# The path-valued keys whose conf-relative values anchor to the workspace.
+# Deliberately NOT every path-ish key: the state-file names (PUMP_LOG,
+# POOL_CAP_FILE, ...) are relative to the STATE DIR by contract, and
+# TASKPUMP_LEDGER_PROBE is relative to a candidate workspace by definition.
+TP_ANCHORED_PATH_KEYS=(
+  TASKS_DIR TASK_OUT CODE_REPO LEDGER_REPO
+  PUMP_TASKS_DIR PUMP_OPS_DIR WORKSPACE_ROOT
+  BRIEF_TEMPLATE PHASE_BRIEF_TEMPLATE RESUME_TEMPLATE
+)
+
+# tp_conf_supplied <KEY_SUFFIX>
+# True when TASKPUMP_<KEY_SUFFIX>'s current value came from the loaded conf
+# file rather than the environment.
+tp_conf_supplied() {
+  [[ $'\n'"${TP_CONF_KEYS:-}"$'\n' == *$'\n'"$1"$'\n'* ]]
+}
+
+# tp__conf_anchor_dir
+# The directory a conf-relative path resolves against: a discovered conf's own
+# directory; for an explicit TASKPUMP_CONFIG (which may live anywhere), the
+# caller's workspace root. Empty when there is nothing to anchor to.
+tp__conf_anchor_dir() {
+  if [[ -z "${TASKPUMP_CONFIG:-}" && -n "${TP_CONFIG_FILE:-}" ]]; then
+    CDPATH='' cd -- "$(dirname "$TP_CONFIG_FILE")" 2>/dev/null && pwd
+    return 0
+  fi
+  tp_workspace_cwd_root
+}
+
+# tp__anchor_conf_paths
+# Anchor every conf-supplied relative TP_ANCHORED_PATH_KEYS value. Loud on the
+# residual unanchorable case (explicit config, relative value, no workspace):
+# resolving it against $PWD would be the silent wrong answer this exists to
+# remove, so it is an error that names the key and both fixes.
+tp__anchor_conf_paths() {
+  local anchor="" key name val
+  for key in "${TP_ANCHORED_PATH_KEYS[@]}"; do
+    tp_conf_supplied "$key" || continue
+    name="TASKPUMP_$key"
+    val="${!name-}"
+    [[ -z "$val" || "$val" == /* ]] && continue
+    [[ -n "$anchor" ]] || anchor="$(tp__conf_anchor_dir)"
+    if [[ -z "$anchor" ]]; then
+      printf 'config.sh: %s=%s is a relative path from %s,
+  and there is no workspace to anchor it to ($PWD is not inside a git worktree,
+  and an explicit TASKPUMP_CONFIG may live outside the workspace it describes).
+  Resolving it against $PWD would silently pick a different %s per directory.
+  fix it with either:
+    an absolute path for %s in the conf
+    running from inside the workspace the conf describes\n' \
+        "$name" "$val" "$TP_CONFIG_FILE" "$name" "$name" >&2
+      return 1
+    fi
+    val="$anchor/$val"
+    val="${val%/.}"                       # tidy the CODE_REPO=. spelling
+    printf -v "$name" '%s' "$val"
+    export "${name?}"
+    # Keep the legacy mirror in step; a stale relative ARACHNE_* would win in a
+    # child process that still reads the legacy name directly.
+    printf -v "ARACHNE_$key" '%s' "$val"
+    export "ARACHNE_$key"
+  done
   return 0
 }
 
@@ -160,9 +339,11 @@ tp_load_config() {
   else
     TP_CONFIG_FILE="$(tp__discover_config)"
   fi
+  local conf_sourced=0
   if [[ -n "$TP_CONFIG_FILE" ]]; then
     if [[ -f "$TP_CONFIG_FILE" ]]; then
       tp__source_config "$TP_CONFIG_FILE"
+      conf_sourced=1
     elif [[ -n "${TASKPUMP_CONFIG:-}" ]]; then
       printf 'config.sh: TASKPUMP_CONFIG points at a missing file: %s\n' \
         "$TP_CONFIG_FILE" >&2
@@ -170,6 +351,21 @@ tp_load_config() {
     fi
   fi
   export TP_CONFIG_FILE
+
+  # Which canonical keys did the CONF supply? A key set now but present in
+  # neither pre-load snapshot can only have come from the sourced file. The
+  # anchoring pass below is scoped to exactly these: environment values keep
+  # the shell's own $PWD-relative convention.
+  local key
+  TP_CONF_KEYS=""
+  if [[ "$conf_sourced" -eq 1 ]]; then
+    while IFS= read -r name; do
+      key="${name#TASKPUMP_}"
+      [[ -n "${pre_canon[$key]+set}" ]] && continue
+      [[ -n "${pre_legacy[$key]+set}" ]] && continue
+      TP_CONF_KEYS+="$key"$'\n'
+    done < <(tp__names_with_prefix TASKPUMP_)
+  fi
 
   # Environment beats config, for the canonical names.
   local key
@@ -194,6 +390,10 @@ tp_load_config() {
     printf -v "ARACHNE_$key" '%s' "${!name}"
     export "ARACHNE_$key"
   done < <(tp__names_with_prefix TASKPUMP_)
+
+  # Anchor conf-relative paths to the workspace, never to $PWD (issue #1).
+  # Runs after both promotion passes so it sees the values that actually won.
+  tp__anchor_conf_paths || return 1
 
   TP_CONFIG_LOADED=1
   return 0

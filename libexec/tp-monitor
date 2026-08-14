@@ -82,8 +82,10 @@
 # Ledger              TASKPUMP_TASKS_DIR           the ledger
 #                     TASKPUMP_TASKS_SUBDIR        its path within the repo
 #                     TASKPUMP_TASK_EXT            task-file extension (.md)
-#                     TASKPUMP_MANIFEST            v1 parallel-run manifest
-#                     TASKPUMP_MANIFEST_SUBPATH    its path within the repo
+#                     TASKPUMP_MANIFEST            OPT-IN v1 parallel-run manifest
+#                                                  (no default; sessions resolve
+#                                                  their task from ledger claims)
+#                     TASKPUMP_MANIFEST_SUBPATH    its repo-relative spelling
 # Pump                TASKPUMP_PUMP_STATE_FILE     supervisor state file
 #                     TASKPUMP_PUMP_STATE_NAME     its filename
 # Agents              TASKPUMP_AGENT_CONTAINER_PREFIX  docker name filter/slug strip
@@ -132,8 +134,20 @@ _tp_repo_default() {
 }
 REPO_ROOT="${TASKPUMP_MONITOR_REPO_ROOT:-$(_tp_repo_default)}"
 WORKTREES_DIR="${TASKPUMP_WORKTREES_DIR:-.worktrees}"
-MANIFEST_SUBPATH="${TASKPUMP_MANIFEST_SUBPATH:-ops/task-loop/parallel-manifest.tsv}"
-MANIFEST="${TASKPUMP_MANIFEST:-${MANIFEST:-$REPO_ROOT/$MANIFEST_SUBPATH}}"
+# The v1 parallel-run manifest is OPT-IN with no default path: TaskPump does
+# not generate the file (its producer stayed in Arachne at extraction), and the
+# old default pointed every other consumer at a path that cannot exist
+# (issue #7). Sessions get their task from the ledger's live claim either way; a
+# configured manifest only supplies the launch-time display name and the epic
+# fallback. Precedence: TASKPUMP_MANIFEST (bare MANIFEST is its pre-extraction
+# spelling) > TASKPUMP_MANIFEST_SUBPATH resolved against REPO_ROOT > none.
+MANIFEST_KEY="MANIFEST"
+[[ -n "${TASKPUMP_MANIFEST:-}" ]] && MANIFEST_KEY="TASKPUMP_MANIFEST"
+MANIFEST="${TASKPUMP_MANIFEST:-${MANIFEST:-}}"
+if [[ -z "$MANIFEST" && -n "${TASKPUMP_MANIFEST_SUBPATH:-}" ]]; then
+    MANIFEST_KEY="TASKPUMP_MANIFEST_SUBPATH"
+    MANIFEST="$REPO_ROOT/${TASKPUMP_MANIFEST_SUBPATH}"
+fi
 # Honours TASKPUMP_TASKS_DIR for the same reason tp-dag-render does: the two must
 # read the SAME ledger, or the GRAPH tab draws one set of tasks while `o` opens
 # files from another.
@@ -229,9 +243,18 @@ if [[ -z "$WATCH" ]]; then
     if [[ -t 1 ]]; then WATCH=1; else WATCH=0; fi
 fi
 
-# branch-slug -> "name<TAB>epic_task" lookup from the manifest.
+# branch-slug -> "name<TAB>epic_task" lookup from the opt-in manifest. Empty —
+# and everything that reads it fully functional — when no manifest is
+# configured, which is the normal case. An explicitly configured manifest that
+# does not exist is an ERROR, on the same rule TASKPUMP_CONFIG follows: an
+# explicit request for a specific file must not silently fall back.
 declare -A SLUG_NAME SLUG_TASK SLUG_BRANCH
-if [[ -f "$MANIFEST" ]]; then
+if [[ -n "$MANIFEST" ]]; then
+    if [[ ! -f "$MANIFEST" ]]; then
+        echo "ERROR: $MANIFEST_KEY names '$MANIFEST', which does not exist." >&2
+        echo "       Restore the file, or unset $MANIFEST_KEY — sessions resolve their task from the ledger's live claims without it." >&2
+        exit 1
+    fi
     while IFS=$'\t' read -r name branch _ task _rest; do
         [[ -z "${name// }" || "${name:0:1}" == "#" ]] && continue
         slug="${branch//\//-}"
@@ -660,18 +683,46 @@ pump_compute() {
 # bars below, not repeated here. $1 = usage json blob (unused; kept for caller).
 pump_summary_line() {
     [[ -f "$PUMP_STATE" ]] || return 0
-    local uj="${1:-{}}" phases status reason open_ct
+    local uj="${1:-{}}" phases status reason open_ct pump_pid pump_host last_tick
     # Read one field per line via mapfile — NOT `read -r a b c` on a @tsv line.
     # Tab is IFS-whitespace, so an empty middle field (paused_reason when not
     # paused) would collapse and shift open_tasks over by one. Newline-
     # delimited + mapfile preserves empty fields.
     local _pf; mapfile -t _pf < <(jq -r \
-        '(.phases//"?"),(.status//"?"),(.paused_reason//""),((.open_tasks // "")|tostring)' \
+        '(.phases//"?"),(.status//"?"),(.paused_reason//""),((.open_tasks // "")|tostring),((.pid // "")|tostring),(.host//""),(.last_tick//"")' \
         "$PUMP_STATE" 2>/dev/null || true)
     phases="${_pf[0]:-?}"; status="${_pf[1]:-?}"; reason="${_pf[2]:-}"
-    open_ct="${_pf[3]:-}"
+    open_ct="${_pf[3]:-}"; pump_pid="${_pf[4]:-}"; pump_host="${_pf[5]:-}"
+    last_tick="${_pf[6]:-}"
     [[ -z "${phases:-}" ]] && phases="?"
     [[ -z "${status:-}" ]] && status="?"
+
+    # Reader skepticism (issue #22): the state file is a HINT, not an oracle. A
+    # dead pump cannot retract its last `running` write — the G3 drain left one
+    # behind with no supervisor process, and a reader trusting it burned a
+    # rescue session. So a live-pump claim (running/paused) is only presented
+    # as live when the recorded pid verifies with kill -0 on the recording
+    # host. A dead pid, a missing pid (a pre-#22 writer), or another host's
+    # pid table renders STALE, never as a live pump. Terminal states
+    # (drained/stalled/stopped) claim no live process and pass through.
+    # Residual window: kill -0 on a RECYCLED pid (same number, new process —
+    # plausible after a reboot mid-drain) still reads as live. A live pump
+    # rewrites this file every tick, so an old last_tick under a running
+    # claim is the operator's cross-check.
+    local stale=0 stale_why=""
+    if [[ "$status" == "running" || "$status" == "paused" ]]; then
+        if [[ ! "$pump_pid" =~ ^[0-9]+$ ]]; then
+            stale=1; stale_why="no pid recorded"
+        elif [[ -n "$pump_host" && "$pump_host" != "${HOSTNAME:-$(hostname 2>/dev/null || true)}" ]]; then
+            # Another host's pid table is unreadable from here: STALE is the
+            # honest label, but "dead" would be a claim this host cannot make.
+            stale=1; stale_why="unverifiable from this host (recorded on $pump_host)"
+        elif ! kill -0 "$pump_pid" 2>/dev/null && [[ ! -e "/proc/$pump_pid" ]]; then
+            # kill -0 alone reads EPERM as dead — a root-owned pump watched
+            # from a user shell is alive but unsignalable; /proc settles it.
+            stale=1; stale_why="pid $pump_pid dead"
+        fi
+    fi
 
     cache_refresh_if_stale "$PUMP_CACHE" "$PUMP_TTL" pump_compute
     local eligible="…" cached_open=""
@@ -692,6 +743,8 @@ pump_summary_line() {
         paused)  color="$ST_PARK" ;;
         drained) color="$ST_DONE" ;;
         running) color="$ST_LIVE" ;;
+        stalled) color="$ST_ALERT" ;;  # deadlock exit — a human is being paged
+        stopped) color="$C_MUTED" ;;   # terminal stamp from a --once / signal exit
         *)       color="$C_MUTED" ;;   # an unknown state is not a state
     esac
     local rcolor="$C_FAINT"
@@ -704,8 +757,22 @@ pump_summary_line() {
     fi
 
     local line
-    line="$(printf '%spump[%s]:%s %s%s%s' "$C_MUTED" "$phases" "$ST_RST" "$color" "$status" "$ST_RST")"
-    [[ "$status" == "paused" && -n "${reason:-}" ]] && line+=" — $reason"
+    if (( stale )); then
+        # The label says STALE first and keeps the dead claim as a parenthetical:
+        # the one decision this line feeds is "is a pump live?", and the answer
+        # is no. last_tick is when the file was last written — since when the
+        # snapshot has been lying around.
+        local detail="was $status, $stale_why"
+        line="$(printf '%spump[%s]:%s %sSTALE%s%s (%s)' \
+            "$C_MUTED" "$phases" "$ST_RST" "$ST_ALERT" "$ST_RST" "$C_MUTED" "$detail")"
+        [[ -n "$last_tick" ]] && line+=" — since $last_tick"
+        line+="$ST_RST"
+    else
+        line="$(printf '%spump[%s]:%s %s%s%s' "$C_MUTED" "$phases" "$ST_RST" "$color" "$status" "$ST_RST")"
+        case "$status" in paused|stopped|stalled)
+            [[ -n "${reason:-}" ]] && line+=" — $reason" ;;
+        esac
+    fi
     line+="$(printf '%s  |  %s%s ready%s%s · %s open%s' \
         "$C_MUTED" "$rcolor" "$eligible" "$ST_RST" "$C_MUTED" "$open_ct" "$ST_RST")"
     printf '%s\n' "$line"

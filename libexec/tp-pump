@@ -60,8 +60,56 @@ _tp_self_root="$(CDPATH='' cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")"
 . "$_tp_self_root/lib/config.sh"
 tp_load_config
 
-SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
-REPO_ROOT="$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd)"
+# ── The two roots (issue #32) ─────────────────────────────────────────────────
+# TaskPump's INSTALL and the consumer's WORKSPACE are different directories in
+# every vendored layout and the same directory only in dogfooding. The install
+# root — lib/, libexec/, gates/, runners/, templates/, hooks/ — is
+# script-relative: TP_ROOT and friends, set above by lib/config.sh. The
+# workspace — the repository this pump DRIVES: the image-build context, the
+# phase branches and agent worktrees, every `git -C` below, the state-dir
+# default — is a property of the CALLER, resolved exactly as tp-task resolves
+# the ledger. REPO_ROOT used to be script-relative too, which pointed every one
+# of those surfaces at the vendored taskpump/ checkout for a submodule/subtree
+# consumer: branches cut in the wrong object store, agent worktrees inside the
+# vendored copy, right-looking git answers against the wrong repository.
+# TASKPUMP_WORKSPACE_ROOT pins it explicitly (env > conf; a conf-relative value
+# anchors to the conf's workspace); unset, the config anchor decides — which
+# for the dogfood layout is the same directory the script-relative derivation
+# always produced.
+tp_resolve_workspace
+if [[ -n "${TASKPUMP_WORKSPACE_ROOT:-}" ]]; then
+  if ! REPO_ROOT="$(CDPATH='' cd -- "$TASKPUMP_WORKSPACE_ROOT" 2>/dev/null && pwd)"; then
+    printf '%s: TASKPUMP_WORKSPACE_ROOT names a missing directory: %s\n' \
+      "${TASKPUMP_PUMP_PROG_NAME:-tp-pump}" "$TASKPUMP_WORKSPACE_ROOT" >&2
+    exit 1
+  fi
+else
+  REPO_ROOT="$TP_WS_ROOT"
+fi
+# The fallback rung is not an answer for a SUPERVISOR: when neither a
+# discovered conf nor the cwd probe anchored the workspace, TP_WS_ROOT is the
+# install root — and a real run would build, branch, and cut worktrees inside
+# the vendored TaskPump itself, then report the range DONE against the
+# dogfood ledger at rc=0. tp-task refuses this rung for mutating verbs; the
+# pump is the most mutating tool in the box. The vendored layout (install
+# root at or inside the caller's worktree) keeps the fallback, exactly as
+# tp-task allows it.
+# An explicitly named ledger (env, or a conf value the loader anchored) is
+# the caller saying where the work lives — the same first-rung exemption
+# tp_require_resolved_ledger grants.
+if [[ -z "${TASKPUMP_WORKSPACE_ROOT:-}" && -z "${TASKPUMP_PUMP_TASKS_DIR:-}" \
+      && -z "${TASKPUMP_TASKS_DIR:-}" && "$TP_WS_VIA" == "install-root" ]]; then
+  _pump_ws_vendored=0
+  if [[ -n "$TP_WS_CWD_ROOT" ]]; then
+    [[ "$TP_ROOT" == "$TP_WS_CWD_ROOT" || "$TP_ROOT" == "$TP_WS_CWD_ROOT"/* ]] && _pump_ws_vendored=1
+  fi
+  if (( ! _pump_ws_vendored )); then
+    printf '%s: refusing to run against the TaskPump installation itself.\n  No taskpump.conf above $PWD, $PWD is not inside a consumer repository, and no pin was given — so resolution fell back to the install root:\n    %s\n  A drain planned there would target the install, not your project.\n  fix: run from your project root, or set TASKPUMP_WORKSPACE_ROOT=/path/to/project\n' \
+      "${TASKPUMP_PUMP_PROG_NAME:-tp-pump}" "$TP_WS_ROOT" >&2
+    exit 1
+  fi
+  unset _pump_ws_vendored
+fi
 # shellcheck source=../lib/pump-lib.sh
 source "$TP_LIB_DIR/pump-lib.sh"
 
@@ -82,11 +130,32 @@ CLAUDE_JSON="${TASKPUMP_AGENT_CONFIG:-$HOME/.claude.json}"
 # when the range drains, holding the task files.
 OPS_DIR="${TASKPUMP_PUMP_OPS_DIR:-${TASKPUMP_LEDGER_REPO:-$REPO_ROOT/ops}}"
 # Tasks dir — overridable independently of OPS_DIR so phase_dependencies / brief
-# rendering can be unit-tested against a flat fixture dir.
-TASKS_DIR="${TASKPUMP_PUMP_TASKS_DIR:-${TASKPUMP_TASKS_DIR:-$OPS_DIR/task-loop/tasks}}"
-# The file that tells us a submodule ledger has actually been checked out. Any
-# path inside the ledger that only exists once `submodule update` has run.
-SUBMODULE_PROBE="${TASKPUMP_SUBMODULE_PROBE:-ops/planning/STATUS.md}"
+# rendering can be unit-tested against a flat fixture dir. The default derives
+# from the ledger probe against the WORKSPACE (REPO_ROOT above), exactly as
+# tp-task and tp-monitor derive theirs (issue #2): the pump is the tool that
+# tells a launched agent where the ledger is, so it must not keep a private
+# opinion. It anchors to the workspace root rather than OPS_DIR on purpose —
+# the ledger-repo and the ledger-directory are separate questions, and coupling
+# them is what baked Arachne's ops/task-loop/ shape in. A consumer whose ledger
+# lives under a separate ledger repo names it via TASKPUMP_LEDGER_PROBE.
+TASKS_SUBDIR="${TASKPUMP_LEDGER_PROBE:-${TASKPUMP_TASKS_SUBDIR:-tasks}}"
+TASKS_DIR="${TASKPUMP_PUMP_TASKS_DIR:-${TASKPUMP_TASKS_DIR:-$REPO_ROOT/$TASKS_SUBDIR}}"
+# Under an explicit workspace pin, the ledger CLI this pump spawns still
+# anchors to its own $PWD — a different workspace entirely when a mismatch is
+# the reason the pin was set. The pump's answer and its children's answer must
+# not diverge (that split is a silent wrong ledger), so hand the children the
+# pinned derivation — unless the caller (env or conf) already named a ledger,
+# which both sides honor identically.
+if [[ -n "${TASKPUMP_WORKSPACE_ROOT:-}" && -z "${TASKPUMP_TASKS_DIR:-}" ]]; then
+  export TASKPUMP_TASKS_DIR="$REPO_ROOT/$TASKS_SUBDIR"
+fi
+# The file that proves the ledger submodule is populated in a fresh worktree.
+# NO default (issue #3): the old one, ops/planning/STATUS.md, was Arachne's —
+# for anyone else it either never exists (init runs every time, wasteful but
+# safe) or exists for the wrong reason and SKIPS the init that some other
+# submodule still needs, silently. Unset, the pump always runs the (idempotent,
+# cheap) submodule init; the probe is a pure optimization a consumer opts into.
+SUBMODULE_PROBE="${TASKPUMP_SUBMODULE_PROBE:-}"
 
 # Sibling tools.
 TASK_BIN="${TASKPUMP_TASK:-$TP_LIBEXEC_DIR/tp-task}"
@@ -293,6 +362,14 @@ usage() { apl_help "$0"; }
 [[ "$MODE" == "help" ]] && { usage; exit 0; }
 
 [[ -n "$PHASES" ]] || die "--phases is required (e.g. --phases F55..F63)"
+
+# A missing ledger must never read as a drained range: open_count and
+# frontier_phases mask tp-task's refusal into "0 open tasks" with their
+# 2>/dev/null fallbacks, which would render every phase DONE at rc=0 — the
+# false-drain shape this tool's incident history is about. Refuse up front.
+[[ -d "$TASKS_DIR" ]] || die "tasks directory does not exist: $TASKS_DIR
+  A drained range and a missing ledger must not look alike, so this is an
+  error instead. \`tp task resolve --all\` prints how resolution answered."
 case "$GRAIN" in
   phase) ;;
   task|chain) die "grain '$GRAIN' is not implemented yet; only --grain phase is supported (SPEC_GAP: D4 task/chain grains deferred)";;
@@ -369,14 +446,18 @@ trunk_worktree()  { printf '%s/%s' "$WORKTREES_DIR" "$(branch_slug "$INTEGRATION
 # the CONFIGURATION, not of any one launch: it should fail the run at tick zero
 # naming the key to fix, rather than fail per-launch — or worse, launch fine and
 # go invisible to liveness later, which is the failure this closes.
-_pump_probe_branch="$(phase_branch "$(pump_expand_phases "$PHASES" | head -1)")"
+# First phase without a pipe: `| head -1` raced the expander's printf into
+# EPIPE noise ("printf: write error: Broken pipe") that polluted captured
+# plans and flaked the golden suite on CI.
+_pump_all_phases="$(pump_expand_phases "$PHASES")"
+_pump_probe_branch="$(phase_branch "${_pump_all_phases%%$'\n'*}")"
 if ! _pump_branch_problem="$(apl_branch_slug_reject_reason "$_pump_probe_branch")"; then
   die "$_pump_branch_problem
 this run constructs that branch from TASKPUMP_BRANCH_PREFIX='$BRANCH_PREFIX'
 (--branch-prefix). The agent name is the branch with \"/\" replaced by \"-\", and
 that mapping has to be reversible — see docs/RUNNERS.md section 2."
 fi
-unset _pump_probe_branch _pump_branch_problem
+unset _pump_all_phases _pump_probe_branch _pump_branch_problem
 # pump_in_list <needle> <space-separated-haystack> — membership test for the
 # dry-run integration stubs (STUB_INTEGRATE_*).
 pump_in_list() {
@@ -993,7 +1074,9 @@ launch_phase() {
       git -C "$REPO_ROOT" worktree add "$wt" -b "$branch" "$BASE_REF" >/dev/null
     fi
   fi
-  [[ -f "$wt/$SUBMODULE_PROBE" ]] || git -C "$wt" submodule update --init --recursive 2>&1 | tail -1 || true
+  # No probe configured ⇒ always init (idempotent); a configured probe that
+  # answers skips it. See the SUBMODULE_PROBE note in the config block.
+  [[ -n "$SUBMODULE_PROBE" && -f "$wt/$SUBMODULE_PROBE" ]] || git -C "$wt" submodule update --init --recursive 2>&1 | tail -1 || true
   if ! apl_ensure_worktrees_visible "$REPO_ROOT" "$wt"; then
     # Name the deciding pattern and its file: "fix .gitignore" sent an operator
     # whose GLOBAL excludes caused this to the wrong file (G0.6).
@@ -1102,7 +1185,7 @@ ensure_trunk() {
       || die "cannot add trunk worktree $twt"
     log "integration trunk worktree at $twt"
   fi
-  [[ -f "$twt/$SUBMODULE_PROBE" ]] || git -C "$twt" submodule update --init --recursive 2>&1 | tail -1 || true
+  [[ -n "$SUBMODULE_PROBE" && -f "$twt/$SUBMODULE_PROBE" ]] || git -C "$twt" submodule update --init --recursive 2>&1 | tail -1 || true
   apl_ensure_worktrees_visible "$REPO_ROOT" "$twt" \
     || warn "trunk worktree is gitignored: $twt"
 }
@@ -1528,17 +1611,31 @@ is_drained() {
 # disturbs running containers and never double-launches — the state file just
 # makes the run observable (paused_reason) and lets a restart confirm it is
 # resuming the same range.
-write_state() {  # $1=status(running|paused|drained) $2=paused_reason
+# The file also carries the writer's pid + host (issue #22): status alone is a
+# claim a dead pump cannot retract — the G3 drain left `status: running` behind
+# with no supervisor process, and a reader trusting it gets the exact wrong
+# answer to "is a pump live?". The pid lets every reader verify liveness with
+# kill -0 instead of trusting the label; tp-monitor renders a running state
+# with a dead pid as STALE. The last status/reason written are remembered so
+# the exit trap below can tell an already-stamped terminal exit
+# (drained/stalled/stopped) from an abandoned running/paused claim.
+PUMP_LAST_STATUS=""
+PUMP_LAST_REASON=""
+write_state() {  # $1=status(running|paused|drained|stalled|stopped) $2=reason
   local status="${1:-running}" reason="${2:-}"
+  PUMP_LAST_STATUS="$status"
+  PUMP_LAST_REASON="$reason"
   jq -n \
     --arg phases "$PHASES" --argjson jobs "$JOBS" --argjson ceiling "$CEILING" \
     --arg grain "$GRAIN" --arg started "$PUMP_STARTED_AT" \
     --arg last_tick "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --argjson live "$(apl_count_live_agents)" --argjson open "$(open_count)" \
     --arg status "$status" --arg reason "$reason" \
+    --argjson pid "$$" --arg host "${HOSTNAME:-$(hostname 2>/dev/null || echo unknown)}" \
     '{phases:$phases, jobs:$jobs, ceiling:$ceiling, grain:$grain,
       started_at:$started, last_tick:$last_tick, live_agents:$live,
-      open_tasks:$open, status:$status, paused_reason:$reason}' \
+      open_tasks:$open, status:$status, paused_reason:$reason,
+      pid:$pid, host:$host}' \
     >| "$STATE_FILE" 2>/dev/null || true
 }
 
@@ -1561,22 +1658,63 @@ pump_notify() {
 # (clean `journalctl --user -u taskpump-pump`, Restart not set for transient —
 # use systemd/taskpump-pump.service for restart-on-failure); falls back to
 # setsid+nohup. The persistent unit template is systemd/taskpump-pump.service.
+#
+# The transient unit starts from the user manager — cwd $HOME, near-empty env —
+# so everything THIS invocation resolved from its own context must cross the
+# boundary explicitly (issue #31): the working directory (conf discovery walks
+# up from $PWD), TASKPUMP_CONFIG (a consumer shim's export dies with the shim,
+# because $0 is the resolved tp-pump, not the shim), and every override the
+# operator just watched a dry-run of the same invocation honor. The setsid
+# fallback inherits env and cwd natively; the forward below is what keeps the
+# preferred path equivalent to it.
+
+# The documented unprefixed spellings this tool reads alongside TASKPUMP_*
+# (config block above and the runner hand-off), forwarded when the caller
+# exported them.
+DETACH_PASSTHROUGH_NAMES=(
+  GITHUB_TOKEN MAX_TURNS AGENT_MODEL JOBS POOL_TICK POOL_STAGGER HEALTH_WINDOW
+  DOCKER AGENT_MEMORY_MAX AGENT_MEMORY_SWAP
+)
+
+# build_detach_argv — construct the systemd-run re-exec into DETACH_ARGV (plus
+# the shared pieces DETACH_UNIT / DETACH_FWD) rather than inline, so the
+# boundary-crossing contract above is testable without a live user manager.
+# Only EXPORTED names are forwarded: exactly the set the setsid fallback's
+# child would inherit, never this process's internal computed state.
+declare -a DETACH_ARGV DETACH_FWD
+DETACH_UNIT=""
+build_detach_argv() {
+  DETACH_FWD=()
+  local a name
+  for a in "${ORIG_ARGS[@]}"; do [[ "$a" == "--detach" ]] || DETACH_FWD+=("$a"); done
+  DETACH_UNIT="$PROG_NAME-$(printf '%s' "$PHASES" | tr -c 'A-Za-z0-9' '-')"
+  DETACH_ARGV=(
+    systemd-run --user --collect --unit="$DETACH_UNIT"
+    --description="$PROG_NAME usage-governed pump ($PHASES)"
+    -p WorkingDirectory="$PWD"
+  )
+  while IFS= read -r name; do
+    case "$name" in TASKPUMP_*|ARACHNE_*) ;; *) continue ;; esac
+    tp__is_set "$name" || continue
+    DETACH_ARGV+=(--setenv="$name=${!name}")
+  done < <(compgen -A export 2>/dev/null || true)
+  for name in "${DETACH_PASSTHROUGH_NAMES[@]}"; do
+    [[ "$(declare -p "$name" 2>/dev/null)" == "declare -x"* ]] || continue
+    tp__is_set "$name" || continue
+    DETACH_ARGV+=(--setenv="$name=${!name}")
+  done
+  DETACH_ARGV+=("$0" "${DETACH_FWD[@]}")
+}
+
 detach_and_exit() {
-  local -a fwd=()
-  local a
-  for a in "${ORIG_ARGS[@]}"; do [[ "$a" == "--detach" ]] || fwd+=("$a"); done
-  local unit
-  unit="$PROG_NAME-$(printf '%s' "$PHASES" | tr -c 'A-Za-z0-9' '-')"
+  build_detach_argv
   if command -v systemd-run >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
-    systemd-run --user --collect --unit="$unit" \
-      --description="$PROG_NAME usage-governed pump ($PHASES)" \
-      --setenv=GITHUB_TOKEN="${GITHUB_TOKEN:-}" \
-      "$0" "${fwd[@]}"
-    log "detached as systemd --user unit '$unit'."
-    log "  status: systemctl --user status $unit   logs: journalctl --user -u $unit -f"
-    log "  stop:   systemctl --user stop $unit"
+    "${DETACH_ARGV[@]}"
+    log "detached as systemd --user unit '$DETACH_UNIT'."
+    log "  status: systemctl --user status $DETACH_UNIT   logs: journalctl --user -u $DETACH_UNIT -f"
+    log "  stop:   systemctl --user stop $DETACH_UNIT"
   else
-    setsid nohup "$0" "${fwd[@]}" >>"$PUMP_LOG" 2>&1 </dev/null &
+    setsid nohup "$0" "${DETACH_FWD[@]}" >>"$PUMP_LOG" 2>&1 </dev/null &
     local pid=$!
     disown "$pid" 2>/dev/null || true
     log "detached via setsid+nohup (pid=$pid, log=$PUMP_LOG)."
@@ -1701,8 +1839,52 @@ fi
 log "Pump: phases=$PHASES grain=$GRAIN cap=$JOBS (live via $CAP_FILE) ceiling=${CEILING}% tick=${TICK}s"
 log "Singular supervisor; Ctrl-C stops feeding but leaves running agents. Monitor: $MONITOR_BIN"
 
+# ── Exit honesty (issue #22) ───────────────────────────────────────────────────
+# From here on, every exit path stamps a terminal status into the state file.
+# The G3 incident: --once exited right after do_tick (whose last write is
+# `running`), and a killed loop died wherever it was — either way the file kept
+# claiming a live pump forever, and a reader trusting it burned a rescue
+# session. The EXIT trap catches normal exits and crashes (set -e, die);
+# INT/TERM/HUP get their own handlers because a fatal signal does not run the
+# EXIT trap in a non-interactive shell — each stamps `stopped` with the signal
+# as the reason, then re-raises so the exit status still reports the signal.
+# Installed only now, after the prerequisites: a pump that never ticked never
+# wrote state, and must not clobber a previous run's file on a startup abort.
+# SIGKILL cannot be trapped — that path is what the pid field in the state file
+# is for (the reader verifies liveness instead of trusting `status`).
+pump_stamp_exit() {   # EXIT trap; $? is the pump's exit status
+  local rc=$?
+  case "$PUMP_LAST_STATUS" in drained|stalled|stopped) return 0 ;; esac
+  local why="pump exited"
+  (( rc != 0 )) && why="pump exited (rc=$rc)"
+  write_state stopped "$why"
+}
+pump_signal_exit() {  # $1 = signal name (INT|TERM|HUP)
+  trap - EXIT
+  write_state stopped "received SIG$1"
+  log "SIG$1 — stopping the supervisor (running agents are left alive; state stamped stopped)"
+  # Reap the backgrounded tick sleep: the signal exit abandons the wait, and
+  # an orphaned `sleep $TICK` would outlive the pump by up to a full tick.
+  kill "${TICK_SLEEP_PID:-}" 2>/dev/null || true
+  trap - "$1"
+  kill -s "$1" $$
+}
+trap pump_stamp_exit EXIT
+trap 'pump_signal_exit INT'  INT
+trap 'pump_signal_exit TERM' TERM
+trap 'pump_signal_exit HUP'  HUP
+
 if [[ "$MODE" == "once" ]]; then
   do_tick
+  # Writer honesty (issue #22): do_tick's last write is `running` (or `paused`
+  # behind a tripped gate), and this process is about to not exist — leaving
+  # either behind is the lie the incident is about. Stamp the terminal state
+  # explicitly, carrying a gate pause forward so a gated single tick stays
+  # diagnosable from the file alone.
+  once_reason="single tick complete (--once)"
+  [[ "$PUMP_LAST_STATUS" == "paused" && -n "$PUMP_LAST_REASON" ]] \
+    && once_reason+="; feeding was paused — $PUMP_LAST_REASON"
+  write_state stopped "$once_reason"
   log "single tick complete (--once)"
   exit 0
 fi
@@ -1717,7 +1899,13 @@ while true; do
   if (( STALL_TICKS >= STALL_EXIT_TICKS )); then
     stall_exit
   fi
-  sleep "$TICK"
+  # Interruptible sleep: bash defers trap handlers until the foreground command
+  # returns, so a plain `sleep $TICK` would make `systemctl stop` wait out the
+  # rest of the tick — and its SIGKILL after the stop timeout would skip the
+  # stamp entirely. Backgrounding the sleep and waiting on it (a builtin, which
+  # signals interrupt immediately) lets the TERM trap run the moment it lands.
+  sleep "$TICK" & TICK_SLEEP_PID=$!
+  wait "$TICK_SLEEP_PID" || true
 done
 
 # Graduate the integration trunk as one auto/trunk → main PR (A3, no-op when

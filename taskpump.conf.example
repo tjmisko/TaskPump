@@ -41,6 +41,10 @@
 #                           #   at a missing file is an error, never a fallback.
 
 # ── Ledger (tp task) ─────────────────────────────────────────────────────────
+# A RELATIVE path in this file is anchored to the workspace the file describes
+# (a discovered conf's own directory; the caller's worktree root under an
+# explicit TASKPUMP_CONFIG) — never to the caller's $PWD. See docs/CONFIG.md
+# "Relative paths in the conf".
 # TASKPUMP_TASKS_DIR=       # directory of task files (default: <repo root>/$TASKPUMP_LEDGER_PROBE)
 # TASKPUMP_LEDGER_PROBE=    # path, relative to a candidate workspace, whose presence
 #                           #   means "this workspace owns a ledger" — how a worktree's
@@ -86,6 +90,14 @@
 # TASKPUMP_PHASE_SEPARATOR= # what ends the phase within an id (default: .)
 
 # ── Pump scheduling (tp pump) ────────────────────────────────────────────────
+# TASKPUMP_WORKSPACE_ROOT=  # the workspace the pump drives: the default image-build
+#                           #   context, the repo phase branches and agent worktrees
+#                           #   are created in, the state-dir default. (default:
+#                           #   derived from the config anchor — a discovered conf's
+#                           #   directory, else the caller's worktree root — never
+#                           #   from a vendored install's own checkout, issue #32.
+#                           #   Set it to pin containers/CI; a missing directory is
+#                           #   a loud error.)
 # TASKPUMP_JOBS=            # concurrent worktree pool cap (default: 4). This is the
 #                           #   key the pump reads; TASKPUMP_PUMP_JOBS is the systemd
 #                           #   unit's name for the same number, passed as --jobs.
@@ -97,7 +109,8 @@
 # TASKPUMP_STAGGER=         # seconds between launches within one tick (default: 3)
 # TASKPUMP_PUMP_TASKS_DIR=  # tasks dir for the pump alone, independent of the ledger
 #                           #   checkout (default: TASKPUMP_TASKS_DIR, else
-#                           #   <ledger>/task-loop/tasks)
+#                           #   <workspace root>/$TASKPUMP_LEDGER_PROBE — the same
+#                           #   derivation tp task and tp monitor use)
 # TASKPUMP_PUMP_OPS_DIR=    # ledger checkout the pump refreshes and pushes
 #                           #   (default: TASKPUMP_LEDGER_REPO, else <repo root>/ops)
 # TASKPUMP_WORKTREES_DIR=   # where agent worktrees live. The pump reads it as a path,
@@ -172,8 +185,13 @@
 # TASKPUMP_TASK_CLI=        # how an agent invokes the ledger CLI from inside its
 #                           #   worktree — the spelling briefs quote at the agent
 #                           #   (default: tp task)
-# TASKPUMP_SUBMODULE_PROBE= # a path that proves the ledger submodule is populated
-#                           #   (default: ops/planning/STATUS.md)
+# TASKPUMP_SUBMODULE_PROBE= # a worktree-relative path that proves the ledger submodule
+#                           #   is populated, letting the pump skip its per-worktree
+#                           #   `git submodule update --init --recursive`. NO default:
+#                           #   unset, the (idempotent) init always runs. A probe that
+#                           #   exists for the wrong reason skips the init some OTHER
+#                           #   submodule still needs — silently — so set it only to a
+#                           #   path that proves everything you need populated.
 # TASKPUMP_RECLAIM_CMD=     # how to reclaim build output from a finished workspace, so
 #                           #   a multi-day run's disk footprint stays bounded — run with
 #                           #   the workspace as its cwd, e.g. 'cargo clean'
@@ -191,10 +209,14 @@
 #                           #   each tick, same executable-path rule as gates
 #                           #   (default: <install>/hooks/gitignore-repair and
 #                           #   <install>/hooks/fs-guard)
-# TASKPUMP_MANIFEST=        # v1 parallel-run manifest mapping containers to tasks
-#                           #   (default: <repo root>/$TASKPUMP_MANIFEST_SUBPATH)
-# TASKPUMP_MANIFEST_SUBPATH=  # its path within the repo
-#                           #   (default: ops/task-loop/parallel-manifest.tsv)
+# TASKPUMP_MANIFEST=        # OPT-IN consumer-supplied v1 parallel-run manifest — a
+#                           #   TSV of name<TAB>branch<TAB>brief<TAB>task rows that
+#                           #   tp-monitor/tp-cleanup consult for launch-time labels
+#                           #   (default: none — TaskPump does not generate the file;
+#                           #   the ledger's live claim is the canonical mapping, and
+#                           #   a configured path that does not exist is an error)
+# TASKPUMP_MANIFEST_SUBPATH=  # the same file named relative to the repo root
+#                           #   (default: none)
 
 # ── Integration trunk (opt-in; off unless a trunk flag is passed) ────────────
 # TASKPUMP_TRUNK=           # integration trunk branch name (default: auto/trunk;

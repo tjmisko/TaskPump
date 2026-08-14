@@ -195,16 +195,21 @@ pump_tick() {  # $1=phases ; extra env via caller
   "$PUMP" --no-health-gate "${@:2}" --phases "$1"
 }
 
-# 8a: a feeding tick writes status=running for the range.
+# 8a: a --once tick records the range and — issue #22 — exits with a TERMINAL
+# status. do_tick's last write is `running`, and leaving that behind after the
+# process dies is exactly the G3 incident, so the tail stamps `stopped`.
 mk F55.0 open; mk F55.1 open F55.0; mk F56.0 open; mk F57.0 open F55.1
 STUB_GATE_RC=0 pump_tick F55..F57 --once >/dev/null 2>&1
 [[ "$(jq -r '.phases' "$STATE" 2>/dev/null)" == "F55..F57" ]] && pass "state.phases = F55..F57" || fail "state.phases: $(cat "$STATE" 2>/dev/null)"
-[[ "$(jq -r '.status' "$STATE" 2>/dev/null)" == "running" ]] && pass "state.status = running on a feeding tick" || fail "state.status not running: $(cat "$STATE" 2>/dev/null)"
+[[ "$(jq -r '.status' "$STATE" 2>/dev/null)" == "stopped" ]] && pass "state.status = stopped after a feeding --once tick (never running, #22)" || fail "state.status not stopped: $(cat "$STATE" 2>/dev/null)"
+have "$(jq -r '.paused_reason // empty' "$STATE" 2>/dev/null)" 'single tick' && pass "stop reason names the --once exit" || fail "stop reason missing: $(cat "$STATE" 2>/dev/null)"
+[[ "$(jq -r '.pid // empty' "$STATE" 2>/dev/null)" =~ ^[0-9]+$ ]] && pass "state carries the pump's pid (#22 liveness anchor)" || fail "no pid in state: $(cat "$STATE" 2>/dev/null)"
 
-# 8b: a gated tick writes status=paused with a reason.
+# 8b: a gated --once tick also exits terminal, but the gate's pause reason is
+# carried into the stop reason so the tick stays diagnosable from the file.
 STUB_GATE_RC=10 pump_tick F55..F57 --once >/dev/null 2>&1
-[[ "$(jq -r '.status' "$STATE" 2>/dev/null)" == "paused" ]] && pass "state.status = paused when gate trips" || fail "state.status not paused: $(cat "$STATE" 2>/dev/null)"
-[[ -n "$(jq -r '.paused_reason // empty' "$STATE" 2>/dev/null)" ]] && pass "state.paused_reason recorded" || fail "no paused_reason"
+[[ "$(jq -r '.status' "$STATE" 2>/dev/null)" == "stopped" ]] && pass "gated --once still exits terminal (stopped, not paused)" || fail "state.status not stopped: $(cat "$STATE" 2>/dev/null)"
+have "$(jq -r '.paused_reason // empty' "$STATE" 2>/dev/null)" 'paused' && pass "stop reason preserves the gate pause" || fail "gate pause lost from stop reason: $(jq -r '.paused_reason' "$STATE" 2>/dev/null)"
 
 # 8c: a fully-drained range exits → status=drained + one notification.
 mk F55.0 done; mk F55.1 done; mk F56.0 done; mk F57.0 done
@@ -230,11 +235,12 @@ have "$out" 'GATE: feed-ok' && pass "disk gate feed-ok when watchdog --gate retu
 out=$(STUB_DISK_GATE_RC=10 "$PUMP" --no-health-gate --no-disk-gate --dry-run --phases F55..F57)
 have "$out" 'GATE: feed-ok' && pass "--no-disk-gate bypasses the disk gate" || fail "disk gate not bypassed:\n$out"
 
-# 9d: a disk-gated --once tick writes status=paused with the disk reason.
+# 9d: a disk-gated --once tick exits terminal (#22) with the disk reason
+# carried into the stop reason — the pause must survive the terminal stamp.
 mk F55.0 open; mk F55.1 open F55.0; mk F56.0 open; mk F57.0 open F55.1
 STUB_GATE_RC=0 STUB_DISK_GATE_RC=10 pump_tick F55..F57 --once >/dev/null 2>&1
-[[ "$(jq -r '.status' "$STATE" 2>/dev/null)" == "paused" ]] && pass "disk gate trip writes status=paused" || fail "status not paused on disk gate: $(cat "$STATE" 2>/dev/null)"
-have "$(jq -r '.paused_reason // empty' "$STATE" 2>/dev/null)" 'disk gate' && pass "paused_reason names the disk gate" || fail "paused_reason missing disk gate: $(jq -r '.paused_reason' "$STATE" 2>/dev/null)"
+[[ "$(jq -r '.status' "$STATE" 2>/dev/null)" == "stopped" ]] && pass "disk-gated --once exits terminal (stopped)" || fail "status not stopped on disk gate: $(cat "$STATE" 2>/dev/null)"
+have "$(jq -r '.paused_reason // empty' "$STATE" 2>/dev/null)" 'disk gate' && pass "stop reason names the disk gate" || fail "stop reason missing disk gate: $(jq -r '.paused_reason' "$STATE" 2>/dev/null)"
 
 echo "--- Test 10: reclaim sweep cleans completed-phase target/ dirs (A4 / F65.3) ---"
 WT="$TMP/wt"; STATE10="$TMP/pump10.state"
@@ -314,6 +320,17 @@ assert_mounts() {  # <launcher-path> <label>
     fail "$label: blanket RW primary mount re-introduced"
   else
     pass "$label: no blanket RW primary mount"
+  fi
+  # G4.3: the TaskPump installation rides into the container read-only at
+  # /opt/taskpump so tp is on the agent's PATH. Read-only is load-bearing —
+  # an agent that can write /opt/taskpump edits the supervisor supervising it.
+  grep -qE -- '-v +"?\$tp_install_root"?:/opt/taskpump:ro' "$f" \
+    && pass "$label: TaskPump installation mounted :ro at /opt/taskpump (G4.3)" \
+    || fail "$label: missing the :ro /opt/taskpump installation mount"
+  if grep -vE '^[[:space:]]*#' "$f" | grep -qE -- ':/opt/taskpump([[:space:]]|$)'; then
+    fail "$label: /opt/taskpump mounted read-write (must be :ro)"
+  else
+    pass "$label: no RW /opt/taskpump mount"
   fi
 }
 if [[ -f "$RUNNER_SH" ]]; then
@@ -1360,6 +1377,81 @@ out=$(TASKPUMP_AGENT_HOME="$IMGHOME" pump F55..F57); rc=$?
 have "$out" 'LAUNCH +F55' && have "$out" 'LAUNCH +F56' && have "$out" 'WAITING +F57' \
   && pass "--dry-run still prints the full plan imageless" \
   || fail "imageless dry-run plan incomplete:\n$out"
+
+echo "--- Test 32: a killed loop stamps a terminal state (G4.6 / #22) ---"
+# The G3 incident: the state file kept claiming status:running with no
+# supervisor process behind it, because a killed loop died wherever it was.
+# The loop now traps INT/TERM/HUP (and EXIT), stamps `stopped` with the signal
+# as the reason, and re-raises so the exit status still reports the signal.
+# The tick is 600s so the kill always lands in the loop's interruptible sleep.
+STATE32="$TMP/pump32.state"
+sig_pump() {  # loop-mode pump; the CALLER backgrounds this exact command
+  # exec so $! in the caller IS the supervisor's pid; stagger 0 so the first
+  # tick finishes (and writes state) promptly.
+  TASKPUMP_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 TASKPUMP_STAGGER=0 \
+  ARACHNE_PUMP_OPS_DIR="$TMP/noops" ARACHNE_PUMP_STATE_FILE="$STATE32" \
+  ARACHNE_POOL_CAP_FILE="$TMP/cap" ARACHNE_PUMP_LOG="$TMP/pump32.log" \
+  ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" STUB_GATE_RC=0 \
+  exec "$PUMP" --no-health-gate --phases F55..F57 --tick 600
+}
+await_state32() {  # poll until the state file reports $1 (the first tick has run)
+  local want="$1" i
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25; do
+    [[ "$(jq -r '.status // empty' "$STATE32" 2>/dev/null)" == "$want" ]] && return 0
+    sleep 0.4
+  done
+  return 1
+}
+
+# 32a: SIGTERM mid-loop (systemctl stop, the OOM killer's polite sibling).
+mk F55.0 open; mk F55.1 open F55.0; mk F56.0 open; mk F57.0 open F55.1
+rm -f "$STATE32"
+sig_pump >/dev/null 2>&1 &
+PUMP32=$!
+await_state32 running && pass "mid-loop the state file reads running" \
+  || fail "loop never wrote running: $(cat "$STATE32" 2>/dev/null)"
+[[ "$(jq -r '.pid // empty' "$STATE32" 2>/dev/null)" == "$PUMP32" ]] \
+  && pass "state.pid is the supervisor's pid" \
+  || fail "state.pid != $PUMP32: $(cat "$STATE32" 2>/dev/null)"
+kill -TERM "$PUMP32" 2>/dev/null
+wait "$PUMP32" 2>/dev/null; rc=$?
+[[ "$rc" -eq 143 ]] && pass "the re-raise preserves the SIGTERM exit status (rc=143)" \
+  || fail "SIGTERM'd pump exited rc=$rc, not 143"
+[[ "$(jq -r '.status' "$STATE32" 2>/dev/null)" == "stopped" ]] \
+  && pass "SIGTERM'd loop leaves status=stopped, never running (#22)" \
+  || fail "state after SIGTERM: $(cat "$STATE32" 2>/dev/null)"
+have "$(jq -r '.paused_reason // empty' "$STATE32" 2>/dev/null)" 'SIGTERM' \
+  && pass "the stop reason names the signal" \
+  || fail "reason missing SIGTERM: $(jq -r '.paused_reason' "$STATE32" 2>/dev/null)"
+
+# 32b: a hangup (terminal closed / SSH drop) takes the same path. SIGHUP
+# stands in for Ctrl-C here because SIGINT is UNDELIVERABLE to this fixture:
+# a non-job-control shell starts background jobs with SIGINT ignored, and a
+# signal ignored at entry cannot be trapped — while a real Ctrl-C hits a
+# FOREGROUND pump, where the same three-signal handler receives it fine.
+rm -f "$STATE32"
+sig_pump >/dev/null 2>&1 &
+PUMP32=$!
+await_state32 running || fail "loop never wrote running before SIGHUP"
+kill -HUP "$PUMP32" 2>/dev/null
+wait "$PUMP32" 2>/dev/null; rc=$?
+[[ "$(jq -r '.status' "$STATE32" 2>/dev/null)" == "stopped" ]] \
+  && pass "a hangup leaves status=stopped (rc=$rc)" \
+  || fail "state after SIGHUP: $(cat "$STATE32" 2>/dev/null)"
+have "$(jq -r '.paused_reason // empty' "$STATE32" 2>/dev/null)" 'SIGHUP' \
+  && pass "the stop reason names SIGHUP" \
+  || fail "reason missing SIGHUP: $(jq -r '.paused_reason' "$STATE32" 2>/dev/null)"
+
+# 32c: a completed drain still writes drained — the exit trap must not
+# overwrite a terminal state the pump already stamped on purpose.
+mk F55.0 done; mk F55.1 done; mk F56.0 done; mk F57.0 done
+rm -f "$STATE32"
+sig_pump >/dev/null 2>&1 &
+PUMP32=$!
+wait "$PUMP32" 2>/dev/null
+[[ "$(jq -r '.status' "$STATE32" 2>/dev/null)" == "drained" ]] \
+  && pass "a completed drain keeps status=drained (trap does not clobber it)" \
+  || fail "drain state clobbered: $(cat "$STATE32" 2>/dev/null)"
 
 echo
 echo "=============================================="

@@ -319,6 +319,11 @@ EOF
 printf 'Phase {{PHASE}}. Goal: {{GOAL}}\n' >| "$E2E/brief.md"
 
 E2E_REG="$E2E/registry"
+# Hermeticity: TASKPUMP_AGENT_HOME points the Claude gates' credentials at the
+# fixture (absent — both gates skip, fail-open), and TASKPUMP_USAGE_CACHE keeps
+# the usage gate off the host-global /tmp/claude-plan-usage.json — a statusline
+# keeps that cache warm with the operator's REAL usage, and a live window at or
+# above the ceiling would pause feeding and fail every launch assertion below.
 e2e_tick() {
   env -u WORKSPACE_PATH -u TP_WORKSPACE -u TP_CONTAINER_NAME -u ARACHNE_CONTAINER_NAME \
     TASKPUMP_NO_CONF=1 \
@@ -333,6 +338,7 @@ e2e_tick() {
     TASKPUMP_PHASE_BRIEF_TEMPLATE="$E2E/brief.md" \
     TASKPUMP_PUMP_WORKTREES_DIR="$E2E/worktrees" \
     TASKPUMP_AGENT_HOME="$E2E/home" \
+    TASKPUMP_USAGE_CACHE="$E2E/usage-cache.json" \
     TASKPUMP_TASK_NOCOMMIT=1 \
     TASKPUMP_RUNNER="$REPO/runners/local/runner.sh" \
     TASKPUMP_LOCAL_REGISTRY="$E2E_REG" \
