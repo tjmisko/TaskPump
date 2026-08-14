@@ -60,8 +60,56 @@ _tp_self_root="$(CDPATH='' cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")"
 . "$_tp_self_root/lib/config.sh"
 tp_load_config
 
-SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
-REPO_ROOT="$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd)"
+# ── The two roots (issue #32) ─────────────────────────────────────────────────
+# TaskPump's INSTALL and the consumer's WORKSPACE are different directories in
+# every vendored layout and the same directory only in dogfooding. The install
+# root — lib/, libexec/, gates/, runners/, templates/, hooks/ — is
+# script-relative: TP_ROOT and friends, set above by lib/config.sh. The
+# workspace — the repository this pump DRIVES: the image-build context, the
+# phase branches and agent worktrees, every `git -C` below, the state-dir
+# default — is a property of the CALLER, resolved exactly as tp-task resolves
+# the ledger. REPO_ROOT used to be script-relative too, which pointed every one
+# of those surfaces at the vendored taskpump/ checkout for a submodule/subtree
+# consumer: branches cut in the wrong object store, agent worktrees inside the
+# vendored copy, right-looking git answers against the wrong repository.
+# TASKPUMP_WORKSPACE_ROOT pins it explicitly (env > conf; a conf-relative value
+# anchors to the conf's workspace); unset, the config anchor decides — which
+# for the dogfood layout is the same directory the script-relative derivation
+# always produced.
+tp_resolve_workspace
+if [[ -n "${TASKPUMP_WORKSPACE_ROOT:-}" ]]; then
+  if ! REPO_ROOT="$(CDPATH='' cd -- "$TASKPUMP_WORKSPACE_ROOT" 2>/dev/null && pwd)"; then
+    printf '%s: TASKPUMP_WORKSPACE_ROOT names a missing directory: %s\n' \
+      "${TASKPUMP_PUMP_PROG_NAME:-tp-pump}" "$TASKPUMP_WORKSPACE_ROOT" >&2
+    exit 1
+  fi
+else
+  REPO_ROOT="$TP_WS_ROOT"
+fi
+# The fallback rung is not an answer for a SUPERVISOR: when neither a
+# discovered conf nor the cwd probe anchored the workspace, TP_WS_ROOT is the
+# install root — and a real run would build, branch, and cut worktrees inside
+# the vendored TaskPump itself, then report the range DONE against the
+# dogfood ledger at rc=0. tp-task refuses this rung for mutating verbs; the
+# pump is the most mutating tool in the box. The vendored layout (install
+# root at or inside the caller's worktree) keeps the fallback, exactly as
+# tp-task allows it.
+# An explicitly named ledger (env, or a conf value the loader anchored) is
+# the caller saying where the work lives — the same first-rung exemption
+# tp_require_resolved_ledger grants.
+if [[ -z "${TASKPUMP_WORKSPACE_ROOT:-}" && -z "${TASKPUMP_PUMP_TASKS_DIR:-}" \
+      && -z "${TASKPUMP_TASKS_DIR:-}" && "$TP_WS_VIA" == "install-root" ]]; then
+  _pump_ws_vendored=0
+  if [[ -n "$TP_WS_CWD_ROOT" ]]; then
+    [[ "$TP_ROOT" == "$TP_WS_CWD_ROOT" || "$TP_ROOT" == "$TP_WS_CWD_ROOT"/* ]] && _pump_ws_vendored=1
+  fi
+  if (( ! _pump_ws_vendored )); then
+    printf '%s: refusing to run against the TaskPump installation itself.\n  No taskpump.conf above $PWD, $PWD is not inside a consumer repository, and no pin was given — so resolution fell back to the install root:\n    %s\n  A drain planned there would target the install, not your project.\n  fix: run from your project root, or set TASKPUMP_WORKSPACE_ROOT=/path/to/project\n' \
+      "${TASKPUMP_PUMP_PROG_NAME:-tp-pump}" "$TP_WS_ROOT" >&2
+    exit 1
+  fi
+  unset _pump_ws_vendored
+fi
 # shellcheck source=../lib/pump-lib.sh
 source "$TP_LIB_DIR/pump-lib.sh"
 
@@ -83,16 +131,24 @@ CLAUDE_JSON="${TASKPUMP_AGENT_CONFIG:-$HOME/.claude.json}"
 OPS_DIR="${TASKPUMP_PUMP_OPS_DIR:-${TASKPUMP_LEDGER_REPO:-$REPO_ROOT/ops}}"
 # Tasks dir — overridable independently of OPS_DIR so phase_dependencies / brief
 # rendering can be unit-tested against a flat fixture dir. The default derives
-# from the ledger probe against the WORKSPACE, exactly as tp-task and
-# tp-monitor derive theirs (issue #2): the pump is the tool that tells a
-# launched agent where the ledger is, so it must not keep a private opinion.
-# It anchors to the workspace root rather than OPS_DIR on purpose — the
-# ledger-repo and the ledger-directory are separate questions, and coupling
+# from the ledger probe against the WORKSPACE (REPO_ROOT above), exactly as
+# tp-task and tp-monitor derive theirs (issue #2): the pump is the tool that
+# tells a launched agent where the ledger is, so it must not keep a private
+# opinion. It anchors to the workspace root rather than OPS_DIR on purpose —
+# the ledger-repo and the ledger-directory are separate questions, and coupling
 # them is what baked Arachne's ops/task-loop/ shape in. A consumer whose ledger
 # lives under a separate ledger repo names it via TASKPUMP_LEDGER_PROBE.
-tp_resolve_workspace
 TASKS_SUBDIR="${TASKPUMP_LEDGER_PROBE:-${TASKPUMP_TASKS_SUBDIR:-tasks}}"
-TASKS_DIR="${TASKPUMP_PUMP_TASKS_DIR:-${TASKPUMP_TASKS_DIR:-$TP_WS_ROOT/$TASKS_SUBDIR}}"
+TASKS_DIR="${TASKPUMP_PUMP_TASKS_DIR:-${TASKPUMP_TASKS_DIR:-$REPO_ROOT/$TASKS_SUBDIR}}"
+# Under an explicit workspace pin, the ledger CLI this pump spawns still
+# anchors to its own $PWD — a different workspace entirely when a mismatch is
+# the reason the pin was set. The pump's answer and its children's answer must
+# not diverge (that split is a silent wrong ledger), so hand the children the
+# pinned derivation — unless the caller (env or conf) already named a ledger,
+# which both sides honor identically.
+if [[ -n "${TASKPUMP_WORKSPACE_ROOT:-}" && -z "${TASKPUMP_TASKS_DIR:-}" ]]; then
+  export TASKPUMP_TASKS_DIR="$REPO_ROOT/$TASKS_SUBDIR"
+fi
 # The file that proves the ledger submodule is populated in a fresh worktree.
 # NO default (issue #3): the old one, ops/planning/STATUS.md, was Arachne's —
 # for anyone else it either never exists (init runs every time, wasteful but
@@ -1602,22 +1658,63 @@ pump_notify() {
 # (clean `journalctl --user -u taskpump-pump`, Restart not set for transient —
 # use systemd/taskpump-pump.service for restart-on-failure); falls back to
 # setsid+nohup. The persistent unit template is systemd/taskpump-pump.service.
+#
+# The transient unit starts from the user manager — cwd $HOME, near-empty env —
+# so everything THIS invocation resolved from its own context must cross the
+# boundary explicitly (issue #31): the working directory (conf discovery walks
+# up from $PWD), TASKPUMP_CONFIG (a consumer shim's export dies with the shim,
+# because $0 is the resolved tp-pump, not the shim), and every override the
+# operator just watched a dry-run of the same invocation honor. The setsid
+# fallback inherits env and cwd natively; the forward below is what keeps the
+# preferred path equivalent to it.
+
+# The documented unprefixed spellings this tool reads alongside TASKPUMP_*
+# (config block above and the runner hand-off), forwarded when the caller
+# exported them.
+DETACH_PASSTHROUGH_NAMES=(
+  GITHUB_TOKEN MAX_TURNS AGENT_MODEL JOBS POOL_TICK POOL_STAGGER HEALTH_WINDOW
+  DOCKER AGENT_MEMORY_MAX AGENT_MEMORY_SWAP
+)
+
+# build_detach_argv — construct the systemd-run re-exec into DETACH_ARGV (plus
+# the shared pieces DETACH_UNIT / DETACH_FWD) rather than inline, so the
+# boundary-crossing contract above is testable without a live user manager.
+# Only EXPORTED names are forwarded: exactly the set the setsid fallback's
+# child would inherit, never this process's internal computed state.
+declare -a DETACH_ARGV DETACH_FWD
+DETACH_UNIT=""
+build_detach_argv() {
+  DETACH_FWD=()
+  local a name
+  for a in "${ORIG_ARGS[@]}"; do [[ "$a" == "--detach" ]] || DETACH_FWD+=("$a"); done
+  DETACH_UNIT="$PROG_NAME-$(printf '%s' "$PHASES" | tr -c 'A-Za-z0-9' '-')"
+  DETACH_ARGV=(
+    systemd-run --user --collect --unit="$DETACH_UNIT"
+    --description="$PROG_NAME usage-governed pump ($PHASES)"
+    -p WorkingDirectory="$PWD"
+  )
+  while IFS= read -r name; do
+    case "$name" in TASKPUMP_*|ARACHNE_*) ;; *) continue ;; esac
+    tp__is_set "$name" || continue
+    DETACH_ARGV+=(--setenv="$name=${!name}")
+  done < <(compgen -A export 2>/dev/null || true)
+  for name in "${DETACH_PASSTHROUGH_NAMES[@]}"; do
+    [[ "$(declare -p "$name" 2>/dev/null)" == "declare -x"* ]] || continue
+    tp__is_set "$name" || continue
+    DETACH_ARGV+=(--setenv="$name=${!name}")
+  done
+  DETACH_ARGV+=("$0" "${DETACH_FWD[@]}")
+}
+
 detach_and_exit() {
-  local -a fwd=()
-  local a
-  for a in "${ORIG_ARGS[@]}"; do [[ "$a" == "--detach" ]] || fwd+=("$a"); done
-  local unit
-  unit="$PROG_NAME-$(printf '%s' "$PHASES" | tr -c 'A-Za-z0-9' '-')"
+  build_detach_argv
   if command -v systemd-run >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
-    systemd-run --user --collect --unit="$unit" \
-      --description="$PROG_NAME usage-governed pump ($PHASES)" \
-      --setenv=GITHUB_TOKEN="${GITHUB_TOKEN:-}" \
-      "$0" "${fwd[@]}"
-    log "detached as systemd --user unit '$unit'."
-    log "  status: systemctl --user status $unit   logs: journalctl --user -u $unit -f"
-    log "  stop:   systemctl --user stop $unit"
+    "${DETACH_ARGV[@]}"
+    log "detached as systemd --user unit '$DETACH_UNIT'."
+    log "  status: systemctl --user status $DETACH_UNIT   logs: journalctl --user -u $DETACH_UNIT -f"
+    log "  stop:   systemctl --user stop $DETACH_UNIT"
   else
-    setsid nohup "$0" "${fwd[@]}" >>"$PUMP_LOG" 2>&1 </dev/null &
+    setsid nohup "$0" "${DETACH_FWD[@]}" >>"$PUMP_LOG" 2>&1 </dev/null &
     local pid=$!
     disown "$pid" 2>/dev/null || true
     log "detached via setsid+nohup (pid=$pid, log=$PUMP_LOG)."

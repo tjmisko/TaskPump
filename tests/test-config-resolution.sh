@@ -212,13 +212,18 @@ mk "$ZC/tasks" T1
 # The brief the pump would hand an agent must name this repository's tasks
 # dir. It used to say ops/task-loop/tasks — a directory that does not exist in
 # a repo set up exactly as documented — because tp-pump never consulted
-# TASKPUMP_LEDGER_PROBE.
+# TASKPUMP_LEDGER_PROBE. Named as the AGENT reaches it from its worktree:
+# workspace-relative (`tasks/…`), since the ledger lives inside the workspace.
+# (Before issue #32 this rendered as the primary checkout's ABSOLUTE path —
+# an artifact of REPO_ROOT being the install root, so the workspace prefix
+# never stripped.)
 out=$( cd "$ZC" && env "${TP_ENV_UNSET[@]}" TASKPUMP_TASK_NOCOMMIT=1 \
         TASKPUMP_TASK="$TASK" "$PUMP" --render-brief T1 2>&1 ); rc=$?
 [[ $rc -eq 0 ]] && pass "zero-conf --render-brief renders (rc=0)" \
   || fail "zero-conf --render-brief rc=$rc:\n$out"
-have "$out" "$ZC/tasks" && pass "the brief names the consumer's own tasks dir" \
-  || fail "the brief does not mention $ZC/tasks:\n$out"
+have "$out" '`tasks/T1\.N\.md`' \
+  && pass "the brief names the consumer's own tasks dir, worktree-relative" \
+  || fail "the brief does not name tasks/T1.N.md:\n$out"
 have "$out" 'ops/task-loop/tasks' \
   && fail "the Arachne-shaped tasks dir is still in the brief:\n$out" \
   || pass "the Arachne ops/task-loop/tasks fallback is gone from the brief"
@@ -230,7 +235,8 @@ mk "$ZC/work/items" T9
 out=$( cd "$ZC" && env "${TP_ENV_UNSET[@]}" TASKPUMP_TASK_NOCOMMIT=1 \
         TASKPUMP_LEDGER_PROBE=work/items TASKPUMP_TASK="$TASK" \
         "$PUMP" --render-brief T9 2>&1 )
-have "$out" "$ZC/work/items" && pass "TASKPUMP_LEDGER_PROBE drives the pump's tasks dir" \
+have "$out" '`work/items/T9\.N\.md`' \
+  && pass "TASKPUMP_LEDGER_PROBE drives the pump's tasks dir" \
   || fail "the probe did not reach the pump's derivation:\n$out"
 
 # ══ Issue #3 — no Arachne-shaped submodule probe default ══════════════════════
