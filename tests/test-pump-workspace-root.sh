@@ -272,6 +272,107 @@ out=$( cd "$PINCONF/sub" && env "${TP_ENV_UNSET[@]}" "${DRY_STUBS[@]}" \
   && pass "a conf-relative pin anchors to the conf's own workspace" \
   || fail "conf-relative pin failed from a subdir (rc=$rc):\n$out"
 
+# ══ #31 — --detach carries cwd and environment across the boundary ════════════
+echo "--- #31: the systemd-run re-exec preserves cwd and forwards the environment ---"
+
+# The consumer-shim shape that hit this live: an explicit TASKPUMP_CONFIG plus
+# prompt-level overrides, detached. The stub records the exact argv the pump
+# constructs, one element per line.
+DET="$TMP/detach-consumer"
+mkdir -p "$DET/tasks"
+git -C "$TMP" init -qb main detach-consumer
+cat >| "$DET/shim.conf" <<'CONF'
+TASKPUMP_TASKS_DIR=tasks
+TASKPUMP_PUMP_PROG_NAME=consumer-pump
+CONF
+
+SBIN="$TMP/sbin"; mkdir -p "$SBIN"
+SDLOG="$TMP/systemd-run.log"
+cat >| "$SBIN/systemd-run" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$@" >| "$SDLOG"
+exit 0
+EOF
+cat >| "$SBIN/systemctl" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$SBIN/systemd-run" "$SBIN/systemctl"
+
+out=$( cd "$DET" && env "${TP_ENV_UNSET[@]}" \
+        PATH="$SBIN:$PATH" \
+        TASKPUMP_CONFIG="$DET/shim.conf" \
+        TASKPUMP_JOBS=2 \
+        MAX_TURNS=123 AGENT_MODEL=fancy-model \
+        GITHUB_TOKEN=tok123 \
+        TASKPUMP_PUMP_MONITOR=0 \
+        "$PUMP" --phases T7 --jobs 1 --grain phase --detach 2>&1 ); rc=$?
+[[ $rc -eq 0 ]] && pass "--detach through the stubbed systemd path exits 0" \
+  || fail "--detach rc=$rc:\n$out"
+have "$out" "detached as systemd --user unit 'consumer-pump-T7'" \
+  && pass "the detach message carries the consumer's PROG_NAME identity" \
+  || fail "wrong detach identity:\n$out"
+
+sdargv() { grep -qxF -- "$1" "$SDLOG" 2>/dev/null; }
+
+sdargv "--unit=consumer-pump-T7" \
+  && pass "the transient unit is named for the consumer's PROG_NAME" \
+  || fail "wrong unit name in the argv:\n$(cat "$SDLOG" 2>/dev/null)"
+
+# cwd: the transient unit would otherwise run from \$HOME, where \$PWD-anchored
+# conf discovery finds nothing.
+sdargv "-p" && sdargv "WorkingDirectory=$DET" \
+  && pass "the re-exec pins WorkingDirectory to the caller's \$PWD" \
+  || fail "no WorkingDirectory=$DET in the argv:\n$(cat "$SDLOG" 2>/dev/null)"
+
+# TASKPUMP_CONFIG: the consumer shim's export must survive, because \$0 is the
+# resolved tp-pump and the re-exec bypasses the shim.
+sdargv "--setenv=TASKPUMP_CONFIG=$DET/shim.conf" \
+  && pass "the shim's TASKPUMP_CONFIG crosses the detach boundary" \
+  || fail "TASKPUMP_CONFIG was dropped:\n$(cat "$SDLOG" 2>/dev/null)"
+
+# The TASKPUMP_* namespace, including conf-loaded values in their anchored form.
+sdargv "--setenv=TASKPUMP_JOBS=2" \
+  && pass "a TASKPUMP_* override is forwarded" \
+  || fail "TASKPUMP_JOBS was dropped:\n$(cat "$SDLOG" 2>/dev/null)"
+sdargv "--setenv=TASKPUMP_TASKS_DIR=$DET/tasks" \
+  && pass "the conf-loaded tasks dir is forwarded in its anchored form" \
+  || fail "TASKPUMP_TASKS_DIR was dropped:\n$(cat "$SDLOG" 2>/dev/null)"
+
+# The legacy mirror, which un-migrated readers in the child still consult.
+sdargv "--setenv=ARACHNE_JOBS=2" \
+  && pass "the legacy ARACHNE_* mirror is forwarded" \
+  || fail "ARACHNE_JOBS was dropped:\n$(cat "$SDLOG" 2>/dev/null)"
+
+# The documented UNPREFIXED spellings — the consumer's launch line uses these.
+sdargv "--setenv=MAX_TURNS=123" \
+  && pass "unprefixed MAX_TURNS is forwarded" \
+  || fail "MAX_TURNS was dropped:\n$(cat "$SDLOG" 2>/dev/null)"
+sdargv "--setenv=AGENT_MODEL=fancy-model" \
+  && pass "unprefixed AGENT_MODEL is forwarded" \
+  || fail "AGENT_MODEL was dropped:\n$(cat "$SDLOG" 2>/dev/null)"
+sdargv "--setenv=GITHUB_TOKEN=tok123" \
+  && pass "GITHUB_TOKEN is still forwarded" \
+  || fail "GITHUB_TOKEN was dropped:\n$(cat "$SDLOG" 2>/dev/null)"
+
+# The re-exec is the same command minus --detach.
+sdargv "$PUMP" \
+  && pass "the re-exec argv ends with \$0" \
+  || fail "\$0 missing from the argv:\n$(cat "$SDLOG" 2>/dev/null)"
+sdargv "--phases" && sdargv "T7" && sdargv "--jobs" && sdargv "1" \
+  && pass "the original flags are forwarded" \
+  || fail "original flags missing:\n$(cat "$SDLOG" 2>/dev/null)"
+sdargv "--detach" \
+  && fail "--detach leaked into the re-exec (a detach loop)" \
+  || pass "--detach itself is stripped from the re-exec"
+
+# An unprefixed name the operator did NOT export must not be forwarded: the
+# child's own conf keeps deciding it (forwarding the parent's computed default
+# would freeze it).
+grep -q -- '--setenv=DOCKER=' "$SDLOG" 2>/dev/null \
+  && fail "DOCKER was forwarded although the caller never exported it" \
+  || pass "an unexported passthrough name is not forwarded"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"

@@ -1620,22 +1620,63 @@ pump_notify() {
 # (clean `journalctl --user -u taskpump-pump`, Restart not set for transient —
 # use systemd/taskpump-pump.service for restart-on-failure); falls back to
 # setsid+nohup. The persistent unit template is systemd/taskpump-pump.service.
+#
+# The transient unit starts from the user manager — cwd $HOME, near-empty env —
+# so everything THIS invocation resolved from its own context must cross the
+# boundary explicitly (issue #31): the working directory (conf discovery walks
+# up from $PWD), TASKPUMP_CONFIG (a consumer shim's export dies with the shim,
+# because $0 is the resolved tp-pump, not the shim), and every override the
+# operator just watched a dry-run of the same invocation honor. The setsid
+# fallback inherits env and cwd natively; the forward below is what keeps the
+# preferred path equivalent to it.
+
+# The documented unprefixed spellings this tool reads alongside TASKPUMP_*
+# (config block above and the runner hand-off), forwarded when the caller
+# exported them.
+DETACH_PASSTHROUGH_NAMES=(
+  GITHUB_TOKEN MAX_TURNS AGENT_MODEL JOBS POOL_TICK POOL_STAGGER HEALTH_WINDOW
+  DOCKER AGENT_MEMORY_MAX AGENT_MEMORY_SWAP
+)
+
+# build_detach_argv — construct the systemd-run re-exec into DETACH_ARGV (plus
+# the shared pieces DETACH_UNIT / DETACH_FWD) rather than inline, so the
+# boundary-crossing contract above is testable without a live user manager.
+# Only EXPORTED names are forwarded: exactly the set the setsid fallback's
+# child would inherit, never this process's internal computed state.
+declare -a DETACH_ARGV DETACH_FWD
+DETACH_UNIT=""
+build_detach_argv() {
+  DETACH_FWD=()
+  local a name
+  for a in "${ORIG_ARGS[@]}"; do [[ "$a" == "--detach" ]] || DETACH_FWD+=("$a"); done
+  DETACH_UNIT="$PROG_NAME-$(printf '%s' "$PHASES" | tr -c 'A-Za-z0-9' '-')"
+  DETACH_ARGV=(
+    systemd-run --user --collect --unit="$DETACH_UNIT"
+    --description="$PROG_NAME usage-governed pump ($PHASES)"
+    -p WorkingDirectory="$PWD"
+  )
+  while IFS= read -r name; do
+    case "$name" in TASKPUMP_*|ARACHNE_*) ;; *) continue ;; esac
+    tp__is_set "$name" || continue
+    DETACH_ARGV+=(--setenv="$name=${!name}")
+  done < <(compgen -A export 2>/dev/null || true)
+  for name in "${DETACH_PASSTHROUGH_NAMES[@]}"; do
+    [[ "$(declare -p "$name" 2>/dev/null)" == "declare -x"* ]] || continue
+    tp__is_set "$name" || continue
+    DETACH_ARGV+=(--setenv="$name=${!name}")
+  done
+  DETACH_ARGV+=("$0" "${DETACH_FWD[@]}")
+}
+
 detach_and_exit() {
-  local -a fwd=()
-  local a
-  for a in "${ORIG_ARGS[@]}"; do [[ "$a" == "--detach" ]] || fwd+=("$a"); done
-  local unit
-  unit="$PROG_NAME-$(printf '%s' "$PHASES" | tr -c 'A-Za-z0-9' '-')"
+  build_detach_argv
   if command -v systemd-run >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
-    systemd-run --user --collect --unit="$unit" \
-      --description="$PROG_NAME usage-governed pump ($PHASES)" \
-      --setenv=GITHUB_TOKEN="${GITHUB_TOKEN:-}" \
-      "$0" "${fwd[@]}"
-    log "detached as systemd --user unit '$unit'."
-    log "  status: systemctl --user status $unit   logs: journalctl --user -u $unit -f"
-    log "  stop:   systemctl --user stop $unit"
+    "${DETACH_ARGV[@]}"
+    log "detached as systemd --user unit '$DETACH_UNIT'."
+    log "  status: systemctl --user status $DETACH_UNIT   logs: journalctl --user -u $DETACH_UNIT -f"
+    log "  stop:   systemctl --user stop $DETACH_UNIT"
   else
-    setsid nohup "$0" "${fwd[@]}" >>"$PUMP_LOG" 2>&1 </dev/null &
+    setsid nohup "$0" "${DETACH_FWD[@]}" >>"$PUMP_LOG" 2>&1 </dev/null &
     local pid=$!
     disown "$pid" 2>/dev/null || true
     log "detached via setsid+nohup (pid=$pid, log=$PUMP_LOG)."
