@@ -306,6 +306,14 @@ usage() { apl_help "$0"; }
 [[ "$MODE" == "help" ]] && { usage; exit 0; }
 
 [[ -n "$PHASES" ]] || die "--phases is required (e.g. --phases F55..F63)"
+
+# A missing ledger must never read as a drained range: open_count and
+# frontier_phases mask tp-task's refusal into "0 open tasks" with their
+# 2>/dev/null fallbacks, which would render every phase DONE at rc=0 — the
+# false-drain shape this tool's incident history is about. Refuse up front.
+[[ -d "$TASKS_DIR" ]] || die "tasks directory does not exist: $TASKS_DIR
+  A drained range and a missing ledger must not look alike, so this is an
+  error instead. \`tp task resolve --all\` prints how resolution answered."
 case "$GRAIN" in
   phase) ;;
   task|chain) die "grain '$GRAIN' is not implemented yet; only --grain phase is supported (SPEC_GAP: D4 task/chain grains deferred)";;
@@ -382,7 +390,11 @@ trunk_worktree()  { printf '%s/%s' "$WORKTREES_DIR" "$(branch_slug "$INTEGRATION
 # the CONFIGURATION, not of any one launch: it should fail the run at tick zero
 # naming the key to fix, rather than fail per-launch — or worse, launch fine and
 # go invisible to liveness later, which is the failure this closes.
-_pump_probe_branch="$(phase_branch "$(pump_expand_phases "$PHASES" | head -1)")"
+# First phase without a pipe: `| head -1` raced the expander's printf into
+# EPIPE noise ("printf: write error: Broken pipe") that polluted captured
+# plans and flaked the golden suite on CI.
+_pump_all_phases="$(pump_expand_phases "$PHASES")"
+_pump_probe_branch="$(phase_branch "${_pump_all_phases%%$'\n'*}")"
 if ! _pump_branch_problem="$(apl_branch_slug_reject_reason "$_pump_probe_branch")"; then
   die "$_pump_branch_problem
 this run constructs that branch from TASKPUMP_BRANCH_PREFIX='$BRANCH_PREFIX'
