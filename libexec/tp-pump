@@ -673,6 +673,26 @@ unit_files_conflict() {
   return 0
 }
 
+# The units already holding the tree in the tick being planned, in admission
+# order. A module-scope array rather than a `local` one because both admission
+# passes below consult it through hold_reason, and bash has no clean way to pass
+# an array to a function. compute_plan_task resets it.
+declare -a PLAN_HOLDERS=()
+
+# hold_reason <candidate> — the first reason the candidate may not be dispatched
+# beside what already holds the tree, or nothing when it is free to go. Every
+# unit the pump will START this tick must pass this, RESUME included: a resumed
+# container is as real as a launched one.
+hold_reason() {
+  local cand="$1" h reason
+  for h in "${PLAN_HOLDERS[@]:-}"; do
+    [[ -z "$h" ]] && continue
+    reason="$(unit_files_conflict "$cand" "$h")"
+    [[ -n "$reason" ]] && { printf '%s' "$reason"; return 0; }
+  done
+  return 0
+}
+
 # The units a task-grain run dispatches: every task whose phase is in range, in
 # the range's own phase order, numerically within each phase (the ledger's
 # ordering — LEDGER-CONTRACT §6.1 — so the plan reads like `next` would hand the
@@ -1705,7 +1725,8 @@ compute_plan() {
 # changes is only what a unit is; every mechanism keeps its shape:
 #
 #   RUNNING  a live container on this task's own branch — never double-launched.
-#   RESUME   an orphaned claim with committed work on this task's own branch.
+#   RESUME   an orphaned claim with committed work on this task's own branch,
+#            and no file conflict with anything already holding the tree.
 #   LAUNCH   eligible per the ledger, deps physically integrated (when the trunk
 #            is on), and no file conflict with anything already holding the tree.
 #   WAITING  everything else that is not finished, WITH THE REASON — blockers
@@ -1716,6 +1737,12 @@ compute_plan() {
 # The RESUME-before-open ordering is the F79 stall's lesson at the finer grain: a
 # task whose only remaining state is its own committed-but-claimed work must not
 # be able to read as finished.
+#
+# Three passes, and the split is the disjoint-files rule's: everything the tick
+# will START — RUNNING already has, RESUME and LAUNCH will — becomes a holder,
+# and a holder has to bind candidates planned BEFORE it as well as after. So
+# each dispatch class is admitted in its own full pass over the range rather
+# than inline in one loop.
 compute_plan_task() {
   load_task_snapshot
   detect_stalled_orphans
@@ -1729,34 +1756,61 @@ compute_plan_task() {
   while IFS= read -r nm; do [[ -n "$nm" ]] && live_name["$nm"]=1; done < <(apl_live_agents)
 
   # Units already holding the tree this tick, in admission order: the live ones
-  # first (they are running whatever the plan says), then each task admitted to
-  # LAUNCH. A candidate is checked against all of them.
-  local -a holders=()
-  local unit status claimed reason h b pending
+  # first (they are running whatever the plan says), then the resumed ones, then
+  # each task admitted to LAUNCH. A candidate is checked against all of them.
+  PLAN_HOLDERS=()
+  local -A classified=()
+  local unit status claimed reason b pending
   # Pass 1 — live containers. Done as its own pass so a running task's footprint
   # is held against every candidate, not just the ones planned after it.
   while IFS= read -r unit; do
     [[ -z "$unit" ]] && continue
     if [[ -n "${live_name[$(unit_container "$unit")]:-}" ]]; then
       PLAN_RUNNING+=("$unit")
-      holders+=("$unit")
+      PLAN_HOLDERS+=("$unit")
+      classified["$unit"]=1
     fi
+  done < <(tasks_in_range)
+
+  # Pass 2 — resumable orphans, for exactly the reason pass 1 is its own pass.
+  # do_tick dispatches PLAN_RESUME in the SAME tick as PLAN_LAUNCH, so a resumed
+  # unit starts a container and its footprint has to be held against every
+  # candidate — including the ones that sort ahead of it. Classifying RESUME
+  # inline in the admission loop below (and appending to the holder list there)
+  # bound only the candidates planned after it: an eligible task with the
+  # IDENTICAL files: of a stranded one planned as RESUME + LAUNCH with "0
+  # waiting", and a real tick started both containers on one file — the plan
+  # looking clean while scheduling the collision this rule exists to refuse.
+  # (adversarial review, 2026-08-14)
+  #
+  # A resume is itself checked against what already holds the tree, and can only
+  # be held by a LIVE container (nothing else has been admitted yet). That is
+  # safe for the deadlock detector: a live holder means have > 0, so a held
+  # resume can never be mistaken for an idle tick.
+  while IFS= read -r unit; do
+    [[ -z "$unit" ]] && continue
+    [[ -n "${classified[$unit]:-}" ]] && continue
+    [[ -n "${STALL_TASK[$unit]:-}" ]] || continue
+    # Classified ahead of eligibility and ahead of `done`: the claim IS the
+    # reason this task is not in the frontier, and classifying it any other way
+    # is how committed, unfinished work reads as finished.
+    classified["$unit"]=1
+    reason="$(hold_reason "$unit")"
+    if [[ -n "$reason" ]]; then
+      PLAN_WAITING+=("$unit")
+      PLAN_WAIT_REASON["$unit"]="stalled on ${STALL_TASK[$unit]} (${STALL_STATUS[$unit]:-?}) but held: $reason"
+      continue
+    fi
+    PLAN_RESUME+=("$unit")
+    PLAN_HOLDERS+=("$unit")
   done < <(tasks_in_range)
 
   while IFS= read -r unit; do
     [[ -z "$unit" ]] && continue
-    # Already classified RUNNING above.
-    [[ -n "${live_name[$(unit_container "$unit")]:-}" ]] && continue
+    # Already classified RUNNING, RESUME, or held above.
+    [[ -n "${classified[$unit]:-}" ]] && continue
     status="${TSNAP_STATUS[$unit]:-}"
     claimed="${TSNAP_CLAIMED[$unit]:-}"
-
-    if [[ -n "${STALL_TASK[$unit]:-}" ]]; then
-      # Tested ahead of eligibility and ahead of `done`: the claim IS the reason
-      # this task is not in the frontier, and classifying it any other way is how
-      # committed, unfinished work reads as finished.
-      PLAN_RESUME+=("$unit")
-      continue
-    fi
 
     if [[ -n "${TSNAP_ELIGIBLE[$unit]:-}" ]]; then
       if [[ "$INTEGRATION" -eq 1 ]] && ! unit_deps_integrated "$unit"; then
@@ -1764,19 +1818,14 @@ compute_plan_task() {
         PLAN_WAIT_REASON["$unit"]="blockers done but not yet integrated into $INTEGRATION_TRUNK"
         continue
       fi
-      reason=""
-      for h in "${holders[@]:-}"; do
-        [[ -z "$h" ]] && continue
-        reason="$(unit_files_conflict "$unit" "$h")"
-        [[ -n "$reason" ]] && break
-      done
+      reason="$(hold_reason "$unit")"
       if [[ -n "$reason" ]]; then
         PLAN_WAITING+=("$unit")
         PLAN_WAIT_REASON["$unit"]="$reason"
         continue
       fi
       PLAN_LAUNCH+=("$unit")
-      holders+=("$unit")
+      PLAN_HOLDERS+=("$unit")
       continue
     fi
 

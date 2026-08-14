@@ -378,6 +378,86 @@ have "$out" 'RESUME   G3\.2' && fail "resumed a foreign-branch claim:\n$out" || 
 have "$out" 'WAITING  G3\.2 +\(claimed by feat/somebody-else' \
   && pass "and the plan says whose it is" || fail "foreign claim not explained:\n$out"
 
+echo "--- 5d. a RESUMED unit holds its footprint too (the disjoint rule is not bypassable) ---"
+# The blocking defect the 2026-08-14 adversarial review found: RESUME was
+# classified inline in the admission loop WITHOUT becoming a holder, and do_tick
+# dispatches PLAN_RESUME and PLAN_LAUNCH in the SAME tick. A stranded task and an
+# eligible task with the IDENTICAL files: planned as RESUME + LAUNCH, reported
+# "0 waiting", and a real tick started both containers on one file — the plan
+# looking clean while scheduling the collision this whole grain exists to refuse.
+rtick() {  # a REAL --once tick against the resume fixture repo
+  : >| "$RUNLOG"
+  TASKPUMP_WORKSPACE_ROOT="$REPO2" \
+  TASKPUMP_PUMP_WORKTREES_DIR="$REPO2/.worktrees" \
+  TASKPUMP_PUMP_OPS_DIR="$OPS" \
+  TASKPUMP_PUMP_STATE_FILE="$TMP/rd.state" \
+  TASKPUMP_POOL_CAP_FILE="$TMP/rd.cap" \
+  TASKPUMP_PUMP_LOG="$TMP/rd.log" \
+  TASKPUMP_RUNNER="$BIN/runner.sh" \
+  TASKPUMP_IMAGE=fixture-image \
+  TASKPUMP_IMAGE_BUILD= \
+  TASKPUMP_AGENT_HOME="$HOME_STUB" \
+  TASKPUMP_PUMP_NO_GH=1 \
+  TASKPUMP_STAGGER=0 \
+  STUB_RUNNER_LOG="$RUNLOG" \
+  STUB_LIVE="" \
+  "$PUMP" --no-health-gate --no-usage-gate --once --phases G3 --grain task 2>&1
+}
+
+# The resumable sorts AHEAD of the eligible one.
+rm -f "$TASKS"/*.md
+mk G3.2 in_progress "" "libexec/shared.sh" feat/g3.2
+mk G3.5 open        "" "libexec/shared.sh"
+out=$(STUB_LIVE="" rpump --dry-run --phases G3)
+have "$out" 'RESUME   G3\.2' && pass "the stranded task still resumes" || fail "G3.2 not RESUME:\n$out"
+have "$out" 'LAUNCH   G3\.5' && fail "an identical footprint was scheduled beside a RESUME:\n$out" \
+  || pass "the eligible task with the identical footprint is not launched beside it"
+have "$out" 'WAITING  G3\.5 +\(files overlap with G3\.2: libexec/shared\.sh\)' \
+  && pass "it WAITS, naming the resumed task and the path they collide on" \
+  || fail "the hold is unnamed or missing:\n$out"
+have "$out" 'frontier: 0 launchable, 0 running, 1 resumable, 1 waiting' \
+  && pass "and the frontier line counts the hold instead of reporting 0 waiting" \
+  || fail "frontier counts wrong:\n$out"
+
+# ...and the case an append-as-you-go holder list could never have caught: the
+# resumable sorts AFTER the candidate it has to bind.
+rm -f "$TASKS"/*.md
+mk G3.0 open        "" "libexec/shared.sh"
+mk G3.2 in_progress "" "libexec/shared.sh" feat/g3.2
+out=$(STUB_LIVE="" rpump --dry-run --phases G3)
+have "$out" 'RESUME   G3\.2' && pass "a resumable that sorts last still resumes" || fail "G3.2 not RESUME:\n$out"
+have "$out" 'LAUNCH   G3\.0' && fail "a candidate planned BEFORE the resume was admitted onto its files:\n$out" \
+  || pass "a candidate planned before the resume is held by it too"
+have "$out" 'WAITING  G3\.0 +\(files overlap with G3\.2' \
+  && pass "and says which unit holds the path" || fail "hold reason wrong:\n$out"
+
+# The plan is only half the claim; the tick is the other half.
+rm -f "$TASKS"/*.md
+mk G3.2 in_progress "" "libexec/shared.sh" feat/g3.2
+mk G3.5 open        "" "libexec/shared.sh"
+rm -f "$TMP/rd.cap"
+out=$(rtick)
+n=$(wc -l < "$RUNLOG")
+[[ "$n" -eq 1 ]] && pass "a real tick starts exactly ONE container over two identical footprints" \
+  || fail "the runner was handed $n launches:\n$(cat "$RUNLOG")\n$out"
+[[ "$(cut -f1 "$RUNLOG")" == "feat/g3.2" ]] \
+  && pass "and it is the resumed branch, not the eligible sibling" \
+  || fail "runner saw branch $(cut -f1 "$RUNLOG")"
+
+echo "--- 5e. a LIVE container holds its footprint against a resume ---"
+# The same rule from the other side: a resume is a launch, so it is checked
+# against what is already running rather than waved through.
+rm -f "$TASKS"/*.md
+mk G3.1 in_progress "" "libexec/shared.sh" feat/g3.1
+mk G3.2 in_progress "" "libexec/shared.sh" feat/g3.2
+out=$(STUB_LIVE="tp-agent-feat-g3.1" rpump --dry-run --phases G3)
+have "$out" 'RUNNING  G3\.1' && pass "the live task is RUNNING" || fail "G3.1 not RUNNING:\n$out"
+have "$out" 'RESUME   G3\.2' && fail "resumed onto a live container's declared files:\n$out" \
+  || pass "the resume is held by the live footprint"
+have "$out" 'WAITING  G3\.2 +\(stalled on G3\.2 \(in_progress\) but held: files overlap with G3\.1' \
+  && pass "and the plan says both that it is stalled and what holds it" \
+  || fail "held-resume reason wrong:\n$out"
+
 # ── 6. Naming: refused at tick zero, never at launch ──────────────────────────
 echo "--- 6. two tasks that slug to one agent name are refused up front ---"
 # The cardinal failure of this grain: one container name for two units means
