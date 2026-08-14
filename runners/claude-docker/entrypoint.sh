@@ -424,6 +424,15 @@ if [[ "$TEST_MODE" != "plan" ]]; then
     log "permission mode: $(jq -r '.permissions.defaultMode // "default"' "$AGENT_CLAUDE_DIR/settings.json" 2>/dev/null)"
 fi
 
+# ── Git HTTPS auth: the credential-helper text ───────────────────────────────
+# Configured for the unprivileged user below; reads the token from the calling
+# git process's environment AT USE TIME. The text itself contains no secret —
+# the single quotes survive into git's config, so $GITHUB_TOKEN is expanded by
+# the helper's shell when git invokes it, never on any command line. Never
+# interpolate the token's VALUE into this string, into git config, or into the
+# session script: argv is world-readable via /proc/<pid>/cmdline (issue #14).
+GIT_CRED_HELPER='!f() { echo username=x-access-token; echo "password=$GITHUB_TOKEN"; }; f'
+
 if [[ -z "$TEST_MODE" ]]; then
     # ── Background credential refresher ───────────────────────────────────────
     # Periodically re-copies credentials (and the agent config) from the live
@@ -440,9 +449,12 @@ if [[ -z "$TEST_MODE" ]]; then
     log "Credential refresher started (interval=${CRED_REFRESH_INTERVAL_S}s, pid=$!)"
 
     # ── Git HTTPS auth ────────────────────────────────────────────────────────
+    # A credential helper, not url.insteadOf: the insteadOf form embedded the
+    # token in this su's argv AND persisted it into ~/.gitconfig. The helper
+    # text is secret-free (see GIT_CRED_HELPER above), so this argv is safe.
     if [[ -n "${GITHUB_TOKEN:-}" ]]; then
-        su "$CONTAINER_USER" -c "git config --global url.'https://x-access-token:${GITHUB_TOKEN}@github.com/'.insteadOf 'https://github.com/'"
-        log "Git HTTPS auth configured"
+        su "$CONTAINER_USER" -c "git config --global credential.'https://github.com'.helper '$GIT_CRED_HELPER'"
+        log "Git HTTPS auth configured (helper reads GITHUB_TOKEN from the environment)"
     else
         log "WARNING: GITHUB_TOKEN not set; ledger fetch + gh will fail"
     fi
@@ -534,7 +546,7 @@ for part in "${PROMPT_PARTS[@]}"; do
     PROMPT_ARGS+="$(printf '%q' "$part") "
 done
 
-if [[ -n "$TEST_MODE" ]]; then
+if [[ -n "$TEST_MODE" && "$TEST_MODE" != "script" ]]; then
     # Deterministic, greppable report of everything resolution decided.
     echo "REPORT workspace=$WORKSPACE_PATH"
     echo "REPORT repo_root=$REPO_ROOT"
@@ -570,7 +582,11 @@ echo | tee -a "$LOG_FILE"
 DEV_SESSION_SCRIPT="
     cd '$WORKSPACE_PATH'
     export PATH=/usr/local/cargo/bin:\$PATH
-    export GITHUB_TOKEN='${GITHUB_TOKEN:-}'
+    # By NAME only: the value arrives through the environment (docker -e, then
+    # su's env passthrough). Interpolating it here put the secret in this
+    # script — the argv of a many-hour su process, world-readable in
+    # /proc/<pid>/cmdline (issue #14).
+    export GITHUB_TOKEN
     export CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1
     export DISABLE_TELEMETRY=1
     export DISABLE_ERROR_REPORTING=1
@@ -631,6 +647,16 @@ DEV_SESSION_SCRIPT="
     (cd '$LEDGER_REPO' && git push 2>&1) | tee -a '$LOG_FILE' || true
     echo \"Agent finished at \$(date -u).\" | tee -a '$LOG_FILE'
 "
+
+# TASKPUMP_ENTRYPOINT_TEST_MODE=script: print the credential-helper text and
+# the assembled session script, then exit before the privilege drop. The suite
+# plants a canary token and asserts the secret appears in neither — by NAME
+# only (issue #14).
+if [[ "$TEST_MODE" == "script" ]]; then
+    echo "REPORT git_cred_helper=$GIT_CRED_HELPER"
+    printf '%s\n' "$DEV_SESSION_SCRIPT"
+    exit 0
+fi
 
 # ── The privilege drop: setpriv on a script file, never su -c ─────────────────
 # su(1) sets itself as a child subreaper, so every orphaned grandchild of the
