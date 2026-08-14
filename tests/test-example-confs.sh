@@ -42,9 +42,8 @@ PUMP="$TP_ROOT/libexec/tp-pump"
 # only conf allowed into a fixture invocation is the one this suite passes
 # explicitly via TASKPUMP_CONFIG, which outranks this switch. run-all.sh
 # exports the same; this covers standalone runs.
-export TASKPUMP_NO_CONF=1
-export TASKPUMP_NOTIFY_CMD=true
-export ARACHNE_NOTIFY_CMD=true
+# shellcheck source=tests/suite-prologue.sh
+. "$SCRIPT_DIR/suite-prologue.sh"
 
 PASS=0; FAIL=0
 pass() { printf 'PASS: %s\n' "$*"; PASS=$((PASS + 1)); }

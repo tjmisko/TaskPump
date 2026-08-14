@@ -90,6 +90,14 @@
 # TASKPUMP_PHASE_SEPARATOR= # what ends the phase within an id (default: .)
 
 # ── Pump scheduling (tp pump) ────────────────────────────────────────────────
+# TASKPUMP_WORKSPACE_ROOT=  # the workspace the pump drives: the default image-build
+#                           #   context, the repo phase branches and agent worktrees
+#                           #   are created in, the state-dir default. (default:
+#                           #   derived from the config anchor — a discovered conf's
+#                           #   directory, else the caller's worktree root — never
+#                           #   from a vendored install's own checkout, issue #32.
+#                           #   Set it to pin containers/CI; a missing directory is
+#                           #   a loud error.)
 # TASKPUMP_JOBS=            # concurrent worktree pool cap (default: 4). This is the
 #                           #   key the pump reads; TASKPUMP_PUMP_JOBS is the systemd
 #                           #   unit's name for the same number, passed as --jobs.
