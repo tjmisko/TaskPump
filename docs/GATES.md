@@ -7,6 +7,14 @@ A gate answers one question, every tick, before the pump launches anything:
 That is the entire scope. A gate never stops work already running, never fails a
 task, and never decides anything about correctness. It governs the *feed*.
 
+> **Not to be confused with review gates.** A *feed* gate (this document)
+> pauses the whole pump's launching, and deliberately fails open (§1.1). A
+> *review* gate holds specific downstream tasks shut until a reviewer task in
+> the DAG renders its verdict — it is made of ordinary tasks and `blockers:`,
+> not of this plugin seam, and it must never fail open: a review that fails
+> open is not a review. See
+> [LEDGER-CONTRACT.md §5.12](LEDGER-CONTRACT.md#512-review--verdict--review-gates).
+
 ---
 
 ## 1. The contract

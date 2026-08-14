@@ -177,6 +177,20 @@ set.
 | `blocked_reason` | string \| null | Why. Cleared by `reopen`. Default `null`. |
 | `scrub_reason` *(verb-added)* | string \| null | Why a task was parked in `needs-review` or `stuck` — the tripwire that fired, or the reason passed to `needs-review`. Cleared by `reopen`. |
 
+### Review *(all verb-added)*
+
+Written by `review` and `verdict` (§5.12); `create` never emits them. A task
+carrying none of them is a plain task, and every reader must treat it that
+way. All five are additive — MINOR per §1.
+
+| Field | Type | Semantics |
+|---|---|---|
+| `review_of` | string | On a review task: the id of the implementation task under review. `verdict` resolves the chain through it; fsck checks that it names a real task, and never the task itself. |
+| `review_role` | string | `reviewer` or `adjudicator` — no other value is valid. Presence is what makes a task a review task: `next` and the eligible walks of `ready` hide it (§6), and `heartbeat --end` stops measuring commit productivity on it (§5.3). |
+| `review_prompt` | string \| null | The review lens recorded at chain creation (`review --prompt`), stored repo-relative when the file lies inside the code repo. Validated to exist when recorded; read by whatever dispatches the reviewer. |
+| `review_round` | integer | On the *implementation* task: the review round in progress, 1 from chain creation. Advanced by a change-request verdict. |
+| `review_max_rounds` | integer | On the *implementation* task: the round bound (`review --max-rounds`, default 3). A change-request that would need a round past it parks the task `needs-review` instead (§5.12). |
+
 ### Timestamps
 
 All timestamps are ISO-8601 UTC to second precision, `YYYY-MM-DDTHH:MM:SSZ`.
@@ -278,6 +292,13 @@ some *other* `in_progress` task, the cycle is credited to neither and a warning
 names the conflict. A wrong attribution is worse than none: it silently clears
 the tripwire on a task nobody is working.
 
+On a **review task** (`review_role` present, §3 "Review") `--end` decrements
+the budget and stamps liveness but runs no productivity check and never moves
+the failure counter: an honest reviewer commits nothing, so the commit meter
+measures nothing there, and a meter that measures nothing must not drive a
+tripwire. A wedged reviewer is still bounded — by budget exhaustion and by
+heartbeat staleness (§5.10).
+
 ### 5.4 `complete <id> [--commits ...] [--defer-wiring "..."]`
 `* → done`. Records the commits and `completed_at`, releases the claim, and
 appends completion notes read from stdin when stdin is not a terminal.
@@ -365,6 +386,58 @@ Status-preserving bookkeeping for the wiring flag. `undefer` requires a
 `--caller` naming the non-test call site, so the ledger records evidence for the
 claim rather than an assertion. `deferred` lists everything still outstanding.
 
+### 5.12 `review` / `verdict` — review gates
+
+Review gates put *reviewer tasks in the DAG*: ordinary tasks in the six-status
+vocabulary, wired with ordinary blockers, and everything above — eligibility,
+the state machine, ordering, the renderer — applies to them unchanged. Two
+verbs do all the work; neither adds a status or a transition. (Not to be
+confused with the pump's *feed* gates — see [GATES.md](GATES.md), which gate
+launching globally and deliberately fail open. A review gate holds one edge of
+the DAG shut and must never fail open.)
+
+`review <impl-id> [--panel N] [--prompt <file>] [--max-rounds N]` synthesizes
+the chain atomically under the state lock, as one ledger commit:
+
+- N reviewer tasks (default 1) blocked by the implementation task, with ids
+  allocated from the phase's own namespace (next free `.N`, §7);
+- an **adjudicator** task blocked by every reviewer, when N > 1;
+- the **gate task** — the adjudicator, or the lone reviewer — **added** to the
+  blockers of every task that listed the implementation as a blocker. Added,
+  never substituted: a later `reopen` of the implementation must hold
+  downstream shut on its own.
+
+One subject, one chain: a second `review` of the same task is refused, as is
+reviewing a review task. Reviewing already-`done` work is legal (the chain is
+simply eligible at once) and warns rather than refuses.
+
+`verdict <review-id> --approve [--findings -|"…"]` /
+`--request-changes --findings -|"…"` records the outcome. Every verdict
+requires the implementation to be `done` — `claim` checks status, not
+blockers, so this guard is what refuses a ruling on unfinished or reopened
+work. An adjudicator's verdict is refused while any of its reviewers has not
+reported. Then:
+
+- **Approve** completes the review task (`* → done`, exactly as `complete`),
+  findings appended to its own body. A panel reviewer's approve *is* its
+  report — reviewers never move the implementation, and nothing surfaces one
+  reviewer's findings to another before the adjudicator reads them all.
+- **Request changes** — the gate task's call alone — appends the findings to
+  the *implementation* task's body under `## Review findings (round N, …)`,
+  reopens it as `reopen`-from-`done` does (completion markers shed, prior
+  commits preserved in the note), re-arms the whole chain to `open`, and sets
+  `review_round = N + 1`. The re-armed reviews are ineligible until the fix
+  lands and `complete` runs again; the loop closes through §6 alone.
+- A change-request that would need a round past `review_max_rounds` instead
+  completes the gate (its verdict is delivered) and parks the implementation
+  `needs-review` with `scrub_reason: review rounds exhausted (N/N)` and the
+  findings intact. The bound measures futility, not duration; the door back is
+  the ordinary `reopen` (§5.7), by a human.
+
+Supervisors that cannot dispatch review tasks see them only through
+`ready --count` (§6): a range gated on an unrendered verdict reads as open
+work with an empty frontier — a stall, reported loudly, never a drain.
+
 ---
 
 ## 6. The eligibility predicate
@@ -389,6 +462,12 @@ Queries add scoping on top of the predicate, never replacing it:
 - `next` returns the single lowest-ordered eligible task, and additionally skips
   tasks claimed by a *different* branch (`--branch` names yours; unclaimed or
   yours both qualify).
+- `next` and the eligible walks of `ready` (`--json`, the table,
+  `--count-eligible`) also skip **review tasks** (`review_role` present, §5.12)
+  unless `--include-reviews` is passed: an in-context agent loop must never
+  claim the review of its own work. `ready --count` deliberately does *not*
+  skip them — a pending review is open work, and a range gated on one is
+  stalled, not drained.
 - `ready` returns the whole eligible frontier, same predicate.
 - `ready --count` is deliberately **broader**: every `open` task in range,
   ignoring blockers and claims. This is the *drain test* — "is any open work
@@ -581,6 +660,7 @@ Checked per file:
   and what lies between them parses as a YAML mapping;
 - `id` equals the filename stem (§2) and matches the configured id pattern (§7);
 - `status` is one of the six values of §4;
+- `review_role`, where present, is `reviewer` or `adjudicator` (§3 "Review");
 - every machine key of §3 that is present has its contract type, and timestamps
   have the exact shape of §3 ("Timestamps"). A machine key absent from the file
   is reported too — a reader treats it as its default, but a writer should emit
@@ -597,7 +677,10 @@ Checked whole-ledger — what no single-file tool can do:
   keeps answering "not yet", and no per-file read ever produces a diagnostic.
   The mutating blocker verbs validate each edge as it is written, but a cycle
   is made of individually valid edges — and an imported ledger arrives with
-  all of its edges already drawn. fsck is the check that sees the whole graph.
+  all of its edges already drawn. fsck is the check that sees the whole graph;
+- every `review_of` names an existing task file, and never the task itself
+  (§5.12): a dangling one is a chain whose verdict can never land, and no
+  per-file read would ever say so.
 
 Exit codes follow scrub's convention (§10): **3** when violations were found
 (actionable — one line names each), **0** on a clean ledger with no output, and
