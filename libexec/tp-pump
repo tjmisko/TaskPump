@@ -86,6 +86,30 @@ if [[ -n "${TASKPUMP_WORKSPACE_ROOT:-}" ]]; then
 else
   REPO_ROOT="$TP_WS_ROOT"
 fi
+# The fallback rung is not an answer for a SUPERVISOR: when neither a
+# discovered conf nor the cwd probe anchored the workspace, TP_WS_ROOT is the
+# install root — and a real run would build, branch, and cut worktrees inside
+# the vendored TaskPump itself, then report the range DONE against the
+# dogfood ledger at rc=0. tp-task refuses this rung for mutating verbs; the
+# pump is the most mutating tool in the box. The vendored layout (install
+# root at or inside the caller's worktree) keeps the fallback, exactly as
+# tp-task allows it.
+# An explicitly named ledger (env, or a conf value the loader anchored) is
+# the caller saying where the work lives — the same first-rung exemption
+# tp_require_resolved_ledger grants.
+if [[ -z "${TASKPUMP_WORKSPACE_ROOT:-}" && -z "${TASKPUMP_PUMP_TASKS_DIR:-}" \
+      && -z "${TASKPUMP_TASKS_DIR:-}" && "$TP_WS_VIA" == "install-root" ]]; then
+  _pump_ws_vendored=0
+  if [[ -n "$TP_WS_CWD_ROOT" ]]; then
+    [[ "$TP_ROOT" == "$TP_WS_CWD_ROOT" || "$TP_ROOT" == "$TP_WS_CWD_ROOT"/* ]] && _pump_ws_vendored=1
+  fi
+  if (( ! _pump_ws_vendored )); then
+    printf '%s: refusing to run against the TaskPump installation itself.\n  No taskpump.conf above $PWD, $PWD is not inside a consumer repository, and no pin was given — so resolution fell back to the install root:\n    %s\n  A drain planned there would target the install, not your project.\n  fix: run from your project root, or set TASKPUMP_WORKSPACE_ROOT=/path/to/project\n' \
+      "${TASKPUMP_PUMP_PROG_NAME:-tp-pump}" "$TP_WS_ROOT" >&2
+    exit 1
+  fi
+  unset _pump_ws_vendored
+fi
 # shellcheck source=../lib/pump-lib.sh
 source "$TP_LIB_DIR/pump-lib.sh"
 

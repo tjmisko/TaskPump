@@ -259,6 +259,55 @@ out=$( cd "$CONS" && env "${TP_ENV_UNSET[@]}" "${DRY_STUBS[@]}" \
   && pass "a pin naming a missing directory refuses loudly, naming the key" \
   || fail "missing-dir pin was not refused (rc=$rc):\n$out"
 
+# The review's live reproduction: an unpinned pump from a cwd that is NOT a
+# repository, with the vendored install carrying its own dogfood-shaped
+# ledger. Resolution falls to the install root, and planning there would
+# render the dogfood range DONE at rc=0 — the false-drain shape. The
+# supervisor refuses the fallback rung outright; tp-task's vendored-layout
+# exception is preserved (from inside the vendored copy the fallback still
+# answers, as the earlier case pins).
+mkdir -p "$VEND/tasks"
+mk "$VEND/tasks" T9
+NOWHERE="$TMP/nowhere"; mkdir -p "$NOWHERE"
+out=$( cd "$NOWHERE" && env "${TP_ENV_UNSET[@]}" "${DRY_STUBS[@]}" \
+        TASKPUMP_TASK_NOCOMMIT=1 \
+        "$VPUMP" "${DRY_FLAGS[@]}" --phases T9 --dry-run 2>&1 ); rc=$?
+[[ $rc -ne 0 ]] && have "$out" 'refusing to run against the TaskPump installation' \
+  && pass "unpinned from a non-repo cwd: the install-root rung is refused" \
+  || fail "install-root fallback not refused (rc=$rc):\n$out"
+have "$out" 'TASKPUMP_WORKSPACE_ROOT' \
+  && pass "the refusal names the pin key" \
+  || fail "the refusal does not name TASKPUMP_WORKSPACE_ROOT:\n$out"
+have "$out" 'DONE' \
+  && fail "a plan was rendered against the install's own ledger:\n$out" \
+  || pass "no plan is rendered against the install's own ledger"
+rm -rf "$VEND/tasks"
+
+# The shape that hit the field incident: TaskPump vendored as a true git
+# SUBMODULE (.git is a FILE pointing into the superproject). Discovery hops
+# to the superproject, so an unpinned pump from inside the submodule still
+# targets the consumer's ledger.
+SUBCONS="$TMP/subconsumer"
+mkdir -p "$SUBCONS/tasks"
+git -C "$TMP" init -qb main subconsumer
+mk "$SUBCONS/tasks" T1
+printf 'TASKPUMP_TASKS_DIR=tasks\n' >| "$SUBCONS/taskpump.conf"
+( cd "$SUBCONS" \
+  && git -c user.name=t -c user.email=t@e add -A >/dev/null \
+  && git -c user.name=t -c user.email=t@e commit -qm seed )
+if git -C "$SUBCONS" -c protocol.file.allow=always -c user.name=t -c user.email=t@e \
+     submodule add -q "$VEND" taskpump 2>/dev/null; then
+  SUBPUMP="$SUBCONS/taskpump/libexec/tp-pump"
+  out=$( cd "$SUBCONS/taskpump" && env "${TP_ENV_UNSET[@]}" "${DRY_STUBS[@]}" \
+          TASKPUMP_NO_CONF=0 TASKPUMP_TASK_NOCOMMIT=1 \
+          "$SUBPUMP" "${DRY_FLAGS[@]}" --phases T1 --dry-run 2>&1 ); rc=$?
+  [[ $rc -eq 0 ]] && have "$out" 'open tasks in range: 1' \
+    && pass "a submodule-vendored pump from inside the submodule plans the consumer's ledger" \
+    || fail "submodule-shape dry-run failed (rc=$rc):\n$out"
+else
+  pass "SKIP: git submodule add unavailable here (file protocol refused)"
+fi
+
 # A conf-relative pin anchors to the conf's workspace (the issue-#1 rule).
 PINCONF="$TMP/pin-consumer"
 mkdir -p "$PINCONF/tasks" "$PINCONF/sub"
