@@ -105,6 +105,24 @@ out=$( cd "$C1/crates/deep" && env "${TP_ENV_UNSET[@]}" TASKPUMP_NO_CONF=0 \
   && pass "discovered conf from a subdir: the frontier lists the open tasks" \
   || fail "discovered conf from a subdir lost the frontier (rc=$rc):\n$out"
 
+# The pump flavor of the same defect — the shape G5.2 escalated: a pump
+# launched from a subdirectory used to read an empty ledger and false-drain
+# the range at rc=0. The plan must see both open tasks from anywhere in the
+# workspace. HOME is pointed at an empty dir so the claude gates skip
+# identically on any host.
+CFGHOME="$TMP/cfg-home"; mkdir -p "$CFGHOME"
+out=$( cd "$C1/crates" && env "${TP_ENV_UNSET[@]}" TASKPUMP_NO_CONF=0 \
+        TASKPUMP_TASK_NOCOMMIT=1 HOME="$CFGHOME" TASKPUMP_TASK="$TASK" \
+        "$PUMP" --no-health-gate --no-usage-gate --no-disk-gate \
+        --phases T1..T2 --dry-run 2>&1 ); rc=$?
+[[ $rc -eq 0 ]] && pass "pump --dry-run from a subdir exits 0" \
+  || fail "pump --dry-run from a subdir rc=$rc:\n$out"
+have "$out" 'open tasks in range: 2' \
+  && pass "the subdir plan sees both open tasks — no false drain" \
+  || fail "the subdir plan lost the ledger (the G5.2 false-drain shape):\n$out"
+have "$out" 'LAUNCH' && pass "the subdir plan can launch the frontier" \
+  || fail "no LAUNCH in the subdir plan:\n$out"
+
 # resolve reports what will actually be used: an absolute path, the same
 # answer from every directory of the workspace.
 got=$( cd "$C1/crates" && env "${TP_ENV_UNSET[@]}" TASKPUMP_NO_CONF=0 \
