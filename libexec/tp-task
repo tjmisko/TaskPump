@@ -1367,6 +1367,220 @@ cmd_review() {
   return 0
 }
 
+# Render a review verdict, through the state machine's existing doors only —
+# no new status, no new transition. --approve is `complete` for a review task,
+# findings in its body. --request-changes is the change loop, and it is the
+# GATE task's call alone: findings land on the IMPLEMENTATION task's body (the
+# implementer is who must act on them), the implementation reopens exactly as
+# reopen-from-done would (completion markers shed, prior commits preserved in
+# the note), the whole chain re-arms to open, and review_round advances. The
+# reviews are then ineligible until the fix lands and `complete` runs again —
+# the loop closes through the eligibility predicate, nothing else.
+#
+# A change-request that would need a round past review_max_rounds instead
+# parks the implementation needs-review with the findings intact: the round
+# bound measures futility, not duration, and past it a human renders the
+# final call. Panel reviewers only ever report — their --request-changes is
+# refused with a pointer to the adjudicator, because a panel where any
+# member can reopen the work is a panel whose verdict nobody rendered.
+cmd_verdict() {
+  local rid="" approve=0 request=0 findings=""
+  while (( $# )); do
+    case $1 in
+      --approve) approve=1; shift;;
+      --request-changes) request=1; shift;;
+      --findings) findings=$2; shift 2;;
+      --findings=*) findings=${1#--findings=}; shift;;
+      -*) die "unknown flag to verdict: $1";;
+      *) [[ -z "$rid" ]] && rid=$1 || die "too many positional args to verdict"; shift;;
+    esac
+  done
+  [[ -z "$rid" ]] && die "usage: $TASKPUMP_PROG_NAME verdict <review-id> --approve [--findings -|\"...\"]  |  --request-changes --findings -|\"...\""
+  (( approve + request == 1 )) \
+    || die "verdict requires exactly one of --approve or --request-changes"
+
+  local rfile; rfile=$(task_file_required "$rid")
+  local role; role=$(fm_get "$rfile" '.review_role')
+  [[ -z "$role" ]] \
+    && die "$rid is not a review task (no review_role); verdict applies only to reviewer/adjudicator tasks"
+  local rstatus; rstatus=$(fm_get "$rfile" '.status')
+  [[ "$rstatus" == "done" ]] \
+    && die "a verdict is already recorded for $rid (status=done); reopen it to re-review"
+
+  local impl_id; impl_id=$(fm_get "$rfile" '.review_of')
+  [[ -z "$impl_id" ]] \
+    && die "$rid carries review_role but no review_of; the chain is broken — repair it through the CLI"
+  local impl_file; impl_file=$(task_file "$impl_id" || true)
+  [[ -z "$impl_file" ]] \
+    && die "review_of '$impl_id' names no task in this ledger; the verdict has no implementation to act on"
+  # `claim` checks status, not blockers, so nothing upstream of this line
+  # stops a verdict on work that is not finished — or was reopened while the
+  # reviewer read it. A verdict on a moving target reviews nothing.
+  local impl_status; impl_status=$(fm_get "$impl_file" '.status')
+  [[ "$impl_status" != "done" ]] \
+    && die "cannot render a verdict on $impl_id while it is $impl_status; the review is of completed work (wait for complete)"
+
+  if [[ "$findings" == "-" ]]; then
+    findings=$(cat)
+  fi
+  if (( request )) && [[ -z "$findings" ]]; then
+    die "--request-changes requires --findings (the implementer needs something to act on)"
+  fi
+
+  review_chain_scan "$impl_id"
+  local gate_id="$REVIEW_GATE_ID"
+  local is_gate=0
+  [[ -n "$gate_id" && "$rid" == "$gate_id" ]] && is_gate=1
+
+  # An adjudicator's ruling before every reviewer has reported is a verdict
+  # over findings that do not exist yet — and since `claim` does not check
+  # blockers, nothing else refuses it.
+  if [[ "$role" == "adjudicator" ]]; then
+    local pending="" rev rev_file rev_status
+    for rev in "${REVIEW_REVIEWER_IDS[@]-}"; do
+      [[ -z "$rev" ]] && continue
+      rev_file=$(task_file "$rev" || true)
+      [[ -z "$rev_file" ]] && continue
+      rev_status=$(fm_get "$rev_file" '.status')
+      [[ "$rev_status" == "done" ]] || pending="$pending $rev"
+    done
+    [[ -n "$pending" ]] \
+      && die "adjudicator verdict before the panel reported — still pending:$pending"
+  fi
+
+  local round max
+  round=$(fm_get "$impl_file" '.review_round'); [[ "$round" =~ ^[0-9]+$ ]] || round=1
+  max=$(fm_get "$impl_file" '.review_max_rounds'); [[ "$max" =~ ^[0-9]+$ ]] || max=3
+  local now; now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+  if (( approve )); then
+    fm_set "$rfile" "
+      .status = \"done\" |
+      .completed_at = \"$now\" |
+      .claimed_by = null |
+      .turn_budget_remaining = null |
+      .consecutive_failed_iterations = 0 |
+      .last_heartbeat_head_sha = null
+    "
+    {
+      printf '\n## Verdict: approve (round %s, %s)\n' "$round" "$now"
+      [[ -n "$findings" ]] && printf '\n%s\n' "$findings"
+    } >> "$rfile"
+    git_commit_state "verdict $rid: approve (round $round)"
+    if (( is_gate )); then
+      echo "verdict $rid: approve (round $round) — the gate is done; downstream unblocks as its remaining blockers do"
+    else
+      echo "verdict $rid: approve (round $round) — report recorded; the gate verdict belongs to ${gate_id:-the adjudicator}"
+    fi
+    return 0
+  fi
+
+  # --request-changes from here on.
+  if (( ! is_gate )); then
+    if [[ -z "$gate_id" ]]; then
+      die "this chain has no gate task (a panel with no adjudicator?); repair the chain before rendering a change-request"
+    fi
+    die "only the gate task ($gate_id) renders the change-request verdict; record your findings with --approve — independence is the point of the panel"
+  fi
+
+  local prior_commits
+  prior_commits=$(yq --front-matter=extract '.completed_by_commits | join(",")' "$impl_file" 2>/dev/null || echo "")
+  [[ "$prior_commits" == "null" ]] && prior_commits=""
+
+  local new_round=$((round + 1))
+  if (( new_round > max )); then
+    # The round budget is spent. The gate's verdict is delivered (its task
+    # completes; the report stands), and the implementation is parked for a
+    # human — completion markers shed, because a needs-review task still
+    # claiming completed_at would carry that lie through the next reopen.
+    fm_set "$rfile" "
+      .status = \"done\" |
+      .completed_at = \"$now\" |
+      .claimed_by = null |
+      .turn_budget_remaining = null |
+      .consecutive_failed_iterations = 0 |
+      .last_heartbeat_head_sha = null
+    "
+    printf '\n## Verdict: request-changes (round %s, %s) — rounds exhausted\n\n%s\n' \
+      "$round" "$now" "$findings" >> "$rfile"
+    fm_set "$impl_file" "
+      .status = \"needs-review\" |
+      .scrub_reason = \"review rounds exhausted ($round/$max)\" |
+      .claimed_by = null |
+      .claimed_at = null |
+      .turn_budget_remaining = null |
+      .last_heartbeat_head_sha = null |
+      .completed_at = null |
+      .completed_by_commits = [] |
+      .wiring_deferred = false |
+      .wiring_deferred_note = null
+    "
+    {
+      printf '\n## Review findings (round %s, %s)\n\n%s\n' "$round" "$now" "$findings"
+      printf '\nReview rounds exhausted (%s/%s); parked needs-review for a human decision.' "$round" "$max"
+      [[ -n "$prior_commits" ]] && printf ' Prior completion commits: %s.' "$prior_commits"
+      printf '\n'
+    } >> "$impl_file"
+    git_commit_state "verdict $rid: request-changes — rounds exhausted ($round/$max), $impl_id parked needs-review"
+    echo "verdict $rid: request-changes (round $round) — review rounds exhausted ($round/$max); $impl_id parked needs-review with the findings"
+    return 0
+  fi
+
+  # Reopen the implementation exactly as reopen-from-done would, plus the
+  # round advance; findings go to its body because the implementer acts there.
+  fm_set "$impl_file" "
+    .status = \"open\" |
+    .completed_at = null |
+    .completed_by_commits = [] |
+    .wiring_deferred = false |
+    .wiring_deferred_note = null |
+    .claimed_by = null |
+    .claimed_at = null |
+    .turn_budget_remaining = null |
+    .last_heartbeat_head_sha = null |
+    .blocked_at = null |
+    .blocked_reason = null |
+    .scrub_reason = null |
+    .review_round = $new_round
+  "
+  {
+    printf '\n## Review findings (round %s, %s)\n\n%s\n' "$round" "$now" "$findings"
+    printf '\nReopened for round %s.' "$new_round"
+    [[ -n "$prior_commits" ]] && printf ' Prior completion commits: %s.' "$prior_commits"
+    printf '\n'
+  } >> "$impl_file"
+
+  # Re-arm the whole chain — gate included — back to open. Blockers are
+  # intact, so every member is ineligible until the fix lands and `complete`
+  # runs again. The gate keeps its verdict note; siblings get a line saying
+  # why their `done` was shed.
+  printf '\n## Verdict: request-changes (round %s, %s)\n\n%s\n' \
+    "$round" "$now" "$findings" >> "$rfile"
+  local i cid cfile
+  for i in "${!REVIEW_CHAIN_IDS[@]}"; do
+    cid="${REVIEW_CHAIN_IDS[$i]}"
+    cfile="${REVIEW_CHAIN_FILES[$i]}"
+    fm_set "$cfile" "
+      .status = \"open\" |
+      .claimed_by = null |
+      .claimed_at = null |
+      .turn_budget_remaining = null |
+      .consecutive_failed_iterations = 0 |
+      .last_heartbeat_head_sha = null |
+      .completed_at = null |
+      .completed_by_commits = [] |
+      .scrub_reason = null
+    "
+    [[ "$cid" == "$rid" ]] && continue
+    printf '\n## Re-armed for round %s (%s)\n\n%s was reopened by %s'\''s change-request verdict; blockers hold this review until the fix completes.\n' \
+      "$new_round" "$now" "$impl_id" "$rid" >> "$cfile"
+  done
+
+  git_commit_state "verdict $rid: request-changes (round $round -> $new_round)"
+  echo "verdict $rid: request-changes (round $round) — $impl_id reopened for round $new_round; chain re-armed"
+  return 0
+}
+
 # Record that the pump is about to auto-resume a stalled task, and rule on
 # whether it still may. Returns the verdict on stdout and in the exit code so the
 # caller never has to read frontmatter itself — there is no generic read verb,
@@ -2323,6 +2537,24 @@ Commands:
                                        now, read by whatever dispatches the
                                        reviewer); --max-rounds bounds the
                                        change-request loop (default 3).
+  verdict <review-id> --approve [--findings -|"..."]
+          | --request-changes --findings -|"..."
+                                     Render a review's outcome through existing
+                                       state-machine doors. --approve completes
+                                       the review task (findings to its body);
+                                       a panel reviewer's approve is its report.
+                                       --request-changes (gate task only,
+                                       findings required, requires the reviewed
+                                       task to be done) appends the findings to
+                                       the IMPLEMENTATION task's body, reopens
+                                       it (completion markers shed, prior
+                                       commits preserved in the note), re-arms
+                                       the chain to open, and advances
+                                       review_round — or, past
+                                       review_max_rounds, parks the
+                                       implementation needs-review with the
+                                       findings intact. --findings - reads
+                                       stdin.
   resume-attempt <id> --head <sha> [--max N]
                                      Pump-only: record an auto-resume of a stalled
                                        task and rule on whether it may proceed.
@@ -2489,19 +2721,19 @@ main() {
   # about the install-root fallback's ledger is a wrong answer about the
   # caller's — `resolve` stays available to diagnose.
   case $cmd in
-    create|claim|heartbeat|complete|block|needs-review|release|reopen|review|defer|undefer|resume-attempt|scrub|goal|title|blockers|fsck)
+    create|claim|heartbeat|complete|block|needs-review|release|reopen|review|verdict|defer|undefer|resume-attempt|scrub|goal|title|blockers|fsck)
       tp_require_resolved_ledger;;
   esac
   # Every verb that reads or writes the ledger needs the directory to exist;
   # `resolve` is the diagnostic the refusal points at and keeps working.
   case $cmd in
-    next|ready|list|goal|title|blockers|create|claim|heartbeat|complete|block|needs-review|release|reopen|review|defer|undefer|deferred|resume-attempt|scrub)
+    next|ready|list|goal|title|blockers|create|claim|heartbeat|complete|block|needs-review|release|reopen|review|verdict|defer|undefer|deferred|resume-attempt|scrub)
       tp_require_tasks_dir;;
   esac
   # Mutating subcommands serialize on the cross-agent state lock for their
   # whole read-modify-write + commit. Read-only commands (next/list) skip it.
   case $cmd in
-    claim|heartbeat|complete|block|needs-review|release|reopen|review|defer|undefer|resume-attempt|scrub) acquire_state_lock;;
+    claim|heartbeat|complete|block|needs-review|release|reopen|review|verdict|defer|undefer|resume-attempt|scrub) acquire_state_lock;;
   esac
   case $cmd in
     next) cmd_next "$@";;
@@ -2519,6 +2751,7 @@ main() {
     release) cmd_release "$@";;
     reopen) cmd_reopen "$@";;
     review) cmd_review "$@";;
+    verdict) cmd_verdict "$@";;
     defer) cmd_defer "$@";;
     undefer) cmd_undefer "$@";;
     deferred) cmd_deferred "$@";;

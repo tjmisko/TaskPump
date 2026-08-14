@@ -220,7 +220,165 @@ out=$("$CLI" ready)
 grep -q 'T6\.1' <<<"$out" && pass "cascade 4: gate done — downstream is eligible" \
   || fail "cascade 4: downstream not eligible: $out"
 
-# ── Section 3: every mutation is one auditable ledger commit ─────────────────
+# ── Section 3: verdict guards ────────────────────────────────────────────────
+echo
+echo "--- verdict: guards ---"
+
+# Ledger A state here: T1 done, T1.1 open+eligible, T2 gated, T3 open.
+export TASKPUMP_TASKS_DIR="$A/tasks"
+export TASKPUMP_TASK_OUT="$A/.next-task"
+export TASKPUMP_CODE_REPO="$A"
+
+set +e
+"$CLI" verdict T3 --approve >/dev/null 2>&1 && fail "verdict on a plain task was accepted" \
+  || pass "verdict on a plain task is refused"
+"$CLI" verdict T1.1 >/dev/null 2>&1 && fail "verdict with no ruling was accepted" \
+  || pass "verdict requires --approve or --request-changes"
+"$CLI" verdict T1.1 --approve --request-changes >/dev/null 2>&1 \
+  && fail "verdict with both rulings was accepted" \
+  || pass "verdict refuses both rulings at once"
+"$CLI" verdict T1.1 --request-changes >/dev/null 2>&1 \
+  && fail "request-changes without findings was accepted" \
+  || pass "request-changes requires --findings"
+set -e
+
+# A verdict on work that is not done reviews nothing — and `claim` checks
+# status, not blockers, so this guard is the only thing refusing it.
+C="$TMPDIR_TEST/c"
+mkdir -p "$C/tasks"
+TASKPUMP_TASKS_DIR="$C/tasks" "$CLI" create T1 --title "Unfinished impl" >/dev/null
+TASKPUMP_TASKS_DIR="$C/tasks" "$CLI" review T1 >/dev/null
+set +e
+out=$(TASKPUMP_TASKS_DIR="$C/tasks" "$CLI" verdict T1.1 --approve 2>&1); rc=$?
+set -e
+[[ $rc -ne 0 ]] && pass "a verdict while the implementation is open is refused" \
+  || fail "verdict on an open implementation exited 0"
+grep -q 'while it is open' <<<"$out" && pass "and the refusal names the status" \
+  || fail "refusal was '$out'"
+
+# ── Section 4: the change-request loop closes through eligibility ────────────
+echo
+echo "--- verdict: the change-request loop ---"
+
+"$CLI" claim T1.1 --branch review/t1 --turns 5 >/dev/null
+"$CLI" verdict T1.1 --request-changes --findings - <<< "The parser drops the last line." >/dev/null
+
+assert_fm "$A/tasks" T1 '.status' "open" "request-changes reopens the implementation"
+assert_fm "$A/tasks" T1 '.review_round' "2" "and advances the round"
+assert_fm "$A/tasks" T1 '.completed_at' "null" "completion markers are shed"
+assert_fm "$A/tasks" T1 '.completed_by_commits | length' "0" "including the commit list"
+grep -q '## Review findings (round 1' "$A/tasks/T1.md" \
+  && pass "the findings land on the implementation's body, named by round" \
+  || fail "no round-1 findings section on T1"
+grep -q 'The parser drops the last line.' "$A/tasks/T1.md" \
+  && pass "with the findings text intact" || fail "findings text missing from T1's body"
+grep -q 'Prior completion commits: 1234abc' "$A/tasks/T1.md" \
+  && pass "and the prior completion commits preserved in the note" \
+  || fail "prior commits not preserved in T1's body"
+assert_fm "$A/tasks" T1.1 '.status' "open" "the gate re-arms to open"
+assert_fm "$A/tasks" T1.1 '.claimed_by' "null" "with its claim cleared"
+grep -q '## Verdict: request-changes (round 1' "$A/tasks/T1.1.md" \
+  && pass "the gate's body keeps the verdict for the audit trail" \
+  || fail "no verdict note on T1.1"
+
+# The loop is closed by the eligibility predicate alone: the re-armed review
+# is ineligible (its blocker is open again), and becomes eligible when the
+# fix completes.
+got=$("$CLI" ready --count-eligible --include-reviews)
+[[ "$got" == "2" ]] && pass "re-armed review is ineligible while the fix is open (frontier = T1, T3)" \
+  || fail "post-request-changes frontier got '$got', expected 2"
+
+"$CLI" complete T1 --commits 5678def >/dev/null
+got=$("$CLI" next --branch feat/x --include-reviews | jq -r .id)
+[[ "$got" == "T1.1" ]] && pass "the fix completing re-opens the review's turn" \
+  || fail "post-fix next got '$got', expected T1.1"
+
+"$CLI" verdict T1.1 --approve --findings "Clean now." >/dev/null
+assert_fm "$A/tasks" T1.1 '.status' "done" "round-2 approve completes the gate"
+grep -q '## Verdict: approve (round 2' "$A/tasks/T1.1.md" \
+  && pass "and the approval is named by its round" \
+  || fail "no round-2 approve note on T1.1"
+got=$("$CLI" ready --count-eligible)
+[[ "$got" == "2" ]] && pass "downstream unblocks: T2 joins the frontier" \
+  || fail "post-approve frontier got '$got', expected 2 (T2, T3)"
+
+set +e
+"$CLI" verdict T1.1 --approve >/dev/null 2>&1 \
+  && fail "a second verdict on a done review was accepted" \
+  || pass "a rendered verdict is final; reopen is the only way back"
+set -e
+
+# ── Section 5: panel discipline and the round bound ──────────────────────────
+echo
+echo "--- verdict: panel discipline, rounds exhaustion ---"
+
+E="$TMPDIR_TEST/e"
+mkdir -p "$E/tasks"
+export TASKPUMP_TASKS_DIR="$E/tasks"
+export TASKPUMP_TASK_OUT="$E/.next-task"
+export TASKPUMP_CODE_REPO="$E"
+
+"$CLI" create T8.1 --title "Panel impl" >/dev/null
+"$CLI" create T9.1 --title "Panel downstream" --blockers T8.1 >/dev/null
+"$CLI" review T8.1 --panel 2 --max-rounds 2 >/dev/null
+"$CLI" complete T8.1 --commits aaa1111 >/dev/null
+
+set +e
+out=$("$CLI" verdict T8.2 --request-changes --findings "x" 2>&1); rc=$?
+set -e
+[[ $rc -ne 0 ]] && pass "a panel reviewer's request-changes is refused" \
+  || fail "panel reviewer request-changes exited 0"
+grep -q 'T8.4' <<<"$out" && pass "and the refusal points at the adjudicator" \
+  || fail "refusal did not name the gate: '$out'"
+
+set +e
+out=$("$CLI" verdict T8.4 --approve 2>&1); rc=$?
+set -e
+[[ $rc -ne 0 ]] && pass "an adjudicator verdict before the panel reported is refused" \
+  || fail "early adjudicator verdict exited 0"
+grep -q 'T8.2' <<<"$out" && pass "and the refusal names the pending reviewers" \
+  || fail "refusal did not name pending reviewers: '$out'"
+
+"$CLI" verdict T8.2 --approve --findings "Concern: the naming is off." >/dev/null
+"$CLI" verdict T8.3 --approve >/dev/null
+grep -q 'Concern: the naming is off.' "$E/tasks/T8.2.md" \
+  && pass "a panel reviewer's findings live on its own task" \
+  || fail "reviewer findings missing from T8.2"
+
+# Round 1 of 2: the adjudicator may rule over the panel's approvals.
+"$CLI" verdict T8.4 --request-changes --findings "Reviewer 1 is right; rename it." >/dev/null
+assert_fm "$E/tasks" T8.1 '.status' "open" "adjudicator request-changes reopens the implementation"
+assert_fm "$E/tasks" T8.1 '.review_round' "2" "round advances to 2"
+assert_fm "$E/tasks" T8.2 '.status' "open" "sibling reviewers re-arm"
+assert_fm "$E/tasks" T8.2 '.completed_at' "null" "shedding their done markers"
+grep -q '## Re-armed for round 2' "$E/tasks/T8.2.md" \
+  && pass "and their body says why the done was shed" \
+  || fail "no re-arm note on T8.2"
+assert_fm "$E/tasks" T8.4 '.status' "open" "the adjudicator re-arms too"
+
+# Round 2 of 2: a second rejection would need round 3 — past the bound.
+"$CLI" complete T8.1 --commits bbb2222 >/dev/null
+"$CLI" verdict T8.2 --approve >/dev/null
+"$CLI" verdict T8.3 --approve >/dev/null
+"$CLI" verdict T8.4 --request-changes --findings "Still wrong; the rename went half way." >/dev/null
+
+assert_fm "$E/tasks" T8.1 '.status' "needs-review" "past max-rounds the implementation parks needs-review"
+assert_fm "$E/tasks" T8.1 '.scrub_reason' "review rounds exhausted (2/2)" "with the tripwire named in scrub_reason"
+assert_fm "$E/tasks" T8.1 '.completed_at' "null" "completion markers shed on the park too"
+grep -q 'Still wrong; the rename went half way.' "$E/tasks/T8.1.md" \
+  && pass "the exhausting round's findings are intact on the implementation" \
+  || fail "exhaustion findings missing from T8.1"
+grep -q 'rounds exhausted' "$E/tasks/T8.1.md" \
+  && pass "and the body says the bound fired" || fail "no exhaustion note on T8.1"
+assert_fm "$E/tasks" T8.4 '.status' "done" "the gate's verdict is delivered — its task completes"
+got=$("$CLI" ready --count-eligible)
+[[ "$got" == "0" ]] && pass "downstream stays shut: the parked implementation is not done" \
+  || fail "post-exhaustion frontier got '$got', expected 0"
+
+"$CLI" reopen T8.1 --reason "human ruling: proceed with the rename as-is" >/dev/null
+assert_fm "$E/tasks" T8.1 '.status' "open" "the human door out of the park is the ordinary reopen"
+
+# ── Section 6: every mutation is one auditable ledger commit ─────────────────
 echo
 echo "--- audit trail ---"
 
@@ -245,6 +403,17 @@ got=$(git -C "$D" log -1 --format='%s')
 got=$(git -C "$D" log -1 --format='%an')
 [[ "$got" == "tp-task" ]] && pass "the commit carries the ledger committer identity" \
   || fail "committer was '$got'"
+
+TASKPUMP_TASK_NOCOMMIT=0 "$CLI" complete T1 --commits ccc3333 >/dev/null
+commits_before=$(git -C "$D" rev-list --count HEAD)
+TASKPUMP_TASK_NOCOMMIT=0 "$CLI" verdict T1.1 --approve --findings "Fine." >/dev/null
+commits_after=$(git -C "$D" rev-list --count HEAD)
+[[ "$commits_after" -eq $((commits_before + 1)) ]] \
+  && pass "a verdict is one ledger commit" \
+  || fail "verdict commit count went $commits_before -> $commits_after"
+got=$(git -C "$D" log -1 --format='%s')
+[[ "$got" == *"verdict T1.1"* ]] && pass "and its message names the verdict" \
+  || fail "verdict commit message was '$got'"
 
 echo
 echo "=============================================="
