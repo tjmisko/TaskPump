@@ -1461,6 +1461,28 @@ grep -q 'pump\[F80\]: STALE' <<<"$pout" && grep -q 'was paused' <<<"$pout" \
     && pass "paused + dead pid renders STALE (was paused)" \
     || fail "dead-pid paused file not STALE:\n$pout"
 
+# EPERM is not death: pid 1 is alive, root-owned, unsignalable from here —
+# kill -0 fails with EPERM but /proc/1 exists. A live pump run by another
+# user (a system unit) must not be labeled dead.
+mk37 running 1
+eout=$(glance37)
+grep -q 'pump\[F80\]: running' <<<"$eout" && pass "an alive-but-unsignalable pid (EPERM) renders running" \
+    || fail "EPERM-alive pid mislabeled:\n$eout"
+grep -q 'STALE' <<<"$eout" && fail "EPERM-alive pid mislabeled STALE:\n$eout" \
+    || pass "no STALE label for an EPERM-alive pid"
+
+# A foreign host's pid table is unreadable from here: STALE, but the label
+# must not claim "dead" about a pid it never checked.
+printf '%s' "{\"phases\":\"F80\",\"last_tick\":\"2026-08-13T21:46:49Z\",\"open_tasks\":6,\"status\":\"running\",\"paused_reason\":\"\",\"pid\":$$,\"host\":\"not-this-host\"}" >| "$PS37"
+hout=$(glance37)
+grep -q 'pump\[F80\]: STALE' <<<"$hout" && pass "a foreign-host running claim renders STALE" \
+    || fail "foreign-host claim not STALE:\n$hout"
+grep -q 'unverifiable from this host (recorded on not-this-host)' <<<"$hout" \
+    && pass "the foreign-host label says unverifiable, not dead" \
+    || fail "foreign-host label does not say unverifiable:\n$hout"
+grep -q "pid $$ dead" <<<"$hout" && fail "foreign-host label claims a death it never checked:\n$hout" \
+    || pass "no false death claim for an unchecked pid"
+
 # Terminal states claim no live process — they pass through untouched, dead
 # pid and all, with the stop reason shown.
 printf '%s' "{\"phases\":\"F80\",\"last_tick\":\"2026-08-13T21:46:49Z\",\"open_tasks\":6,\"status\":\"stopped\",\"paused_reason\":\"received SIGTERM\",\"pid\":$DEAD37,\"host\":\"$HOST37\"}" >| "$PS37"

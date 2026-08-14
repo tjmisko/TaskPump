@@ -1766,6 +1766,9 @@ pump_signal_exit() {  # $1 = signal name (INT|TERM|HUP)
   trap - EXIT
   write_state stopped "received SIG$1"
   log "SIG$1 — stopping the supervisor (running agents are left alive; state stamped stopped)"
+  # Reap the backgrounded tick sleep: the signal exit abandons the wait, and
+  # an orphaned `sleep $TICK` would outlive the pump by up to a full tick.
+  kill "${TICK_SLEEP_PID:-}" 2>/dev/null || true
   trap - "$1"
   kill -s "$1" $$
 }
@@ -1804,7 +1807,8 @@ while true; do
   # rest of the tick — and its SIGKILL after the stop timeout would skip the
   # stamp entirely. Backgrounding the sleep and waiting on it (a builtin, which
   # signals interrupt immediately) lets the TERM trap run the moment it lands.
-  sleep "$TICK" & wait $! || true
+  sleep "$TICK" & TICK_SLEEP_PID=$!
+  wait "$TICK_SLEEP_PID" || true
 done
 
 # Graduate the integration trunk as one auto/trunk → main PR (A3, no-op when
