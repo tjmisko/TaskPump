@@ -590,7 +590,7 @@ launch_line() {  # launch_line <extra var=value>...
 got=$(launch_line); rc=$?
 got_norm=${got//$R6/@R@}
 want='run --rm -d --init --name tp-agent-feat-f9 --cap-add NET_ADMIN --memory 3g --memory-swap 5g'
-want+=' -e GITHUB_TOKEN= -e WORKSPACE_PATH=@R@/wt -e REPO_ROOT=@R@'
+want+=' -e GITHUB_TOKEN -e WORKSPACE_PATH=@R@/wt -e REPO_ROOT=@R@'
 want+=' -e ARACHNE_BRIEF=@R@/brief.md -e ARACHNE_RESUME_NOTE= -e ARACHNE_TASK_ID=F9.1'
 want+=' -e ARACHNE_PHASE=F9 -e MAX_TURNS=600 -e AGENT_MODEL=opus'
 want+=' -e TASKPUMP_WORKSPACE_PATH=@R@/wt -e TASKPUMP_REPO_ROOT=@R@ -e TASKPUMP_LEDGER_REPO=@R@/ops'
@@ -686,9 +686,13 @@ grep -qF -- '--user' <<<"$got" && fail "--user emitted by default (root is requi
   || pass "no --user by default"
 
 got=$(launch_line TASKPUMP_PRE_FLIGHT=/preflight.sh)
-grep -qF -- '-e TASKPUMP_PRE_FLIGHT=/preflight.sh' <<<"$got" \
+grep -qF -- '-e TASKPUMP_PRE_FLIGHT' <<<"$got" \
   && pass "a set passthrough variable is forwarded into the container" \
   || fail "passthrough did not forward TASKPUMP_PRE_FLIGHT:\n$got"
+# By name only: the value rides docker's own environment, never its argv (#14).
+grep -qF -- '-e TASKPUMP_PRE_FLIGHT=' <<<"$got" \
+  && fail "passthrough embeds the variable's VALUE in docker argv" \
+  || pass "passthrough forwards the name only; the value stays in the environment"
 
 # Legacy-only inputs must produce the same line as canonical-only inputs.
 got_legacy=$(run_runner launch DOCKER=/bin/echo \
@@ -870,6 +874,50 @@ grep -qE 'bash "\$SESSION_SCRIPT_FILE"' "$EP" \
 grep -qE 'HOME="\$CONTAINER_HOME"' "$EP" \
   && pass "the launch sets the session user's HOME explicitly" \
   || fail "the launch does not set HOME (setpriv would inherit root's)"
+
+# ── Secrets never reach argv (issue #14) ───────────────────────────────────────
+# The token rides the environment end to end: docker -e forwards it by name,
+# the privilege drop passes it through, and git reads it via a credential
+# helper at use time. Neither the assembled session script (once the argv of a
+# many-hour su process; a root-owned file since issue #15) nor the helper text
+# may carry the VALUE — /proc/<pid>/cmdline is world-readable, and one drain
+# exposed a live token there for 2.5 hours.
+echo "--- secrets stay out of argv ---"
+CANARY='gho_canary_value_must_not_appear'
+RS=$(mk_ws secrets)
+out_script=$(run_ep TASKPUMP_ENTRYPOINT_TEST_MODE=script GITHUB_TOKEN="$CANARY" \
+  TP_WORKSPACE="$RS/wt" TP_REPO_ROOT="$RS" TP_BRIEF="$RS/brief.md" \
+  TP_TASK_ID=F9.1 TP_PHASE=F9 TASKPUMP_TASKS_DIR="$RS/tasks" \
+  TASKPUMP_CONTAINER_HOME="$RS/home")
+rc_script=$?
+[[ $rc_script -eq 0 ]] \
+  && pass "TEST_MODE=script renders the session script and exits 0" \
+  || fail "TEST_MODE=script failed (rc=$rc_script): $out_script"
+if grep -qF "$CANARY" <<<"$out_script"; then
+  fail "the token VALUE appears in the session script or credential helper (argv leak)"
+else
+  pass "the token value appears nowhere in the assembled session script"
+fi
+grep -q 'export GITHUB_TOKEN$' <<<"$out_script" \
+  && pass "the session script re-exports GITHUB_TOKEN by name only" \
+  || fail "the session script does not re-export GITHUB_TOKEN by bare name"
+grep -qF 'password=$GITHUB_TOKEN' <<<"$out_script" \
+  && pass "the credential helper reads the token from the environment at use time" \
+  || fail "the credential helper does not reference \$GITHUB_TOKEN by name"
+
+# The runner's side of the same rule, asserted statically like the permission
+# posture above: no executable line may put a value after -e for the token or
+# the passthrough set.
+if grep -vE '^[[:space:]]*#' "$RUNNER" | grep -qE -- '-e GITHUB_TOKEN='; then
+  fail "runner.sh interpolates GITHUB_TOKEN's value into docker argv (must be bare -e GITHUB_TOKEN)"
+else
+  pass "runner.sh forwards GITHUB_TOKEN with a bare -e (value stays in the environment)"
+fi
+if grep -vE '^[[:space:]]*#' "$RUNNER" | grep -qF -- '-e "$name=${!name}"'; then
+  fail 'runner.sh passthrough embeds values in docker argv (must be bare -e "$name")'
+else
+  pass "runner.sh passthrough forwards variable names only"
+fi
 
 echo
 echo "=============================================="

@@ -185,10 +185,12 @@ do_launch() {
   local run_user; run_user="$(first_set TP_CONTAINER_RUN_USER)"
   [[ -n "$run_user" ]] && run_user_args=(--user "$run_user")
 
-  # Opt-in extra environment, appended in list order so the launch line is stable.
+  # Opt-in extra environment, appended in list order so the launch line is
+  # stable. Bare -e on purpose: docker reads each value from its own
+  # environment, so values (which may be secrets) never enter argv (#14).
   local passthrough_args=() name
   for name in ${TP_ENV_PASSTHROUGH-$DEFAULT_PASSTHROUGH}; do
-    [[ -n "${!name-}" ]] && passthrough_args+=(-e "$name=${!name}")
+    [[ -n "${!name-}" ]] && passthrough_args+=(-e "$name")
   done
 
   # The mount set. Host and container paths are identical on purpose: a git
@@ -238,7 +240,7 @@ do_launch() {
     --memory "$mem_max" \
     --memory-swap "$mem_swap" \
     ${run_user_args[@]+"${run_user_args[@]}"} \
-    -e GITHUB_TOKEN="${GITHUB_TOKEN:-}" \
+    -e GITHUB_TOKEN \
     -e WORKSPACE_PATH="$wt" \
     -e REPO_ROOT="$repo_root" \
     -e ARACHNE_BRIEF="$brief" \
