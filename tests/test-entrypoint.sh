@@ -70,6 +70,7 @@ TASKPUMP_MAX_TURNS TP_MAX_TURNS MAX_TURNS
 TASKPUMP_AGENT_MODEL TP_MODEL AGENT_MODEL
 TASKPUMP_SAFETY_TURNS TP_SAFETY_TURNS
 TASKPUMP_WORKSPACE_TASK_CLI TP_WORKSPACE_TASK_CLI
+TASKPUMP_INSTALL_MOUNT TP_INSTALL_MOUNT
 TASKPUMP_CONTAINER_USER TP_CONTAINER_USER
 TASKPUMP_CONTAINER_HOME TP_CONTAINER_HOME
 TASKPUMP_PRE_FLIGHT TP_PRE_FLIGHT
@@ -212,11 +213,27 @@ fi
 
 # Both single-sided fallbacks must exist, or a run with only one of the two files
 # silently launches with no settings.json at all.
-if grep -qF 'cp "$AUTO_JSON" /home/dev/.claude/settings.json' "$PF" \
-   && grep -qF 'cp "$MCP_JSON" /home/dev/.claude/settings.json' "$PF"; then
+if grep -qF 'cp "$AUTO_JSON" "$AGENT_SETTINGS"' "$PF" \
+   && grep -qF 'cp "$MCP_JSON" "$AGENT_SETTINGS"' "$PF"; then
   pass "pre-flight falls back to whichever config exists when only one is present"
 else
   fail "preflight-example.sh is missing a single-sided fallback for MCP-only / Auto-only"
+fi
+
+# The settings must land in the session user's home as the entrypoint exports it
+# (TASKPUMP_CONTAINER_HOME / TASKPUMP_CONTAINER_USER), never a hardcoded
+# /home/dev — a non-default image would lose its MCP config and allow rules
+# silently (issue #9). Behavioral coverage: tests/test-example-confs.sh runs the
+# hook against a fixture home.
+if grep -vE '^[[:space:]]*#' "$PF" | grep -q '/home/dev'; then
+  fail "an executable line of preflight-example.sh hardcodes /home/dev (must use TASKPUMP_CONTAINER_HOME)"
+else
+  pass "no executable line hardcodes /home/dev"
+fi
+if grep -q 'TASKPUMP_CONTAINER_HOME' "$PF" && grep -q 'TASKPUMP_CONTAINER_USER' "$PF"; then
+  pass "pre-flight resolves the settings path through TASKPUMP_CONTAINER_HOME/_USER"
+else
+  fail "preflight-example.sh never reads TASKPUMP_CONTAINER_HOME/_USER"
 fi
 
 # ── Smoke test is run before the session ───────────────────────────────────────
@@ -295,9 +312,17 @@ if grep -vE '^[[:space:]]*#' "$EP" | grep -q "WORKSPACE_PATH/scripts/arachne-tas
 else
   pass "task CLI is reached through TASKPUMP_WORKSPACE_TASK_CLI, not a literal path"
 fi
-n=$(grep -cE "^\s+'\\\$TASK_CLI'" "$EP")
-[[ "$n" -eq 3 ]] && pass "all three task-CLI call sites go through \$TASK_CLI (claim, --start, --end)" \
-  || fail "expected 3 \$TASK_CLI call sites, found $n"
+n=$(grep -cE "^\s+\\\$TASK_CLI_ARGV " "$EP")
+[[ "$n" -eq 3 ]] && pass "all three task-CLI call sites go through \$TASK_CLI_ARGV (claim, --start, --end)" \
+  || fail "expected 3 \$TASK_CLI_ARGV call sites, found $n"
+# And none may still use the raw single-word form: '$TASK_CLI' claim would
+# invoke `tp claim` — an unknown verb swallowed by || true, the silent no-op
+# G1.6's completion notes flagged for exactly this task.
+if grep -qE "^\s+'\\\$TASK_CLI'" "$EP"; then
+  fail "a session call site still uses the single-word '\$TASK_CLI' form (breaks the bare tp default)"
+else
+  pass "no session call site bypasses \$TASK_CLI_ARGV"
+fi
 
 # ── Exit-code discipline: 75 must be reachable only before heartbeat --start ────
 echo "--- exit-code discipline ---"
@@ -389,6 +414,12 @@ grep -q "^tasks_dir=$R2/ops/tasks$" <<<"$rep_def" \
 grep -q '^task_cli=tp$' <<<"$rep_def" \
   && pass "workspace task CLI defaults to tp on PATH (G1.6)" \
   || fail "task CLI default wrong:\n$rep_def"
+# tp keeps its ledger verbs under `tp task`; the bare default must expand to
+# that invocation or every safety-net call would be `tp claim` — an unknown
+# verb swallowed by || true (the silent no-op G1.6's completion notes flagged).
+grep -q '^task_cli_argv=tp task$' <<<"$rep_def" \
+  && pass "the bare tp default is invoked as 'tp task' (G4.3 verb grammar)" \
+  || fail "bare-default invocation wrong:\n$rep_def"
 
 # The workspace task CLI is the consumer's shim and must be overridable, both by
 # a workspace-relative and an absolute path.
@@ -404,6 +435,14 @@ rep_cli=$(report "$(run_ep TASKPUMP_ENTRYPOINT_TEST_MODE=plan \
 grep -q '^task_cli=/usr/local/bin/tp$' <<<"$rep_cli" \
   && pass "an absolute TASKPUMP_WORKSPACE_TASK_CLI is used as given" \
   || fail "absolute task-CLI override wrong:\n$rep_cli"
+# The grammar keys on the resolved CLI's BASENAME, not the literal 'tp': a tp
+# pinned by absolute path is still tp and still keeps its verbs under `task`.
+# Keying on the literal would take the direct-verb branch and every safety-net
+# call would be `/usr/local/bin/tp claim` — the G1.6 silent no-op, reborn one
+# rung up the resolution order.
+grep -q '^task_cli_argv=/usr/local/bin/tp task$' <<<"$rep_cli" \
+  && pass "a tp pinned by path keeps the 'tp task' verb grammar (basename keying)" \
+  || fail "pinned-by-path tp invocation wrong:\n$rep_cli"
 # The arachne.conf-pinned spelling, literally: a consumer that vendors its shim
 # keeps exactly the pre-flip behaviour.
 rep_cli=$(report "$(run_ep TASKPUMP_ENTRYPOINT_TEST_MODE=plan \
@@ -412,13 +451,20 @@ rep_cli=$(report "$(run_ep TASKPUMP_ENTRYPOINT_TEST_MODE=plan \
 grep -q "^task_cli=$R2/wt/scripts/arachne-task$" <<<"$rep_cli" \
   && pass "the arachne.conf-pinned scripts/arachne-task resolves under the workspace as before" \
   || fail "pinned task-CLI spelling wrong:\n$rep_cli"
+# A pinned shim keeps the direct-verb grammar: no `task` verb is inserted.
+grep -q "^task_cli_argv=$R2/wt/scripts/arachne-task$" <<<"$rep_cli" \
+  && pass "a pinned shim keeps the direct-verb invocation (no 'task' inserted)" \
+  || fail "pinned shim invocation wrong:\n$rep_cli"
 
-# ── The bare-image error: workspace CLI unset, no tp on PATH ───────────────────
-# Until G4.3 mounts tp into the agent image, the bare default cannot resolve in
-# a container. That must fail at STARTUP, before the session banner, with an
+# ── The bare-image error: workspace CLI unset, no tp anywhere ──────────────────
+# With no /opt/taskpump mount (a custom runner) the bare default cannot resolve
+# in a container. That must fail at STARTUP, before the session banner, with an
 # error naming both fixes — an agent discovering its ledger CLI missing
-# mid-session burns the whole iteration on a misconfiguration.
-echo "--- bare default without tp on PATH ---"
+# mid-session burns the whole iteration on a misconfiguration. The install
+# mount is pinned to an absent path so a real /opt/taskpump on the host this
+# suite runs on cannot leak into the fixture (hermeticity).
+echo "--- bare default without tp on PATH (mount absent) ---"
+NOMOUNT="$WORK/absent-install-mount"   # never created
 NOTP="$WORK/no-tp-bin"; mkdir -p "$NOTP"
 # Everything plan mode needs, minus tp: bash for run_ep's re-exec, tee and date
 # for the startup banner the pinned-CLI contrast case reaches.
@@ -426,10 +472,11 @@ ln -s "$(command -v bash)" "$NOTP/bash"
 ln -s "$(command -v tee)"  "$NOTP/tee"
 ln -s "$(command -v date)" "$NOTP/date"
 out_notp=$(run_ep TASKPUMP_ENTRYPOINT_TEST_MODE=plan PATH="$NOTP" \
+  TASKPUMP_INSTALL_MOUNT="$NOMOUNT" \
   TP_WORKSPACE="$R2/wt" TP_REPO_ROOT="$R2" TP_BRIEF="$R2/brief.md")
 rc_notp=$?
 [[ $rc_notp -eq 1 ]] \
-  && pass "workspace CLI unset + no tp on PATH exits 1 (operator misconfiguration)" \
+  && pass "workspace CLI unset + no tp on PATH + no mount exits 1 (operator misconfiguration)" \
   || fail "missing-CLI run exited $rc_notp:\n$out_notp"
 grep -q "task CLI 'tp' is not on PATH" <<<"$out_notp" \
   && pass "the error says what is missing" || fail "no missing-CLI diagnostic:\n$out_notp"
@@ -444,11 +491,76 @@ grep -q 'TaskPump agent started' <<<"$out_notp" \
 # PATH-searched, so the same tp-less environment plans fine when the consumer
 # pinned its shim.
 out_pinned=$(run_ep TASKPUMP_ENTRYPOINT_TEST_MODE=plan PATH="$NOTP" \
+  TASKPUMP_INSTALL_MOUNT="$NOMOUNT" \
   TP_WORKSPACE="$R2/wt" TP_REPO_ROOT="$R2" TP_BRIEF="$R2/brief.md" \
   TASKPUMP_WORKSPACE_TASK_CLI=scripts/arachne-task)
 grep -q "^task_cli=$R2/wt/scripts/arachne-task$" <<<"$(report "$out_pinned")" \
   && pass "a set workspace CLI is used as before even with no tp on PATH" \
   || fail "pinned CLI failed without tp on PATH:\n$out_pinned"
+
+# ── The /opt/taskpump mount: tp on the agent PATH (G4.3) ───────────────────────
+# The shipped runner bind-mounts the TaskPump installation read-only at
+# /opt/taskpump, and the entrypoint prepends its bin to PATH before resolving
+# the task CLI. Resolution order: explicit TASKPUMP_WORKSPACE_TASK_CLI, then tp
+# on PATH (guaranteed by the mount), then the loud G1.6 error (unreachable with
+# the shipped runner; kept for custom runners). TASKPUMP_INSTALL_MOUNT is the
+# hermetic seam standing in for the fixed in-container mount path.
+echo "--- the /opt/taskpump install mount (G4.3) ---"
+FAKEINSTALL="$WORK/install-mount"; mkdir -p "$FAKEINSTALL/bin"
+printf '#!/usr/bin/env bash\nexit 0\n' >| "$FAKEINSTALL/bin/tp"
+chmod +x "$FAKEINSTALL/bin/tp"
+# Unset CLI + no tp on PATH + mount present: the mounted tp is found, where the
+# identical environment without the mount exited 1 just above.
+out_mnt=$(run_ep TASKPUMP_ENTRYPOINT_TEST_MODE=plan PATH="$NOTP" \
+  TASKPUMP_INSTALL_MOUNT="$FAKEINSTALL" \
+  TP_WORKSPACE="$R2/wt" TP_REPO_ROOT="$R2" TP_BRIEF="$R2/brief.md")
+rc_mnt=$?
+rep_mnt=$(report "$out_mnt")
+[[ $rc_mnt -eq 0 ]] \
+  && pass "unset CLI + tp-less PATH plans fine once the install mount is present" \
+  || fail "mounted-tp run exited $rc_mnt:\n$out_mnt"
+grep -q '^task_cli=tp$' <<<"$rep_mnt" \
+  && pass "the bare default still resolves as tp" || fail "task_cli wrong with mount:\n$rep_mnt"
+grep -q "^task_cli_path=$FAKEINSTALL/bin/tp$" <<<"$rep_mnt" \
+  && pass "the tp found is the MOUNTED one (\$mount/bin/tp), not some other" \
+  || fail "task_cli_path is not the mounted tp:\n$rep_mnt"
+grep -q '^task_cli_argv=tp task$' <<<"$rep_mnt" \
+  && pass "the mounted tp is invoked as 'tp task <verb>'" \
+  || fail "mounted-tp invocation wrong:\n$rep_mnt"
+# The mount is a PREPEND: it outranks an image-baked tp already on PATH.
+out_shadow=$(run_ep TASKPUMP_ENTRYPOINT_TEST_MODE=plan \
+  TASKPUMP_INSTALL_MOUNT="$FAKEINSTALL" \
+  TP_WORKSPACE="$R2/wt" TP_REPO_ROOT="$R2" TP_BRIEF="$R2/brief.md")
+grep -q "^task_cli_path=$FAKEINSTALL/bin/tp$" <<<"$(report "$out_shadow")" \
+  && pass "the mounted tp outranks an image-baked tp (PATH prepend, not append)" \
+  || fail "an image-baked tp shadowed the mount:\n$(report "$out_shadow")"
+# An explicit pin still wins over the mount — the resolution order's first rung.
+out_pinwin=$(run_ep TASKPUMP_ENTRYPOINT_TEST_MODE=plan PATH="$NOTP" \
+  TASKPUMP_INSTALL_MOUNT="$FAKEINSTALL" \
+  TP_WORKSPACE="$R2/wt" TP_REPO_ROOT="$R2" TP_BRIEF="$R2/brief.md" \
+  TASKPUMP_WORKSPACE_TASK_CLI=scripts/arachne-task)
+rep_pinwin=$(report "$out_pinwin")
+grep -q "^task_cli=$R2/wt/scripts/arachne-task$" <<<"$rep_pinwin" \
+  && pass "an explicit TASKPUMP_WORKSPACE_TASK_CLI wins over the mounted tp" \
+  || fail "the mount shadowed the consumer's pin:\n$rep_pinwin"
+grep -q "^task_cli_argv=$R2/wt/scripts/arachne-task$" <<<"$rep_pinwin" \
+  && pass "the winning pin keeps its direct-verb invocation" \
+  || fail "pinned invocation wrong under the mount:\n$rep_pinwin"
+# The natural spelling once the mount exists: pinning the MOUNTED tp by path.
+# Basename keying must recognise it as tp and keep the `task` verb grammar —
+# the literal-'tp' comparison would have taken the direct-verb branch and
+# turned every safety-net call into a silent `... tp claim` no-op.
+out_pinmnt=$(run_ep TASKPUMP_ENTRYPOINT_TEST_MODE=plan PATH="$NOTP" \
+  TASKPUMP_INSTALL_MOUNT="$FAKEINSTALL" \
+  TP_WORKSPACE="$R2/wt" TP_REPO_ROOT="$R2" TP_BRIEF="$R2/brief.md" \
+  TASKPUMP_WORKSPACE_TASK_CLI="$FAKEINSTALL/bin/tp")
+rep_pinmnt=$(report "$out_pinmnt")
+grep -q "^task_cli=$FAKEINSTALL/bin/tp$" <<<"$rep_pinmnt" \
+  && pass "the mounted tp can be pinned by its absolute path" \
+  || fail "pinned mounted tp resolved wrong:\n$rep_pinmnt"
+grep -q "^task_cli_argv=$FAKEINSTALL/bin/tp task$" <<<"$rep_pinmnt" \
+  && pass "a pinned mounted tp is still invoked as '<path>/tp task <verb>'" \
+  || fail "pinned mounted tp lost the task-verb grammar:\n$rep_pinmnt"
 
 # The TP_ spelling must work for EVERY key, not just the headline ones. The pump
 # was exporting TP_TASKS_DIR / TP_AGENT_LOG_NAME / TP_GOAL_NOTE_NAME against an
@@ -577,6 +689,12 @@ grep -q "^pre_flight=hook:$HOOK$" <<<"$rep_win" \
 echo "--- runner.sh launch contract ---"
 R6=$(mk_ws runner)
 mkdir -p "$R6/ops" "$R6/.git"
+# The install-mount source the runner will resolve: its own realpath, up two
+# levels — the same derivation bin/tp uses for its libexec (G4.3). Computed the
+# runner's way (readlink -f) rather than reusing TP_ROOT, so a symlinked
+# checkout normalizes identically on both sides of the compare.
+TP_MOUNT_SRC="$(CDPATH= cd -- "$(dirname "$(readlink -f "$RUNNER")")/../.." && pwd)"
+norm_line() { local s="${1//$R6/@R@}"; printf '%s' "${s//$TP_MOUNT_SRC/@TP@}"; }
 launch_line() {  # launch_line <extra var=value>...
   run_runner launch \
     DOCKER=/bin/echo \
@@ -588,7 +706,7 @@ launch_line() {  # launch_line <extra var=value>...
     "$@"
 }
 got=$(launch_line); rc=$?
-got_norm=${got//$R6/@R@}
+got_norm=$(norm_line "$got")
 want='run --rm -d --init --name tp-agent-feat-f9 --cap-add NET_ADMIN --memory 3g --memory-swap 5g'
 want+=' -e GITHUB_TOKEN -e WORKSPACE_PATH=@R@/wt -e REPO_ROOT=@R@'
 want+=' -e ARACHNE_BRIEF=@R@/brief.md -e ARACHNE_RESUME_NOTE= -e ARACHNE_TASK_ID=F9.1'
@@ -599,6 +717,9 @@ want+=' -e TASKPUMP_PHASE=F9 -e TASKPUMP_BRANCH=feat/f9 -e TASKPUMP_MAX_TURNS=60
 want+=' -e TASKPUMP_AGENT_MODEL=opus'
 want+=' -v @R@/claude-home:/tmp/claude-home:ro'
 want+=' -v @R@/claude.json:/tmp/claude-home-json/.claude.json:ro'
+# The TaskPump installation rides along read-only so tp is on the agent's PATH
+# (G4.3); the source is the runner's own installation root.
+want+=' -v @TP@:/opt/taskpump:ro'
 want+=' -v @R@:@R@:ro -v @R@/.git:@R@/.git -v @R@/wt:@R@/wt -v @R@/ops:@R@/ops'
 # The trailing /entrypoint.sh is the bare ENTRYPOINT default (this launch
 # passes no TP_ENTRYPOINT): the shipped runner's own entrypoint at the path
@@ -617,10 +738,19 @@ fi
 # failure says which one broke rather than just "the line changed".
 for probe in \
   '--cap-add NET_ADMIN' '--memory 3g' '--memory-swap 5g' '--rm -d' '--init' \
-  "-v @R@:@R@:ro" "-v @R@/.git:@R@/.git" "-v @R@/wt:@R@/wt" "-v @R@/ops:@R@/ops"; do
+  "-v @R@:@R@:ro" "-v @R@/.git:@R@/.git" "-v @R@/wt:@R@/wt" "-v @R@/ops:@R@/ops" \
+  "-v @TP@:/opt/taskpump:ro"; do
   grep -qF -- "$probe" <<<"$got_norm" && pass "launch line carries '$probe'" \
     || fail "launch line is missing '$probe'"
 done
+# The installation mount must never be writable: an agent that can edit the
+# host's TaskPump checkout edits the supervisor supervising it. With :ro the
+# next character after the destination is ':', so space-or-EOL is the RW shape.
+if grep -qE -- ':/opt/taskpump( |$)' <<<"$got_norm"; then
+  fail "the /opt/taskpump installation mount lost its :ro"
+else
+  pass "the /opt/taskpump installation mount is read-only"
+fi
 # The read-only primary must not have regressed to a blanket RW mount.
 #
 # The terminator matters. `( |$)` is what distinguishes a blanket `-v X:X` from
@@ -650,7 +780,7 @@ fi
 # RW ledger mounts into a single RW mount of the checkout — here the blanket
 # mount IS the contract, and the .git overlay is subsumed by it.
 got=$(launch_line TP_LEDGER_REPO="$R6")
-got_norm=${got//$R6/@R@}
+got_norm=$(norm_line "$got")
 grep -qE -- "$BLANKET_RE" <<<"$got_norm" \
   && pass "ledger==primary mounts the checkout read-write" \
   || fail "ledger==primary is missing the RW checkout mount:\n$got_norm"
@@ -672,7 +802,7 @@ grep -qF -- "-e TASKPUMP_LEDGER_REPO=@R@ " <<<"$got_norm" \
   || fail "TASKPUMP_LEDGER_REPO env wrong in ledger==primary shape:\n$got_norm"
 
 got=$(launch_line TP_ENTRYPOINT=/tp-entrypoint.sh TP_IMAGE=other TP_MEMORY_MAX=8g)
-got_norm=${got//$R6/@R@}
+got_norm=$(norm_line "$got")
 grep -qF -- 'other /tp-entrypoint.sh' <<<"$got_norm" \
   && pass "TP_IMAGE and TP_ENTRYPOINT are honoured, in that order, last" \
   || fail "image/entrypoint override wrong:\n$got_norm"
@@ -701,9 +831,9 @@ got_legacy=$(run_runner launch DOCKER=/bin/echo \
   ARACHNE_BRANCH=feat/f9 ARACHNE_TASK_ID=F9.1 ARACHNE_PHASE=F9 \
   ARACHNE_BRIEF="$R6/brief.md" AGENT_MODEL=opus MAX_TURNS=600 \
   CLAUDE_DIR="$R6/claude-home" CLAUDE_JSON="$R6/claude.json")
-[[ "${got_legacy//$R6/@R@}" == "$want" ]] \
+[[ "$(norm_line "$got_legacy")" == "$want" ]] \
   && pass "legacy-only runner inputs produce the identical launch line" \
-  || fail "legacy runner inputs diverged:\n${got_legacy//$R6/@R@}"
+  || fail "legacy runner inputs diverged:\n$(norm_line "$got_legacy")"
 
 echo "--- runner.sh error + stop contract ---"
 out=$(run_runner launch DOCKER=/bin/echo TP_WORKSPACE="$R6/wt" TP_REPO_ROOT="$R6" \
@@ -713,6 +843,26 @@ out=$(run_runner launch DOCKER=/bin/echo TP_WORKSPACE="$R6/wt" TP_REPO_ROOT="$R6
 out=$(run_runner launch DOCKER=/bin/echo TP_REPO_ROOT="$R6" TP_CONTAINER_NAME=c1 TP_IMAGE=i); rc=$?
 [[ $rc -ne 0 ]] && grep -q 'TP_WORKSPACE' <<<"$out" \
   && pass "a missing workspace fails loudly" || fail "missing workspace not rejected:\n$out"
+
+# A runner copied away from its installation has nothing to mount at
+# /opt/taskpump. It must refuse the launch loudly, naming the resolved path —
+# otherwise the failure surfaces much later, inside the container, as a
+# missing task CLI (G4.3).
+LONE="$WORK/lone-runner"; mkdir -p "$LONE"
+cp "$RUNNER" "$LONE/runner.sh"
+out=$(
+  # shellcheck disable=SC2086
+  unset $CONTRACT_VARS
+  export DOCKER=/bin/echo TP_WORKSPACE="$R6/wt" TP_REPO_ROOT="$R6" \
+         TP_CONTAINER_NAME=c1 TP_IMAGE=i
+  bash "$LONE/runner.sh" launch 2>&1
+); rc=$?
+[[ $rc -ne 0 ]] && grep -q 'no tp at' <<<"$out" \
+  && pass "a relocated runner refuses to launch rather than mount a tp-less directory" \
+  || fail "relocated runner did not fail loudly (rc=$rc):\n$out"
+grep -q '/opt/taskpump' <<<"$out" \
+  && pass "the relocation error names the mount it could not honour" \
+  || fail "relocation error does not name /opt/taskpump:\n$out"
 
 FAKE_DOCKER="$WORK/docker-fail"
 cat >| "$FAKE_DOCKER" <<'EOF'
@@ -751,6 +901,65 @@ out=$(run_runner stop DOCKER="$FAKE_GONE" TP_CONTAINER_NAME=ghost); rc=$?
 
 out=$(run_runner bogus DOCKER=/bin/echo); rc=$?
 [[ $rc -eq 2 ]] && pass "an unknown verb exits 2 (bad usage)" || fail "unknown verb rc=$rc (expected 2)"
+
+# ── G4.3 end to end (stubbed): a container claims with the mounted tp ──────────
+# The acceptance shape: a container launched by the reference runner can run
+# `tp task claim` against the mounted ledger with NO vendored CLI in the
+# workspace. Two hermetic halves of one path: the runner composes the argv that
+# mounts this installation and the ledger (stub docker echoes it back), and the
+# entrypoint — resolving in exactly the environment that argv creates: no
+# workspace CLI pinned, the install mount pointing at this very checkout —
+# assembles a session script whose safety-net calls are `tp task claim` /
+# `tp task heartbeat` against the ledger's tasks dir. No ledger verb is
+# executed; composition is the assertion.
+echo "--- G4.3 end to end: claim via the mounted tp (stubbed) ---"
+R7=$(mk_ws mountedclaim)
+mkdir -p "$R7/ops/tasks" "$R7/.git" "$R7/home"
+mv "$R7/tasks/F9.1.md" "$R7/ops/tasks/F9.1.md"
+argv=$(run_runner launch DOCKER=/bin/echo \
+  TP_WORKSPACE="$R7/wt" TP_REPO_ROOT="$R7" TP_LEDGER_REPO="$R7/ops" \
+  TP_CONTAINER_NAME=tp-agent-feat-f9 TP_IMAGE=agentimg \
+  TP_BRANCH=feat/f9 TP_TASK_ID=F9.1 TP_PHASE=F9 \
+  TP_BRIEF="$R7/brief.md" \
+  TP_CLAUDE_DIR="$R7/claude-home" TP_CLAUDE_JSON="$R7/claude.json"); rc=$?
+[[ $rc -eq 0 ]] \
+  && pass "launch composes with no vendored CLI and no TASKPUMP_WORKSPACE_TASK_CLI pin" \
+  || fail "launch failed rc=$rc:\n$argv"
+grep -qF -- "-v $TP_MOUNT_SRC:/opt/taskpump:ro" <<<"$argv" \
+  && pass "argv mounts THIS installation read-only at /opt/taskpump" \
+  || fail "argv does not mount the installation:\n$argv"
+grep -qF -- "-v $R7/ops:$R7/ops" <<<"$argv" \
+  && pass "argv mounts the ledger checkout read-write" \
+  || fail "argv is missing the ledger mount:\n$argv"
+grep -qF -- "-e TASKPUMP_LEDGER_REPO=$R7/ops" <<<"$argv" \
+  && pass "argv hands the entrypoint the ledger path" \
+  || fail "argv is missing the ledger env:\n$argv"
+grep -qF -- '-e TASKPUMP_WORKSPACE_TASK_CLI' <<<"$argv" \
+  && fail "argv pins a workspace task CLI (this shape must rely on the mount)" \
+  || pass "argv pins no workspace task CLI — resolution rides the mount"
+# The entrypoint half, in the environment that argv creates.
+out_e2e=$(run_ep TASKPUMP_ENTRYPOINT_TEST_MODE=script \
+  TASKPUMP_INSTALL_MOUNT="$TP_MOUNT_SRC" \
+  TP_WORKSPACE="$R7/wt" TP_REPO_ROOT="$R7" TP_LEDGER_REPO="$R7/ops" \
+  TP_BRIEF="$R7/brief.md" TP_TASK_ID=F9.1 TP_PHASE=F9 \
+  TASKPUMP_CONTAINER_HOME="$R7/home"); rc=$?
+[[ $rc -eq 0 ]] \
+  && pass "the entrypoint assembles the session with only the mounted tp" \
+  || fail "script mode failed (rc=$rc):\n$out_e2e"
+grep -qF "tp task claim 'F9.1' --branch" <<<"$out_e2e" \
+  && pass "the safety-net claim is 'tp task claim' via the mounted tp" \
+  || fail "no 'tp task claim' in the session script:\n$out_e2e"
+grep -qF "tp task heartbeat 'F9.1' --start" <<<"$out_e2e" \
+  && pass "the start heartbeat rides the same 'tp task' invocation" \
+  || fail "no 'tp task heartbeat --start' in the session script:\n$out_e2e"
+grep -qF "export TASKPUMP_TASKS_DIR='$R7/ops/tasks'" <<<"$out_e2e" \
+  && pass "the claim targets the mounted ledger's tasks dir" \
+  || fail "session script does not export the ledger tasks dir:\n$out_e2e"
+# The grammar the script composes must be one the mounted tp actually answers:
+# `tp` dispatches a `task` subcommand. Read-only probe — no ledger verb runs.
+"$TP_MOUNT_SRC/bin/tp" help 2>/dev/null | grep -qE '^\s+task\b' \
+  && pass "the mounted tp dispatches a 'task' subcommand (the composed grammar exists)" \
+  || fail "the mounted tp at $TP_MOUNT_SRC/bin/tp does not answer 'tp task'"
 
 # ── Shipped prompt templates ───────────────────────────────────────────────────
 # The pump refuses to start without a brief template, so the shipped defaults are

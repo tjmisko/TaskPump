@@ -102,8 +102,9 @@ describes**, never relative to wherever the caller happens to stand. After the
 file loads, every relative value of the ledger-locating keys —
 `TASKPUMP_TASKS_DIR`, `TASKPUMP_TASK_OUT`, `TASKPUMP_CODE_REPO`,
 `TASKPUMP_LEDGER_REPO`, `TASKPUMP_PUMP_TASKS_DIR`, `TASKPUMP_PUMP_OPS_DIR`,
-`TASKPUMP_BRIEF_TEMPLATE`, `TASKPUMP_PHASE_BRIEF_TEMPLATE`,
-`TASKPUMP_RESUME_TEMPLATE` — is anchored to a fixed root: a *discovered*
+`TASKPUMP_WORKSPACE_ROOT`, `TASKPUMP_BRIEF_TEMPLATE`,
+`TASKPUMP_PHASE_BRIEF_TEMPLATE`, `TASKPUMP_RESUME_TEMPLATE` — is anchored to a
+fixed root: a *discovered*
 conf's own directory; for an explicit `TASKPUMP_CONFIG` (which may live
 anywhere), the caller's worktree root. Unanchored, `tp task ready` run from a
 subdirectory returned an **empty frontier with rc=0** over live work, and the
@@ -297,6 +298,7 @@ consistent — a sigil the pattern does not accept produces tasks nothing can gr
 
 | Key | What it configures |
 |---|---|
+| `TASKPUMP_WORKSPACE_ROOT` | The workspace the pump **drives** — the default image-build context, the repository phase branches and agent worktrees are created in, the state-dir default, every `git` surface of a run. Unset, it derives from the config anchor (a discovered conf's directory, else the caller's worktree root) exactly as the ledger does — never from where the tools are installed, so a vendored TaskPump's own checkout is never mistaken for the workspace (issue #32). Set it to pin a container/CI run whose `$PWD` proves nothing. Naming a missing directory is a loud error. The install's own assets (`lib/`, `libexec/`, `gates/`, `runners/`, `templates/`, `hooks/`) stay script-relative regardless. |
 | `TASKPUMP_JOBS` | Concurrent pool cap. This is the key the pump reads; `TASKPUMP_PUMP_JOBS` is the systemd unit's name for the same number, which it passes as `--jobs`. |
 | `TASKPUMP_JOBS_FALLBACK` | The cap used when neither `--jobs` nor the cap file yields one. |
 | `TASKPUMP_POOL_CAP_FILE` | A file holding the live cap, re-read each tick so concurrency can be retuned mid-run. |

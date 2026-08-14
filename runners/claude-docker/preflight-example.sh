@@ -86,14 +86,36 @@ echo "Firewall configured" | tee -a "$LOG_FILE"
 # and the auto permission mode + allow rules coexist. Auto settings win on
 # conflicting keys. These live with the orchestrator in the primary checkout
 # (REPO_ROOT), NOT in the worktree, so connector worktrees stay pure-from-main.
+#
+# The merged file must land in the home of the user the SESSION runs as — the
+# entrypoint exports TASKPUMP_CONTAINER_USER / TASKPUMP_CONTAINER_HOME for
+# exactly this. Hardcoding a home path here is how an image with a non-default
+# user loses its MCP config and allow rules silently: the write succeeds into a
+# home the session never reads (issue #9).
+AGENT_USER="${TASKPUMP_CONTAINER_USER:-dev}"
+AGENT_HOME="${TASKPUMP_CONTAINER_HOME:-/home/$AGENT_USER}"
+AGENT_SETTINGS="$AGENT_HOME/.claude/settings.json"
+# The reference image's credential install has already created ~/.claude, but
+# that is an ordering dependency between the entrypoint and this hook that no
+# contract states — make the directory unconditionally.
+mkdir -p "${AGENT_SETTINGS%/*}"
 MCP_JSON="$REPO_ROOT/claude-mcp.json"
 AUTO_JSON="$REPO_ROOT/claude-settings-auto.json"
 if [[ -f "$MCP_JSON" && -f "$AUTO_JSON" ]]; then
-    jq -s '.[0] * .[1]' "$MCP_JSON" "$AUTO_JSON" > /home/dev/.claude/settings.json
+    jq -s '.[0] * .[1]' "$MCP_JSON" "$AUTO_JSON" > "$AGENT_SETTINGS"
 elif [[ -f "$AUTO_JSON" ]]; then
-    cp "$AUTO_JSON" /home/dev/.claude/settings.json
+    cp "$AUTO_JSON" "$AGENT_SETTINGS"
 elif [[ -f "$MCP_JSON" ]]; then
-    cp "$MCP_JSON" /home/dev/.claude/settings.json
+    cp "$MCP_JSON" "$AGENT_SETTINGS"
+fi
+# This hook runs as root; the session does not. The shipped entrypoint re-chowns
+# the agent home after the hook returns (entrypoint.sh, "After the hook, not
+# before"), but a hook should not depend on who runs next — hand the file to the
+# session user here, and say so if that fails rather than leaving a root-owned
+# settings file the agent cannot rewrite.
+if [[ -e "$AGENT_SETTINGS" ]]; then
+    chown "$AGENT_USER" "$AGENT_SETTINGS" 2>/dev/null \
+        || echo "WARNING: could not chown $AGENT_SETTINGS to $AGENT_USER (relying on the entrypoint's post-hook chown)" | tee -a "$LOG_FILE"
 fi
 
 # ── Smoke test ─────────────────────────────────────────────────────────────────
