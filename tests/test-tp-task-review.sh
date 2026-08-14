@@ -378,7 +378,46 @@ got=$("$CLI" ready --count-eligible)
 "$CLI" reopen T8.1 --reason "human ruling: proceed with the rename as-is" >/dev/null
 assert_fm "$E/tasks" T8.1 '.status' "open" "the human door out of the park is the ordinary reopen"
 
-# ── Section 6: every mutation is one auditable ledger commit ─────────────────
+# ── Section 6: heartbeat honesty — reviewers are kept off the tripwire ───────
+echo
+echo "--- heartbeat: the commit meter is inert on review tasks ---"
+
+H="$TMPDIR_TEST/h"
+mkdir -p "$H/tasks"
+git -C "$H" init -q
+git -C "$H" -c user.name=test -c user.email=t@e commit --allow-empty -q -m "init code"
+export TASKPUMP_TASKS_DIR="$H/tasks"
+export TASKPUMP_TASK_OUT="$H/.next-task"
+export TASKPUMP_CODE_REPO="$H"
+
+"$CLI" create T1 --title "Impl" >/dev/null
+"$CLI" review T1 >/dev/null
+"$CLI" complete T1 >/dev/null
+"$CLI" claim T1.1 --branch review/t1 --turns 5 >/dev/null
+
+# Control: a PLAIN task with the same no-commit cycles walks toward `stuck`.
+"$CLI" create T3 --title "Plain control" >/dev/null
+"$CLI" claim T3 --branch feat/t3 --turns 5 >/dev/null
+
+for _i in 1 2 3; do
+  "$CLI" heartbeat T1.1 --start >/dev/null
+  "$CLI" heartbeat T1.1 --end >/dev/null
+  "$CLI" heartbeat T3 --start >/dev/null
+  "$CLI" heartbeat T3 --end >/dev/null
+done
+unset _i
+
+assert_fm "$H/tasks" T3 '.consecutive_failed_iterations' "3" "control: three commit-less cycles push a plain task to the stuck threshold"
+assert_fm "$H/tasks" T1.1 '.consecutive_failed_iterations' "0" "the same three cycles leave a reviewer's failure streak untouched"
+assert_fm "$H/tasks" T1.1 '.turn_budget_remaining' "2" "while the turn budget still decrements — the reviewer stays bounded"
+got=$(fm "$H/tasks" T1.1 '.last_heartbeat_ts')
+[[ "$got" != "null" && -n "$got" ]] && pass "and liveness is still stamped for the staleness tripwire" \
+  || fail "last_heartbeat_ts was '$got'"
+
+"$CLI" verdict T1.1 --approve --findings "Read it three times; it is sound." >/dev/null
+assert_fm "$H/tasks" T1.1 '.status' "done" "the verdict is the productive terminal act"
+
+# ── Section 7: every mutation is one auditable ledger commit ─────────────────
 echo
 echo "--- audit trail ---"
 

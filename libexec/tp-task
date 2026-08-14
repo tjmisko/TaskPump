@@ -810,6 +810,29 @@ cmd_heartbeat() {
   local new_budget=$((budget - 1))
   (( new_budget < 0 )) && new_budget=0
 
+  # Review tasks: the commit-productivity meter measures nothing here — an
+  # honest reviewer commits no code, its deliverable is the verdict in the
+  # ledger — so the meter must not drive the failure-streak tripwire. Left
+  # unmodified, three cycles of carefully reading a diff would scrub the
+  # reviewer `stuck`, punishing exactly the agent doing its job. The counter
+  # is left untouched (not incremented, not reset): the cycle is neither
+  # productive nor failed, it is unmeasured. A wedged reviewer is still
+  # bounded — the budget below decrements every cycle and scrub parks it at
+  # 0, and heartbeat staleness catches one that stops beating entirely. See
+  # docs/design/review-gates.md for why "a recorded verdict counts as the
+  # productive act" was rejected as the mechanism: the verdict completes the
+  # task, so --end never observes it.
+  if [[ -n "$(fm_get "$file" '.review_role')" ]]; then
+    fm_set "$file" "
+      .turn_budget_remaining = $new_budget |
+      .last_heartbeat_head_sha = null |
+      .last_heartbeat_ts = \"$now\"
+    "
+    git_commit_state "heartbeat end $id (budget=$new_budget review task: productivity unmeasured)"
+    echo "heartbeat end $id: budget=$new_budget (review task — commit productivity is not measured; the recorded verdict is the productive act)"
+    return 0
+  fi
+
   local start_sha; start_sha=$(fm_get "$file" '.last_heartbeat_head_sha')
   local productive=0
   local touched=""
@@ -2512,7 +2535,11 @@ Commands:
                                        TASKPUMP_ID_PATTERN. Refuses to
                                        overwrite an existing task.
   claim <id> --branch <b> [--turns N]  Atomically claim a task.
-  heartbeat <id> [--start|--end]     Budget + failure tracking.
+  heartbeat <id> [--start|--end]     Budget + failure tracking. On review tasks
+                                       --end decrements the budget only: commit
+                                       productivity is not measured for a task
+                                       whose deliverable is a ledger verdict,
+                                       so the failure streak never moves.
   complete <id> [--commits sha,sha] [--defer-wiring "note"]
                                      Mark done; stdin → completion notes.
                                      --defer-wiring flags that the runtime wiring
