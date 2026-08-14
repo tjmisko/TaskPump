@@ -1406,6 +1406,93 @@ grep -q 'subname' <<<"$sout" \
     || fail "opt-in SUBPATH manifest ignored:\n$sout"
 printf '#!/usr/bin/env bash\nexit 0\n' >| "$BIN/docker"; chmod +x "$BIN/docker"
 
+# ── Test 37: pump liveness is verified from the pid, never trusted (#22) ─────
+# The G3 incident: a finished drain left .taskpump-pump.state claiming
+# status:running with no supervisor process, and a reader trusting the label
+# burned a rescue session. The state file now carries the writer's pid; the
+# monitor verifies it with kill -0 and labels an unverifiable live-pump claim
+# STALE — with the last_tick, so the reader can see since when — instead of
+# reporting a live pump.
+echo "--- Test 37: stale pump-state labeling ---"
+make_usage_stub 30 40
+PS37="$TMP/pump37.state"
+PC37="$TMP/pump37-cache.tsv"; printf 'ELIG\t0\nOPEN\t6\n' >| "$PC37"
+HOST37="${HOSTNAME:-$(hostname)}"
+mk37() {  # $1=status $2=pid-json (a number, or the empty string for "no pid")
+  local pidfield=""
+  [[ -n "$2" ]] && pidfield=",\"pid\":$2,\"host\":\"$HOST37\""
+  printf '%s' "{\"phases\":\"F80\",\"started_at\":\"2026-08-13T21:46:41Z\",\"last_tick\":\"2026-08-13T21:46:49Z\",\"live_agents\":1,\"open_tasks\":6,\"status\":\"$1\",\"paused_reason\":\"\"$pidfield}" >| "$PS37"
+}
+glance37() { TASKPUMP_PUMP_STATE_FILE="$PS37" TASKPUMP_MONITOR_PUMP_CACHE="$PC37" \
+  TASKPUMP_MONITOR_PUMP_TTL=99999 "$CLI" --glance 2>/dev/null | strip_ansi; }
+
+# Positive control: a running claim whose pid is alive renders as running.
+mk37 running $$          # this harness's pid — alive for the whole test
+lout=$(glance37)
+grep -q 'pump\[F80\]: running' <<<"$lout" && pass "a live-pid running file renders running (positive control)" \
+    || fail "live pump not rendered running:\n$lout"
+grep -q 'STALE' <<<"$lout" && fail "live pump mislabeled STALE:\n$lout" \
+    || pass "no STALE label on a live pump"
+
+# A dead pid: spawn-and-reap a real process so the pid is guaranteed dead.
+sleep 0.05 & DEAD37=$!; wait "$DEAD37" 2>/dev/null
+mk37 running "$DEAD37"
+sout=$(glance37)
+grep -q 'pump\[F80\]: STALE' <<<"$sout" && pass "running + dead pid renders STALE, not a live pump (#22)" \
+    || fail "dead-pid running file not STALE:\n$sout"
+grep -q "pid $DEAD37 dead" <<<"$sout" && pass "the STALE label names the dead pid" \
+    || fail "dead pid not named:\n$sout"
+grep -q 'since 2026-08-13T21:46:49Z' <<<"$sout" && pass "STALE says since when (last_tick)" \
+    || fail "no last_tick in the STALE label:\n$sout"
+grep -q 'pump\[F80\]: running' <<<"$sout" && fail "still presents running alongside STALE:\n$sout" \
+    || pass "the dead claim is never presented as running"
+
+# No pid at all (a pre-#22 writer): the claim cannot be verified → STALE too.
+mk37 running ""
+nout=$(glance37)
+grep -q 'pump\[F80\]: STALE' <<<"$nout" && grep -q 'no pid recorded' <<<"$nout" \
+    && pass "running with no pid renders STALE (unverifiable claim)" \
+    || fail "pidless running file not STALE:\n$nout"
+
+# paused is a live-pump claim as much as running is — same verification.
+mk37 paused "$DEAD37"
+pout=$(glance37)
+grep -q 'pump\[F80\]: STALE' <<<"$pout" && grep -q 'was paused' <<<"$pout" \
+    && pass "paused + dead pid renders STALE (was paused)" \
+    || fail "dead-pid paused file not STALE:\n$pout"
+
+# EPERM is not death: pid 1 is alive, root-owned, unsignalable from here —
+# kill -0 fails with EPERM but /proc/1 exists. A live pump run by another
+# user (a system unit) must not be labeled dead.
+mk37 running 1
+eout=$(glance37)
+grep -q 'pump\[F80\]: running' <<<"$eout" && pass "an alive-but-unsignalable pid (EPERM) renders running" \
+    || fail "EPERM-alive pid mislabeled:\n$eout"
+grep -q 'STALE' <<<"$eout" && fail "EPERM-alive pid mislabeled STALE:\n$eout" \
+    || pass "no STALE label for an EPERM-alive pid"
+
+# A foreign host's pid table is unreadable from here: STALE, but the label
+# must not claim "dead" about a pid it never checked.
+printf '%s' "{\"phases\":\"F80\",\"last_tick\":\"2026-08-13T21:46:49Z\",\"open_tasks\":6,\"status\":\"running\",\"paused_reason\":\"\",\"pid\":$$,\"host\":\"not-this-host\"}" >| "$PS37"
+hout=$(glance37)
+grep -q 'pump\[F80\]: STALE' <<<"$hout" && pass "a foreign-host running claim renders STALE" \
+    || fail "foreign-host claim not STALE:\n$hout"
+grep -q 'unverifiable from this host (recorded on not-this-host)' <<<"$hout" \
+    && pass "the foreign-host label says unverifiable, not dead" \
+    || fail "foreign-host label does not say unverifiable:\n$hout"
+grep -q "pid $$ dead" <<<"$hout" && fail "foreign-host label claims a death it never checked:\n$hout" \
+    || pass "no false death claim for an unchecked pid"
+
+# Terminal states claim no live process — they pass through untouched, dead
+# pid and all, with the stop reason shown.
+printf '%s' "{\"phases\":\"F80\",\"last_tick\":\"2026-08-13T21:46:49Z\",\"open_tasks\":6,\"status\":\"stopped\",\"paused_reason\":\"received SIGTERM\",\"pid\":$DEAD37,\"host\":\"$HOST37\"}" >| "$PS37"
+tout=$(glance37)
+grep -q 'pump\[F80\]: stopped — received SIGTERM' <<<"$tout" \
+    && pass "a terminal stopped state renders as stopped with its reason" \
+    || fail "stopped state mangled:\n$tout"
+grep -q 'STALE' <<<"$tout" && fail "terminal state mislabeled STALE:\n$tout" \
+    || pass "no STALE label on a terminal state"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"
