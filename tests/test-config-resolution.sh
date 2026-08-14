@@ -131,6 +131,20 @@ got=$( cd "$C1/crates" && env "${TP_ENV_UNSET[@]}" TASKPUMP_NO_CONF=0 \
   && pass "resolve prints the absolute anchored tasks dir" \
   || fail "resolve got '$got', expected '$C1/planning/tasks'"
 
+# The via line names the rung that actually decided — a conf-supplied or
+# env-supplied tasks dir must not be attributed to the workspace walk.
+got=$( cd "$C1/crates" && env "${TP_ENV_UNSET[@]}" TASKPUMP_NO_CONF=0 \
+        TASKPUMP_TASK_NOCOMMIT=1 "$TASK" resolve --all | awk '/^via/{print $2}' )
+[[ "$got" == "conf-value" ]] \
+  && pass "resolve --all attributes a conf-supplied tasks dir to conf-value" \
+  || fail "via for a conf-supplied tasks dir reads '$got', expected conf-value"
+got=$( cd "$C1" && env "${TP_ENV_UNSET[@]}" TASKPUMP_TASK_NOCOMMIT=1 \
+        TASKPUMP_TASKS_DIR="$C1/planning/tasks" "$TASK" resolve --all \
+        | awk '/^via/{print $2}' )
+[[ "$got" == "env" ]] \
+  && pass "resolve --all attributes an env-supplied tasks dir to env" \
+  || fail "via for an env-supplied tasks dir reads '$got', expected env"
+
 # An ENVIRONMENT value keeps the shell's own convention: the caller typed it
 # where they stood, so it stays $PWD-relative and is not rewritten.
 got=$( cd "$C1" && env "${TP_ENV_UNSET[@]}" TASKPUMP_TASK_NOCOMMIT=1 \
@@ -151,6 +165,21 @@ have "$out" "$TMP/no-such-ledger" && pass "the refusal names the missing directo
   || fail "the refusal does not name the directory:\n$out"
 have "$out" 'resolve' && pass "the refusal points at the resolve diagnostic" \
   || fail "the refusal does not point at resolve:\n$out"
+
+# The pump flavor of the same refusal: open_count/frontier_phases mask
+# tp-task's error into "0 open tasks" with their 2>/dev/null fallbacks, so
+# without a startup check a missing ledger renders every phase DONE at rc=0.
+out=$( cd "$C1" && env "${TP_ENV_UNSET[@]}" TASKPUMP_TASK_NOCOMMIT=1 \
+        HOME="$CFGHOME" TASKPUMP_TASKS_DIR="$TMP/no-such-ledger" \
+        TASKPUMP_TASK="$TASK" "$PUMP" --no-health-gate --no-usage-gate \
+        --no-disk-gate --phases T1..T2 --dry-run 2>&1 ); rc=$?
+[[ $rc -ne 0 ]] && pass "pump --dry-run refuses a nonexistent tasks dir (rc=$rc)" \
+  || fail "pump --dry-run over a missing ledger exited 0:\n$out"
+have "$out" "$TMP/no-such-ledger" && pass "the pump refusal names the missing directory" \
+  || fail "the pump refusal does not name the directory:\n$out"
+have "$out" 'DONE' \
+  && fail "the plan still renders DONE over a missing ledger:\n$out" \
+  || pass "no phase renders DONE over a missing ledger"
 
 # `resolve` itself keeps working — it is the diagnostic the error points at.
 rc=0
