@@ -415,6 +415,18 @@ Queries add scoping on top of the predicate, never replacing it:
   field is missing" must not be distinguishable to a reader. `list --json` adds
   status, claimant and blockers for **every** task, not just the frontier: what a
   *running* task is touching is exactly what a candidate must not collide with.
+  Its object is exactly these eight keys:
+
+  | Key | Type | Notes |
+  |---|---|---|
+  | `id` | string | The task id. |
+  | `file` | string | Path to the task file as the ledger reader resolved it — absolute or relative exactly as `resolve --tasks-dir` reports the directory. The one field that is *not* frontmatter: it is where this record was read from. |
+  | `phase` | string | The id's phase, derived (`id` up to the first `.`). Present so a reader need not re-implement §7.2's split. |
+  | `status` | string | §4. |
+  | `claimed_by` | string \| null | `null`, never `""`, when unclaimed. |
+  | `title` | string | The task's one-line title. |
+  | `blockers` | array of strings | `[]`, never `null`. |
+  | `files` | array of strings | `[]`, never `null`. See §3. |
 
 The two counts diverge exactly when something is stalling the queue: work
 remains open but nothing can start. `--count > 0` with `--count-eligible == 0` is
