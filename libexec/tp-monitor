@@ -82,8 +82,10 @@
 # Ledger              TASKPUMP_TASKS_DIR           the ledger
 #                     TASKPUMP_TASKS_SUBDIR        its path within the repo
 #                     TASKPUMP_TASK_EXT            task-file extension (.md)
-#                     TASKPUMP_MANIFEST            v1 parallel-run manifest
-#                     TASKPUMP_MANIFEST_SUBPATH    its path within the repo
+#                     TASKPUMP_MANIFEST            OPT-IN v1 parallel-run manifest
+#                                                  (no default; sessions resolve
+#                                                  their task from ledger claims)
+#                     TASKPUMP_MANIFEST_SUBPATH    its repo-relative spelling
 # Pump                TASKPUMP_PUMP_STATE_FILE     supervisor state file
 #                     TASKPUMP_PUMP_STATE_NAME     its filename
 # Agents              TASKPUMP_AGENT_CONTAINER_PREFIX  docker name filter/slug strip
@@ -132,8 +134,20 @@ _tp_repo_default() {
 }
 REPO_ROOT="${TASKPUMP_MONITOR_REPO_ROOT:-$(_tp_repo_default)}"
 WORKTREES_DIR="${TASKPUMP_WORKTREES_DIR:-.worktrees}"
-MANIFEST_SUBPATH="${TASKPUMP_MANIFEST_SUBPATH:-ops/task-loop/parallel-manifest.tsv}"
-MANIFEST="${TASKPUMP_MANIFEST:-${MANIFEST:-$REPO_ROOT/$MANIFEST_SUBPATH}}"
+# The v1 parallel-run manifest is OPT-IN with no default path: TaskPump does
+# not generate the file (its producer stayed in Arachne at extraction), and the
+# old default pointed every other consumer at a path that cannot exist
+# (issue #7). Sessions get their task from the ledger's live claim either way; a
+# configured manifest only supplies the launch-time display name and the epic
+# fallback. Precedence: TASKPUMP_MANIFEST (bare MANIFEST is its pre-extraction
+# spelling) > TASKPUMP_MANIFEST_SUBPATH resolved against REPO_ROOT > none.
+MANIFEST_KEY="MANIFEST"
+[[ -n "${TASKPUMP_MANIFEST:-}" ]] && MANIFEST_KEY="TASKPUMP_MANIFEST"
+MANIFEST="${TASKPUMP_MANIFEST:-${MANIFEST:-}}"
+if [[ -z "$MANIFEST" && -n "${TASKPUMP_MANIFEST_SUBPATH:-}" ]]; then
+    MANIFEST_KEY="TASKPUMP_MANIFEST_SUBPATH"
+    MANIFEST="$REPO_ROOT/${TASKPUMP_MANIFEST_SUBPATH}"
+fi
 # Honours TASKPUMP_TASKS_DIR for the same reason tp-dag-render does: the two must
 # read the SAME ledger, or the GRAPH tab draws one set of tasks while `o` opens
 # files from another.
@@ -229,9 +243,18 @@ if [[ -z "$WATCH" ]]; then
     if [[ -t 1 ]]; then WATCH=1; else WATCH=0; fi
 fi
 
-# branch-slug -> "name<TAB>epic_task" lookup from the manifest.
+# branch-slug -> "name<TAB>epic_task" lookup from the opt-in manifest. Empty —
+# and everything that reads it fully functional — when no manifest is
+# configured, which is the normal case. An explicitly configured manifest that
+# does not exist is an ERROR, on the same rule TASKPUMP_CONFIG follows: an
+# explicit request for a specific file must not silently fall back.
 declare -A SLUG_NAME SLUG_TASK SLUG_BRANCH
-if [[ -f "$MANIFEST" ]]; then
+if [[ -n "$MANIFEST" ]]; then
+    if [[ ! -f "$MANIFEST" ]]; then
+        echo "ERROR: $MANIFEST_KEY names '$MANIFEST', which does not exist." >&2
+        echo "       Restore the file, or unset $MANIFEST_KEY — sessions resolve their task from the ledger's live claims without it." >&2
+        exit 1
+    fi
     while IFS=$'\t' read -r name branch _ task _rest; do
         [[ -z "${name// }" || "${name:0:1}" == "#" ]] && continue
         slug="${branch//\//-}"
