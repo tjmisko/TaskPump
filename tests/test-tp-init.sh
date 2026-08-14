@@ -26,19 +26,13 @@ SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
 TP_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd)
 TP="$TP_ROOT/bin/tp"
 
-export TASKPUMP_NO_CONF=1
-
 # An operator's exported TaskPump settings must not pre-satisfy or break a case:
 # the whole point of the end-to-end leg is that the generated conf alone is
-# enough. Both spellings go, since the legacy one is promoted onto the canonical.
-for _suffix in TASKS_DIR TASK_OUT CODE_REPO LEDGER_REPO LEDGER_PROBE TASKS_SUBDIR \
-               TASK_PUSH PUSH TASK_NOCOMMIT TASK_DEBUG ID_PATTERN PHASE_SIGIL \
-               PHASE_SEPARATOR TURN_BUDGET_DEFAULT COMMITTER_NAME COMMITTER_EMAIL \
-               PROG_NAME CONFIG; do
-  unset "ARACHNE_$_suffix" "TASKPUMP_$_suffix" 2>/dev/null || true
-done
-unset _suffix
-unset ARACHNE_NO_CONF 2>/dev/null || true
+# enough. The shared prologue scrubs the entire TASKPUMP_*/TP_*/ARACHNE_*
+# namespace by enumeration and re-establishes the hermetic baseline (issue #18);
+# run-all.sh sources the same one, and this covers standalone runs.
+# shellcheck source=tests/suite-prologue.sh
+. "$SCRIPT_DIR/suite-prologue.sh"
 
 PASS=0; FAIL=0
 pass() { printf 'PASS: %s\n' "$*"; PASS=$((PASS + 1)); }

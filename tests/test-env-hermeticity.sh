@@ -41,8 +41,12 @@ TP_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 CLI="$TP_ROOT/libexec/tp-task"
 PROLOGUE="$SCRIPT_DIR/suite-prologue.sh"
 
+# Sourced by its literal path, not through $PROLOGUE: the coverage check below
+# looks for a source line naming the file, and this suite must satisfy its own
+# rule the same way every other suite does. $PROLOGUE stays for the control
+# case, which re-sources it deliberately.
 # shellcheck source=tests/suite-prologue.sh
-. "$PROLOGUE"
+. "$SCRIPT_DIR/suite-prologue.sh"
 
 PASS=0; FAIL=0
 pass() { printf 'PASS: %s\n' "$*"; PASS=$((PASS + 1)); }
@@ -150,12 +154,15 @@ echo "--- coverage: every suite and run-all source the shared prologue ---"
 
 missing=""
 while IFS= read -r suite; do
-  grep -q 'suite-prologue\.sh' "$suite" || missing+=" $(basename "$suite")"
+  # A SOURCE line, not a mention: a suite that only names the prologue in a
+  # comment would satisfy a bare substring match while inheriting pump env.
+  grep -qE '^[[:space:]]*(\.|source)[[:space:]].*suite-prologue\.sh' "$suite" \
+    || missing+=" $(basename "$suite")"
 done < <(find "$SCRIPT_DIR" -maxdepth 1 -name 'test-*.sh' | LC_ALL=C sort)
 [[ -z "$missing" ]] && pass "every tests/test-*.sh sources the shared prologue" \
   || fail "suites missing the shared prologue (standalone runs inherit pump env):$missing"
 
-grep -q 'suite-prologue\.sh' "$SCRIPT_DIR/run-all.sh" \
+grep -qE '^[[:space:]]*(\.|source)[[:space:]].*suite-prologue\.sh' "$SCRIPT_DIR/run-all.sh" \
   && pass "run-all.sh sources the shared prologue (the central guard)" \
   || fail "run-all.sh does not source the shared prologue"
 
