@@ -632,21 +632,43 @@ DEV_SESSION_SCRIPT="
     echo \"Agent finished at \$(date -u).\" | tee -a '$LOG_FILE'
 "
 
+# ── The privilege drop: setpriv on a script file, never su -c ─────────────────
+# su(1) sets itself as a child subreaper, so every orphaned grandchild of the
+# many-hour session — tool subprocesses that outlive their immediate parent —
+# reparented to `su`, which sits blocked waiting on its one direct child and
+# never reaps them: zombies accumulated at the agent's tool-call rate for the
+# life of the session (issue #15). setpriv changes ids and EXECS — no
+# intermediary lingers — so orphans reparent to PID 1, the tini that
+# runner.sh's `--init` installs, and are reaped there.
+#
+# Two consequences of losing su, handled here:
+#   * su chose the target user's HOME/USER/LOGNAME/SHELL; setpriv touches ids
+#     only, so the session identity is set explicitly.
+#   * the script rides a root-owned FILE instead of -c argv — a session script
+#     in the argv of the longest-lived process in the container was always
+#     wrong (/proc/<pid>/cmdline is world-readable; issue #14's surface).
+SESSION_SCRIPT_FILE="${TMPDIR:-/tmp}/.taskpump-session.sh"
+printf '%s\n' "$DEV_SESSION_SCRIPT" > "$SESSION_SCRIPT_FILE"
+chmod 0644 "$SESSION_SCRIPT_FILE"
+SESSION_LAUNCH=(
+    env HOME="$CONTAINER_HOME" USER="$CONTAINER_USER" LOGNAME="$CONTAINER_USER" SHELL=/bin/bash
+    setpriv --reuid "$CONTAINER_USER" --regid "$(id -g "$CONTAINER_USER")" --init-groups
+    bash "$SESSION_SCRIPT_FILE"
+)
+
 # ── Launch the session: optional wall-clock backstop, else exec ────────────────
 # The wall-clock cap is opt-in (unset = the plain exec path) and acts as a
 # last-resort guard below the token TTL. `timeout` needs a child to signal, so we
-# cannot `exec` in that branch — a desirable side effect is that the end-heartbeat
-# and ledger push inside the script run on a wall-clock kill, whereas `exec`
-# silently drops them when the process is replaced. `|| WALL_RC=$?` keeps `set -e`
-# from aborting before we capture rc.
+# cannot `exec` in that branch. `|| WALL_RC=$?` keeps `set -e` from aborting
+# before we capture rc.
 if [[ -n "$AGENT_WALL_TIMEOUT_S" ]]; then
     log "Wall-clock cap: ${AGENT_WALL_TIMEOUT_S}s"
     WALL_RC=0
-    timeout "$AGENT_WALL_TIMEOUT_S" su "$CONTAINER_USER" -c "$DEV_SESSION_SCRIPT" || WALL_RC=$?
+    timeout "$AGENT_WALL_TIMEOUT_S" "${SESSION_LAUNCH[@]}" || WALL_RC=$?
     if [[ "$WALL_RC" -eq 124 ]]; then
         echo "$(date -u) [wall-cap] session killed by wall-clock timeout (${AGENT_WALL_TIMEOUT_S}s)" | tee -a "$LOG_FILE"
     fi
     exit "$WALL_RC"
 else
-    exec su "$CONTAINER_USER" -c "$DEV_SESSION_SCRIPT"
+    exec "${SESSION_LAUNCH[@]}"
 fi

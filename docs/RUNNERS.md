@@ -171,9 +171,11 @@ The image a consumer names must satisfy this contract:
   `/entrypoint-parallel.sh` layout.
 
 - **What the entrypoint finds inside:** the `claude` CLI on `PATH`, `git`, `jq`,
-  and an unprivileged user to drop to (`TASKPUMP_CONTAINER_USER`, default `dev`,
-  home `/home/dev`). The container starts as root and hands the session to that
-  user with `su` — see *Why root* in `runners/claude-docker/README.md`.
+  `setpriv` (util-linux — present in any Debian/Ubuntu base), and an
+  unprivileged user to drop to (`TASKPUMP_CONTAINER_USER`, default `dev`, home
+  `/home/dev`). The container starts as root and hands the session to that user
+  with `setpriv`, never `su` — `su` subreaps and leaks the session's orphans as
+  zombies (issue #15). See *Why root* in `runners/claude-docker/README.md`.
 
 - **Everything project-shaped stays out of the image contract.** Toolchains,
   smoke tests, and the egress allowlist arrive through the pre-flight hook

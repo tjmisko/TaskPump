@@ -101,9 +101,12 @@ and the entrypoint's own startup self-check guard against it.
 The launch does not pass `--user`. The container starts as root because the
 pre-flight installs an iptables egress allowlist (hence `--cap-add NET_ADMIN`)
 and writes into the agent user's home; the entrypoint drops to the unprivileged
-container user with `su` for the session itself. `TP_CONTAINER_RUN_USER` exists
-for a consumer whose image needs a `--user`, but setting it breaks any pre-flight
-that configures the firewall.
+container user with `setpriv` for the session itself — `setpriv` execs, where
+`su` set itself as a child subreaper and collected the session's orphaned tool
+subprocesses as never-reaped zombies (issue #15). The launch passes `--init`
+so tini, as PID 1, adopts and reaps those orphans instead.
+`TP_CONTAINER_RUN_USER` exists for a consumer whose image needs a `--user`, but
+setting it breaks any pre-flight that configures the firewall.
 
 ---
 

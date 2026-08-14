@@ -589,7 +589,7 @@ launch_line() {  # launch_line <extra var=value>...
 }
 got=$(launch_line); rc=$?
 got_norm=${got//$R6/@R@}
-want='run --rm -d --name tp-agent-feat-f9 --cap-add NET_ADMIN --memory 3g --memory-swap 5g'
+want='run --rm -d --init --name tp-agent-feat-f9 --cap-add NET_ADMIN --memory 3g --memory-swap 5g'
 want+=' -e GITHUB_TOKEN= -e WORKSPACE_PATH=@R@/wt -e REPO_ROOT=@R@'
 want+=' -e ARACHNE_BRIEF=@R@/brief.md -e ARACHNE_RESUME_NOTE= -e ARACHNE_TASK_ID=F9.1'
 want+=' -e ARACHNE_PHASE=F9 -e MAX_TURNS=600 -e AGENT_MODEL=opus'
@@ -616,7 +616,7 @@ fi
 # The individual invariants the golden line encodes, asserted separately so a
 # failure says which one broke rather than just "the line changed".
 for probe in \
-  '--cap-add NET_ADMIN' '--memory 3g' '--memory-swap 5g' '--rm -d' \
+  '--cap-add NET_ADMIN' '--memory 3g' '--memory-swap 5g' '--rm -d' '--init' \
   "-v @R@:@R@:ro" "-v @R@/.git:@R@/.git" "-v @R@/wt:@R@/wt" "-v @R@/ops:@R@/ops"; do
   grep -qF -- "$probe" <<<"$got_norm" && pass "launch line carries '$probe'" \
     || fail "launch line is missing '$probe'"
@@ -831,6 +831,45 @@ for word in cargo clippy rustc npm vitest playwright pytest 'ops/planning' 'ops/
   [[ -n "$hits" ]] && fail "shipped template names '$word' (must stay tool-agnostic): $hits"
 done
 pass "shipped templates name no build tool, test runner, or consumer repo layout"
+
+# ── No subreaping intermediary in the session launch chain (issue #15) ─────────
+# su(1) sets itself as a child subreaper, so orphaned tool subprocesses of the
+# many-hour agent session reparented to it and were never reaped — zombies
+# accumulated at the agent's tool-call rate. The contract: the privilege drop
+# EXECS (setpriv), the script rides a file rather than a -c argv, and the
+# runner installs tini as PID 1 (`--init`, asserted in the golden launch line
+# above) to adopt and reap the orphans. runuser shares su's su-common.c and
+# subreaps the same way, so it is equally banned from the session launch.
+echo "--- session launch chain (issue #15) ---"
+SUBREAP_RE='\b(su|runuser)\b[^|]*(DEV_SESSION_SCRIPT|SESSION_SCRIPT_FILE|SESSION_LAUNCH)'
+# Positive controls first: the predicate must fire on both historical shapes
+# before its silence is trusted.
+grep -qE -- "$SUBREAP_RE" <<<'timeout 5 su "$CONTAINER_USER" -c "$DEV_SESSION_SCRIPT"' \
+  && pass "control: the subreaper predicate fires on the su -c launch" \
+  || fail "control: the subreaper predicate MISSED the su -c launch — the guard is inert"
+grep -qE -- "$SUBREAP_RE" <<<'exec runuser -u dev -- bash "$SESSION_SCRIPT_FILE"' \
+  && pass "control: it also fires on a runuser file launch" \
+  || fail "control: the predicate misses a runuser launch"
+grep -qE -- "$SUBREAP_RE" <<<'exec setpriv --reuid dev bash "$SESSION_SCRIPT_FILE"' \
+  && fail "control: the predicate condemns the setpriv launch" \
+  || pass "control: it does not fire on the setpriv launch"
+if grep -vE '^[[:space:]]*#' "$EP" | grep -qE -- "$SUBREAP_RE"; then
+  fail "a subreaping intermediary (su/runuser) launches the session (issue #15)"
+else
+  pass "no su/runuser touches the session launch chain"
+fi
+grep -qE -- 'setpriv --reuid' "$EP" \
+  && pass "the session privilege drop is setpriv (execs; leaves no intermediary)" \
+  || fail "entrypoint.sh does not drop privileges with setpriv"
+grep -qE 'bash "\$SESSION_SCRIPT_FILE"' "$EP" \
+  && pass "the session script runs from a file, not a -c argv" \
+  || fail "the session script is not launched from a file"
+# su also chose the session identity; setpriv does not, so losing su silently
+# inherits root's HOME unless the launch sets it — and the agent's ~/.claude
+# resolution rides on it.
+grep -qE 'HOME="\$CONTAINER_HOME"' "$EP" \
+  && pass "the launch sets the session user's HOME explicitly" \
+  || fail "the launch does not set HOME (setpriv would inherit root's)"
 
 echo
 echo "=============================================="
