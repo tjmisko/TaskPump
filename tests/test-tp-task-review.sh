@@ -23,24 +23,17 @@ TP_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd)
 CLI="$TP_ROOT/libexec/tp-task"
 
 # Hermeticity: ignore any taskpump.conf in the repo this suite happens to run
-# from. run-all.sh exports the same switch; this covers standalone runs.
-export TASKPUMP_NO_CONF=1
+# from, and scrub inherited pump env (issue #18) — a hand-kept unset list here
+# would miss whatever key lands next, which is exactly the leak the shared
+# prologue closes by enumeration. run-all.sh sources the same prologue; this
+# covers standalone runs.
+# shellcheck source=tests/suite-prologue.sh
+. "$SCRIPT_DIR/suite-prologue.sh"
 
 PASS=0
 FAIL=0
 fail() { printf 'FAIL: %s\n' "$*" >&2; FAIL=$((FAIL + 1)); }
 pass() { printf 'PASS: %s\n' "$*"; PASS=$((PASS + 1)); }
-
-# Clear both spellings of every config key, so an operator's exported TaskPump
-# settings cannot leak in and pre-satisfy (or break) a case here.
-for _suffix in TASKS_DIR TASK_OUT CODE_REPO TASK_PUSH PUSH TASK_NOCOMMIT \
-               TASK_DEBUG LEDGER_PROBE COMMITTER_NAME COMMITTER_EMAIL \
-               ID_PATTERN PHASE_SIGIL TURN_BUDGET_DEFAULT FAILURE_LIMIT \
-               CLAIM_STALE_HOURS LOCK_WAIT LOCK_NAME PUSH_RETRIES PROG_NAME \
-               CONFIG; do
-  unset "ARACHNE_$_suffix" "TASKPUMP_$_suffix" 2>/dev/null || true
-done
-unset _suffix
 
 TMPDIR_TEST=$(mktemp -d)
 trap 'rm -rf "$TMPDIR_TEST"' EXIT
