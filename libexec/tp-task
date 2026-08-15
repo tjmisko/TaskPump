@@ -2823,6 +2823,8 @@ Commands:
                                      Mark done; stdin → completion notes.
                                      --defer-wiring flags that the runtime wiring
                                        (first real caller) was left for a follow-up.
+                                     Refused on a review task — those close by
+                                       rendering their verdict.
   block <id> --reason "..."          Mark blocked with reason.
   needs-review <id> --reason "..."   Flag for human review (pump quarantine setter).
   release <id> --reason "..."        Relinquish a claim back to status=open.
@@ -2830,6 +2832,10 @@ Commands:
                                        task to status=open (done → sheds completion
                                        markers: falsely-done; needs-review/stuck →
                                        clears the failure streak + scrub_reason).
+                                     A task carrying a review chain re-arms it:
+                                       every member back to open, review_round
+                                       reset to 1 — the redone work has not been
+                                       reviewed, so the gate must live again.
   review <impl-id> [--panel N] [--prompt <file>] [--max-rounds N]
                                      Synthesize a review chain in the DAG: N
                                        reviewer tasks blocked by <impl-id> (default
@@ -2838,17 +2844,23 @@ Commands:
                                        or the lone reviewer) ADDED to the blockers
                                        of every task downstream of <impl-id>.
                                        Blockers do the gating; no new predicate.
+                                       That rewiring is a snapshot, so `create
+                                       --blockers` and `blockers --add/--set`
+                                       carry the gate along afterwards.
                                        Refuses a second chain for the same task.
                                        --prompt records a review lens (validated
                                        now, read by whatever dispatches the
                                        reviewer); --max-rounds bounds the
                                        change-request loop (default 3).
-  verdict <review-id> --approve [--findings -|"..."]
+  verdict <review-id> [--branch <b>] --approve [--findings -|"..."]
           | --request-changes --findings -|"..."
                                      Render a review's outcome through existing
                                        state-machine doors. --approve completes
                                        the review task (findings to its body);
                                        a panel reviewer's approve is its report.
+                                     A claimed review needs --branch matching
+                                       claimed_by; an unclaimed one rules with a
+                                       warning (nothing records who ruled).
                                        --request-changes (gate task only,
                                        findings required, requires the reviewed
                                        task to be done) appends the findings to
