@@ -21,6 +21,7 @@ set -euo pipefail
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
 TP_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd)
 CLI="$TP_ROOT/libexec/tp-task"
+RENDER="$TP_ROOT/libexec/tp-dag-render"
 
 # Hermeticity: ignore any taskpump.conf in the repo this suite happens to run
 # from, and scrub inherited pump env (issue #18) — a hand-kept unset list here
@@ -53,6 +54,18 @@ assert_fm() { # <ledger-dir> <id> <yq-expr> <expected> <label>
   if [[ "$got" == "$4" ]]; then pass "$5"; else fail "$5 — $2 $3 expected '$4' got '$got'"; fi
 }
 
+strip() { sed -r 's/\x1b\[[0-9;]*m//g'; }
+
+# The 1-based line of a node's box in a rendered graph, or "" when the node is
+# absent. Row order is layer order, so `line(child) > line(parent)` is how an
+# EDGE is asserted from the outside.
+graph_line() { # <id> <graph-text>
+  grep -nE "│ ${1//./\\.} +[^│]*│" <<<"$2" | head -1 | cut -d: -f1
+}
+graph_glyph() { # <id> <graph-text>
+  sed -rn "s/.*│ ${1//./\\.} +(.) │.*/\1/p" <<<"$2" | head -1
+}
+
 # ── Section 1: panel of one — the lone reviewer is the gate ──────────────────
 echo "--- panel 1: wiring shape ---"
 
@@ -65,6 +78,9 @@ export TASKPUMP_CODE_REPO="$A"
 "$CLI" create T1 --title "Impl task" --goal "It works." >/dev/null
 "$CLI" create T2 --title "Downstream" --blockers T1 >/dev/null
 "$CLI" create T3 --title "Independent" --goal "Also works." >/dev/null
+
+graph_pre=$(TASKPUMP_PUMP_STATE_FILE="$TMPDIR_TEST/no-such.state" \
+  "$RENDER" --phases T1..T3 --no-color 2>/dev/null | strip)
 
 out=$("$CLI" review T1)
 grep -q 'gate: T1.1' <<<"$out" && pass "review names the gate" \
@@ -84,6 +100,52 @@ assert_fm "$A/tasks" T1 '.review_max_rounds' "3" "--max-rounds defaults to 3"
 grep -q '## Review chain created' "$A/tasks/T1.md" \
   && pass "the implementation body records the chain" \
   || fail "no chain note appended to T1's body"
+
+# ── Section 1a: the gate is DRAWN — the renderer sees the rewired edges ──────
+echo
+echo "--- the gate in the graph ---"
+
+# Issue #12's acceptance is literally visual ("visible in tp monitor's GRAPH
+# tab, with previously-downstream tasks now blocked on the adjudicator"), and
+# the renderer is a SECOND reader of `blockers:` — a line-oriented awk parser,
+# not yq. Asserting the rewiring through yq alone missed a rewrite that emitted
+# a flow-style list: yq read two blockers, lib/dag-layout.awk read none, and
+# every gated task drew as a detached root carrying the *eligible* glyph while
+# the predicate correctly held it shut. Two readers must give one answer, so
+# the wiring is pinned from the outside, through the renderer, as edges.
+graph_post=$(TASKPUMP_PUMP_STATE_FILE="$TMPDIR_TEST/no-such.state" \
+  "$RENDER" --phases T1..T3 --no-color 2>/dev/null | strip)
+
+l1_pre=$(graph_line T1 "$graph_pre"); l2_pre=$(graph_line T2 "$graph_pre")
+[[ -n "$l1_pre" && -n "$l2_pre" && "$l1_pre" -lt "$l2_pre" ]] \
+  && pass "pre-review: T2 is drawn below its blocker T1" \
+  || fail "pre-review graph did not draw T1 -> T2 (T1=$l1_pre T2=$l2_pre):\n$graph_pre"
+
+l1=$(graph_line T1 "$graph_post")
+lg=$(graph_line T1.1 "$graph_post")
+l2=$(graph_line T2 "$graph_post")
+[[ -n "$l1" && -n "$lg" && -n "$l2" ]] \
+  && pass "post-review: implementation, gate and downstream are all drawn" \
+  || fail "post-review graph is missing a node (T1=$l1 T1.1=$lg T2=$l2):\n$graph_post"
+[[ -n "$lg" && -n "$l2" && "$lg" -lt "$l2" ]] \
+  && pass "EDGE T1.1 -> T2: downstream is drawn BELOW the gate, not as a detached root" \
+  || fail "the gate edge is not in the graph (T1.1=$lg T2=$l2):\n$graph_post"
+[[ -n "$l1" && -n "$lg" && "$l1" -lt "$lg" ]] \
+  && pass "EDGE T1 -> T1.1: the reviewer is drawn below the implementation" \
+  || fail "the reviewer edge is not in the graph (T1=$l1 T1.1=$lg):\n$graph_post"
+got=$(graph_glyph T2 "$graph_post")
+[[ "$got" == "◌" ]] \
+  && pass "and T2 carries the WAITING glyph — the renderer agrees with the eligibility predicate" \
+  || fail "T2 rendered glyph '$got', expected ◌ (◌=waiting, ○=eligible: an ○ here is the renderer disagreeing with the predicate)"
+got=$(graph_glyph T3 "$graph_post")
+[[ "$got" == "○" ]] && pass "an unrelated root still renders eligible" \
+  || fail "T3 rendered glyph '$got', expected ○"
+
+# The style is the mechanism, so pin it directly too: a future writer that
+# emits flow style passes every yq assertion above and still breaks the graph.
+grep -qE '^  - T1\.1$' "$A/tasks/T2.md" \
+  && pass "blockers are written as a BLOCK sequence (the only style the renderer parses)" \
+  || fail "T2's blockers are not block-style:\n$(sed -n '/^blockers:/,/^completed_by_commits:/p' "$A/tasks/T2.md")"
 
 # ── Section 1b: the frontier hides reviews; the drain count does not ─────────
 echo

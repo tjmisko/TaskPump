@@ -1365,8 +1365,7 @@ cmd_review() {
     done < <(yq --front-matter=extract '.blockers[]?' "$df" 2>/dev/null || true)
     (( seen )) && continue
     cur+=("$gate_id")
-    local json; json=$(printf '%s\n' "${cur[@]}" | jq -R . | jq -s -c .)
-    BLOCKERS="$json" yq -i --front-matter=process '.blockers = (strenv(BLOCKERS) | from_json)' "$df"
+    write_blockers "$df" "${cur[@]}"
   done
 
   # Round bookkeeping lives on the implementation task: one home for the
@@ -2300,6 +2299,36 @@ normalize_blockers() {
   return 0
 }
 
+# Write a task's `blockers:` list, in BLOCK sequence style.
+#
+# The style is not cosmetic. yq's default for a list built with `from_json` is
+# FLOW style (`blockers: ["T1", "T1.1"]`), and lib/dag-layout.awk — the DAG
+# renderer's parser, and the monitor's GRAPH tab through it — is line-oriented:
+# it reads `blockers:` followed by `  - id` lines and special-cases only the
+# empty `[]`. A flow-style list therefore parses as NO blockers at all, so the
+# task loses every DAG edge and draws as a detached root with the *eligible*
+# glyph while the eligibility predicate (which reads the same file through yq)
+# correctly holds it shut. Two readers, two answers, no diagnostic — the exact
+# silent-wrong-answer shape the ledger exists to prevent. Every writer of
+# `blockers:` goes through here so the two can never disagree again.
+# Empty arguments are dropped: `"${arr[@]-}"` on an empty array expands to one
+# empty string, and a blockers list holding "" would be a blocker naming no
+# task — unsatisfiable forever.
+# Usage: write_blockers <file> [id...]
+write_blockers() {
+  local file=$1; shift
+  local -a ids=() b
+  for b in "$@"; do [[ -n "$b" ]] && ids+=("$b"); done
+  if (( ${#ids[@]} == 0 )); then
+    fm_set "$file" '.blockers = []'
+    return 0
+  fi
+  local json; json=$(printf '%s\n' "${ids[@]}" | jq -R . | jq -s -c .)
+  BLOCKERS="$json" yq -i --front-matter=process \
+    '.blockers = (strenv(BLOCKERS) | from_json) | .blockers style="" | .blockers[] style=""' \
+    "$file"
+}
+
 cmd_title() {
   local id="" set_text="" do_set=0
   while (( $# )); do
@@ -2387,12 +2416,7 @@ cmd_blockers() {
   normalize_blockers "$id" "${next[@]-}"
   local -a cleaned=("${NORMALIZED_BLOCKERS[@]-}")
 
-  if (( ${#cleaned[@]} == 0 )); then
-    fm_set "$file" '.blockers = []'
-  else
-    local json; json=$(printf '%s\n' "${cleaned[@]}" | jq -R . | jq -s -c .)
-    BLOCKERS="$json" yq -i --front-matter=process '.blockers = (strenv(BLOCKERS) | from_json)' "$file"
-  fi
+  write_blockers "$file" "${cleaned[@]-}"
   git_commit_state "blockers: $mode $id"
   echo "blockers for $id: ${cleaned[*]-(none)}"
 }
