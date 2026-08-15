@@ -162,6 +162,39 @@ where it exists: `review_role` outside `reviewer|adjudicator` is a violation,
 `review_of` naming no task in the ledger is a violation (the verdict verb
 could never find the implementation), a review task reviewing itself is a
 violation, and the `review_round`/`review_max_rounds` counters must be
-integers. The conventions the verb establishes (a reviewer blocks on its
-subject) are *not* checked — fsck checks the contract, and a hand-imported
-chain wired differently fails loudly at `verdict` time, not silently.
+integers, and `review_role` present with no `review_of` is a violation (a
+review task with no subject is hidden from the frontier by §6 and `verdict`
+dies on it — open work nothing can dispatch and nothing can close).
+
+One graph shape is checked too, because it is the only one that makes the
+feature fail **open**: a task that blocks on an implementation under a live
+chain but not on that chain's gate goes eligible the moment the implementation
+completes, with the verdict unrendered and every other reader silent. The CLI
+cannot produce that shape — `review` wires it and the authoring blocker verbs
+carry the gate along (below) — but an import, a hand edit, or a deliberate
+`blockers --remove` of the gate can.
+
+The other conventions the verb establishes (a reviewer blocks on its subject)
+are *not* checked — fsck checks the contract, and a hand-imported chain wired
+differently fails loudly at `verdict` time, not silently.
+
+## The gate is not a snapshot
+
+`review`'s downstream rewiring runs once, over the tasks that name the
+implementation at chain-creation time. A long-horizon drain authors tasks as
+work is discovered, so that snapshot goes stale within minutes: a task filed
+afterwards with `--blockers <impl>` would be gated by nothing, eligible the
+moment the implementation completes. So `create --blockers` and
+`blockers --add`/`--set` carry the chain's gate along whenever the named
+blocker is an implementation whose gate is not yet `done`, and say so on
+stdout. Three cases deliberately get no rider: a blocker that is itself a
+review task (the chain's internal wiring), an owner that is a member of that
+blocker's chain (a reviewer blocks its subject by design — riding the gate
+onto it would build a cycle), and a chain whose verdict is already rendered
+(the edge would be inert). `--remove`/`--clear` stay subtractive, because an
+operator must be able to unwire a bad edge; fsck is the net under that case.
+
+The alternative — document the snapshot semantics and let fsck complain — was
+rejected as the primary answer. The feature's promise is that downstream of a
+reviewed task stays shut, and a promise that silently expires the instant the
+verb returns is worse than no promise, because the graph still *looks* gated.

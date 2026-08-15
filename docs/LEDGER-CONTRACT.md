@@ -418,6 +418,20 @@ One subject, one chain: a second `review` of the same task is refused, as is
 reviewing a review task. Reviewing already-`done` work is legal (the chain is
 simply eligible at once) and warns rather than refuses.
 
+That rewiring is a snapshot, so the **authoring** blocker verbs keep it true
+afterwards: `create --blockers` and `blockers --add`/`--set` carry the gate
+along whenever a named blocker is an implementation under a live chain (a chain
+whose gate is not yet `done`). Naming such an implementation as your blocker
+means what it meant at chain-creation time — otherwise a task filed after the
+chain exists would go eligible the moment the implementation completes, with
+the verdict unrendered. No rider is added when the blocker is itself a review
+task, when the owner is a member of that blocker's chain (a reviewer blocks its
+subject by design), or when the gate is already `done`. `--remove` and
+`--clear` are untouched — an operator must be able to undo a bad edge — and
+`fsck` is the net: a task blocking on an implementation under live review but
+not on its gate is a violation, because a review that fails open is not a
+review.
+
 `verdict <review-id> --approve [--findings -|"…"]` /
 `--request-changes --findings -|"…"` records the outcome. Every verdict
 requires the implementation to be `done` — `claim` checks status, not

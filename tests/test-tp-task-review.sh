@@ -275,6 +275,84 @@ out=$("$CLI" ready)
 grep -q 'T6\.1' <<<"$out" && pass "cascade 4: gate done — downstream is eligible" \
   || fail "cascade 4: downstream not eligible: $out"
 
+# ── Section 2b: the gate is not a one-shot snapshot ──────────────────────────
+echo
+echo "--- the gate rides along with blockers authored later ---"
+
+# `review` rewires the tasks that name the implementation AT CHAIN-CREATION
+# TIME. In a long-horizon drain, tasks are authored as work is discovered — so
+# without propagation a task filed five minutes later blocks on the
+# implementation alone and goes eligible the moment it completes, verdict
+# unrendered, nothing warning. The gate would look applied and not be, which is
+# the feature's central promise leaking out the back.
+F="$TMPDIR_TEST/f"
+mkdir -p "$F/tasks"
+export TASKPUMP_TASKS_DIR="$F/tasks"
+export TASKPUMP_TASK_OUT="$F/.next-task"
+export TASKPUMP_CODE_REPO="$F"
+
+"$CLI" create T20 --title "Impl under panel review" >/dev/null
+"$CLI" review T20 --panel 2 >/dev/null    # T20.1, T20.2 reviewers; T20.3 the gate
+
+out=$("$CLI" create T21.1 --title "Filed after the chain" --blockers T20)
+assert_fm "$F/tasks" T21.1 '.blockers | join(",")' "T20,T20.3" \
+  "create --blockers carries the live gate along"
+grep -q 'review gate' <<<"$out" && pass "and says so — the extra edge is never silent" \
+  || fail "create did not report the carried gate: '$out'"
+
+"$CLI" create T21.2 --title "Wired after the chain" >/dev/null
+out=$("$CLI" blockers T21.2 --add T20)
+assert_fm "$F/tasks" T21.2 '.blockers | join(",")' "T20,T20.3" \
+  "blockers --add carries the live gate along"
+grep -q 'review gate' <<<"$out" && pass "and says so too" \
+  || fail "blockers --add did not report the carried gate: '$out'"
+
+"$CLI" create T21.3 --title "Set after the chain" >/dev/null
+"$CLI" blockers T21.3 --set T20 >/dev/null
+assert_fm "$F/tasks" T21.3 '.blockers | join(",")' "T20,T20.3" \
+  "blockers --set carries it as well — the same authoring act"
+
+# Blocking on a review task itself is the chain's own internal wiring; riding
+# the gate onto it would be noise at best and a cycle at worst.
+"$CLI" create T21.4 --title "Blocks a panel reviewer" --blockers T20.1 >/dev/null
+assert_fm "$F/tasks" T21.4 '.blockers | join(",")' "T20.1" \
+  "blocking on a review task itself gets no rider"
+
+# The point of the propagation, through the predicate:
+"$CLI" complete T20 --commits eee5555 >/dev/null
+got=$("$CLI" ready --count-eligible)
+[[ "$got" == "0" ]] && pass "the implementation completing does NOT release the late-authored work" \
+  || fail "post-complete frontier got '$got', expected 0 (T21.1-3 must be gated)"
+TASKPUMP_TASKS_DIR="$F/tasks" "$CLI" fsck >/dev/null 2>&1 \
+  && pass "and the ledger is fsck-clean" || fail "fsck flagged the propagated wiring"
+
+# Subtractive forms stay subtractive — an operator rewiring by hand must be
+# able to undo a bad edge — but fsck is the net under exactly that case.
+"$CLI" blockers T21.3 --remove T20.3 >/dev/null
+assert_fm "$F/tasks" T21.3 '.blockers | join(",")' "T20" \
+  "blockers --remove does not re-add what it just removed"
+set +e
+out=$(TASKPUMP_TASKS_DIR="$F/tasks" "$CLI" fsck 2>/dev/null); rc=$?
+set -e
+[[ $rc -eq 3 ]] && pass "but fsck refuses a task that bypasses a live gate" \
+  || fail "fsck exited $rc on a bypassed gate, expected 3"
+grep -q "T21.3.md: blocks on 'T20'" <<<"$out" \
+  && pass "and names the task, the subject and the gate" \
+  || fail "fsck line was '$out'"
+"$CLI" blockers T21.3 --add T20.3 >/dev/null
+
+# Once the verdict is rendered the chain is spent: a later blocker on the
+# implementation gates nothing and gets no inert edge.
+"$CLI" verdict T20.1 --approve >/dev/null
+"$CLI" verdict T20.2 --approve >/dev/null
+"$CLI" verdict T20.3 --approve --findings "Sound." >/dev/null
+"$CLI" create T21.5 --title "Filed after the verdict" --blockers T20 >/dev/null
+assert_fm "$F/tasks" T21.5 '.blockers | join(",")' "T20" \
+  "a rendered chain adds no rider — the review already happened"
+out=$("$CLI" ready)
+grep -q 'T21\.1' <<<"$out" && pass "and the gated work is released by the verdict" \
+  || fail "T21.1 not eligible after the gate approved: $out"
+
 # ── Section 3: verdict guards ────────────────────────────────────────────────
 echo
 echo "--- verdict: guards ---"

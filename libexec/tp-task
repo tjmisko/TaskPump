@@ -1196,6 +1196,57 @@ review_chain_scan() {
   return 0
 }
 
+# Collect the review gates that must ride along with a set of blockers, into
+# REVIEW_GATE_RIDERS (a global, because review_chain_scan's results are globals
+# and a $(...) capture would lose them).
+#
+# `review` rewires downstream by snapshotting the tasks that name the
+# implementation AT CHAIN-CREATION TIME, and never revisits. In a long-horizon
+# drain, tasks are authored as work is discovered — so a task filed after the
+# chain exists would block on the implementation alone and become eligible the
+# moment it completes, with the verdict unrendered and nothing warning. The
+# gate would look applied and not be, which is the feature's central promise
+# leaking out the back. So the authoring verbs (`create --blockers`,
+# `blockers --add/--set`) carry the gate along: naming an implementation under
+# live review as your blocker means what it meant at chain-creation time.
+#
+# Three cases deliberately do NOT get a rider:
+#   * a blocker that is itself a review task — the chain's own internal wiring;
+#   * an owner that is a member of that blocker's chain — a reviewer blocks its
+#     subject by design, and riding the gate onto it would build a cycle;
+#   * a chain whose gate is already `done` — the review is rendered, so the
+#     edge would be inert. (Reopening the subject re-arms the chain, §5.7, at
+#     which point new blockers gate again.)
+# Subtractive forms (`--remove`, `--clear`) are untouched: they are an operator
+# explicitly rewiring, and re-adding what they just removed would make a bad
+# edge unfixable. `fsck` is the net under that case.
+# Usage: review_gate_riders <owner-id> <blocker-id>...
+review_gate_riders() {
+  local owner=$1; shift
+  REVIEW_GATE_RIDERS=()
+  local ownerfile b bfile gate gfile e seen
+  ownerfile=$(task_file "$owner" || true)
+  for b in "$@"; do
+    [[ -z "$b" ]] && continue
+    bfile=$(task_file "$b" || true)
+    [[ -z "$bfile" ]] && continue
+    [[ -n "$(fm_get "$bfile" '.review_role')" ]] && continue
+    [[ -n "$(fm_get "$bfile" '.review_round')" ]] || continue
+    review_chain_scan "$b"
+    gate="$REVIEW_GATE_ID"
+    [[ -z "$gate" || "$gate" == "$owner" ]] && continue
+    [[ -n "$ownerfile" && "$(fm_get "$ownerfile" '.review_of')" == "$b" ]] && continue
+    gfile=$(task_file "$gate" || true)
+    [[ -z "$gfile" ]] && continue
+    [[ "$(fm_get "$gfile" '.status')" == "done" ]] && continue
+    seen=0
+    for e in "$@"; do [[ "$e" == "$gate" ]] && seen=1; done
+    for e in "${REVIEW_GATE_RIDERS[@]-}"; do [[ "$e" == "$gate" ]] && seen=1; done
+    (( seen )) || REVIEW_GATE_RIDERS+=("$gate")
+  done
+  return 0
+}
+
 # Re-arm one review-chain member back to `open`, shedding every marker a
 # completed (or parked) review left behind. Shared by the two paths that
 # re-arm a chain — a change-request verdict and a `reopen` of the subject — so
@@ -2081,12 +2132,25 @@ fsck_check_file() {
   blockers=$(jq -r 'if (.blockers | type) == "array" then .blockers[] | select(type == "string") else empty end' <<<"$fm_json")
   [[ -n "$blockers" ]] && FSCK_ADJ[$stem]=$blockers
 
-  # Review-chain fact for the whole-ledger pass: `verdict` resolves the
+  # Review-chain facts for the whole-ledger pass: `verdict` resolves the
   # implementation through review_of by name, so a dangling one is a chain
   # whose verdict can never land — and nothing per-file will ever say so.
-  local review_of
+  # Status and role ride along for the gate-coverage check below.
+  local review_of review_role status
   review_of=$(jq -r 'if (.review_of | type) == "string" then .review_of else "" end' <<<"$fm_json")
+  review_role=$(jq -r 'if (.review_role | type) == "string" then .review_role else "" end' <<<"$fm_json")
+  status=$(jq -r 'if (.status | type) == "string" then .status else "" end' <<<"$fm_json")
   [[ -n "$review_of" ]] && FSCK_REVIEW_OF[$stem]=$review_of
+  [[ -n "$review_role" ]] && FSCK_ROLE[$stem]=$review_role
+  [[ -n "$status" ]] && FSCK_STATUS[$stem]=$status
+
+  # review_role is what makes a task a review task (§5.12), and every verb that
+  # acts on one resolves its subject through review_of. A role with no subject
+  # is a task the frontier hides (§6) and `verdict` refuses outright — open
+  # work that nothing can dispatch and nothing can close, with no diagnostic
+  # until someone runs the verb by hand.
+  [[ -n "$review_role" && -z "$review_of" ]] \
+    && FSCK_VIOLATIONS+=("$file: review_role '$review_role' with no review_of (a review task with no subject: hidden from the frontier, and 'verdict' dies on it)")
   return 0
 }
 
@@ -2094,7 +2158,7 @@ fsck_check_file() {
 # Each is a way a task leaves the frontier forever with no diagnostic from any
 # per-file read — the eligibility predicate (§6) just keeps answering "not yet".
 fsck_graph_check() {
-  local stem b cyc
+  local stem b cyc e
   local -a stems_sorted=()
   if (( ${#FSCK_STEMS[@]} > 0 )); then
     while IFS= read -r stem; do stems_sorted+=("$stem"); done \
@@ -2124,6 +2188,54 @@ fsck_graph_check() {
     elif [[ -z "${FSCK_STEMS[$b]:-}" ]]; then
       FSCK_VIOLATIONS+=("$TASKPUMP_TASKS_DIR/$stem.md: review_of '$b' names no task in this ledger (the verdict verb has no implementation to act on)")
     fi
+  done
+
+  # Gate coverage: a task that blocks on an implementation under LIVE review
+  # must also block on that chain's gate. `review` wires this for everything
+  # downstream at chain-creation time and the authoring verbs carry the gate
+  # along afterwards (review_gate_riders), so the CLI cannot produce this
+  # shape — but an imported ledger, a hand edit, or a deliberate
+  # `blockers --remove` of the gate can, and the result is the feature failing
+  # OPEN: the task goes eligible the moment the implementation completes, with
+  # the verdict unrendered and every other reader silent. A review that fails
+  # open is not a review, so it is a violation, not a warning.
+  local -A FSCK_GATE_OF=() FSCK_CHAIN_ADJ=() FSCK_CHAIN_N=() FSCK_CHAIN_ONE=()
+  local impl
+  for stem in "${stems_sorted[@]-}"; do
+    impl="${FSCK_REVIEW_OF[$stem]:-}"
+    [[ -z "$impl" ]] && continue
+    FSCK_CHAIN_N[$impl]=$(( ${FSCK_CHAIN_N[$impl]:-0} + 1 ))
+    FSCK_CHAIN_ONE[$impl]=$stem
+    [[ "${FSCK_ROLE[$stem]:-}" == "adjudicator" ]] && FSCK_CHAIN_ADJ[$impl]=$stem
+  done
+  for impl in "${!FSCK_CHAIN_N[@]}"; do
+    # The gate is the adjudicator, or the lone reviewer. A panel with no
+    # adjudicator has no gate — hand-built, and nothing to check against.
+    if [[ -n "${FSCK_CHAIN_ADJ[$impl]:-}" ]]; then
+      FSCK_GATE_OF[$impl]="${FSCK_CHAIN_ADJ[$impl]}"
+    elif (( ${FSCK_CHAIN_N[$impl]} == 1 )); then
+      FSCK_GATE_OF[$impl]="${FSCK_CHAIN_ONE[$impl]}"
+    fi
+  done
+  local gate has_gate
+  for stem in "${stems_sorted[@]-}"; do
+    [[ -n "${FSCK_ADJ[$stem]:-}" ]] || continue
+    while IFS= read -r b; do
+      [[ -z "$b" ]] && continue
+      gate="${FSCK_GATE_OF[$b]:-}"
+      [[ -z "$gate" || "$gate" == "$stem" ]] && continue
+      # A chain member blocks on its own subject by design (§5.12).
+      [[ "${FSCK_REVIEW_OF[$stem]:-}" == "$b" ]] && continue
+      # A rendered verdict has already gated this edge; only a live chain can
+      # still be bypassed. (Reopening the subject re-arms the chain, §5.7.)
+      [[ "${FSCK_STATUS[$gate]:-}" == "done" ]] && continue
+      has_gate=0
+      while IFS= read -r e; do
+        [[ "$e" == "$gate" ]] && { has_gate=1; break; }
+      done <<<"${FSCK_ADJ[$stem]}"
+      (( has_gate )) && continue
+      FSCK_VIOLATIONS+=("$TASKPUMP_TASKS_DIR/$stem.md: blocks on '$b', which is under live review, but not on that chain's gate '$gate' (the review fails open: this task goes eligible the moment '$b' completes, verdict unrendered)")
+    done <<<"${FSCK_ADJ[$stem]}"
   done
 
   # Cycle detection: depth-first walk over the blocker edges, sorted start
@@ -2245,6 +2357,7 @@ cmd_fsck() {
   # what the exit code answers for) is what REMAINS wrong.
   local -a FSCK_VIOLATIONS=() FSCK_PATH=() FSCK_CYCLES=()
   local -A FSCK_STEMS=() FSCK_ADJ=() FSCK_COLOR=() FSCK_REVIEW_OF=()
+  local -A FSCK_ROLE=() FSCK_STATUS=()
   local file
   while IFS= read -r file; do
     [[ -z "$file" ]] && continue
@@ -2468,9 +2581,23 @@ cmd_blockers() {
   normalize_blockers "$id" "${next[@]-}"
   local -a cleaned=("${NORMALIZED_BLOCKERS[@]-}")
 
+  # The authoring forms carry live review gates along; the subtractive ones do
+  # not (see review_gate_riders).
+  local riders=""
+  if [[ "$mode" == "add" || "$mode" == "set" ]]; then
+    review_gate_riders "$id" "${cleaned[@]-}"
+    if (( ${#REVIEW_GATE_RIDERS[@]} > 0 )); then
+      cleaned+=("${REVIEW_GATE_RIDERS[@]}")
+      riders="${REVIEW_GATE_RIDERS[*]}"
+    fi
+  fi
+
   write_blockers "$file" "${cleaned[@]-}"
   git_commit_state "blockers: $mode $id"
   echo "blockers for $id: ${cleaned[*]-(none)}"
+  [[ -n "$riders" ]] \
+    && echo "review gate(s) carried along (the named blocker is under live review): $riders"
+  return 0
 }
 
 # Create a new task file. Exists so that filing work never requires hand-authoring
@@ -2512,11 +2639,19 @@ cmd_create() {
   [[ -n "$(task_file "$id")" ]] && die "task already exists: $id"
 
   local -a blist=()
+  local riders=""
   if [[ -n "$blockers" ]]; then
     local -a raw=()
     IFS=',' read -r -a raw <<<"$blockers"
     normalize_blockers "$id" "${raw[@]-}"
     blist=("${NORMALIZED_BLOCKERS[@]-}")
+    # A task filed AFTER a review chain exists is invisible to that chain's
+    # one-shot downstream snapshot, so the gate rides along here instead.
+    review_gate_riders "$id" "${blist[@]-}"
+    if (( ${#REVIEW_GATE_RIDERS[@]} > 0 )); then
+      blist+=("${REVIEW_GATE_RIDERS[@]}")
+      riders="${REVIEW_GATE_RIDERS[*]}"
+    fi
   fi
 
   local b
@@ -2571,6 +2706,9 @@ cmd_create() {
 
   git_commit_state "create $id"
   echo "created $id at $file"
+  [[ -n "$riders" ]] \
+    && echo "review gate(s) carried along (the named blocker is under live review): $riders"
+  return 0
 }
 
 cmd_resolve() {

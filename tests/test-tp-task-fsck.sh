@@ -110,6 +110,25 @@ full_task "$BAD/T21.md" T21 open '[T1]'
 sed -i 's/^resume_head_sha: null$/resume_head_sha: null\nreview_of: T1\nreview_role: reviewer\nreview_prompt: null/' "$BAD/T21.md"
 full_task "$BAD/T22.md" T22
 sed -i 's/^resume_head_sha: null$/resume_head_sha: null\nreview_of: T22\nreview_role: adjudicator/' "$BAD/T22.md"
+# T23: review_role with review_of absent. `review_role` is what makes a task a
+# review task — the frontier hides it (§6) and every verb that acts on one
+# resolves its subject through review_of, so this is open work nothing can
+# dispatch and `verdict` dies on. fsck accepted it until the shapes below were
+# added, which is the same silent class as a dangling review_of.
+full_task "$BAD/T23.md" T23
+sed -i 's/^resume_head_sha: null$/resume_head_sha: null\nreview_role: reviewer/' "$BAD/T23.md"
+# T24 + T24.1 + T25: the review that fails OPEN. T24 is an implementation under
+# a live one-reviewer chain (T24.1 is the gate); T25 blocks on the
+# implementation but not on the gate, so it goes eligible the moment T24
+# completes with the verdict unrendered. `review` wires this correctly and the
+# authoring verbs carry the gate along, but an imported ledger, a hand edit, or
+# a `blockers --remove` of the gate produces it — and every other reader is
+# silent about it.
+full_task "$BAD/T24.md" T24 done
+sed -i 's/^resume_head_sha: null$/resume_head_sha: null\nreview_round: 1\nreview_max_rounds: 3/' "$BAD/T24.md"
+full_task "$BAD/T24.1.md" T24.1 open '[T24]'
+sed -i 's/^resume_head_sha: null$/resume_head_sha: null\nreview_of: T24\nreview_role: reviewer/' "$BAD/T24.1.md"
+full_task "$BAD/T25.md" T25 open '[T24]'
 
 set +e
 out=$(TASKPUMP_TASKS_DIR="$BAD" "$CLI" fsck 2>/dev/null)
@@ -138,6 +157,12 @@ expect_line "T18.md: review_role 'judge' is not in the role vocabulary" "a role 
 expect_line "T19.md: review_of 'T77' names no task" "a dangling review_of is named"
 expect_line "T20.md: review_round: expected an integer or null" "a non-integer review round is named"
 expect_line "T22.md: review_of names the task itself" "a self-review is named"
+expect_line "T23.md: review_role 'reviewer' with no review_of" "a review task with no subject is named"
+expect_line "T25.md: blocks on 'T24', which is under live review, but not on that chain's gate 'T24.1'" \
+  "a task that bypasses a live review gate is named (the review would fail open)"
+grep -q 'T24\.1\.md: blocks' <<<"$out" \
+  && fail "the chain's own reviewer was reported as bypassing its gate" \
+  || pass "a chain member blocking on its own subject is not a bypass"
 
 # The cycle: one line, all three members, anchored deterministically.
 cycle_lines=$(grep -c 'blocker cycle' <<<"$out" || true)
@@ -163,9 +188,12 @@ echo "--- clean ledger ---"
 CLEAN="$TMPDIR_TEST/clean/tasks"
 mkdir -p "$CLEAN"
 full_task "$CLEAN/T1.md" T1 "done"
-full_task "$CLEAN/T2.1.md" T2.1 open '[T1]'
 # A full review chain in flight: the round counters on the implementation and
-# a reviewer gating a downstream task are contract-clean, not violations.
+# a reviewer gating a downstream task are contract-clean, not violations. The
+# downstream task blocks on BOTH the implementation and the gate — that is the
+# shape `review` writes, and blocking on the implementation alone is itself a
+# violation now (the review would fail open; see the bad ledger above).
+full_task "$CLEAN/T2.1.md" T2.1 open '[T1, T1.1]'
 sed -i 's/^resume_head_sha: null$/resume_head_sha: null\nreview_round: 1\nreview_max_rounds: 3/' "$CLEAN/T1.md"
 full_task "$CLEAN/T1.1.md" T1.1 open '[T1]'
 sed -i 's|^resume_head_sha: null$|resume_head_sha: null\nreview_of: T1\nreview_role: reviewer\nreview_prompt: prompts/security.md|' "$CLEAN/T1.1.md"
