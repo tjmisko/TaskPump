@@ -18,6 +18,7 @@
 #   7. deadlock        — nothing live/launchable/resumable still exits 3, loudly
 #   8. phase grain     — untouched: same range, same plan, phases not tasks
 #   9. integration     — a quarantined MERGE never un-completes the WORK
+#  10. range coverage  — every phase in the range contributes its tasks
 #
 # Hermetic throughout: a throwaway ledger, a throwaway git repo, a stub runner
 # and a stub container runtime. Nothing here touches a real ledger or a real
@@ -623,6 +624,53 @@ have "$out" 'quarantine G3\.4: conflict' && pass "an open task's conflicting mer
   || fail "no quarantine for G3.4:\n$out"
 have "$out" 'G3\.4 → needs-review' && pass "and unfinished work IS flagged needs-review" \
   || fail "open task not flagged:\n$out"
+
+# ── 10. Range coverage: every phase in the range contributes its tasks ────────
+# Every section above ran a single-phase range, and that is exactly where this
+# defect hid. The unit list is built by scanning the ledger once per phase, and
+# an id belonging to a DIFFERENT phase is the normal case in that scan — but the
+# per-id guard was a trailing AND-list, so under `set -e` + `pipefail` the first
+# non-matching id ended the scan, killed the enclosing function, and the process
+# substitution the planner reads swallowed the non-zero exit. A multi-phase
+# range planned its first phase and silently dropped the rest, while the open
+# count printed beside it still counted them all. Found smoke-testing a real
+# consumer whose every task is its own phase (2026-08-14).
+echo "--- 10. a multi-phase range plans every phase's tasks, not just the first ---"
+rm -f "$TASKS"/*.md
+mk G1.1 open "" "a.txt"
+mk G2.1 open "" "b.txt"
+mk G3.1 open "" "c.txt"
+out=$(tpump G1..G3)
+have "$out" 'LAUNCH   G1\.1' && pass "the first phase's task is planned" || fail "G1.1 missing:\n$out"
+have "$out" 'LAUNCH   G2\.1' && pass "the second phase's task is planned too" || fail "G2.1 missing:\n$out"
+have "$out" 'LAUNCH   G3\.1' && pass "and so is the last phase's" || fail "G3.1 missing:\n$out"
+have "$out" 'frontier: 3 launchable' && pass "all three count as launchable" || fail "wrong count:\n$out"
+
+echo "--- 10b. and every unit in range is classified, launchable or not ---"
+# The tally is the operator's only cross-check on the plan: a unit missing from
+# it is a unit nobody is told about. Held and blocked units in LATER phases are
+# where the drop was invisible, because neither prints a LAUNCH line anyway.
+rm -f "$TASKS"/*.md
+mk G1.1 open ""     "a.txt"
+mk G2.1 open G1.1   "b.txt"
+mk G3.1 open ""     ""
+out=$(tpump G1..G3)
+have "$out" 'WAITING  G2\.1 +\(blockers pending: G1\.1\)' \
+  && pass "a blocked task in a later phase still says what it waits on" || fail "G2.1 not WAITING:\n$out"
+have "$out" 'WAITING  G3\.1 +\(files: empty — exclusive' \
+  && pass "a held task in a later phase still names its holder" || fail "G3.1 not WAITING:\n$out"
+have "$out" 'frontier: 1 launchable, 0 running, 0 resumable, 2 waiting \| open tasks in range: 3' \
+  && pass "the tally accounts for every open task in the range" || fail "tally does not add up:\n$out"
+
+echo "--- 10c. a finished first phase does not end the range ---"
+# The operational shape of the bug: a drain that had finished its first phase
+# planned nothing at all, and hit the deadlock detector with open work in range.
+rm -f "$TASKS"/*.md
+mk G1.1 done "" "a.txt"
+mk G2.1 open "" "b.txt"
+out=$(tpump G1..G3)
+have "$out" 'LAUNCH   G2\.1' && pass "work behind a completed phase is still dispatched" || fail "G2.1 not LAUNCH:\n$out"
+have "$out" 'frontier: 1 launchable' && pass "and the range is not mistaken for stalled" || fail "wrong count:\n$out"
 
 echo
 echo "=============================================="
