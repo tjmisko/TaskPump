@@ -915,6 +915,19 @@ cmd_complete() {
   [[ -z "$id" ]] && die "usage: $TASKPUMP_PROG_NAME complete <id> [--commits <sha,sha>] [--defer-wiring \"note\"]"
   local file; file=$(task_file_required "$id")
 
+  # A review task closes through `verdict`, never through `complete`. Both
+  # write the same `done`, but every guard that makes the verdict mean
+  # something lives in `verdict`: that the subject is still `done` (not
+  # reopened under the reviewer's feet), that an adjudicator does not rule
+  # before its panel reported, and that a change-request goes to the
+  # implementation instead. `complete` on a gate task therefore hands
+  # downstream a green light with the panel still open and no ruling recorded
+  # anywhere — a review that never happened, indistinguishable in the ledger
+  # from one that did.
+  local review_role; review_role=$(fm_get "$file" '.review_role')
+  [[ -n "$review_role" ]] \
+    && die "cannot complete $id: it is a $review_role task, and a review closes by rendering its verdict — '$TASKPUMP_PROG_NAME verdict $id --approve [--findings -]' (complete would skip every guard: the panel, the subject's status, and the change-request path)"
+
   local now; now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   # Build JSON array of commits.
   local commits_json
@@ -1519,18 +1532,20 @@ cmd_review() {
 # refused with a pointer to the adjudicator, because a panel where any
 # member can reopen the work is a panel whose verdict nobody rendered.
 cmd_verdict() {
-  local rid="" approve=0 request=0 findings=""
+  local rid="" approve=0 request=0 findings="" branch=""
   while (( $# )); do
     case $1 in
       --approve) approve=1; shift;;
       --request-changes) request=1; shift;;
       --findings) findings=$2; shift 2;;
       --findings=*) findings=${1#--findings=}; shift;;
+      --branch) branch=$2; shift 2;;
+      --branch=*) branch=${1#--branch=}; shift;;
       -*) die "unknown flag to verdict: $1";;
       *) [[ -z "$rid" ]] && rid=$1 || die "too many positional args to verdict"; shift;;
     esac
   done
-  [[ -z "$rid" ]] && die "usage: $TASKPUMP_PROG_NAME verdict <review-id> --approve [--findings -|\"...\"]  |  --request-changes --findings -|\"...\""
+  [[ -z "$rid" ]] && die "usage: $TASKPUMP_PROG_NAME verdict <review-id> [--branch <b>] --approve [--findings -|\"...\"]  |  --request-changes --findings -|\"...\""
   (( approve + request == 1 )) \
     || die "verdict requires exactly one of --approve or --request-changes"
 
@@ -1541,6 +1556,27 @@ cmd_verdict() {
   local rstatus; rstatus=$(fm_get "$rfile" '.status')
   [[ "$rstatus" == "done" ]] \
     && die "a verdict is already recorded for $rid (status=done); reopen it to re-review"
+
+  # Ownership. A claimed review belongs to its claimant: ruling over another
+  # branch's live claim is a bystander overwriting a reviewer's work in
+  # progress, and it is what makes the self-review exclusion (§6's frontier
+  # skip) advisory — the implementer's own session could rule on the review of
+  # its own work while a real reviewer holds the claim. Refused on the same
+  # rule `claim` applies: same branch fine, different branch never.
+  #
+  # An UNCLAIMED review warns rather than refusing. Requiring in_progress (as
+  # `release` does) would make `verdict` stricter than `complete`, its closest
+  # sibling — and §5.12's door out of a rounds-exhausted park is explicitly a
+  # human rendering the final call, which no dispatcher is around to claim for.
+  local claimed_by; claimed_by=$(fm_get "$rfile" '.claimed_by')
+  if [[ -n "$claimed_by" ]]; then
+    [[ -z "$branch" ]] \
+      && die "$rid is claimed by '$claimed_by'; pass --branch to say who is ruling (a verdict over another branch's live claim overwrites a reviewer mid-read)"
+    [[ "$branch" != "$claimed_by" ]] \
+      && die "cannot render a verdict on $rid from '$branch': it is claimed by '$claimed_by' (one claim, one ruling — release or reopen it first)"
+  else
+    warn "rendering a verdict on an unclaimed review ($rid, status=$rstatus): nothing records who ruled, and the self-review exclusion is only advisory without a claim"
+  fi
 
   local impl_id; impl_id=$(fm_get "$rfile" '.review_of')
   [[ -z "$impl_id" ]] \

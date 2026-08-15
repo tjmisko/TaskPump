@@ -257,20 +257,22 @@ got=$("$CLI" ready --count-eligible)
 [[ "$got" == "0" ]] && pass "cascade 1: and none of them is on the default frontier" \
   || fail "cascade 1 default frontier got '$got', expected 0"
 
-"$CLI" complete T5.2 >/dev/null
-"$CLI" complete T5.3 >/dev/null
+# Reviews close by rendering their verdict — `complete` is refused on them
+# (it would skip every guard), so the cascade is driven by the real verb.
+"$CLI" verdict T5.2 --approve >/dev/null
+"$CLI" verdict T5.3 --approve >/dev/null
 got=$("$CLI" ready --count-eligible --include-reviews)
 [[ "$got" == "1" ]] && pass "cascade 2: two reviewers done — adjudicator still waits on the third" \
   || fail "cascade 2 got '$got', expected 1"
 
-"$CLI" complete T5.4 >/dev/null
+"$CLI" verdict T5.4 --approve >/dev/null
 out=$("$CLI" ready --include-reviews)
 grep -q 'T5\.5' <<<"$out" && pass "cascade 3: all reviewers done — the adjudicator is eligible" \
   || fail "cascade 3: adjudicator not eligible: $out"
 grep -q 'T6\.1' <<<"$out" && fail "cascade 3: downstream leaked past the gate" \
   || pass "cascade 3: downstream still gated"
 
-"$CLI" complete T5.5 >/dev/null
+"$CLI" verdict T5.5 --approve >/dev/null
 out=$("$CLI" ready)
 grep -q 'T6\.1' <<<"$out" && pass "cascade 4: gate done — downstream is eligible" \
   || fail "cascade 4: downstream not eligible: $out"
@@ -343,9 +345,17 @@ grep -q "T21.3.md: blocks on 'T20'" <<<"$out" \
 
 # Once the verdict is rendered the chain is spent: a later blocker on the
 # implementation gates nothing and gets no inert edge.
-"$CLI" verdict T20.1 --approve >/dev/null
-"$CLI" verdict T20.2 --approve >/dev/null
-"$CLI" verdict T20.3 --approve --findings "Sound." >/dev/null
+# An UNCLAIMED review still rules, but says so: requiring in_progress would
+# make verdict stricter than `complete`, and §5.12's door out of a
+# rounds-exhausted park is a human ruling by hand with no dispatcher around to
+# claim for them. The warning is what keeps that honest — nothing records who
+# ruled.
+err=$("$CLI" verdict T20.1 --approve 2>&1 >/dev/null)
+assert_fm "$F/tasks" T20.1 '.status' "done" "a verdict on an unclaimed review is allowed"
+grep -q 'unclaimed' <<<"$err" && pass "and warns that nothing records who ruled" \
+  || fail "no unclaimed-review warning: '$err'"
+"$CLI" verdict T20.2 --approve >/dev/null 2>&1
+"$CLI" verdict T20.3 --approve --findings "Sound." >/dev/null 2>&1
 "$CLI" create T21.5 --title "Filed after the verdict" --blockers T20 >/dev/null
 assert_fm "$F/tasks" T21.5 '.blockers | join(",")' "T20" \
   "a rendered chain adds no rider — the review already happened"
@@ -361,6 +371,21 @@ echo "--- verdict: guards ---"
 export TASKPUMP_TASKS_DIR="$A/tasks"
 export TASKPUMP_TASK_OUT="$A/.next-task"
 export TASKPUMP_CODE_REPO="$A"
+
+# `complete` is the door around every one of those guards: both verbs write
+# the same `done`, but only `verdict` checks that the subject is still done,
+# that an adjudicator's panel has reported, and that a change-request reaches
+# the implementation. Completing a gate hands downstream a green light with no
+# ruling recorded anywhere — a review that never happened, indistinguishable
+# in the ledger from one that did.
+set +e
+out=$("$CLI" complete T1.1 2>&1); rc=$?
+set -e
+[[ $rc -ne 0 ]] && pass "complete on a review task is refused" \
+  || fail "complete on a review task exited 0 — the verdict guards are bypassable"
+grep -q 'verdict T1.1' <<<"$out" && pass "and the refusal points at the verdict verb" \
+  || fail "refusal did not name verdict: '$out'"
+assert_fm "$A/tasks" T1.1 '.status' "open" "the refused complete wrote nothing"
 
 set +e
 "$CLI" verdict T3 --approve >/dev/null 2>&1 && fail "verdict on a plain task was accepted" \
@@ -394,7 +419,27 @@ echo
 echo "--- verdict: the change-request loop ---"
 
 "$CLI" claim T1.1 --branch review/t1 --turns 5 >/dev/null
-"$CLI" verdict T1.1 --request-changes --findings - <<< "The parser drops the last line." >/dev/null
+
+# Ownership: a claimed review belongs to its claimant. Ruling over another
+# branch's live claim overwrites a reviewer mid-read, and it is what leaves the
+# self-review exclusion advisory — the implementer's own session could rule on
+# the review of its own work while the real reviewer holds the claim. Same rule
+# `claim` applies: same branch fine, different branch never.
+set +e
+out=$("$CLI" verdict T1.1 --approve --branch feat/impl 2>&1); rc=$?
+set -e
+[[ $rc -ne 0 ]] && pass "a verdict from a foreign branch on a claimed review is refused" \
+  || fail "foreign-branch verdict exited 0"
+grep -q 'review/t1' <<<"$out" && pass "and the refusal names the claimant" \
+  || fail "refusal did not name the claim: '$out'"
+set +e
+out=$("$CLI" verdict T1.1 --approve 2>&1); rc=$?
+set -e
+[[ $rc -ne 0 ]] && pass "and so is a verdict that will not say who is ruling" \
+  || fail "branchless verdict on a claimed review exited 0"
+assert_fm "$A/tasks" T1.1 '.status' "in_progress" "neither refusal wrote anything"
+
+"$CLI" verdict T1.1 --branch review/t1 --request-changes --findings - <<< "The parser drops the last line." >/dev/null
 
 assert_fm "$A/tasks" T1 '.status' "open" "request-changes reopens the implementation"
 assert_fm "$A/tasks" T1 '.review_round' "2" "and advances the round"
@@ -607,7 +652,7 @@ got=$(fm "$H/tasks" T1.1 '.last_heartbeat_ts')
 [[ "$got" != "null" && -n "$got" ]] && pass "and liveness is still stamped for the staleness tripwire" \
   || fail "last_heartbeat_ts was '$got'"
 
-"$CLI" verdict T1.1 --approve --findings "Read it three times; it is sound." >/dev/null
+"$CLI" verdict T1.1 --branch review/t1 --approve --findings "Read it three times; it is sound." >/dev/null
 assert_fm "$H/tasks" T1.1 '.status' "done" "the verdict is the productive terminal act"
 
 # ── Section 7: every mutation is one auditable ledger commit ─────────────────

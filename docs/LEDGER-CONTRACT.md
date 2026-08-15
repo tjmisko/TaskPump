@@ -303,6 +303,12 @@ heartbeat staleness (§5.10).
 `* → done`. Records the commits and `completed_at`, releases the claim, and
 appends completion notes read from stdin when stdin is not a terminal.
 
+Refused on a **review task** (`review_role` present, §5.12): a review closes by
+rendering its verdict. Both verbs write the same `done`, but every guard that
+makes the verdict mean something lives in `verdict`, so completing a gate task
+would hand downstream a green light with the panel still open and no ruling
+recorded anywhere.
+
 `--defer-wiring` additionally sets `wiring_deferred`. It is the sanctioned way to
 say "the primitive landed and its tests pass, but nothing calls it at runtime
 yet" — visible and collectable rather than silently overstated.
@@ -432,12 +438,17 @@ subject by design), or when the gate is already `done`. `--remove` and
 not on its gate is a violation, because a review that fails open is not a
 review.
 
-`verdict <review-id> --approve [--findings -|"…"]` /
+`verdict <review-id> [--branch <b>] --approve [--findings -|"…"]` /
 `--request-changes --findings -|"…"` records the outcome. Every verdict
 requires the implementation to be `done` — `claim` checks status, not
 blockers, so this guard is what refuses a ruling on unfinished or reopened
 work. An adjudicator's verdict is refused while any of its reviewers has not
-reported. Then:
+reported. A **claimed** review belongs to its claimant: `--branch` must be
+given and must match `claimed_by`, on the same rule `claim` applies (same
+branch fine, different branch never). An **unclaimed** review still rules, with
+a warning — nothing records who ruled, and requiring `in_progress` would make
+`verdict` stricter than `complete` and put a claim between a human and the
+final call this section's round bound sends them. Then:
 
 - **Approve** completes the review task (`* → done`, exactly as `complete`),
   findings appended to its own body. A panel reviewer's approve *is* its

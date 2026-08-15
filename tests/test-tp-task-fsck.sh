@@ -124,7 +124,7 @@ sed -i 's/^resume_head_sha: null$/resume_head_sha: null\nreview_role: reviewer/'
 # authoring verbs carry the gate along, but an imported ledger, a hand edit, or
 # a `blockers --remove` of the gate produces it — and every other reader is
 # silent about it.
-full_task "$BAD/T24.md" T24 done
+full_task "$BAD/T24.md" T24 "done"
 sed -i 's/^resume_head_sha: null$/resume_head_sha: null\nreview_round: 1\nreview_max_rounds: 3/' "$BAD/T24.md"
 full_task "$BAD/T24.1.md" T24.1 open '[T24]'
 sed -i 's/^resume_head_sha: null$/resume_head_sha: null\nreview_of: T24\nreview_role: reviewer/' "$BAD/T24.1.md"
