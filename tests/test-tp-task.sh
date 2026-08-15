@@ -1059,10 +1059,24 @@ got=$(vcli blockers F90.2 | tr '\n' ',')
 [[ "$got" == "F90.1,F90.3," ]] && pass "blockers --set replaces the list" \
   || fail "blockers --set produced '$got'"
 
+# Style is load-bearing, not cosmetic: lib/dag-layout.awk (the DAG renderer and
+# the monitor's GRAPH tab) parses `blockers:` as a BLOCK sequence and
+# special-cases only the empty `[]`. yq's natural output for a list rebuilt
+# from JSON is FLOW style, which that parser reads as no blockers at all — so
+# the task loses every edge and draws as a detached root with the *eligible*
+# glyph while yq-based eligibility correctly holds it shut. Read-back through
+# yq (every assertion above) cannot see the difference.
+grep -qE '^  - F90\.1$' "$VERB_TASKS/F90.2.md" \
+  && pass "blockers --set writes a BLOCK sequence (the only style the DAG renderer parses)" \
+  || fail "blockers --set wrote a non-block style:\n$(grep -A3 '^blockers:' "$VERB_TASKS/F90.2.md")"
+
 vcli blockers F90.2 --clear >/dev/null
 got=$(vcli blockers F90.2)
 [[ -z "$got" ]] && pass "blockers --clear empties the list" \
   || fail "blockers --clear left '$got'"
+grep -qE '^blockers: \[\]$' "$VERB_TASKS/F90.2.md" \
+  && pass "and --clear writes the empty flow form the renderer special-cases" \
+  || fail "blockers --clear wrote an unparseable empty list:\n$(grep -A3 '^blockers:' "$VERB_TASKS/F90.2.md")"
 
 # The whole point of validating: a typo'd blocker silently removes a task from
 # the frontier forever, with no diagnostic anywhere.

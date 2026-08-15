@@ -95,6 +95,40 @@ sed -i 's/^resume_attempts: 0$/resume_attempts: three/' "$BAD/T14.md"
 # T17: clean, plus a namespaced extension key — §3 says unknown keys pass.
 full_task "$BAD/T17.md" T17
 sed -i 's/^resume_head_sha: null$/resume_head_sha: null\nx_myteam_note: extension keys are legal/' "$BAD/T17.md"
+# The review surface (§3 "Review", all verb-added). T18: a role outside the
+# vocabulary. T19: review_of dangling — the verdict verb could never find its
+# implementation, and no per-file read would ever say so. T20: a counter that
+# is not an integer. T22: a chain reviewing itself. T21 is the clean control:
+# a well-formed reviewer task must produce no line at all.
+full_task "$BAD/T18.md" T18
+sed -i 's/^resume_head_sha: null$/resume_head_sha: null\nreview_of: T1\nreview_role: judge/' "$BAD/T18.md"
+full_task "$BAD/T19.md" T19
+sed -i 's/^resume_head_sha: null$/resume_head_sha: null\nreview_of: T77\nreview_role: reviewer/' "$BAD/T19.md"
+full_task "$BAD/T20.md" T20
+sed -i 's/^resume_head_sha: null$/resume_head_sha: null\nreview_of: T1\nreview_role: reviewer\nreview_round: three/' "$BAD/T20.md"
+full_task "$BAD/T21.md" T21 open '[T1]'
+sed -i 's/^resume_head_sha: null$/resume_head_sha: null\nreview_of: T1\nreview_role: reviewer\nreview_prompt: null/' "$BAD/T21.md"
+full_task "$BAD/T22.md" T22
+sed -i 's/^resume_head_sha: null$/resume_head_sha: null\nreview_of: T22\nreview_role: adjudicator/' "$BAD/T22.md"
+# T23: review_role with review_of absent. `review_role` is what makes a task a
+# review task — the frontier hides it (§6) and every verb that acts on one
+# resolves its subject through review_of, so this is open work nothing can
+# dispatch and `verdict` dies on. fsck accepted it until the shapes below were
+# added, which is the same silent class as a dangling review_of.
+full_task "$BAD/T23.md" T23
+sed -i 's/^resume_head_sha: null$/resume_head_sha: null\nreview_role: reviewer/' "$BAD/T23.md"
+# T24 + T24.1 + T25: the review that fails OPEN. T24 is an implementation under
+# a live one-reviewer chain (T24.1 is the gate); T25 blocks on the
+# implementation but not on the gate, so it goes eligible the moment T24
+# completes with the verdict unrendered. `review` wires this correctly and the
+# authoring verbs carry the gate along, but an imported ledger, a hand edit, or
+# a `blockers --remove` of the gate produces it — and every other reader is
+# silent about it.
+full_task "$BAD/T24.md" T24 "done"
+sed -i 's/^resume_head_sha: null$/resume_head_sha: null\nreview_round: 1\nreview_max_rounds: 3/' "$BAD/T24.md"
+full_task "$BAD/T24.1.md" T24.1 open '[T24]'
+sed -i 's/^resume_head_sha: null$/resume_head_sha: null\nreview_of: T24\nreview_role: reviewer/' "$BAD/T24.1.md"
+full_task "$BAD/T25.md" T25 open '[T24]'
 
 set +e
 out=$(TASKPUMP_TASKS_DIR="$BAD" "$CLI" fsck 2>/dev/null)
@@ -119,6 +153,16 @@ expect_line "T10.md: task blocks itself" "a self-block is named"
 expect_line "T14.md: claimed_at: expected an ISO-8601 UTC timestamp" "a malformed timestamp is named"
 expect_line "T14.md: resume_attempts: expected an integer" "a non-integer counter is named"
 expect_line "T15.md: missing machine key 'status'" "a missing machine key is named"
+expect_line "T18.md: review_role 'judge' is not in the role vocabulary" "a role outside reviewer|adjudicator is named"
+expect_line "T19.md: review_of 'T77' names no task" "a dangling review_of is named"
+expect_line "T20.md: review_round: expected an integer or null" "a non-integer review round is named"
+expect_line "T22.md: review_of names the task itself" "a self-review is named"
+expect_line "T23.md: review_role 'reviewer' with no review_of" "a review task with no subject is named"
+expect_line "T25.md: blocks on 'T24', which is under live review, but not on that chain's gate 'T24.1'" \
+  "a task that bypasses a live review gate is named (the review would fail open)"
+grep -q 'T24\.1\.md: blocks' <<<"$out" \
+  && fail "the chain's own reviewer was reported as bypassing its gate" \
+  || pass "a chain member blocking on its own subject is not a bypass"
 
 # The cycle: one line, all three members, anchored deterministically.
 cycle_lines=$(grep -c 'blocker cycle' <<<"$out" || true)
@@ -131,6 +175,8 @@ grep -q 'T1\.md' <<<"$out" && fail "the clean control file was reported" \
   || pass "a clean file produces no line"
 grep -q 'T17\.md' <<<"$out" && fail "a namespaced extension key was reported" \
   || pass "unknown extension keys pass (§3 Extension)"
+grep -q 'T21\.md' <<<"$out" && fail "a well-formed reviewer task was reported" \
+  || pass "a well-formed reviewer task passes (§3 Review, verb-added)"
 bad_format=$(grep -cEv '^[^:]+\.md: ' <<<"$out" || true)
 [[ "$bad_format" -eq 0 ]] && pass "every line is <file>: <what>" \
   || fail "$bad_format line(s) broke the <file>: <what> format"
@@ -142,7 +188,15 @@ echo "--- clean ledger ---"
 CLEAN="$TMPDIR_TEST/clean/tasks"
 mkdir -p "$CLEAN"
 full_task "$CLEAN/T1.md" T1 "done"
-full_task "$CLEAN/T2.1.md" T2.1 open '[T1]'
+# A full review chain in flight: the round counters on the implementation and
+# a reviewer gating a downstream task are contract-clean, not violations. The
+# downstream task blocks on BOTH the implementation and the gate — that is the
+# shape `review` writes, and blocking on the implementation alone is itself a
+# violation now (the review would fail open; see the bad ledger above).
+full_task "$CLEAN/T2.1.md" T2.1 open '[T1, T1.1]'
+sed -i 's/^resume_head_sha: null$/resume_head_sha: null\nreview_round: 1\nreview_max_rounds: 3/' "$CLEAN/T1.md"
+full_task "$CLEAN/T1.1.md" T1.1 open '[T1]'
+sed -i 's|^resume_head_sha: null$|resume_head_sha: null\nreview_of: T1\nreview_role: reviewer\nreview_prompt: prompts/security.md|' "$CLEAN/T1.1.md"
 
 set +e
 out=$(TASKPUMP_TASKS_DIR="$CLEAN" "$CLI" fsck 2>&1)
@@ -205,6 +259,12 @@ got=$(git -C "$IMP" log -1 --format='%an')
 got=$(git -C "$IMP" log -1 --format='%s')
 [[ "$got" == *"fsck --fix"* ]] && pass "the commit message names the verb" \
   || fail "repair commit message was '$got'"
+
+# The review keys are verb-added: legal to omit, so --fix must not stamp them
+# — a plain task that never met the review verb stays a plain task.
+grep -qE '^review_' "$IMP/tasks/T1.md" \
+  && fail "--fix stamped review keys onto a plain task" \
+  || pass "--fix leaves the verb-added review keys unstamped"
 
 # Round-trip, leg two: the stamped ledger is clean.
 set +e

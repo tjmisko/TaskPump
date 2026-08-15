@@ -409,13 +409,14 @@ blockers_satisfied() {
 }
 
 cmd_next() {
-  local branch="" phase=""
+  local branch="" phase="" include_reviews=0
   while (( $# )); do
     case $1 in
       --branch) branch=$2; shift 2;;
       --branch=*) branch=${1#--branch=}; shift;;
       --phase) phase=$2; shift 2;;
       --phase=*) phase=${1#--phase=}; shift;;
+      --include-reviews) include_reviews=1; shift;;
       *) die "unknown arg to next: $1";;
     esac
   done
@@ -444,6 +445,16 @@ cmd_next() {
     status=$(fm_get "$file" '.status')
     if [[ "$status" != "open" ]]; then
       dbg "skip $id: status=$status"
+      continue
+    fi
+    # Review tasks are surfaced only on request. A phase-scoped agent loop
+    # running `next --phase` after completing its own task would otherwise
+    # claim the review of its own work in its own session — a self-review,
+    # which looks like independent scrutiny and is not. Query scoping only:
+    # the eligibility predicate (§6) is untouched, and `claim` still works
+    # on a review task directly.
+    if (( ! include_reviews )) && [[ -n "$(fm_get "$file" '.review_role')" ]]; then
+      dbg "skip $id: review task (pass --include-reviews to surface review units)"
       continue
     fi
     claimed_by=$(fm_get "$file" '.claimed_by')
@@ -510,7 +521,7 @@ cmd_next() {
 # The two diverge exactly when a cross-phase blocker or orphaned claim stalls the
 # queue (open > 0 while eligible == 0); only then does the drain count mislead.
 cmd_ready() {
-  local branch="" phases="" json=0 count=0 count_eligible=0
+  local branch="" phases="" json=0 count=0 count_eligible=0 include_reviews=0
   while (( $# )); do
     case $1 in
       --branch) branch=$2; shift 2;;
@@ -521,6 +532,7 @@ cmd_ready() {
       --json) json=1; shift;;
       --count) count=1; shift;;
       --count-eligible) count_eligible=1; shift;;
+      --include-reviews) include_reviews=1; shift;;
       *) die "unknown arg to ready: $1";;
     esac
   done
@@ -566,6 +578,15 @@ cmd_ready() {
     fi
     status=$(fm_get "$file" '.status')
     [[ "$status" != "open" ]] && { dbg "skip $id: status=$status"; continue; }
+    # Same review-task scoping as cmd_next: the eligible frontier hides review
+    # units unless --include-reviews asks for them. Deliberately NOT applied to
+    # --count above — a pending review is open work, and a drain test that
+    # stopped counting it would let a supervisor exit "drained" over an
+    # unrendered verdict.
+    if (( ! include_reviews )) && [[ -n "$(fm_get "$file" '.review_role')" ]]; then
+      dbg "skip $id: review task (pass --include-reviews to surface review units)"
+      continue
+    fi
     claimed_by=$(fm_get "$file" '.claimed_by')
     if [[ -n "$claimed_by" && "$claimed_by" != "$branch" ]]; then
       dbg "skip $id: claimed by '$claimed_by' (branch: '$branch')"
@@ -840,6 +861,29 @@ cmd_heartbeat() {
   local new_budget=$((budget - 1))
   (( new_budget < 0 )) && new_budget=0
 
+  # Review tasks: the commit-productivity meter measures nothing here — an
+  # honest reviewer commits no code, its deliverable is the verdict in the
+  # ledger — so the meter must not drive the failure-streak tripwire. Left
+  # unmodified, three cycles of carefully reading a diff would scrub the
+  # reviewer `stuck`, punishing exactly the agent doing its job. The counter
+  # is left untouched (not incremented, not reset): the cycle is neither
+  # productive nor failed, it is unmeasured. A wedged reviewer is still
+  # bounded — the budget below decrements every cycle and scrub parks it at
+  # 0, and heartbeat staleness catches one that stops beating entirely. See
+  # docs/design/review-gates.md for why "a recorded verdict counts as the
+  # productive act" was rejected as the mechanism: the verdict completes the
+  # task, so --end never observes it.
+  if [[ -n "$(fm_get "$file" '.review_role')" ]]; then
+    fm_set "$file" "
+      .turn_budget_remaining = $new_budget |
+      .last_heartbeat_head_sha = null |
+      .last_heartbeat_ts = \"$now\"
+    "
+    git_commit_state "heartbeat end $id (budget=$new_budget review task: productivity unmeasured)"
+    echo "heartbeat end $id: budget=$new_budget (review task — commit productivity is not measured; the recorded verdict is the productive act)"
+    return 0
+  fi
+
   local start_sha; start_sha=$(fm_get "$file" '.last_heartbeat_head_sha')
   local productive=0
   local touched=""
@@ -921,6 +965,19 @@ cmd_complete() {
   done
   [[ -z "$id" ]] && die "usage: $TASKPUMP_PROG_NAME complete <id> [--commits <sha,sha>] [--defer-wiring \"note\"]"
   local file; file=$(task_file_required "$id")
+
+  # A review task closes through `verdict`, never through `complete`. Both
+  # write the same `done`, but every guard that makes the verdict mean
+  # something lives in `verdict`: that the subject is still `done` (not
+  # reopened under the reviewer's feet), that an adjudicator does not rule
+  # before its panel reported, and that a change-request goes to the
+  # implementation instead. `complete` on a gate task therefore hands
+  # downstream a green light with the panel still open and no ruling recorded
+  # anywhere — a review that never happened, indistinguishable in the ledger
+  # from one that did.
+  local review_role; review_role=$(fm_get "$file" '.review_role')
+  [[ -n "$review_role" ]] \
+    && die "cannot complete $id: it is a $review_role task, and a review closes by rendering its verdict — '$TASKPUMP_PROG_NAME verdict $id --approve [--findings -]' (complete would skip every guard: the panel, the subject's status, and the change-request path)"
 
   local now; now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   # Build JSON array of commits.
@@ -1120,8 +1177,620 @@ cmd_reopen() {
   local note="$reason"
   [[ "$status" == "done" && -n "$prior_commits" ]] && note="$reason (prior completion commits: $prior_commits)"
   printf '\n## Reopened (%s, from %s)\n\n%s\n' "$now" "$status" "$note" >> "$file"
+
+  # Reopening work that carries a review chain re-arms the chain, because the
+  # work about to be redone has not been reviewed. Contract §5.12 names the
+  # ordinary `reopen` as the human door out of a rounds-exhausted park, and
+  # without this that door is a trapdoor: the exhaustion path completes the
+  # gate, so a bare reopen leaves the gate `done` and the NEXT `complete` makes
+  # downstream eligible with no review rendered and nothing warning. The same
+  # hole opens after an ordinary approve-then-reopen. `verdict` cannot patch
+  # it either — it refuses a second ruling on a done review ("a verdict is
+  # already recorded"), and `review` refuses a second chain ("one subject, one
+  # chain"), so there is no other sanctioned way back.
+  #
+  # The round counter resets to 1 with the chain: a human who reopens is
+  # granting the work another look, and leaving the counter at its bound would
+  # re-park the task on the first change-request of the new round.
+  local rearmed=""
+  if [[ -n "$(fm_get "$file" '.review_round')" ]]; then
+    review_chain_scan "$id"
+    if (( ${#REVIEW_CHAIN_IDS[@]} > 0 )); then
+      local i cid cfile cstatus
+      for i in "${!REVIEW_CHAIN_IDS[@]}"; do
+        cid="${REVIEW_CHAIN_IDS[$i]}"
+        cfile="${REVIEW_CHAIN_FILES[$i]}"
+        cstatus=$(fm_get "$cfile" '.status')
+        [[ "$cstatus" == "open" ]] && continue
+        review_rearm_task "$cfile"
+        printf '\n## Re-armed by reopen (%s)\n\n%s was reopened (was %s); this review re-runs against the redone work.\n' \
+          "$now" "$id" "$status" >> "$cfile"
+        rearmed="$rearmed $cid"
+      done
+      fm_set "$file" ".review_round = 1"
+    fi
+  fi
+
   git_commit_state "reopen $id: $reason"
   echo "reopened $id (was $status)"
+  [[ -n "$rearmed" ]] && echo "review chain re-armed (round 1):$rearmed"
+  return 0
+}
+
+# ── Review gates (issue #12) ──────────────────────────────────────────────────
+# A review is an ordinary task the CLI synthesizes: reviewer tasks blocked by
+# the implementation task, an adjudicator blocked by the reviewers when a panel
+# exists, and every task downstream of the implementation gains the chain's
+# GATE task (adjudicator, or the lone reviewer) as an additional blocker. The
+# eligibility predicate then does the gating with zero new predicate logic, and
+# the DAG renderer draws the chain because it is nodes with edges. See
+# docs/design/review-gates.md for the shape and the rejected alternatives.
+
+# Collect the review chain of <impl-id> into globals (dynamic scoping; results
+# on stdout would die inside $(...) without killing the caller — the same trap
+# normalize_blockers documents):
+#   REVIEW_CHAIN_IDS / REVIEW_CHAIN_FILES  every task whose review_of == impl
+#   REVIEW_REVIEWER_IDS                    the reviewer members
+#   REVIEW_ADJ_ID                          the adjudicator, if any
+#   REVIEW_GATE_ID                         adjudicator, else the lone reviewer,
+#                                          else "" (a panel with no adjudicator
+#                                          has no gate — hand-built only)
+review_chain_scan() {
+  local impl_id=$1 f rid role
+  REVIEW_CHAIN_IDS=(); REVIEW_CHAIN_FILES=(); REVIEW_REVIEWER_IDS=()
+  REVIEW_ADJ_ID=""; REVIEW_GATE_ID=""
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    [[ "$(fm_get "$f" '.review_of')" == "$impl_id" ]] || continue
+    rid=$(fm_get "$f" '.id')
+    [[ -z "$rid" ]] && continue
+    role=$(fm_get "$f" '.review_role')
+    REVIEW_CHAIN_IDS+=("$rid"); REVIEW_CHAIN_FILES+=("$f")
+    if [[ "$role" == "adjudicator" ]]; then
+      REVIEW_ADJ_ID="$rid"
+    else
+      REVIEW_REVIEWER_IDS+=("$rid")
+    fi
+  done < <(list_all_files)
+  if [[ -n "$REVIEW_ADJ_ID" ]]; then
+    REVIEW_GATE_ID="$REVIEW_ADJ_ID"
+  elif (( ${#REVIEW_CHAIN_IDS[@]} == 1 )); then
+    REVIEW_GATE_ID="${REVIEW_CHAIN_IDS[0]}"
+  fi
+  return 0
+}
+
+# Collect the review gates that must ride along with a set of blockers, into
+# REVIEW_GATE_RIDERS (a global, because review_chain_scan's results are globals
+# and a $(...) capture would lose them).
+#
+# `review` rewires downstream by snapshotting the tasks that name the
+# implementation AT CHAIN-CREATION TIME, and never revisits. In a long-horizon
+# drain, tasks are authored as work is discovered — so a task filed after the
+# chain exists would block on the implementation alone and become eligible the
+# moment it completes, with the verdict unrendered and nothing warning. The
+# gate would look applied and not be, which is the feature's central promise
+# leaking out the back. So the authoring verbs (`create --blockers`,
+# `blockers --add/--set`) carry the gate along: naming an implementation under
+# live review as your blocker means what it meant at chain-creation time.
+#
+# Three cases deliberately do NOT get a rider:
+#   * a blocker that is itself a review task — the chain's own internal wiring;
+#   * an owner that is a member of that blocker's chain — a reviewer blocks its
+#     subject by design, and riding the gate onto it would build a cycle;
+#   * a chain whose gate is already `done` — the review is rendered, so the
+#     edge would be inert. (Reopening the subject re-arms the chain, §5.7, at
+#     which point new blockers gate again.)
+# Subtractive forms (`--remove`, `--clear`) are untouched: they are an operator
+# explicitly rewiring, and re-adding what they just removed would make a bad
+# edge unfixable. `fsck` is the net under that case.
+# Usage: review_gate_riders <owner-id> <blocker-id>...
+review_gate_riders() {
+  local owner=$1; shift
+  REVIEW_GATE_RIDERS=()
+  local ownerfile b bfile gate gfile e seen
+  ownerfile=$(task_file "$owner" || true)
+  for b in "$@"; do
+    [[ -z "$b" ]] && continue
+    bfile=$(task_file "$b" || true)
+    [[ -z "$bfile" ]] && continue
+    [[ -n "$(fm_get "$bfile" '.review_role')" ]] && continue
+    [[ -n "$(fm_get "$bfile" '.review_round')" ]] || continue
+    review_chain_scan "$b"
+    gate="$REVIEW_GATE_ID"
+    [[ -z "$gate" || "$gate" == "$owner" ]] && continue
+    [[ -n "$ownerfile" && "$(fm_get "$ownerfile" '.review_of')" == "$b" ]] && continue
+    gfile=$(task_file "$gate" || true)
+    [[ -z "$gfile" ]] && continue
+    [[ "$(fm_get "$gfile" '.status')" == "done" ]] && continue
+    seen=0
+    for e in "$@"; do [[ "$e" == "$gate" ]] && seen=1; done
+    for e in "${REVIEW_GATE_RIDERS[@]-}"; do [[ "$e" == "$gate" ]] && seen=1; done
+    (( seen )) || REVIEW_GATE_RIDERS+=("$gate")
+  done
+  return 0
+}
+
+# Re-arm one review-chain member back to `open`, shedding every marker a
+# completed (or parked) review left behind. Shared by the two paths that
+# re-arm a chain — a change-request verdict and a `reopen` of the subject — so
+# the two can never disagree about what a re-armed review looks like.
+#
+# blocked_at/blocked_reason are cleared with the rest because contract §3 ties
+# them to the `blocked` status and §5.7 has `reopen` clear both: a task sitting
+# `open` while still carrying the reason it was once blocked is a stale field
+# every reader must learn to disbelieve.
+# Usage: review_rearm_task <file>
+review_rearm_task() {
+  fm_set "$1" "
+    .status = \"open\" |
+    .claimed_by = null |
+    .claimed_at = null |
+    .turn_budget_remaining = null |
+    .consecutive_failed_iterations = 0 |
+    .last_heartbeat_head_sha = null |
+    .completed_at = null |
+    .completed_by_commits = [] |
+    .blocked_at = null |
+    .blocked_reason = null |
+    .scrub_reason = null
+  "
+}
+
+# Write one synthesized review task file. Emits the full machine-key set of
+# LEDGER-CONTRACT §3 (a writer should emit the full set) plus the review
+# fields, through yaml_scalar so no generated title can break the frontmatter.
+# Usage: review_write_task <file> <id> <role> <is_gate> <impl-id> <impl-title> <prompt> <blocker...>
+review_write_task() {
+  local file=$1 id=$2 role=$3 is_gate=$4 impl_id=$5 impl_title=$6 prompt=$7
+  shift 7
+  local -a blist=("$@")
+  local title goal b
+  if [[ "$role" == "adjudicator" ]]; then
+    title="Adjudicate the review of $impl_id: $impl_title"
+    goal="The reviewer findings for $impl_id are adjudicated and the gate verdict is rendered."
+  else
+    title="Adversarial review of $impl_id: $impl_title"
+    goal="The work of $impl_id is adversarially reviewed against its stated goal and a verdict is recorded."
+  fi
+  {
+    printf -- '---\n'
+    printf 'id: %s\n' "$(yaml_scalar "$id")"
+    printf 'phase: %s\n' "$(yaml_scalar "${id%%.*}")"
+    printf 'title: %s\n' "$(yaml_scalar "$title")"
+    printf 'status: open\n'
+    printf 'claimed_by: null\n'
+    printf 'claimed_at: null\n'
+    printf 'turn_budget_remaining: null\n'
+    printf 'consecutive_failed_iterations: 0\n'
+    printf 'blockers:\n'
+    for b in "${blist[@]}"; do
+      printf -- '  - %s\n' "$(yaml_scalar "$b")"
+    done
+    printf 'completed_by_commits: []\n'
+    printf 'milestone: null\n'
+    printf 'files: []\n'
+    printf 'last_heartbeat_head_sha: null\n'
+    printf 'completed_at: null\n'
+    printf 'goal: %s\n' "$(yaml_scalar "$goal")"
+    printf 'last_heartbeat_ts: null\n'
+    printf 'blocked_at: null\n'
+    printf 'blocked_reason: null\n'
+    printf 'resume_attempts: 0\n'
+    printf 'resume_head_sha: null\n'
+    printf 'review_of: %s\n' "$(yaml_scalar "$impl_id")"
+    printf 'review_role: %s\n' "$role"
+    if [[ -n "$prompt" ]]; then
+      printf 'review_prompt: %s\n' "$(yaml_scalar "$prompt")"
+    else
+      printf 'review_prompt: null\n'
+    fi
+    printf -- '---\n\n'
+    printf '# %s — %s\n\n' "$id" "$title"
+    printf '## Subject\n\n'
+    if [[ "$role" == "adjudicator" ]]; then
+      printf 'Adjudicate the review of %s ("%s"). Read every reviewer task'\''s findings\n' "$impl_id" "$impl_title"
+      printf 'AND the delivered work — an adjudicator that cannot read the code cannot\n'
+      printf 'break ties. The change-request path is yours alone; you may approve over a\n'
+      printf 'lone objection.\n\n'
+    else
+      printf 'Adversarial review of %s ("%s"). Read its task file'\''s goal and\n' "$impl_id" "$impl_title"
+      printf 'acceptance, read the work it delivered, run the tests. Your deliverable is\n'
+      printf 'the verdict in the ledger, not code commits.\n\n'
+    fi
+    printf '## Verdict\n\n'
+    if [[ "$is_gate" == "1" ]]; then
+      printf '    %s verdict %s --approve [--findings -]\n' "$TASKPUMP_PROG_NAME" "$id"
+      printf '    %s verdict %s --request-changes --findings -\n\n' "$TASKPUMP_PROG_NAME" "$id"
+      printf 'This task is the gate: downstream work stays blocked until it completes, and\n'
+      printf 'a change-request reopens %s with your findings.\n' "$impl_id"
+    else
+      printf '    %s verdict %s --approve --findings -\n\n' "$TASKPUMP_PROG_NAME" "$id"
+      printf 'You are one voice on a panel: only the adjudicator renders the gate verdict,\n'
+      printf 'and your findings must not be shaped by the other reviewers'\'' — independence\n'
+      printf 'is what makes the panel adversarial rather than an echo.\n'
+    fi
+  } >"$file"
+}
+
+# Synthesize a review chain for an implementation task, atomically under the
+# state lock: reviewers, adjudicator, and the downstream rewiring, in one
+# ledger commit. Refuses a second chain for the same task — one subject, one
+# chain — and warns (does not die) when the subject is already done, because
+# reviewing landed work is legitimate and the chain is simply eligible at once.
+cmd_review() {
+  local impl_id="" panel=1 prompt="" max_rounds=3
+  while (( $# )); do
+    case $1 in
+      --panel) panel=$2; shift 2;;
+      --panel=*) panel=${1#--panel=}; shift;;
+      --prompt) prompt=$2; shift 2;;
+      --prompt=*) prompt=${1#--prompt=}; shift;;
+      --max-rounds) max_rounds=$2; shift 2;;
+      --max-rounds=*) max_rounds=${1#--max-rounds=}; shift;;
+      -*) die "unknown flag to review: $1";;
+      *) [[ -z "$impl_id" ]] && impl_id=$1 || die "too many positional args to review"; shift;;
+    esac
+  done
+  [[ -z "$impl_id" ]] && die "usage: $TASKPUMP_PROG_NAME review <impl-id> [--panel N] [--prompt <file>] [--max-rounds N]"
+  [[ "$panel" =~ ^[0-9]+$ ]] && (( panel >= 1 )) \
+    || die "--panel must be a positive integer, got: $panel"
+  [[ "$max_rounds" =~ ^[0-9]+$ ]] && (( max_rounds >= 1 )) \
+    || die "--max-rounds must be a positive integer, got: $max_rounds"
+
+  local impl_file; impl_file=$(task_file_required "$impl_id")
+  [[ -n "$(fm_get "$impl_file" '.review_role')" ]] \
+    && die "cannot review $impl_id: it is itself a review task (the adjudicator is the review of the reviews)"
+
+  review_chain_scan "$impl_id"
+  (( ${#REVIEW_CHAIN_IDS[@]} > 0 )) \
+    && die "a review chain for $impl_id already exists (${REVIEW_CHAIN_IDS[*]}); one subject, one chain — reopen its tasks to re-review"
+
+  # The prompt is validated now, at creation time, so a typo'd path fails here
+  # and not in whatever dispatches the reviewer weeks later. Stored relative to
+  # the code repo when it lies inside it, so the recorded path survives the
+  # ledger being read from another checkout.
+  if [[ -n "$prompt" ]]; then
+    [[ -f "$prompt" ]] || die "review prompt file does not exist: $prompt"
+    local prompt_abs code_root
+    prompt_abs=$(readlink -f "$prompt")
+    code_root=$(git -C "$TASKPUMP_CODE_REPO" rev-parse --show-toplevel 2>/dev/null || true)
+    [[ -z "$code_root" ]] && code_root="$TASKPUMP_CODE_REPO"
+    if [[ "$prompt_abs" == "$code_root"/* ]]; then
+      prompt=${prompt_abs#"$code_root"/}
+    else
+      prompt="$prompt_abs"
+    fi
+  fi
+
+  local impl_status impl_title
+  impl_status=$(fm_get "$impl_file" '.status')
+  [[ "$impl_status" == "done" ]] \
+    && warn "reviewing already-done work: $impl_id is done, so the chain is eligible immediately"
+  impl_title=$(fm_get "$impl_file" '.title')
+
+  # Allocate the next free .N ids in the implementation's phase namespace —
+  # the id grammar (§7) is contract-frozen, so review tasks live in the same
+  # namespace as every other task. The bare-phase file, if any, counts as 0.
+  local idphase=${impl_id%%.*} max_n=0 f stem n
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    stem=$(basename "$f" .md)
+    [[ "$stem" == "$idphase".* ]] || continue
+    n=${stem#"$idphase".}
+    [[ "$n" =~ ^[0-9]+$ ]] || continue
+    (( n > max_n )) && max_n=$n
+  done < <(list_all_files)
+
+  # Downstream snapshot BEFORE any new file exists, so the chain's own members
+  # (whose blockers name the implementation) can never be rewired onto the
+  # gate they are part of.
+  local -a downstream_files=() downstream_ids=()
+  local blk hit did
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    hit=0
+    while IFS= read -r blk; do
+      [[ "$blk" == "$impl_id" ]] && { hit=1; break; }
+    done < <(yq --front-matter=extract '.blockers[]?' "$f" 2>/dev/null || true)
+    (( hit )) || continue
+    did=$(fm_get "$f" '.id')
+    downstream_files+=("$f"); downstream_ids+=("$did")
+  done < <(list_all_files)
+
+  # Reserve the ids: reviewers first, then the adjudicator.
+  local -a reviewer_ids=()
+  local i new_id adj_id="" gate_id
+  for (( i = 1; i <= panel; i++ )); do
+    new_id="$idphase.$((max_n + i))"
+    [[ "$new_id" =~ $TASKPUMP_ID_PATTERN ]] \
+      || die "generated review id '$new_id' does not match TASKPUMP_ID_PATTERN $TASKPUMP_ID_PATTERN"
+    reviewer_ids+=("$new_id")
+  done
+  if (( panel > 1 )); then
+    adj_id="$idphase.$((max_n + panel + 1))"
+    [[ "$adj_id" =~ $TASKPUMP_ID_PATTERN ]] \
+      || die "generated adjudicator id '$adj_id' does not match TASKPUMP_ID_PATTERN $TASKPUMP_ID_PATTERN"
+    gate_id="$adj_id"
+  else
+    gate_id="${reviewer_ids[0]}"
+  fi
+
+  # Write the chain. A lone reviewer is the gate; panel reviewers are not.
+  local rid is_gate
+  for rid in "${reviewer_ids[@]}"; do
+    is_gate=0; [[ "$rid" == "$gate_id" ]] && is_gate=1
+    review_write_task "$TASKPUMP_TASKS_DIR/$rid.md" "$rid" reviewer "$is_gate" \
+      "$impl_id" "$impl_title" "$prompt" "$impl_id"
+  done
+  if [[ -n "$adj_id" ]]; then
+    review_write_task "$TASKPUMP_TASKS_DIR/$adj_id.md" "$adj_id" adjudicator 1 \
+      "$impl_id" "$impl_title" "" "${reviewer_ids[@]}"
+  fi
+
+  # Rewire downstream: the gate is ADDED to existing blockers, never a
+  # replacement for the implementation edge — a later reopen of the
+  # implementation must still hold downstream shut on its own.
+  local df
+  for df in "${downstream_files[@]}"; do
+    local -a cur=()
+    local seen=0 e
+    while IFS= read -r blk; do
+      [[ -z "$blk" ]] && continue
+      cur+=("$blk")
+      [[ "$blk" == "$gate_id" ]] && seen=1
+    done < <(yq --front-matter=extract '.blockers[]?' "$df" 2>/dev/null || true)
+    (( seen )) && continue
+    cur+=("$gate_id")
+    write_blockers "$df" "${cur[@]}"
+  done
+
+  # Round bookkeeping lives on the implementation task: one home for the
+  # counter and its bound, whichever chain member renders the verdict.
+  local now; now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  fm_set "$impl_file" ".review_round = 1 | .review_max_rounds = $max_rounds"
+  {
+    printf '\n## Review chain created (%s)\n\n' "$now"
+    printf 'Reviewers: %s.' "${reviewer_ids[*]}"
+    [[ -n "$adj_id" ]] && printf ' Adjudicator: %s.' "$adj_id"
+    printf ' Gate: %s. Rounds: 1/%s.\n' "$gate_id" "$max_rounds"
+  } >> "$impl_file"
+
+  git_commit_state "review $impl_id: ${#reviewer_ids[@]} reviewer(s), gate=$gate_id (max_rounds=$max_rounds)"
+  echo "review chain for $impl_id: reviewer(s) ${reviewer_ids[*]}${adj_id:+, adjudicator $adj_id} (gate: $gate_id)"
+  if (( ${#downstream_ids[@]} > 0 )); then
+    echo "downstream rewired onto the gate: ${downstream_ids[*]}"
+  else
+    echo "no downstream tasks listed $impl_id as a blocker; the gate blocks nothing yet"
+  fi
+  return 0
+}
+
+# Render a review verdict, through the state machine's existing doors only —
+# no new status, no new transition. --approve is `complete` for a review task,
+# findings in its body. --request-changes is the change loop, and it is the
+# GATE task's call alone: findings land on the IMPLEMENTATION task's body (the
+# implementer is who must act on them), the implementation reopens exactly as
+# reopen-from-done would (completion markers shed, prior commits preserved in
+# the note), the whole chain re-arms to open, and review_round advances. The
+# reviews are then ineligible until the fix lands and `complete` runs again —
+# the loop closes through the eligibility predicate, nothing else.
+#
+# A change-request that would need a round past review_max_rounds instead
+# parks the implementation needs-review with the findings intact: the round
+# bound measures futility, not duration, and past it a human renders the
+# final call. Panel reviewers only ever report — their --request-changes is
+# refused with a pointer to the adjudicator, because a panel where any
+# member can reopen the work is a panel whose verdict nobody rendered.
+cmd_verdict() {
+  local rid="" approve=0 request=0 findings="" branch=""
+  while (( $# )); do
+    case $1 in
+      --approve) approve=1; shift;;
+      --request-changes) request=1; shift;;
+      --findings) findings=$2; shift 2;;
+      --findings=*) findings=${1#--findings=}; shift;;
+      --branch) branch=$2; shift 2;;
+      --branch=*) branch=${1#--branch=}; shift;;
+      -*) die "unknown flag to verdict: $1";;
+      *) [[ -z "$rid" ]] && rid=$1 || die "too many positional args to verdict"; shift;;
+    esac
+  done
+  [[ -z "$rid" ]] && die "usage: $TASKPUMP_PROG_NAME verdict <review-id> [--branch <b>] --approve [--findings -|\"...\"]  |  --request-changes --findings -|\"...\""
+  (( approve + request == 1 )) \
+    || die "verdict requires exactly one of --approve or --request-changes"
+
+  local rfile; rfile=$(task_file_required "$rid")
+  local role; role=$(fm_get "$rfile" '.review_role')
+  [[ -z "$role" ]] \
+    && die "$rid is not a review task (no review_role); verdict applies only to reviewer/adjudicator tasks"
+  local rstatus; rstatus=$(fm_get "$rfile" '.status')
+  [[ "$rstatus" == "done" ]] \
+    && die "a verdict is already recorded for $rid (status=done); reopen it to re-review"
+
+  # Ownership. A claimed review belongs to its claimant: ruling over another
+  # branch's live claim is a bystander overwriting a reviewer's work in
+  # progress, and it is what makes the self-review exclusion (§6's frontier
+  # skip) advisory — the implementer's own session could rule on the review of
+  # its own work while a real reviewer holds the claim. Refused on the same
+  # rule `claim` applies: same branch fine, different branch never.
+  #
+  # An UNCLAIMED review warns rather than refusing. Requiring in_progress (as
+  # `release` does) would make `verdict` stricter than `complete`, its closest
+  # sibling — and §5.12's door out of a rounds-exhausted park is explicitly a
+  # human rendering the final call, which no dispatcher is around to claim for.
+  local claimed_by; claimed_by=$(fm_get "$rfile" '.claimed_by')
+  if [[ -n "$claimed_by" ]]; then
+    [[ -z "$branch" ]] \
+      && die "$rid is claimed by '$claimed_by'; pass --branch to say who is ruling (a verdict over another branch's live claim overwrites a reviewer mid-read)"
+    [[ "$branch" != "$claimed_by" ]] \
+      && die "cannot render a verdict on $rid from '$branch': it is claimed by '$claimed_by' (one claim, one ruling — release or reopen it first)"
+  else
+    warn "rendering a verdict on an unclaimed review ($rid, status=$rstatus): nothing records who ruled, and the self-review exclusion is only advisory without a claim"
+  fi
+
+  local impl_id; impl_id=$(fm_get "$rfile" '.review_of')
+  [[ -z "$impl_id" ]] \
+    && die "$rid carries review_role but no review_of; the chain is broken — repair it through the CLI"
+  local impl_file; impl_file=$(task_file "$impl_id" || true)
+  [[ -z "$impl_file" ]] \
+    && die "review_of '$impl_id' names no task in this ledger; the verdict has no implementation to act on"
+  # `claim` checks status, not blockers, so nothing upstream of this line
+  # stops a verdict on work that is not finished — or was reopened while the
+  # reviewer read it. A verdict on a moving target reviews nothing.
+  local impl_status; impl_status=$(fm_get "$impl_file" '.status')
+  [[ "$impl_status" != "done" ]] \
+    && die "cannot render a verdict on $impl_id while it is $impl_status; the review is of completed work (wait for complete)"
+
+  if [[ "$findings" == "-" ]]; then
+    findings=$(cat)
+  fi
+  if (( request )) && [[ -z "$findings" ]]; then
+    die "--request-changes requires --findings (the implementer needs something to act on)"
+  fi
+
+  review_chain_scan "$impl_id"
+  local gate_id="$REVIEW_GATE_ID"
+  local is_gate=0
+  [[ -n "$gate_id" && "$rid" == "$gate_id" ]] && is_gate=1
+
+  # An adjudicator's ruling before every reviewer has reported is a verdict
+  # over findings that do not exist yet — and since `claim` does not check
+  # blockers, nothing else refuses it.
+  if [[ "$role" == "adjudicator" ]]; then
+    local pending="" rev rev_file rev_status
+    for rev in "${REVIEW_REVIEWER_IDS[@]-}"; do
+      [[ -z "$rev" ]] && continue
+      rev_file=$(task_file "$rev" || true)
+      [[ -z "$rev_file" ]] && continue
+      rev_status=$(fm_get "$rev_file" '.status')
+      [[ "$rev_status" == "done" ]] || pending="$pending $rev"
+    done
+    [[ -n "$pending" ]] \
+      && die "adjudicator verdict before the panel reported — still pending:$pending"
+  fi
+
+  local round max
+  round=$(fm_get "$impl_file" '.review_round'); [[ "$round" =~ ^[0-9]+$ ]] || round=1
+  max=$(fm_get "$impl_file" '.review_max_rounds'); [[ "$max" =~ ^[0-9]+$ ]] || max=3
+  local now; now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+  if (( approve )); then
+    fm_set "$rfile" "
+      .status = \"done\" |
+      .completed_at = \"$now\" |
+      .claimed_by = null |
+      .turn_budget_remaining = null |
+      .consecutive_failed_iterations = 0 |
+      .last_heartbeat_head_sha = null
+    "
+    {
+      printf '\n## Verdict: approve (round %s, %s)\n' "$round" "$now"
+      [[ -n "$findings" ]] && printf '\n%s\n' "$findings"
+    } >> "$rfile"
+    git_commit_state "verdict $rid: approve (round $round)"
+    if (( is_gate )); then
+      echo "verdict $rid: approve (round $round) — the gate is done; downstream unblocks as its remaining blockers do"
+    else
+      echo "verdict $rid: approve (round $round) — report recorded; the gate verdict belongs to ${gate_id:-the adjudicator}"
+    fi
+    return 0
+  fi
+
+  # --request-changes from here on.
+  if (( ! is_gate )); then
+    if [[ -z "$gate_id" ]]; then
+      die "this chain has no gate task (a panel with no adjudicator?); repair the chain before rendering a change-request"
+    fi
+    die "only the gate task ($gate_id) renders the change-request verdict; record your findings with --approve — independence is the point of the panel"
+  fi
+
+  local prior_commits
+  prior_commits=$(yq --front-matter=extract '.completed_by_commits | join(",")' "$impl_file" 2>/dev/null || echo "")
+  [[ "$prior_commits" == "null" ]] && prior_commits=""
+
+  local new_round=$((round + 1))
+  if (( new_round > max )); then
+    # The round budget is spent. The gate's verdict is delivered (its task
+    # completes; the report stands), and the implementation is parked for a
+    # human — completion markers shed, because a needs-review task still
+    # claiming completed_at would carry that lie through the next reopen.
+    fm_set "$rfile" "
+      .status = \"done\" |
+      .completed_at = \"$now\" |
+      .claimed_by = null |
+      .turn_budget_remaining = null |
+      .consecutive_failed_iterations = 0 |
+      .last_heartbeat_head_sha = null
+    "
+    printf '\n## Verdict: request-changes (round %s, %s) — rounds exhausted\n\n%s\n' \
+      "$round" "$now" "$findings" >> "$rfile"
+    fm_set "$impl_file" "
+      .status = \"needs-review\" |
+      .scrub_reason = \"review rounds exhausted ($round/$max)\" |
+      .claimed_by = null |
+      .claimed_at = null |
+      .turn_budget_remaining = null |
+      .last_heartbeat_head_sha = null |
+      .completed_at = null |
+      .completed_by_commits = [] |
+      .wiring_deferred = false |
+      .wiring_deferred_note = null
+    "
+    {
+      printf '\n## Review findings (round %s, %s)\n\n%s\n' "$round" "$now" "$findings"
+      printf '\nReview rounds exhausted (%s/%s); parked needs-review for a human decision.' "$round" "$max"
+      [[ -n "$prior_commits" ]] && printf ' Prior completion commits: %s.' "$prior_commits"
+      printf '\n'
+    } >> "$impl_file"
+    git_commit_state "verdict $rid: request-changes — rounds exhausted ($round/$max), $impl_id parked needs-review"
+    echo "verdict $rid: request-changes (round $round) — review rounds exhausted ($round/$max); $impl_id parked needs-review with the findings"
+    return 0
+  fi
+
+  # Reopen the implementation exactly as reopen-from-done would, plus the
+  # round advance; findings go to its body because the implementer acts there.
+  fm_set "$impl_file" "
+    .status = \"open\" |
+    .completed_at = null |
+    .completed_by_commits = [] |
+    .wiring_deferred = false |
+    .wiring_deferred_note = null |
+    .claimed_by = null |
+    .claimed_at = null |
+    .turn_budget_remaining = null |
+    .last_heartbeat_head_sha = null |
+    .blocked_at = null |
+    .blocked_reason = null |
+    .scrub_reason = null |
+    .review_round = $new_round
+  "
+  {
+    printf '\n## Review findings (round %s, %s)\n\n%s\n' "$round" "$now" "$findings"
+    printf '\nReopened for round %s.' "$new_round"
+    [[ -n "$prior_commits" ]] && printf ' Prior completion commits: %s.' "$prior_commits"
+    printf '\n'
+  } >> "$impl_file"
+
+  # Re-arm the whole chain — gate included — back to open. Blockers are
+  # intact, so every member is ineligible until the fix lands and `complete`
+  # runs again. The gate keeps its verdict note; siblings get a line saying
+  # why their `done` was shed.
+  printf '\n## Verdict: request-changes (round %s, %s)\n\n%s\n' \
+    "$round" "$now" "$findings" >> "$rfile"
+  local i cid cfile
+  for i in "${!REVIEW_CHAIN_IDS[@]}"; do
+    cid="${REVIEW_CHAIN_IDS[$i]}"
+    cfile="${REVIEW_CHAIN_FILES[$i]}"
+    review_rearm_task "$cfile"
+    [[ "$cid" == "$rid" ]] && continue
+    printf '\n## Re-armed for round %s (%s)\n\n%s was reopened by %s'\''s change-request verdict; blockers hold this review until the fix completes.\n' \
+      "$new_round" "$now" "$impl_id" "$rid" >> "$cfile"
+  done
+
+  git_commit_state "verdict $rid: request-changes (round $round -> $new_round)"
+  echo "verdict $rid: request-changes (round $round) — $impl_id reopened for round $new_round; chain re-armed"
+  return 0
 }
 
 # Record that the pump is about to auto-resume a stalled task, and rule on
@@ -1486,7 +2155,12 @@ def kindok($kind):
     ["resume_head_sha",               "string?", "a sha string or null",                                      "stamp"],
     ["wiring_deferred",               "bool",    "a boolean",                                                 "verb-added"],
     ["wiring_deferred_note",          "string?", "a string or null",                                          "verb-added"],
-    ["scrub_reason",                  "string?", "a string or null",                                          "verb-added"]
+    ["scrub_reason",                  "string?", "a string or null",                                          "verb-added"],
+    ["review_of",                     "string?", "a task-id string or null",                                  "verb-added"],
+    ["review_role",                   "string?", "a string or null",                                          "verb-added"],
+    ["review_prompt",                 "string?", "a path string or null",                                     "verb-added"],
+    ["review_round",                  "int?",    "an integer or null",                                        "verb-added"],
+    ["review_max_rounds",             "int?",    "an integer or null",                                        "verb-added"]
   ][]
 | . as [$key, $kind, $label, $class]
 | if $mode == "missing" then
@@ -1501,6 +2175,10 @@ def kindok($kind):
        and (["open", "in_progress", "done", "blocked", "needs-review", "stuck"]
             | index($fm[$key]) | not) then
     "status '\($fm[$key])' is not in the status vocabulary (open|in_progress|done|blocked|needs-review|stuck)"
+  elif $key == "review_role"
+       and ($fm[$key] != null)
+       and (["reviewer", "adjudicator"] | index($fm[$key]) | not) then
+    "review_role '\($fm[$key])' is not in the role vocabulary (reviewer|adjudicator)"
   else empty end
 JQ
 }
@@ -1540,6 +2218,26 @@ fsck_check_file() {
   # name, so the stem is the node other tasks actually reach.
   blockers=$(jq -r 'if (.blockers | type) == "array" then .blockers[] | select(type == "string") else empty end' <<<"$fm_json")
   [[ -n "$blockers" ]] && FSCK_ADJ[$stem]=$blockers
+
+  # Review-chain facts for the whole-ledger pass: `verdict` resolves the
+  # implementation through review_of by name, so a dangling one is a chain
+  # whose verdict can never land — and nothing per-file will ever say so.
+  # Status and role ride along for the gate-coverage check below.
+  local review_of review_role status
+  review_of=$(jq -r 'if (.review_of | type) == "string" then .review_of else "" end' <<<"$fm_json")
+  review_role=$(jq -r 'if (.review_role | type) == "string" then .review_role else "" end' <<<"$fm_json")
+  status=$(jq -r 'if (.status | type) == "string" then .status else "" end' <<<"$fm_json")
+  [[ -n "$review_of" ]] && FSCK_REVIEW_OF[$stem]=$review_of
+  [[ -n "$review_role" ]] && FSCK_ROLE[$stem]=$review_role
+  [[ -n "$status" ]] && FSCK_STATUS[$stem]=$status
+
+  # review_role is what makes a task a review task (§5.12), and every verb that
+  # acts on one resolves its subject through review_of. A role with no subject
+  # is a task the frontier hides (§6) and `verdict` refuses outright — open
+  # work that nothing can dispatch and nothing can close, with no diagnostic
+  # until someone runs the verb by hand.
+  [[ -n "$review_role" && -z "$review_of" ]] \
+    && FSCK_VIOLATIONS+=("$file: review_role '$review_role' with no review_of (a review task with no subject: hidden from the frontier, and 'verdict' dies on it)")
   return 0
 }
 
@@ -1547,7 +2245,7 @@ fsck_check_file() {
 # Each is a way a task leaves the frontier forever with no diagnostic from any
 # per-file read — the eligibility predicate (§6) just keeps answering "not yet".
 fsck_graph_check() {
-  local stem b cyc
+  local stem b cyc e
   local -a stems_sorted=()
   if (( ${#FSCK_STEMS[@]} > 0 )); then
     while IFS= read -r stem; do stems_sorted+=("$stem"); done \
@@ -1563,6 +2261,67 @@ fsck_graph_check() {
       elif [[ -z "${FSCK_STEMS[$b]:-}" ]]; then
         FSCK_VIOLATIONS+=("$TASKPUMP_TASKS_DIR/$stem.md: blocker '$b' names no task in this ledger (unsatisfied forever — the task can never enter the frontier)")
       fi
+    done <<<"${FSCK_ADJ[$stem]}"
+  done
+
+  # Review chains: review_of must resolve, and never to the task itself. The
+  # verb validates both on creation, but an imported ledger arrives with its
+  # chains already drawn — same reasoning as the blocker checks above.
+  for stem in "${stems_sorted[@]-}"; do
+    [[ -n "${FSCK_REVIEW_OF[$stem]:-}" ]] || continue
+    b="${FSCK_REVIEW_OF[$stem]}"
+    if [[ "$b" == "$stem" ]]; then
+      FSCK_VIOLATIONS+=("$TASKPUMP_TASKS_DIR/$stem.md: review_of names the task itself (a review cannot review its own verdict)")
+    elif [[ -z "${FSCK_STEMS[$b]:-}" ]]; then
+      FSCK_VIOLATIONS+=("$TASKPUMP_TASKS_DIR/$stem.md: review_of '$b' names no task in this ledger (the verdict verb has no implementation to act on)")
+    fi
+  done
+
+  # Gate coverage: a task that blocks on an implementation under LIVE review
+  # must also block on that chain's gate. `review` wires this for everything
+  # downstream at chain-creation time and the authoring verbs carry the gate
+  # along afterwards (review_gate_riders), so the CLI cannot produce this
+  # shape — but an imported ledger, a hand edit, or a deliberate
+  # `blockers --remove` of the gate can, and the result is the feature failing
+  # OPEN: the task goes eligible the moment the implementation completes, with
+  # the verdict unrendered and every other reader silent. A review that fails
+  # open is not a review, so it is a violation, not a warning.
+  local -A FSCK_GATE_OF=() FSCK_CHAIN_ADJ=() FSCK_CHAIN_N=() FSCK_CHAIN_ONE=()
+  local impl
+  for stem in "${stems_sorted[@]-}"; do
+    impl="${FSCK_REVIEW_OF[$stem]:-}"
+    [[ -z "$impl" ]] && continue
+    FSCK_CHAIN_N[$impl]=$(( ${FSCK_CHAIN_N[$impl]:-0} + 1 ))
+    FSCK_CHAIN_ONE[$impl]=$stem
+    [[ "${FSCK_ROLE[$stem]:-}" == "adjudicator" ]] && FSCK_CHAIN_ADJ[$impl]=$stem
+  done
+  for impl in "${!FSCK_CHAIN_N[@]}"; do
+    # The gate is the adjudicator, or the lone reviewer. A panel with no
+    # adjudicator has no gate — hand-built, and nothing to check against.
+    if [[ -n "${FSCK_CHAIN_ADJ[$impl]:-}" ]]; then
+      FSCK_GATE_OF[$impl]="${FSCK_CHAIN_ADJ[$impl]}"
+    elif (( ${FSCK_CHAIN_N[$impl]} == 1 )); then
+      FSCK_GATE_OF[$impl]="${FSCK_CHAIN_ONE[$impl]}"
+    fi
+  done
+  local gate has_gate
+  for stem in "${stems_sorted[@]-}"; do
+    [[ -n "${FSCK_ADJ[$stem]:-}" ]] || continue
+    while IFS= read -r b; do
+      [[ -z "$b" ]] && continue
+      gate="${FSCK_GATE_OF[$b]:-}"
+      [[ -z "$gate" || "$gate" == "$stem" ]] && continue
+      # A chain member blocks on its own subject by design (§5.12).
+      [[ "${FSCK_REVIEW_OF[$stem]:-}" == "$b" ]] && continue
+      # A rendered verdict has already gated this edge; only a live chain can
+      # still be bypassed. (Reopening the subject re-arms the chain, §5.7.)
+      [[ "${FSCK_STATUS[$gate]:-}" == "done" ]] && continue
+      has_gate=0
+      while IFS= read -r e; do
+        [[ "$e" == "$gate" ]] && { has_gate=1; break; }
+      done <<<"${FSCK_ADJ[$stem]}"
+      (( has_gate )) && continue
+      FSCK_VIOLATIONS+=("$TASKPUMP_TASKS_DIR/$stem.md: blocks on '$b', which is under live review, but not on that chain's gate '$gate' (the review fails open: this task goes eligible the moment '$b' completes, verdict unrendered)")
     done <<<"${FSCK_ADJ[$stem]}"
   done
 
@@ -1684,7 +2443,8 @@ cmd_fsck() {
   # Report pass. In --fix mode it runs after the stamping, so what prints (and
   # what the exit code answers for) is what REMAINS wrong.
   local -a FSCK_VIOLATIONS=() FSCK_PATH=() FSCK_CYCLES=()
-  local -A FSCK_STEMS=() FSCK_ADJ=() FSCK_COLOR=()
+  local -A FSCK_STEMS=() FSCK_ADJ=() FSCK_COLOR=() FSCK_REVIEW_OF=()
+  local -A FSCK_ROLE=() FSCK_STATUS=()
   local file
   while IFS= read -r file; do
     [[ -z "$file" ]] && continue
@@ -1791,6 +2551,36 @@ normalize_blockers() {
   return 0
 }
 
+# Write a task's `blockers:` list, in BLOCK sequence style.
+#
+# The style is not cosmetic. yq's default for a list built with `from_json` is
+# FLOW style (`blockers: ["T1", "T1.1"]`), and lib/dag-layout.awk — the DAG
+# renderer's parser, and the monitor's GRAPH tab through it — is line-oriented:
+# it reads `blockers:` followed by `  - id` lines and special-cases only the
+# empty `[]`. A flow-style list therefore parses as NO blockers at all, so the
+# task loses every DAG edge and draws as a detached root with the *eligible*
+# glyph while the eligibility predicate (which reads the same file through yq)
+# correctly holds it shut. Two readers, two answers, no diagnostic — the exact
+# silent-wrong-answer shape the ledger exists to prevent. Every writer of
+# `blockers:` goes through here so the two can never disagree again.
+# Empty arguments are dropped: `"${arr[@]-}"` on an empty array expands to one
+# empty string, and a blockers list holding "" would be a blocker naming no
+# task — unsatisfiable forever.
+# Usage: write_blockers <file> [id...]
+write_blockers() {
+  local file=$1; shift
+  local -a ids=() b
+  for b in "$@"; do [[ -n "$b" ]] && ids+=("$b"); done
+  if (( ${#ids[@]} == 0 )); then
+    fm_set "$file" '.blockers = []'
+    return 0
+  fi
+  local json; json=$(printf '%s\n' "${ids[@]}" | jq -R . | jq -s -c .)
+  BLOCKERS="$json" yq -i --front-matter=process \
+    '.blockers = (strenv(BLOCKERS) | from_json) | .blockers style="" | .blockers[] style=""' \
+    "$file"
+}
+
 cmd_title() {
   local id="" set_text="" do_set=0
   while (( $# )); do
@@ -1878,14 +2668,23 @@ cmd_blockers() {
   normalize_blockers "$id" "${next[@]-}"
   local -a cleaned=("${NORMALIZED_BLOCKERS[@]-}")
 
-  if (( ${#cleaned[@]} == 0 )); then
-    fm_set "$file" '.blockers = []'
-  else
-    local json; json=$(printf '%s\n' "${cleaned[@]}" | jq -R . | jq -s -c .)
-    BLOCKERS="$json" yq -i --front-matter=process '.blockers = (strenv(BLOCKERS) | from_json)' "$file"
+  # The authoring forms carry live review gates along; the subtractive ones do
+  # not (see review_gate_riders).
+  local riders=""
+  if [[ "$mode" == "add" || "$mode" == "set" ]]; then
+    review_gate_riders "$id" "${cleaned[@]-}"
+    if (( ${#REVIEW_GATE_RIDERS[@]} > 0 )); then
+      cleaned+=("${REVIEW_GATE_RIDERS[@]}")
+      riders="${REVIEW_GATE_RIDERS[*]}"
+    fi
   fi
+
+  write_blockers "$file" "${cleaned[@]-}"
   git_commit_state "blockers: $mode $id"
   echo "blockers for $id: ${cleaned[*]-(none)}"
+  [[ -n "$riders" ]] \
+    && echo "review gate(s) carried along (the named blocker is under live review): $riders"
+  return 0
 }
 
 # Create a new task file. Exists so that filing work never requires hand-authoring
@@ -1927,11 +2726,19 @@ cmd_create() {
   [[ -n "$(task_file "$id")" ]] && die "task already exists: $id"
 
   local -a blist=()
+  local riders=""
   if [[ -n "$blockers" ]]; then
     local -a raw=()
     IFS=',' read -r -a raw <<<"$blockers"
     normalize_blockers "$id" "${raw[@]-}"
     blist=("${NORMALIZED_BLOCKERS[@]-}")
+    # A task filed AFTER a review chain exists is invisible to that chain's
+    # one-shot downstream snapshot, so the gate rides along here instead.
+    review_gate_riders "$id" "${blist[@]-}"
+    if (( ${#REVIEW_GATE_RIDERS[@]} > 0 )); then
+      blist+=("${REVIEW_GATE_RIDERS[@]}")
+      riders="${REVIEW_GATE_RIDERS[*]}"
+    fi
   fi
 
   local b
@@ -1986,6 +2793,9 @@ cmd_create() {
 
   git_commit_state "create $id"
   echo "created $id at $file"
+  [[ -n "$riders" ]] \
+    && echo "review gate(s) carried along (the named blocker is under live review): $riders"
+  return 0
 }
 
 cmd_resolve() {
@@ -2016,6 +2826,10 @@ usage() {
 Commands:
   next [--branch <b>] [--phase <FN>] Emit next ready task as JSON (incl. goal).
                                      --phase scopes to one epic (e.g. F51).
+                                     Review tasks are skipped unless
+                                       --include-reviews: an in-context agent
+                                       loop must never claim the review of its
+                                       own work.
   ready [--phases A..B] [--branch <b>] [--json|--count|--count-eligible]
                                      --json/default: the WHOLE eligible frontier
                                        (open + blockers done + unclaimed or own
@@ -2028,6 +2842,12 @@ Commands:
                                        --count > 0 signals a stall (work, none
                                        ready). --count wins if both are given.
                                      --phases accepts TN, TN..TM, and comma lists.
+                                     The eligible walks (--json/default/
+                                       --count-eligible) skip review tasks
+                                       unless --include-reviews; --count still
+                                       counts them — a pending review is open
+                                       work, and a range gated on one is
+                                       stalled, not drained.
   list [--status <s>] [--json]       Human-readable listing (flags missing goals).
                                      --json adds phase, claimant, blockers and
                                        the declared `files:` footprint per task.
@@ -2047,11 +2867,17 @@ Commands:
                                        TASKPUMP_ID_PATTERN. Refuses to
                                        overwrite an existing task.
   claim <id> --branch <b> [--turns N]  Atomically claim a task.
-  heartbeat <id> [--start|--end]     Budget + failure tracking.
+  heartbeat <id> [--start|--end]     Budget + failure tracking. On review tasks
+                                       --end decrements the budget only: commit
+                                       productivity is not measured for a task
+                                       whose deliverable is a ledger verdict,
+                                       so the failure streak never moves.
   complete <id> [--commits sha,sha] [--defer-wiring "note"]
                                      Mark done; stdin → completion notes.
                                      --defer-wiring flags that the runtime wiring
                                        (first real caller) was left for a follow-up.
+                                     Refused on a review task — those close by
+                                       rendering their verdict.
   block <id> --reason "..."          Mark blocked with reason.
   needs-review <id> --reason "..."   Flag for human review (pump quarantine setter).
   release <id> --reason "..."        Relinquish a claim back to status=open.
@@ -2059,6 +2885,47 @@ Commands:
                                        task to status=open (done → sheds completion
                                        markers: falsely-done; needs-review/stuck →
                                        clears the failure streak + scrub_reason).
+                                     A task carrying a review chain re-arms it:
+                                       every member back to open, review_round
+                                       reset to 1 — the redone work has not been
+                                       reviewed, so the gate must live again.
+  review <impl-id> [--panel N] [--prompt <file>] [--max-rounds N]
+                                     Synthesize a review chain in the DAG: N
+                                       reviewer tasks blocked by <impl-id> (default
+                                       1), an adjudicator blocked by all reviewers
+                                       when N > 1, and the gate task (adjudicator,
+                                       or the lone reviewer) ADDED to the blockers
+                                       of every task downstream of <impl-id>.
+                                       Blockers do the gating; no new predicate.
+                                       That rewiring is a snapshot, so `create
+                                       --blockers` and `blockers --add/--set`
+                                       carry the gate along afterwards.
+                                       Refuses a second chain for the same task.
+                                       --prompt records a review lens (validated
+                                       now, read by whatever dispatches the
+                                       reviewer); --max-rounds bounds the
+                                       change-request loop (default 3).
+  verdict <review-id> [--branch <b>] --approve [--findings -|"..."]
+          | --request-changes --findings -|"..."
+                                     Render a review's outcome through existing
+                                       state-machine doors. --approve completes
+                                       the review task (findings to its body);
+                                       a panel reviewer's approve is its report.
+                                     A claimed review needs --branch matching
+                                       claimed_by; an unclaimed one rules with a
+                                       warning (nothing records who ruled).
+                                       --request-changes (gate task only,
+                                       findings required, requires the reviewed
+                                       task to be done) appends the findings to
+                                       the IMPLEMENTATION task's body, reopens
+                                       it (completion markers shed, prior
+                                       commits preserved in the note), re-arms
+                                       the chain to open, and advances
+                                       review_round — or, past
+                                       review_max_rounds, parks the
+                                       implementation needs-review with the
+                                       findings intact. --findings - reads
+                                       stdin.
   resume-attempt <id> --head <sha> [--max N]
                                      Pump-only: record an auto-resume of a stalled
                                        task and rule on whether it may proceed.
@@ -2087,7 +2954,10 @@ Commands:
                                        the vocabulary, machine keys have
                                        contract-legal types, every blocker
                                        resolves, no self-blocks, no blocker
-                                       cycles. One line per violation
+                                       cycles, review_of resolves (never to
+                                       the task itself), review_role is
+                                       reviewer|adjudicator. One line per
+                                       violation
                                        (<file>: <what>); exit 3 when any
                                        exist, 0 clean, 1 = fsck itself failed.
                                        --fix stamps MISSING machine keys with
@@ -2225,19 +3095,19 @@ main() {
   # about the install-root fallback's ledger is a wrong answer about the
   # caller's — `resolve` stays available to diagnose.
   case $cmd in
-    create|claim|heartbeat|complete|block|needs-review|release|reopen|defer|undefer|resume-attempt|scrub|goal|title|blockers|fsck)
+    create|claim|heartbeat|complete|block|needs-review|release|reopen|review|verdict|defer|undefer|resume-attempt|scrub|goal|title|blockers|fsck)
       tp_require_resolved_ledger;;
   esac
   # Every verb that reads or writes the ledger needs the directory to exist;
   # `resolve` is the diagnostic the refusal points at and keeps working.
   case $cmd in
-    next|ready|list|goal|title|blockers|create|claim|heartbeat|complete|block|needs-review|release|reopen|defer|undefer|deferred|resume-attempt|scrub)
+    next|ready|list|goal|title|blockers|create|claim|heartbeat|complete|block|needs-review|release|reopen|review|verdict|defer|undefer|deferred|resume-attempt|scrub)
       tp_require_tasks_dir;;
   esac
   # Mutating subcommands serialize on the cross-agent state lock for their
   # whole read-modify-write + commit. Read-only commands (next/list) skip it.
   case $cmd in
-    claim|heartbeat|complete|block|needs-review|release|reopen|defer|undefer|resume-attempt|scrub) acquire_state_lock;;
+    claim|heartbeat|complete|block|needs-review|release|reopen|review|verdict|defer|undefer|resume-attempt|scrub) acquire_state_lock;;
   esac
   case $cmd in
     next) cmd_next "$@";;
@@ -2254,6 +3124,8 @@ main() {
     needs-review) cmd_needs_review "$@";;
     release) cmd_release "$@";;
     reopen) cmd_reopen "$@";;
+    review) cmd_review "$@";;
+    verdict) cmd_verdict "$@";;
     defer) cmd_defer "$@";;
     undefer) cmd_undefer "$@";;
     deferred) cmd_deferred "$@";;
