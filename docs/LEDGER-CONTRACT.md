@@ -145,7 +145,21 @@ set.
 |---|---|---|
 | `status` | enum, required | One of the six values in §4. |
 | `blockers` | list of task ids | Tasks that must reach `done` before this one is eligible (§6). Validated on write: each id must exist, and a task may not block itself. Default `[]`. |
-| `files` | list of paths | Repo-relative paths this task is expected to touch. Used by the heartbeat productivity check (§5.3) to attribute commits. Advisory — an empty list means "any commit counts". Default `[]`. |
+| `files` | list of paths | Repo-relative paths this task is expected to touch. Default `[]`. **Two consumers read it, and an empty list means the opposite thing to each — see below.** |
+
+`files:` has two readers, and a writer has to know which one it is writing for:
+
+| Consumer | What it does with `files` | What an **empty** list means |
+|---|---|---|
+| The heartbeat productivity check (§5.3) | Attributes commits to the task to decide whether a heartbeat cycle was productive. | **Advisory, permissive** — any commit counts. |
+| A supervisor scheduling at **task grain** (`tp pump --grain task`) | Two tasks may run concurrently only when their `files:` sets are disjoint; an overlap is a hold. | **Load-bearing, exclusive** — an undeclared footprint is *unknown*, and scheduling unknown as "touches nothing" would put two agents on one file while reporting a clean plan. Such a task runs alone. |
+
+Both readings are deliberate. The productivity check is looking backwards at
+work that already happened, where guessing wrong costs a false stall warning;
+the scheduler is looking forwards at work about to start concurrently, where
+guessing wrong costs two agents on one file. Neither reader is authoritative
+over the other, and a task dispatched at task grain should declare its footprint
+rather than rely on either default.
 
 ### Claim
 
@@ -510,6 +524,25 @@ Queries add scoping on top of the predicate, never replacing it:
   ignoring blockers and claims. This is the *drain test* — "is any open work
   left?" — not "what can run now?".
 - `ready --count-eligible` is the narrower companion: the size of the frontier.
+- `ready --json` and `list --json` both carry each task's declared `files:` as an
+  array — `[]` when the task declares nothing, never `null`. A supervisor
+  dispatching at task grain has to know what two eligible siblings would each
+  touch before it may run them side by side, and "declares nothing" and "the
+  field is missing" must not be distinguishable to a reader. `list --json` adds
+  status, claimant and blockers for **every** task, not just the frontier: what a
+  *running* task is touching is exactly what a candidate must not collide with.
+  Its object is exactly these eight keys:
+
+  | Key | Type | Notes |
+  |---|---|---|
+  | `id` | string | The task id. |
+  | `file` | string | Path to the task file as the ledger reader resolved it — absolute or relative exactly as `resolve --tasks-dir` reports the directory. The one field that is *not* frontmatter: it is where this record was read from. |
+  | `phase` | string | The id's phase, derived (`id` up to the first `.`). Present so a reader need not re-implement §7.2's split. |
+  | `status` | string | §4. |
+  | `claimed_by` | string \| null | `null`, never `""`, when unclaimed. |
+  | `title` | string | The task's one-line title. |
+  | `blockers` | array of strings | `[]`, never `null`. |
+  | `files` | array of strings | `[]`, never `null`. See §3. |
 
 The two counts diverge exactly when something is stalling the queue: work
 remains open but nothing can start. `--count > 0` with `--count-eligible == 0` is

@@ -1,6 +1,6 @@
 # Templates
 
-Prompt text the pump renders and hands to an agent. Both files ship as
+Prompt text the pump renders and hands to an agent. All three files ship as
 **generic defaults**: tool-agnostic, no build system named, no repo layout
 assumed. They exist so a fresh consumer is not dead on arrival — the pump
 refuses to start without a brief template — and as the starting point for
@@ -13,8 +13,15 @@ the next consumer inherits something usable.
 
 | File | Rendered by | Key | Handed to the agent as |
 |---|---|---|---|
-| `phase-drain-brief.md` | once per launch | `TASKPUMP_PHASE_BRIEF_TEMPLATE` | the kickoff brief |
+| `phase-drain-brief.md` | once per launch, at `--grain phase` | `TASKPUMP_PHASE_BRIEF_TEMPLATE` | the kickoff brief |
+| `task-brief.md` | once per launch, at `--grain task` | `TASKPUMP_TASK_BRIEF_TEMPLATE` | the kickoff brief |
 | `resume-note.md` | only when resuming a stalled claim | `TASKPUMP_RESUME_TEMPLATE` | a preamble ahead of the brief |
+
+The two briefs are separate files rather than one parameterized template because
+they instruct the agent to do **opposite** things about acquisition. The phase
+brief's working method IS the in-context `next --phase` loop; the task brief
+forbids `next` outright, because at task grain the pump has already dispatched
+the siblings that loop would claim.
 
 Stdin order at the container is **goal note, then resume note, then brief** —
 see `runners/claude-docker/README.md`.
@@ -52,6 +59,18 @@ their verify prose in a `{{#VERIFY_CMDS}}` section.
 | `{{VERIFY_CMDS}}` | scalar | The per-task verify commands, rendered as an inline phrase. Empty (and its `{{#VERIFY_CMDS}}` sections dropped) unless `TASKPUMP_VERIFY_CMDS` is set. |
 | `{{PROJECT_BRIEF}}` | block | `TASKPUMP_PROJECT_BRIEF` — a paragraph pointing the agent at the project's own docs. |
 | `{{DEPENDS_ON}}` | block | Cross-phase dependency summary, or a line stating there are none. |
+
+### `task-brief.md`
+
+Everything `phase-drain-brief.md` takes, plus:
+
+| Placeholder | Kind | Value |
+|---|---|---|
+| `{{TASK_ID}}` | scalar | The one task this container was launched for, e.g. `G3.4`. Empty at phase grain. |
+
+`{{PHASE}}` is the task's own phase, and `{{DEPENDS_ON}}` names the task's
+blockers (every one of them — at task grain an in-phase blocker is another
+container's branch, not the same session's earlier work).
 
 ### `resume-note.md`
 

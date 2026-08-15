@@ -616,9 +616,17 @@ cmd_ready() {
   fi
 
   if (( json )); then
-    # Emit a JSON array of {id,file,phase,goal,blockers}. Build per-object with
-    # jq -n then aggregate with jq -s so escaping is correct for goals/blockers.
-    local objs=() line oid ofile ophase ogoal oblockers
+    # Emit a JSON array of {id,file,phase,goal,blockers,files}. Build per-object
+    # with jq -n then aggregate with jq -s so escaping is correct for
+    # goals/blockers.
+    #
+    # `files` is the task's declared footprint (§3 Scheduling). It rides along
+    # because a supervisor dispatching at TASK grain has to answer "may these two
+    # eligible siblings run at once?", and the only honest input to that is what
+    # each one says it will touch. Always an array — `[]` for a task that
+    # declares nothing, never `null`, so a reader never has to distinguish
+    # "empty" from "absent".
+    local objs=() line oid ofile ophase ogoal oblockers ofiles
     if [[ -n "$sorted" ]]; then
       while IFS= read -r line; do
         [[ -z "$line" ]] && continue
@@ -628,10 +636,13 @@ cmd_ready() {
         ogoal=$(fm_get "$ofile" '.goal')
         oblockers=$(yq --front-matter=extract -o=json -I=0 '.blockers' "$ofile" 2>/dev/null || echo "null")
         [[ -z "$oblockers" || "$oblockers" == "null" ]] && oblockers="[]"
+        ofiles=$(yq --front-matter=extract -o=json -I=0 '.files' "$ofile" 2>/dev/null || echo "null")
+        [[ -z "$ofiles" || "$ofiles" == "null" ]] && ofiles="[]"
         objs+=("$(jq -n \
           --arg id "$oid" --arg file "$ofile" --arg phase "$ophase" \
           --arg goal "$ogoal" --argjson blockers "$oblockers" \
-          '{id:$id, file:$file, phase:$phase, goal:$goal, blockers:$blockers}')")
+          --argjson files "$ofiles" \
+          '{id:$id, file:$file, phase:$phase, goal:$goal, blockers:$blockers, files:$files}')")
       done <<<"$sorted"
     fi
     if (( ${#objs[@]} == 0 )); then
@@ -660,14 +671,54 @@ cmd_ready() {
 }
 
 cmd_list() {
-  local filter_status=""
+  local filter_status="" json=0
   while (( $# )); do
     case $1 in
       --status) filter_status=$2; shift 2;;
       --status=*) filter_status=${1#--status=}; shift;;
+      --json) json=1; shift;;
       *) die "unknown arg to list: $1";;
     esac
   done
+
+  # --json: the same walk, machine-readable, with the two fields the human table
+  # has no column for — `files` (the declared footprint) and `phase`. A
+  # supervisor dispatching at task grain needs status, claimant, blockers AND
+  # footprint for EVERY task, not just the eligible frontier: what a running
+  # task is touching is exactly what a candidate must not collide with. Reading
+  # that by parsing the human table would freeze the table's column layout into
+  # a contract; reading it with yq behind the CLI's back would put a second
+  # reader on the ledger. So it is a flag on the verb that already walks
+  # everything.
+  if (( json )); then
+    local objs=() file id status claimed_by title blockers files phase
+    while IFS= read -r file; do
+      [[ -z "$file" ]] && continue
+      id=$(fm_get "$file" '.id'); [[ -z "$id" ]] && continue
+      status=$(fm_get "$file" '.status')
+      [[ -n "$filter_status" && "$status" != "$filter_status" ]] && continue
+      claimed_by=$(fm_get "$file" '.claimed_by')
+      title=$(fm_get "$file" '.title')
+      phase=${id%%.*}
+      blockers=$(yq --front-matter=extract -o=json -I=0 '.blockers' "$file" 2>/dev/null || echo "null")
+      [[ -z "$blockers" || "$blockers" == "null" ]] && blockers="[]"
+      files=$(yq --front-matter=extract -o=json -I=0 '.files' "$file" 2>/dev/null || echo "null")
+      [[ -z "$files" || "$files" == "null" ]] && files="[]"
+      objs+=("$(jq -n \
+        --arg id "$id" --arg file "$file" --arg phase "$phase" \
+        --arg status "$status" --arg claimed_by "$claimed_by" --arg title "$title" \
+        --argjson blockers "$blockers" --argjson files "$files" \
+        '{id:$id, file:$file, phase:$phase, status:$status,
+          claimed_by:(if $claimed_by == "" then null else $claimed_by end),
+          title:$title, blockers:$blockers, files:$files}')")
+    done < <(list_all_files)
+    if (( ${#objs[@]} == 0 )); then
+      printf '[]\n'
+    else
+      printf '%s\n' "${objs[@]}" | jq -s '.'
+    fi
+    return 0
+  fi
 
   printf '%-10s %-14s %-24s %-20s %s\n' "ID" "STATUS" "CLAIMED_BY" "BLOCKERS" "TITLE"
   local file id status claimed_by title blockers goal
@@ -2797,7 +2848,9 @@ Commands:
                                        counts them — a pending review is open
                                        work, and a range gated on one is
                                        stalled, not drained.
-  list [--status <s>]                Human-readable listing (flags missing goals).
+  list [--status <s>] [--json]       Human-readable listing (flags missing goals).
+                                     --json adds phase, claimant, blockers and
+                                       the declared `files:` footprint per task.
   goal <id> [--set "text"]           Read or set a task's one-line outcome goal.
   goal --missing                     List open/in_progress tasks with no goal.
   title <id> [--set "text"]          Read or set a task's title.

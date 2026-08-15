@@ -1555,6 +1555,45 @@ for bad in "/leading" "trailing/" "has space"; do
 done
 assert_fm "$TASKS/F90.1.md" '.status' 'open'
 
+# ── Test 30: the declared footprint reaches the query surface (issue #11) ─────
+# `files:` was write-only: the schema carried it, `create --files` wrote it,
+# heartbeat attribution read it — and nothing could ASK for it. A supervisor
+# dispatching at task grain has to answer "may these two eligible siblings run at
+# once?", and the only honest input to that is what each one says it will touch.
+# So both query verbs emit it, always as an array: a reader must never have to
+# tell "declares nothing" from "the field was missing".
+echo "--- Test 30: files: on ready --json and list --json ---"
+"$CLI" create F91.1 --title "Two files" --phase F91 --files "libexec/tp-pump,docs/RUNNERS.md" >/dev/null
+"$CLI" create F91.2 --title "No files"  --phase F91 >/dev/null
+
+got=$("$CLI" ready --phase F91 --json | jq -r '.[] | select(.id=="F91.1") | .files | join(",")')
+[[ "$got" == "libexec/tp-pump,docs/RUNNERS.md" ]] \
+  && pass "ready --json round-trips a task's declared files" || fail "ready files: '$got'"
+got=$("$CLI" ready --phase F91 --json | jq -r '.[] | select(.id=="F91.2") | .files | tostring')
+[[ "$got" == "[]" ]] && pass "an undeclared footprint is [] on ready --json, never null" \
+  || fail "ready files for an undeclared task: '$got'"
+
+"$CLI" claim F91.2 --branch feat/f91.2 --turns 5 >/dev/null
+got=$("$CLI" list --json | jq -r '.[] | select(.id=="F91.1") | .files | join(",")')
+[[ "$got" == "libexec/tp-pump,docs/RUNNERS.md" ]] \
+  && pass "list --json carries files for every task, not just the frontier" || fail "list files: '$got'"
+got=$("$CLI" list --json | jq -r '.[] | select(.id=="F91.2") | [.status, .claimed_by, (.files|tostring)] | join("|")')
+[[ "$got" == "in_progress|feat/f91.2|[]" ]] \
+  && pass "list --json reports a CLAIMED task's status, claimant and footprint" || fail "list json for a claimed task: '$got'"
+got=$("$CLI" list --json --status in_progress | jq -r '[.[].status] | unique | join(",")')
+[[ "$got" == "in_progress" ]] && pass "list --json honors --status" || fail "list --json --status: '$got'"
+"$CLI" list --json --status in_progress | jq -e 'map(.id) | index("F91.2")' >/dev/null \
+  && pass "and the claimed task is in that filtered set" || fail "F91.2 missing from the in_progress set"
+got=$("$CLI" list --json | jq -r '.[] | select(.id=="F91.1") | .claimed_by | tostring')
+[[ "$got" == "null" ]] && pass "an unclaimed task's claimed_by is null, not the empty string" \
+  || fail "unclaimed claimed_by: '$got'"
+"$CLI" list --json | jq -e 'type == "array"' >/dev/null \
+  && pass "list --json is a JSON array" || fail "list --json is not an array"
+# The human table is a separate contract and must not have moved.
+hdr=$("$CLI" list | sed -n 1p)
+[[ "$hdr" =~ ^ID[[:space:]]+STATUS[[:space:]]+CLAIMED_BY[[:space:]]+BLOCKERS[[:space:]]+TITLE ]] \
+  && pass "the human table's columns are unchanged by the new flag" || fail "list table header moved: '$hdr'"
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo
 echo "=============================================="
