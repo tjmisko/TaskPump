@@ -709,13 +709,25 @@ hold_reason() {
 # the range's own phase order, numerically within each phase (the ledger's
 # ordering — LEDGER-CONTRACT §6.1 — so the plan reads like `next` would hand the
 # work out).
+#
+# The per-id guards are `|| continue`, never `[[ … ]] && printf`, and that is
+# load-bearing under `set -e`. A trailing AND-list is the LAST command of the
+# for-loop body, so an id that does not match the phase makes the loop — and,
+# through `pipefail`, the whole `| sort` pipeline — exit 1. This while loop's
+# body would then be a failing command, `set -e` would kill the function
+# mid-range, and because the caller reads it through a process substitution the
+# non-zero exit is invisible: every phase after the first silently vanished from
+# the plan. `--grain task --phases G1..G9` planned G1 and nothing else, then hit
+# the deadlock detector with eight phases of open work still in range.
 tasks_in_range() {
   (( TSNAP_LOADED )) || load_task_snapshot
   local p id
   while IFS= read -r p; do
     [[ -z "$p" ]] && continue
     for id in "${TSNAP_IDS[@]:-}"; do
-      [[ -n "$id" && "${id%%.*}" == "$p" ]] && printf '%s\n' "$id"
+      [[ -n "$id" ]] || continue
+      [[ "${id%%.*}" == "$p" ]] || continue
+      printf '%s\n' "$id"
     done | sort -V
   done < <(pump_expand_phases "$PHASES")
 }
