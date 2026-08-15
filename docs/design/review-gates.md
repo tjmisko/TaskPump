@@ -94,6 +94,22 @@ implementation `needs-review` — `review_round` stays N, because no round N+1
 ever begins. With the default of 3: at most three review rounds, at most two
 automatic reopens, and the third rejection goes to a human.
 
+That human's door back is the ordinary `reopen`, and it **re-arms the chain**:
+every member returns to `open` and `review_round` resets to 1. This is not a
+convenience. The exhaustion path *completes* the gate — its verdict was
+delivered — so a `reopen` touching only the implementation would leave
+downstream blocked on a `done` gate, and the very next `complete` would release
+it with no verdict rendered and nothing warning. Nothing could repair that
+afterwards either: `verdict` refuses a second ruling on a done review and
+`review` refuses a second chain, so `reopen` is the only sanctioned way back
+and has to carry the chain with it. The same rule covers the ordinary case —
+reopening work whose review already approved re-opens the review too, because
+the redone work is not the reviewed work. Leaving the gate `open` on the
+exhaustion path was the alternative: it contradicts "the gate's verdict is
+delivered", it strands a permanently-open task in the graph, and it still needs
+the counter reset, since a chain re-entered at its bound re-parks on the first
+change-request of the new round.
+
 ## Alternatives rejected
 
 - **A `review` status / new state-machine states.** A seventh status is a

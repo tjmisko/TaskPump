@@ -326,7 +326,14 @@ available again, no tripwire tripped, budget cleared. Requires `in_progress`.
   `consecutive_failed_iterations` is reset, so a task reopened from `stuck` does
   not re-trip on its next heartbeat.
 
-All four clear `scrub_reason`, the claim fields, and the budget.
+All four clear `scrub_reason`, `blocked_at`, `blocked_reason`, the claim fields,
+and the budget.
+
+Reopening a task that carries a **review chain** (`review_round`, §5.12) also
+re-arms that chain: every member goes back to `open` with its completion and
+block markers shed, and `review_round` resets to 1. The work about to be redone
+has not been reviewed, so a gate left `done` across a reopen would let the next
+`complete` unblock downstream with no verdict rendered.
 
 That `needs-review` and `stuck` are reopenable is load-bearing. Without it they
 are dead ends — `release` requires `in_progress`, `claim` requires `open` —
@@ -432,7 +439,12 @@ reported. Then:
   completes the gate (its verdict is delivered) and parks the implementation
   `needs-review` with `scrub_reason: review rounds exhausted (N/N)` and the
   findings intact. The bound measures futility, not duration; the door back is
-  the ordinary `reopen` (§5.7), by a human.
+  the ordinary `reopen` (§5.7), by a human — and that door **re-arms the whole
+  chain** and resets `review_round` to 1, so the redone work goes back through
+  the gate rather than past it. Without that, the exhaustion park would retire
+  the gate permanently: it completes the gate task, so a reopen that touched
+  only the implementation would leave downstream blocked on a `done` gate and
+  the next `complete` would release it with no verdict rendered.
 
 Supervisors that cannot dispatch review tasks see them only through
 `ready --count` (§6): a range gated on an unrendered verdict reads as open

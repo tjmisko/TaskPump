@@ -1113,8 +1113,44 @@ cmd_reopen() {
   local note="$reason"
   [[ "$status" == "done" && -n "$prior_commits" ]] && note="$reason (prior completion commits: $prior_commits)"
   printf '\n## Reopened (%s, from %s)\n\n%s\n' "$now" "$status" "$note" >> "$file"
+
+  # Reopening work that carries a review chain re-arms the chain, because the
+  # work about to be redone has not been reviewed. Contract §5.12 names the
+  # ordinary `reopen` as the human door out of a rounds-exhausted park, and
+  # without this that door is a trapdoor: the exhaustion path completes the
+  # gate, so a bare reopen leaves the gate `done` and the NEXT `complete` makes
+  # downstream eligible with no review rendered and nothing warning. The same
+  # hole opens after an ordinary approve-then-reopen. `verdict` cannot patch
+  # it either — it refuses a second ruling on a done review ("a verdict is
+  # already recorded"), and `review` refuses a second chain ("one subject, one
+  # chain"), so there is no other sanctioned way back.
+  #
+  # The round counter resets to 1 with the chain: a human who reopens is
+  # granting the work another look, and leaving the counter at its bound would
+  # re-park the task on the first change-request of the new round.
+  local rearmed=""
+  if [[ -n "$(fm_get "$file" '.review_round')" ]]; then
+    review_chain_scan "$id"
+    if (( ${#REVIEW_CHAIN_IDS[@]} > 0 )); then
+      local i cid cfile cstatus
+      for i in "${!REVIEW_CHAIN_IDS[@]}"; do
+        cid="${REVIEW_CHAIN_IDS[$i]}"
+        cfile="${REVIEW_CHAIN_FILES[$i]}"
+        cstatus=$(fm_get "$cfile" '.status')
+        [[ "$cstatus" == "open" ]] && continue
+        review_rearm_task "$cfile"
+        printf '\n## Re-armed by reopen (%s)\n\n%s was reopened (was %s); this review re-runs against the redone work.\n' \
+          "$now" "$id" "$status" >> "$cfile"
+        rearmed="$rearmed $cid"
+      done
+      fm_set "$file" ".review_round = 1"
+    fi
+  fi
+
   git_commit_state "reopen $id: $reason"
   echo "reopened $id (was $status)"
+  [[ -n "$rearmed" ]] && echo "review chain re-armed (round 1):$rearmed"
+  return 0
 }
 
 # ── Review gates (issue #12) ──────────────────────────────────────────────────
@@ -1158,6 +1194,32 @@ review_chain_scan() {
     REVIEW_GATE_ID="${REVIEW_CHAIN_IDS[0]}"
   fi
   return 0
+}
+
+# Re-arm one review-chain member back to `open`, shedding every marker a
+# completed (or parked) review left behind. Shared by the two paths that
+# re-arm a chain — a change-request verdict and a `reopen` of the subject — so
+# the two can never disagree about what a re-armed review looks like.
+#
+# blocked_at/blocked_reason are cleared with the rest because contract §3 ties
+# them to the `blocked` status and §5.7 has `reopen` clear both: a task sitting
+# `open` while still carrying the reason it was once blocked is a stale field
+# every reader must learn to disbelieve.
+# Usage: review_rearm_task <file>
+review_rearm_task() {
+  fm_set "$1" "
+    .status = \"open\" |
+    .claimed_by = null |
+    .claimed_at = null |
+    .turn_budget_remaining = null |
+    .consecutive_failed_iterations = 0 |
+    .last_heartbeat_head_sha = null |
+    .completed_at = null |
+    .completed_by_commits = [] |
+    .blocked_at = null |
+    .blocked_reason = null |
+    .scrub_reason = null
+  "
 }
 
 # Write one synthesized review task file. Emits the full machine-key set of
@@ -1582,17 +1644,7 @@ cmd_verdict() {
   for i in "${!REVIEW_CHAIN_IDS[@]}"; do
     cid="${REVIEW_CHAIN_IDS[$i]}"
     cfile="${REVIEW_CHAIN_FILES[$i]}"
-    fm_set "$cfile" "
-      .status = \"open\" |
-      .claimed_by = null |
-      .claimed_at = null |
-      .turn_budget_remaining = null |
-      .consecutive_failed_iterations = 0 |
-      .last_heartbeat_head_sha = null |
-      .completed_at = null |
-      .completed_by_commits = [] |
-      .scrub_reason = null
-    "
+    review_rearm_task "$cfile"
     [[ "$cid" == "$rid" ]] && continue
     printf '\n## Re-armed for round %s (%s)\n\n%s was reopened by %s'\''s change-request verdict; blockers hold this review until the fix completes.\n' \
       "$new_round" "$now" "$impl_id" "$rid" >> "$cfile"

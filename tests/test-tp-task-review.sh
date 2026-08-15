@@ -430,8 +430,68 @@ got=$("$CLI" ready --count-eligible)
 [[ "$got" == "0" ]] && pass "downstream stays shut: the parked implementation is not done" \
   || fail "post-exhaustion frontier got '$got', expected 0"
 
-"$CLI" reopen T8.1 --reason "human ruling: proceed with the rename as-is" >/dev/null
+# ── Section 5b: the door back out of the park re-arms the gate ──────────────
+echo
+echo "--- reopen: the human door back is not a trapdoor ---"
+
+# Contract §5.12 names the ordinary `reopen` as the door out of a
+# rounds-exhausted park. The exhaustion path completes the gate, so a reopen
+# that only touched the implementation would leave the gate `done` — and the
+# next `complete` would make downstream eligible with NO review rendered and
+# nothing warning, which is the whole feature failing open. Neither other verb
+# can repair it: `verdict` refuses a second ruling on a done review and
+# `review` refuses a second chain, so `reopen` is the only sanctioned way back
+# and it has to re-arm the chain itself.
+#
+# A chain member parked `blocked` on the way in also pins the re-arm's field
+# hygiene: contract §5.7 has reopen clear blocked_at/blocked_reason, and a
+# task sitting `open` while still carrying the reason it was blocked is a
+# stale field every reader must learn to disbelieve. The re-arm is one shared
+# helper, so this covers the change-request path's re-arm too.
+"$CLI" block T8.3 --reason "the reviewer's machine died mid-read" >/dev/null
+assert_fm "$E/tasks" T8.3 '.blocked_reason' "the reviewer's machine died mid-read" "(setup) a chain member is parked blocked"
+
+out=$("$CLI" reopen T8.1 --reason "human ruling: proceed with the rename as-is")
 assert_fm "$E/tasks" T8.1 '.status' "open" "the human door out of the park is the ordinary reopen"
+assert_fm "$E/tasks" T8.4 '.status' "open" "and it re-arms the GATE — otherwise the next complete unblocks downstream unreviewed"
+assert_fm "$E/tasks" T8.2 '.status' "open" "the panel re-arms with it"
+assert_fm "$E/tasks" T8.3 '.status' "open" "including a member that was parked blocked"
+assert_fm "$E/tasks" T8.3 '.blocked_at' "null" "the re-arm clears blocked_at (§5.7)"
+assert_fm "$E/tasks" T8.3 '.blocked_reason' "null" "and blocked_reason with it"
+assert_fm "$E/tasks" T8.4 '.completed_at' "null" "the gate sheds its completion markers"
+assert_fm "$E/tasks" T8.1 '.review_round' "1" "the round counter resets — the human is granting another look, not one doomed round"
+assert_fm "$E/tasks" T8.1 '.scrub_reason' "null" "and the park's scrub_reason is cleared"
+grep -q 'review chain re-armed' <<<"$out" \
+  && pass "reopen says out loud that it re-armed the chain" \
+  || fail "reopen output did not mention the chain: '$out'"
+grep -q '## Re-armed by reopen' "$E/tasks/T8.4.md" \
+  && pass "and the gate's body records why its done was shed" \
+  || fail "no re-arm note on T8.4"
+
+# The point of all of it: the redone work goes back through the gate.
+"$CLI" complete T8.1 --commits ccc3333 >/dev/null
+got=$("$CLI" ready --count-eligible)
+[[ "$got" == "0" ]] && pass "completing the redone work does NOT unblock downstream — the gate is live again" \
+  || fail "post-reopen-complete frontier got '$got', expected 0 (T9.1 must stay gated)"
+got=$("$CLI" ready --count-eligible --include-reviews)
+[[ "$got" == "2" ]] && pass "the re-armed reviewers are eligible again" \
+  || fail "post-reopen-complete review frontier got '$got', expected 2"
+
+"$CLI" verdict T8.2 --approve >/dev/null
+"$CLI" verdict T8.3 --approve >/dev/null
+# The reset budget is real: a change-request here must reopen for round 2, not
+# re-park the task the instant the human's ruling put it back in the queue.
+"$CLI" verdict T8.4 --request-changes --findings "One more pass: the note is stale." >/dev/null
+assert_fm "$E/tasks" T8.1 '.status' "open" "a post-reopen change-request reopens rather than re-parking"
+assert_fm "$E/tasks" T8.1 '.review_round' "2" "the reset budget is real: round 1 -> 2, not straight back to the park"
+
+"$CLI" complete T8.1 --commits ddd4444 >/dev/null
+"$CLI" verdict T8.2 --approve >/dev/null
+"$CLI" verdict T8.3 --approve >/dev/null
+"$CLI" verdict T8.4 --approve --findings "Good now." >/dev/null
+out=$("$CLI" ready)
+grep -q 'T9\.1' <<<"$out" && pass "and the reviewed work finally unblocks downstream" \
+  || fail "T9.1 not eligible after the post-reopen approve: $out"
 
 # ── Section 6: heartbeat honesty — reviewers are kept off the tripwire ───────
 echo
