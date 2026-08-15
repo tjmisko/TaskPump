@@ -4,9 +4,140 @@ Notable changes to TaskPump. This project versions its **ledger contract**, not
 just its code: the rules for what constitutes a MAJOR, MINOR, or PATCH change are
 in [docs/LEDGER-CONTRACT.md §1](docs/LEDGER-CONTRACT.md#1-versioning).
 
-## Unreleased
+## 0.2.0 — 2026-08-14
+
+The release that makes TaskPump usable by a repository that is not Arachne. Every
+silent-resolution defect found in v0.1.0 is closed, the supervisor stops lying
+about its own state, and a new consumer starts with two commands instead of a
+config census.
+
+The theme is one rule applied everywhere: **a wrong answer must not be able to
+look like a right one.** Most of what is fixed here exited 0 while reporting
+something false — an empty frontier, a drained range, a live pump that was not
+running, a ledger that was not the caller's — and every fix turns that shape
+into a refusal that names the key, the path, and the diagnostic.
 
 ### Fixed
+
+- **Conf-relative paths resolve against the configuration's own workspace, not
+  `$PWD`.** A committed `taskpump.conf` can only carry relative paths — every
+  worktree is a different absolute path — so `TASKPUMP_TASKS_DIR=planning/tasks`
+  was correct from the repository root and silently wrong from anywhere else:
+  the ledger was probed relative to the caller's directory, found nothing, and
+  the frontier came back **empty at exit 0**. Reproduced live against a real
+  consumer during the F80 verification: ten open tasks, header row only, rc=0.
+
+  Resolution now anchors a conf-supplied relative path to the workspace the conf
+  itself belongs to (a discovered conf anchors to its own directory; an explicit
+  `TASKPUMP_CONFIG` anchors to the caller's worktree, because an explicit conf is
+  routinely a cross-worktree template). An **environment**-supplied value keeps
+  the shell's own convention and stays `$PWD`-relative — the caller typed it
+  where they stood. A relative path that cannot be anchored at all is an error
+  naming the key, never a guess. (#1)
+
+- **`tp pump` derives its ledger from the same rule as `tp task`.** The pump's
+  tasks-dir default was hardcoded to Arachne's `ops/task-loop/tasks`, so the
+  brief it handed a launched agent named a directory that does not exist in a
+  repository set up exactly as the README describes. It now derives from
+  `TASKPUMP_LEDGER_PROBE` against the shared workspace anchor: the supervisor and
+  the CLI can no longer disagree about whose ledger an invocation touches. (#2)
+
+- **`TASKPUMP_SUBMODULE_PROBE` has no default.** The old one was Arachne's
+  `ops/planning/STATUS.md` — for anyone else it either never exists (the
+  idempotent init runs every tick, wasteful but safe) or exists for an unrelated
+  reason and **silently skips** the submodule init some other submodule still
+  needed. Unset, the init always runs; configured, it is an opt-in optimization
+  whose skip-trap is documented. (#3)
+
+- **A vendored TaskPump's own conf can no longer hijack its consumer's ledger.**
+  A repository that vendors TaskPump as a subtree, a copy, or a git submodule
+  carries TaskPump's dogfood `taskpump.conf` inside it; discovery walking up from
+  a subdirectory found that file first and answered with TaskPump's ledger. The
+  walk now steps over a vendored installation's own conf — and from inside a
+  submodule it continues into the superproject — while a standalone or dogfood
+  checkout keeps its conf exactly as before. (#6)
+
+- **The pump refuses a missing ledger instead of reporting the range drained.**
+  `open_count` and `frontier_phases` mask a failed `tp task ready` into "0 open
+  tasks" with their `2>/dev/null` fallbacks, so a typo'd tasks dir rendered every
+  phase `DONE` at rc=0 — a false drain, the exact shape of the 563-tick idle
+  incident, arriving through a new door. A nonexistent tasks directory now aborts
+  the run before planning, naming the directory and the `resolve` diagnostic.
+
+- **The pump anchors its workspace to the configuration, not to its own install
+  directory.** `REPO_ROOT` was derived from the script's location, so for a
+  vendored or submodule consumer *every* workspace surface pointed at the
+  vendored `taskpump/` instead of the project: the default image build context,
+  the ops/worktrees/state directories, and every `git -C` call — branch
+  verification, worktree creation, the integration trunk. A real run built,
+  branched, and cut agent worktrees inside the vendored copy.
+
+  Caught by a consumer's first shim-borne canary launch, and invisible to every
+  dry-run before it: a dry run touches none of those surfaces. All 25 workspace
+  uses were audited and re-anchored; TaskPump's own assets (`lib/`, `libexec/`,
+  `gates/`, `runners/`, `templates/`, `hooks/`) already resolved through the
+  install root and are untouched. `TASKPUMP_WORKSPACE_ROOT` pins the workspace
+  explicitly for layouts that need it.
+
+  And because the fallback rung is not an answer for a supervisor: when nothing
+  anchors the workspace — no discovered conf, no repository at `$PWD`, no pin —
+  the pump now refuses outright rather than planning against its own
+  installation. The vendored layout, where the install root sits inside the
+  caller's worktree, keeps the fallback exactly as `tp task` allows it. (#32)
+
+- **`tp pump --detach` carries the caller's world across the systemd boundary.**
+  The `systemd-run` path re-exec'd forwarding only `GITHUB_TOKEN`, dropping
+  `TASKPUMP_CONFIG` (so a consumer's shim was bypassed), the working directory
+  (the unit ran from `$HOME`, where conf discovery finds nothing), and every
+  override. It ran conf-less and died on the missing-image check. The re-exec now
+  pins `WorkingDirectory` and forwards the exported `TASKPUMP_*`/`ARACHNE_*`
+  namespace plus the documented unprefixed passthroughs, so the two detach paths
+  see equivalent environments. (#31)
+
+- **No `tp pump` exit path leaves the state file claiming `running`.** After a
+  completed drain the state file still read `status: running, live_agents: 1`
+  with no supervisor, no container, and an inflated open count — and a reader
+  trusting that label burned a rescue session. Two paths never reached a terminal
+  write: `--once` exited straight after its tick, and a killed loop died wherever
+  it stood.
+
+  `--once` now stamps a terminal state carrying any gate-pause reason; the loop
+  installs EXIT and INT/TERM/HUP handlers that stamp `stopped` with the signal
+  and re-raise, preserving the exit status, and never overwrite a deliberate
+  `drained` or `stalled`. The tick sleep became interruptible so `systemctl stop`
+  is not deferred a full tick, and the handler reaps it.
+
+  SIGKILL cannot be trapped, so the reader is skeptical too: the state file now
+  records the writer's pid and host, and `tp monitor` verifies liveness before
+  believing a `running` claim — a dead pid, a pidless pre-fix file, or another
+  host's claim renders **STALE** with the last tick, never as a live pump. An
+  alive-but-unsignalable pid (a system-unit pump watched from a user shell) is
+  correctly live, and a foreign-host claim says *unverifiable*, not *dead* —
+  it never asserts a death it could not check. (#22)
+
+- **`tp cleanup`'s stuck-agent rescue maps containers to tasks through the
+  ledger.** It read Arachne's `parallel-manifest.tsv` — a file TaskPump does not
+  ship — so for every other consumer the rescue stopped the container and
+  silently skipped the task release. The mapping is now the ledger's live
+  in_progress claim, which works for any consumer, needs no manifest, and follows
+  an agent as it moves through a phase instead of freezing the launch-time
+  assignment. A manifest remains an opt-in fallback with no default, and a
+  configured-but-missing one is a loud error naming the key that was set.
+
+  The claim lookup deliberately ignores the pump state's phase range: a stuck
+  agent is typically the one the range has already moved past, and a narrowed
+  lookup skipped exactly the rescue the tool exists for. A renderer that cannot
+  be reached is now reported by name rather than being swallowed into a false
+  "no live ledger claim". (#7)
+
+- **The example configurations tell the truth.** `examples/arachne.conf` is what
+  a new consumer copies, and thirteen load-bearing pins were annotated
+  `# (default)` after a filename flip made them real overrides — an annotation
+  that, copied, silently changes behavior. Every annotation is now re-derived
+  from source with a `file:line` citation, in a grammar a test suite re-checks on
+  every run. The conf also set a pre-flight hook the shipped entrypoint cannot
+  run, quietly raised the job cap above the historical value, and pinned a notify
+  command that swallowed every notification it was given. (#4, #5, #8, #9)
 
 - **A ledger-mutating command now refuses the install-root fallback** instead of
   silently writing into TaskPump's own ledger. When no explicit tasks dir, no
@@ -30,40 +161,55 @@ in [docs/LEDGER-CONTRACT.md §1](docs/LEDGER-CONTRACT.md#1-versioning).
 
 ### Added
 
-- **`tp init` scaffolds a new consumer.** The first command a repository runs:
-  it writes a starter `taskpump.conf` and creates the tasks directory, and from
-  there `tp task create` and `tp task ready` work with no further configuration.
-  `--tasks-dir <d>` puts the ledger somewhere other than `tasks`. MINOR:
-  additive, and nothing existing behaves differently.
+- **`tp init` scaffolds a new consumer.** The first command a repository runs: a
+  starter `taskpump.conf` and a tasks directory, after which `tp task create` and
+  `tp task ready` work with no further configuration. It refuses to clobber
+  existing state and is a stated no-op on a second run. MINOR: additive.
 
-  The conf carries only the keys a starter actually decides — where the ledger
-  lives, the id grammar, and a commented-out `TASKPUMP_BUILD_GATE` — with a
-  pointer to `taskpump.conf.example` for the census. A scaffold that restates
-  every default produces a file nobody reads and a consumer who cannot tell
-  which lines are their decisions.
+- **`tp task fsck` validates — and can repair — an existing ledger.** The import
+  path for a repository that already keeps markdown task files: frontmatter
+  delimiters, id-versus-filename identity, the status vocabulary, contract-legal
+  types for every machine key, dangling blockers, self-blocking, and **blocker
+  cycles** — the one check no single-file tool can perform, and the one whose
+  absence silently removes a cycle's members from the frontier forever. Report
+  mode prints one line per violation and exits 3; `--fix` stamps only *missing*
+  machine keys with documented defaults, in one auditable commit, never touching
+  bodies and never rewriting a value that is present but wrong. MINOR: additive,
+  and documented as the contract's conformance check.
 
-  Two behaviours are the point of the command rather than details of it. It
-  writes at the **worktree root** even when run from a subdirectory, because the
-  discovery walk stops there: a conf anywhere else governs one subtree and
-  silently leaves the rest of the repository on the defaults. And it **refuses**,
-  naming the file, when a `taskpump.conf` is already discoverable from where it
-  is standing — including one named by `TASKPUMP_CONFIG`, which outranks the
-  walk, and one already sitting at the root when `TASKPUMP_NO_CONF=1` has turned
-  discovery off. A second conf shadows an existing ledger's configuration for
-  part of a repository, which is the wrong-ledger split-brain
-  ([PUMP-MECHANISMS.md §6](docs/PUMP-MECHANISMS.md#6-resolution-starts-from-the-callers-workspace))
-  self-inflicted at setup time, when nobody is yet watching for it. A refusal
-  changes nothing on disk, so re-running after one is a no-op rather than an
-  escalation.
+- **`tp` is on the agent's PATH inside the container.** The reference runner
+  bind-mounts the TaskPump installation read-only at `/opt/taskpump`, so a
+  workspace no longer has to vendor a task CLI for its agents to record their own
+  work. Resolution order is an explicit `TASKPUMP_WORKSPACE_TASK_CLI`, then `tp`
+  on PATH, then the loud error — now unreachable with the shipped runner, kept
+  for custom ones.
 
-  The generated tasks-dir key is anchored to the conf's own directory rather
-  than written as a bare relative path: a relative ledger resolves against `$PWD`,
-  so every invocation from a subdirectory reads an empty ledger and reports an
-  empty frontier at exit 0 (#1) — a silent false drain, and not a trap to hand
-  somebody in their first five minutes.
+- **`tp pump --grain task` dispatches independent siblings concurrently.** The
+  unit of dispatch had always been the phase, so two tasks that touch nothing in
+  common still queued behind one agent. Task grain gives each eligible task its
+  own worktree, branch, and agent name, and every supervisor mechanism moves down
+  with it: liveness corroboration, ownership-aware reclaim, resume-with-context
+  under the same no-progress budget, the jobs cap, and the loud deadlock exit.
+  Phase grain remains the default and is byte-identical — the shipped behavior of
+  an existing consumer does not move.
 
-  Scaffolding only: no commit (when the conf enters history is the consumer's
-  decision), no tasks, no ledger validation.
+  Two things phase grain got for free are now explicit. Concurrency is admitted
+  only between tasks whose `files:` sets are disjoint, which makes that field
+  load-bearing rather than decorative — a task declaring no files is scheduled
+  exclusively, because a task that names nothing may touch anything. And the
+  task-scoped brief forbids `next`: the phase brief tells an agent to keep
+  acquiring work, which at this grain would have it claim the very siblings the
+  pump just dispatched elsewhere. MINOR: additive, opt-in behind the flag.
+
+- **An adoption walkthrough that takes a repository from nothing to a
+  supervised drain**, in the README: `tp init`, then authoring tasks or
+  importing an existing markdown ledger with `fsck`, inspecting the frontier,
+  `--dry-run`, one supervised `--once`, and finally `--jobs 1` with the monitor
+  open. The runner choice is presented honestly — the sandboxed container runner
+  needs an image, the local runner needs no docker and gives no sandbox — and
+  every command in it was executed against a throwaway repository rather than
+  written from the source. Nothing in it refers to the project TaskPump was
+  extracted from.
 
 - **Runner contract v2: `runner.sh list`.** A runner can now be *asked* which of
   its agents are alive, instead of the supervisor inferring it by scraping
@@ -150,6 +296,60 @@ in [docs/LEDGER-CONTRACT.md §1](docs/LEDGER-CONTRACT.md#1-versioning).
   *state* so a zombie is not mistaken for a live agent — `kill -0` succeeds on
   one, and an orphaned agent under a container's non-reaping PID 1 stays a
   zombie forever.
+
+- **Review gates: a reviewer is a task in the DAG.** `tp task review <id>
+  [--panel N]` synthesizes an ordinary reviewer chain — N reviewer tasks blocked
+  by the implementation, an adjudicator blocked by the panel when N > 1 — and
+  adds the gate to the blockers of everything downstream, in one ledger commit
+  under one lock. No new status, no new transition, no change to the eligibility
+  predicate: gating is the blocker rule doing what it already did, which is why
+  `tp monitor` and the DAG renderer draw the chain without being taught about it.
+  The gate is *added* to a downstream task's blockers, never substituted for the
+  implementation edge, so reopening the work still holds downstream shut on its
+  own.
+
+  `tp task verdict <review-id> --approve | --request-changes --findings -`
+  renders the ruling through the existing doors. A change request appends the
+  findings to the *implementation's* body where the next agent will read them,
+  reopens it, re-arms the chain, and advances the round; past
+  `review_max_rounds` (default 3) the implementation parks `needs-review` with
+  the findings intact rather than looping forever. The guards close the quiet
+  bypasses: no verdict on work that is not `done`, no adjudicator ruling before
+  its panel reported, no panel member rendering the change request, no verdict
+  over another branch's live claim, no second verdict on a rendered one.
+
+  Two policy consequences ship with the mechanism. `next` and the eligible walks
+  of `ready` skip review tasks unless `--include-reviews`, so an agent loop
+  cannot claim the review of its own work — while `ready --count` still counts
+  them, because a pending review is open work and a range gated on one is
+  stalled, not drained. And `heartbeat` on a review task spends budget without
+  moving the failure streak: the commit meter measures nothing for a task whose
+  deliverable is a ledger verdict, and three honest readings of a diff must not
+  scrub a reviewer as stuck.
+
+  v1 is the hand-drivable mechanism; pump dispatch of review units, brief
+  templates and monitor badges are sequenced behind it. MINOR: five optional
+  verb-added frontmatter fields, two verbs, one query flag; no field, status,
+  transition or exit code changed, and `fsck` accepts a review-free ledger
+  exactly as before. Rationale and rejected alternatives in
+  [docs/design/review-gates.md](docs/design/review-gates.md). (#12)
+
+### Changed
+
+- **The suites are hermetic against a pump-launched session's environment.** The
+  pump necessarily exports `TASKPUMP_TASKS_DIR` and `TP_TASKS_DIR` — pointing at
+  the real ledger — into every agent session; that is how an agent's `tp` finds
+  its ledger. But the canonical spelling outranks its legacy twin, so a fixture
+  configuring itself as `ARACHNE_TASKS_DIR=<tmpdir>` was silently outranked, and
+  the test read the real ledger while believing it read its fixture. A dogfooding
+  agent saw 64 spurious failures this way and burned session time proving they
+  were not its own — the false-red mirror of the false-green problem
+  `TASKPUMP_NO_CONF` already solved for leaked conf files.
+
+  Every suite now sources a shared prologue that unsets the entire inherited
+  `TASKPUMP_*`/`TP_*`/`ARACHNE_*` namespace **by enumeration** rather than from a
+  hand-kept list, and a coverage assertion fails loudly the moment a new suite
+  forgets it.
 
 ## 0.1.0 — 2026-08-13
 
