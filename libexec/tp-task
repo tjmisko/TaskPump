@@ -2093,17 +2093,26 @@ cmd_scrub() {
 # Parse <file>'s frontmatter to compact JSON on stdout. The return code
 # classifies the ways a file can fail to even reach the schema checks:
 #   0 mapping parsed    1 no opening ---     2 no closing ---
-#   3 not valid YAML    4 parses, but is not a mapping
+#   3 not valid YAML    4 parses, but is not a mapping    5 CRLF line endings
 # The delimiter checks are load-bearing, not pedantry: yq's front-matter mode
 # happily "parses" a file with no frontmatter at all (the whole body reads as a
 # YAML scalar) and treats everything after an unclosed `---` as frontmatter, so
 # without them a README.md in the tasks dir would type-check instead of being
 # named for what it is.
+#
+# CRLF gets its own code because it is not any of the others: the delimiters ARE
+# `---`, yq parses the file, and the frontier and every other verb read it. Both
+# comparisons below therefore strip a trailing CR first — a CR-terminated file
+# used to fall out as "no YAML frontmatter", which sent the importer hunting for
+# a delimiter that was right there (issue #34). What remains true is that --fix
+# must not write to it: fm_set would emit LF frontmatter into a CRLF body, so
+# the report names the line endings and stops.
 fsck_read_frontmatter() {
   local file=$1 first="" fm_json
   IFS= read -r first < "$file" || true
-  [[ "$first" == "---" ]] || return 1
-  awk 'NR > 1 && $0 == "---" { found = 1; exit } END { exit (found ? 0 : 1) }' "$file" || return 2
+  [[ "${first%$'\r'}" == "---" ]] || return 1
+  awk '{ sub(/\r$/, "") } NR > 1 && $0 == "---" { found = 1; exit } END { exit (found ? 0 : 1) }' "$file" || return 2
+  [[ "$first" == *$'\r' ]] && return 5
   fm_json=$(yq --front-matter=extract -o=json -I=0 '.' "$file" 2>/dev/null) || return 3
   [[ "$(jq -r 'type' <<<"$fm_json")" == "object" ]] || return 4
   printf '%s' "$fm_json"
@@ -2196,12 +2205,27 @@ fsck_check_file() {
     2) FSCK_VIOLATIONS+=("$file: frontmatter has no closing \"---\" delimiter"); return 0;;
     3) FSCK_VIOLATIONS+=("$file: frontmatter is not valid YAML between the --- delimiters"); return 0;;
     4) FSCK_VIOLATIONS+=("$file: frontmatter is not a YAML mapping of machine keys"); return 0;;
+    5) FSCK_VIOLATIONS+=("$file: CRLF line endings (the \"---\" delimiters carry a trailing CR) — yq parses it and every verb reads it, but --fix will not stamp it without mixing endings; convert to LF and re-run"); return 0;;
   esac
 
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     FSCK_VIOLATIONS+=("$file: $line")
   done < <(jq -r --arg mode check "$FSCK_SCHEMA_JQ" <<<"$fm_json")
+
+  # Duplicate machine keys. yq's tree keeps BOTH entries, and every reader —
+  # the jq above, and fm_get in every verb — takes the last: a `status: open`
+  # above a `status: done` (the merge-conflict artifact) is a file whose human
+  # reader and whose tools disagree about what it says, and nothing named the
+  # disagreement. Counted from yq's key list rather than $fm_json because jq
+  # collapses duplicates the moment it parses the object. --fix never resolves
+  # one: which value the author meant is exactly the guess it refuses to make.
+  local dup
+  while IFS= read -r dup; do
+    [[ -z "$dup" ]] && continue
+    FSCK_VIOLATIONS+=("$file: duplicate key '$dup' (every reader takes the last value; the one a human reads first is silently dead)")
+  done < <(yq --front-matter=extract -o=json -I=0 'keys' "$file" 2>/dev/null \
+             | jq -r 'group_by(.) | map(select(length > 1) | .[0])[]')
 
   # Identity: the tools resolve a task to a path by name and read the id back
   # out of the frontmatter, so a file whose name and id disagree is reachable
@@ -2218,6 +2242,16 @@ fsck_check_file() {
   # name, so the stem is the node other tasks actually reach.
   blockers=$(jq -r 'if (.blockers | type) == "array" then .blockers[] | select(type == "string") else empty end' <<<"$fm_json")
   [[ -n "$blockers" ]] && FSCK_ADJ[$stem]=$blockers
+
+  # An empty blocker entry names nothing. The dangling check below skips it and
+  # so does the eligibility predicate (§6), so the edge is inert in every
+  # reader — consistent, but it still reads as a dependency in the file, and a
+  # blocker that is a dependency on paper and nowhere else is precisely the
+  # disagreement fsck exists to name.
+  local empty_blockers
+  empty_blockers=$(jq -r 'if (.blockers | type) == "array" then ([.blockers[] | select(. == "")] | length) else 0 end' <<<"$fm_json")
+  [[ "$empty_blockers" -gt 0 ]] \
+    && FSCK_VIOLATIONS+=("$file: blockers contains an empty entry (\"\") — it names no task, and every reader skips it: a dependency on paper and nowhere else")
 
   # Review-chain facts for the whole-ledger pass: `verdict` resolves the
   # implementation through review_of by name, so a dangling one is a chain
@@ -2382,6 +2416,11 @@ fsck_default_expr() {
 # identity is in question, and writing to it would launder a broken file into a
 # half-plausible one. Present-but-wrong values are never rewritten; the report
 # pass that follows still names them. One ledger commit covers the repair.
+#
+# A CRLF file is skipped by the same `parse_rc != 0` gate, deliberately: fm_set
+# writes LF frontmatter, so stamping one key would leave the file half-CRLF and
+# convert line endings nobody asked it to touch. The report says to convert it
+# and re-run, and that second pass stamps it like any other import.
 fsck_apply_fixes() {
   local file stem id fm_json parse_rc key
   local stamped_keys=0 stamped_files=0
@@ -2952,8 +2991,9 @@ Commands:
                                        --- delimiters, id matches the filename
                                        and TASKPUMP_ID_PATTERN, status is in
                                        the vocabulary, machine keys have
-                                       contract-legal types, every blocker
-                                       resolves, no self-blocks, no blocker
+                                       contract-legal types, no key appears
+                                       twice, every blocker resolves and none
+                                       is empty, no self-blocks, no blocker
                                        cycles, review_of resolves (never to
                                        the task itself), review_role is
                                        reviewer|adjudicator. One line per
@@ -2962,7 +3002,8 @@ Commands:
                                        exist, 0 clean, 1 = fsck itself failed.
                                        --fix stamps MISSING machine keys with
                                        their documented defaults as one ledger
-                                       commit; a present-but-wrong value is
+                                       commit; a present-but-wrong value, a
+                                       duplicate key and a CRLF file are
                                        reported, never rewritten.
   resolve [--tasks-dir|--code-repo|--all]
                                      Print which workspace's ledger this

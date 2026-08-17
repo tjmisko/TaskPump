@@ -129,6 +129,23 @@ sed -i 's/^resume_head_sha: null$/resume_head_sha: null\nreview_round: 1\nreview
 full_task "$BAD/T24.1.md" T24.1 open '[T24]'
 sed -i 's/^resume_head_sha: null$/resume_head_sha: null\nreview_of: T24\nreview_role: reviewer/' "$BAD/T24.1.md"
 full_task "$BAD/T25.md" T25 open '[T24]'
+# T26: CRLF line endings — the shape an externally-authored DAG arrives in, and
+# fsck's core audience. yq's front-matter mode parses it, so the frontier and
+# every other verb read it fine; the delimiters are `---`, just CR-terminated.
+# fsck called it "no YAML frontmatter", which sent an importer hunting for a
+# delimiter that is right there.
+full_task "$BAD/T26.md" T26
+sed -i 's/$/\r/' "$BAD/T26.md"
+# T27: the same machine key twice — the classic merge-conflict artifact. yq's
+# tree keeps both entries and every reader takes the LAST, so a human reading
+# the file top-down and every tool reading it disagree about what it says.
+full_task "$BAD/T27.md" T27
+sed -i 's/^status: open$/status: open\nstatus: done/' "$BAD/T27.md"
+sed -i 's/^files: \[\]$/files: []\nfiles: [src\/a.txt]/' "$BAD/T27.md"
+# T28: an empty blocker entry. The dangling check skips it and so does the
+# eligibility predicate (§6), so the edge is inert in every reader — but it
+# reads as a dependency in the file, and nothing said otherwise.
+full_task "$BAD/T28.md" T28 open '[""]'
 
 set +e
 out=$(TASKPUMP_TASKS_DIR="$BAD" "$CLI" fsck 2>/dev/null)
@@ -163,6 +180,17 @@ expect_line "T25.md: blocks on 'T24', which is under live review, but not on tha
 grep -q 'T24\.1\.md: blocks' <<<"$out" \
   && fail "the chain's own reviewer was reported as bypassing its gate" \
   || pass "a chain member blocking on its own subject is not a bypass"
+expect_line "T26.md: CRLF line endings" \
+  "should name CRLF line endings when a task file is CR-terminated"
+grep -q 'T26\.md: no YAML frontmatter' <<<"$out" \
+  && fail "a CRLF file was still reported as having no frontmatter" \
+  || pass "should not claim the frontmatter is missing when it is there behind a CR"
+expect_line "T27.md: duplicate key 'status'" \
+  "should name a duplicated machine key when a file carries one twice"
+expect_line "T27.md: duplicate key 'files'" \
+  "should name every duplicated key when a file carries more than one"
+expect_line "T28.md: blockers contains an empty entry" \
+  "should name an empty blocker entry when blockers carries one"
 
 # The cycle: one line, all three members, anchored deterministically.
 cycle_lines=$(grep -c 'blocker cycle' <<<"$out" || true)
@@ -317,6 +345,51 @@ cmp -s "$WRT/T5.md" "$TMPDIR_TEST/T5.before" \
 grep -qF "T5.md: id 'T99' does not match the filename stem 'T5'" <<<"$out" \
   && pass "and its identity violation is still reported" \
   || fail "identity violation not reported: '$out'"
+
+# ── CRLF: named, never rewritten, and repairable in two passes ───────────────
+echo
+echo "--- --fix: a CRLF file is named, not silently converted ---"
+
+CR="$TMPDIR_TEST/crlf/tasks"
+mkdir -p "$CR"
+printf -- '---\r\nid: T1\r\ntitle: Imported from a Windows checkout\r\n---\r\n\r\n# T1\r\n' >| "$CR/T1.md"
+cp "$CR/T1.md" "$TMPDIR_TEST/crlf-T1.before"
+
+set +e
+out=$(TASKPUMP_TASKS_DIR="$CR" "$CLI" fsck --fix 2>/dev/null)
+rc=$?
+set -e
+[[ $rc -eq 3 ]] && pass "should still exit 3 when a CRLF file is all that remains" \
+  || fail "--fix on a CRLF ledger exited $rc, expected 3"
+cmp -s "$CR/T1.md" "$TMPDIR_TEST/crlf-T1.before" \
+  && pass "should leave a CRLF file byte-identical when --fix runs" \
+  || fail "--fix rewrote a CRLF file (fm_set writes LF frontmatter into a CRLF body)"
+
+# The diagnostic tells the importer to convert and re-run; that has to be a
+# workflow that actually terminates, not advice with no second leg.
+sed -i 's/\r$//' "$CR/T1.md"
+set +e
+out=$(TASKPUMP_TASKS_DIR="$CR" "$CLI" fsck --fix 2>/dev/null)
+rc=$?
+set -e
+[[ $rc -eq 0 ]] && pass "should stamp and go clean when the CRLF file is converted to LF" \
+  || fail "post-conversion --fix exited $rc: '$out'"
+
+# ── a duplicate key is named, never resolved ─────────────────────────────────
+DUP="$TMPDIR_TEST/dup/tasks"
+mkdir -p "$DUP"
+full_task "$DUP/T1.md" T1
+sed -i 's/^status: open$/status: open\nstatus: done/' "$DUP/T1.md"
+cp "$DUP/T1.md" "$TMPDIR_TEST/dup-T1.before"
+set +e
+out=$(TASKPUMP_TASKS_DIR="$DUP" "$CLI" fsck --fix 2>/dev/null)
+rc=$?
+set -e
+[[ $rc -eq 3 ]] && pass "should exit 3 when a duplicate key is all that remains" \
+  || fail "--fix on a duplicate-key ledger exited $rc, expected 3"
+cmp -s "$DUP/T1.md" "$TMPDIR_TEST/dup-T1.before" \
+  && pass "should leave a duplicated key byte-identical when --fix runs" \
+  || fail "--fix picked one of two values for a duplicated key"
 
 # ── the grammar is the configured one, not a baked T ─────────────────────────
 echo
