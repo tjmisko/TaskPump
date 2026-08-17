@@ -728,12 +728,18 @@ Checked per file:
 
 - the file begins with a `---` line and the frontmatter closes with one (§2.1),
   and what lies between them parses as a YAML mapping;
-- the line endings are LF. The delimiter comparison strips a trailing CR first,
-  so a CRLF file is reported as **CRLF line endings** and not as a missing
-  delimiter — it has one, and yq, the frontier and every verb read the file
-  fine. What CRLF does cost is `--fix`, which will not stamp such a file:
-  writing one key would leave LF frontmatter in a CRLF body. Convert it to LF
-  and re-run, and the second pass stamps it like any other import;
+- the line endings of the **frontmatter block** are LF. The delimiter
+  comparison strips a trailing CR first, so a CR-terminated block is reported as
+  **CRLF line endings in the frontmatter** and not as a missing delimiter — it
+  has one. This verdict is reached only after the parse and mapping checks
+  above, because it asserts the file is readable: a CRLF file yq cannot parse is
+  invisible to the frontier, which is what the checks above say and what `scrub`
+  calls UNPARSEABLE, and fsck must not answer that file with a reassurance. What
+  a readable CRLF block does cost is `--fix`, which will not stamp it: `fm_set`
+  writes LF and would convert the rest of the block with it. Convert to LF and
+  re-run, and the second pass stamps it like any other import. The check is the
+  block and its delimiters, not the whole file — a CRLF body is nothing `--fix`
+  writes to, so there is nothing to mix and nothing to report;
 - no key appears twice. A YAML mapping with `status: open` above `status: done`
   is legal to the parser and every reader takes the **last** value, so the
   human who reads the file top-down and the tools disagree about what it says —
@@ -786,6 +792,8 @@ they actually come from, because §3 documents no default for either:
 
 `--fix` stamps neither `id` nor `title`: §3 marks both required and neither has
 a source to derive from, so it reports them and stops. It never touches the
-body, and never rewrites a present-but-wrong value, a duplicate key, or a CRLF
-file — those are reported and left alone, because guessing intent is how
-ledgers get corrupted.
+body, never rewrites a present-but-wrong value, and never resolves a duplicate
+key — a file carrying one is still stamped if it is missing keys, but which of
+the two values survives is not a choice `--fix` makes. A file whose frontmatter
+is CRLF it does not write to at all. All of those are reported and left as they
+are, because guessing intent is how ledgers get corrupted.
