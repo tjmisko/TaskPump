@@ -129,6 +129,52 @@ sed -i 's/^resume_head_sha: null$/resume_head_sha: null\nreview_round: 1\nreview
 full_task "$BAD/T24.1.md" T24.1 open '[T24]'
 sed -i 's/^resume_head_sha: null$/resume_head_sha: null\nreview_of: T24\nreview_role: reviewer/' "$BAD/T24.1.md"
 full_task "$BAD/T25.md" T25 open '[T24]'
+# T26: CRLF line endings — the shape an externally-authored DAG arrives in, and
+# fsck's core audience. yq's front-matter mode parses it, so the frontier and
+# every other verb read it fine; the delimiters are `---`, just CR-terminated.
+# fsck called it "no YAML frontmatter", which sent an importer hunting for a
+# delimiter that is right there.
+full_task "$BAD/T26.md" T26
+sed -i 's/$/\r/' "$BAD/T26.md"
+# T27: the same machine key twice — the classic merge-conflict artifact. yq's
+# tree keeps both entries and every reader takes the LAST, so a human reading
+# the file top-down and every tool reading it disagree about what it says.
+full_task "$BAD/T27.md" T27
+sed -i 's/^status: open$/status: open\nstatus: done/' "$BAD/T27.md"
+sed -i 's/^files: \[\]$/files: []\nfiles: [src\/a.txt]/' "$BAD/T27.md"
+# T28: an empty blocker entry. The dangling check skips it and so does the
+# eligibility predicate (§6), so the edge is inert in every reader — but it
+# reads as a dependency in the file, and nothing said otherwise.
+full_task "$BAD/T28.md" T28 open '[""]'
+# T29/T30: CRLF files yq CANNOT read. The CRLF diagnostic asserts that yq parses
+# the file and every verb reads it, so it must lose to the parse and mapping
+# checks — these are the invisible-to-the-frontier class scrub calls UNPARSEABLE
+# and NO-ID, and answering them with "every verb reads it" is fsck contradicting
+# scrub about the same file. T29 is the unquoted-colon import (the F45.15 shape)
+# in its Windows spelling; T30 is the README-in-the-tasks-dir case, CR-terminated.
+printf -- '---\r\nid: T29\r\ntitle: Imported\r\ngoal: ship it: fast\r\n---\r\n\r\n# T29\r\n' >| "$BAD/T29.md"
+printf -- '---\r\njust a note, not a mapping\r\n---\r\n\r\n# T30\r\n' >| "$BAD/T30.md"
+# T31: an LF opening delimiter over CRLF frontmatter — the file the CR-tolerant
+# delimiter comparison newly admits. Reading the CR off line 1 alone classified
+# it as nothing at all, so --fix stamped it and converted endings nobody asked
+# it to touch. The hazard is a property of the whole block fm_set rewrites.
+full_task "$BAD/T31.md" T31
+sed -i '1!s/$/\r/' "$BAD/T31.md"
+# T32: the CR sits on the closing delimiter and nowhere else — the least of the
+# half-Windows shapes, and still a block fm_set would rewrite as all-LF.
+full_task "$BAD/T32.md" T32
+awk '!closed && NR > 1 && $0 == "---" { printf "%s\r\n", $0; closed = 1; next } { print }' \
+  "$BAD/T32.md" >| "$TMPDIR_TEST/T32.tmp"
+mv "$TMPDIR_TEST/T32.tmp" "$BAD/T32.md"
+# T33: the converse, and the boundary of the check — an all-LF frontmatter over
+# a CRLF body. --fix rewrites the block only, and yq leaves the body's bytes
+# alone, so nothing gets mixed and there is nothing to report. Silence here is
+# what keeps the code-5 message ("--fix would convert the rest of the block")
+# a true statement rather than a blanket complaint about carriage returns.
+full_task "$BAD/T33.md" T33
+awk 'body { printf "%s\r\n", $0; next } { print } NR > 1 && $0 == "---" { body = 1 }' \
+  "$BAD/T33.md" >| "$TMPDIR_TEST/T33.tmp"
+mv "$TMPDIR_TEST/T33.tmp" "$BAD/T33.md"
 
 set +e
 out=$(TASKPUMP_TASKS_DIR="$BAD" "$CLI" fsck 2>/dev/null)
@@ -163,6 +209,34 @@ expect_line "T25.md: blocks on 'T24', which is under live review, but not on tha
 grep -q 'T24\.1\.md: blocks' <<<"$out" \
   && fail "the chain's own reviewer was reported as bypassing its gate" \
   || pass "a chain member blocking on its own subject is not a bypass"
+expect_line "T26.md: CRLF line endings" \
+  "should name CRLF line endings when a task file is CR-terminated"
+grep -q 'T26\.md: no YAML frontmatter' <<<"$out" \
+  && fail "a CRLF file was still reported as having no frontmatter" \
+  || pass "should not claim the frontmatter is missing when it is there behind a CR"
+expect_line "T27.md: duplicate key 'status'" \
+  "should name a duplicated machine key when a file carries one twice"
+expect_line "T27.md: duplicate key 'files'" \
+  "should name every duplicated key when a file carries more than one"
+expect_line "T28.md: blockers contains an empty entry" \
+  "should name an empty blocker entry when blockers carries one"
+expect_line "T29.md: frontmatter is not valid YAML" \
+  "should name the YAML error when a CRLF file's frontmatter does not parse"
+grep -q 'T29\.md: CRLF line endings' <<<"$out" \
+  && fail "an unparseable CRLF file was told every verb reads it" \
+  || pass "should not claim every verb reads it when yq cannot parse the CRLF file"
+expect_line "T30.md: frontmatter is not a YAML mapping" \
+  "should name the missing mapping when a CRLF file's frontmatter is a scalar"
+grep -q 'T30\.md: CRLF line endings' <<<"$out" \
+  && fail "a scalar-frontmatter CRLF file was told every verb reads it" \
+  || pass "should not claim every verb reads it when the CRLF frontmatter is no mapping"
+expect_line "T31.md: CRLF line endings" \
+  "should name CRLF line endings when only the frontmatter after line 1 is CR-terminated"
+expect_line "T32.md: CRLF line endings" \
+  "should name CRLF line endings when only the closing delimiter is CR-terminated"
+grep -q 'T33\.md' <<<"$out" \
+  && fail "an all-LF frontmatter over a CRLF body was reported" \
+  || pass "should report nothing when the CRLF is in the body and not the frontmatter"
 
 # The cycle: one line, all three members, anchored deterministically.
 cycle_lines=$(grep -c 'blocker cycle' <<<"$out" || true)
@@ -317,6 +391,127 @@ cmp -s "$WRT/T5.md" "$TMPDIR_TEST/T5.before" \
 grep -qF "T5.md: id 'T99' does not match the filename stem 'T5'" <<<"$out" \
   && pass "and its identity violation is still reported" \
   || fail "identity violation not reported: '$out'"
+
+# ── CRLF: named, never rewritten, and repairable in two passes ───────────────
+echo
+echo "--- --fix: a CRLF file is named, not silently converted ---"
+
+CR="$TMPDIR_TEST/crlf/tasks"
+mkdir -p "$CR"
+printf -- '---\r\nid: T1\r\ntitle: Imported from a Windows checkout\r\n---\r\n\r\n# T1\r\n' >| "$CR/T1.md"
+cp "$CR/T1.md" "$TMPDIR_TEST/crlf-T1.before"
+
+set +e
+out=$(TASKPUMP_TASKS_DIR="$CR" "$CLI" fsck --fix 2>/dev/null)
+rc=$?
+set -e
+[[ $rc -eq 3 ]] && pass "should still exit 3 when a CRLF file is all that remains" \
+  || fail "--fix on a CRLF ledger exited $rc, expected 3"
+cmp -s "$CR/T1.md" "$TMPDIR_TEST/crlf-T1.before" \
+  && pass "should leave a CRLF file byte-identical when --fix runs" \
+  || fail "--fix rewrote a CRLF file (fm_set writes LF frontmatter into a CRLF body)"
+
+# The diagnostic tells the importer to convert and re-run; that has to be a
+# workflow that actually terminates, not advice with no second leg.
+sed -i 's/\r$//' "$CR/T1.md"
+set +e
+out=$(TASKPUMP_TASKS_DIR="$CR" "$CLI" fsck --fix 2>/dev/null)
+rc=$?
+set -e
+[[ $rc -eq 0 ]] && pass "should stamp and go clean when the CRLF file is converted to LF" \
+  || fail "post-conversion --fix exited $rc: '$out'"
+
+# The half-Windows file: LF opening delimiter, CRLF from there on. Reading the
+# CR off line 1 alone left this one classified as nothing, so --fix stamped it,
+# rewrote its frontmatter to LF and then certified the ledger clean — a silent
+# conversion of the operator's bytes followed by a false all-clear.
+MIX="$TMPDIR_TEST/mixed/tasks"
+mkdir -p "$MIX"
+printf -- '---\nid: T1\r\ntitle: Half a Windows checkout\r\nstatus: open\r\n---\r\n\r\n# T1\r\n' >| "$MIX/T1.md"
+cp "$MIX/T1.md" "$TMPDIR_TEST/mixed-T1.before"
+set +e
+out=$(TASKPUMP_TASKS_DIR="$MIX" "$CLI" fsck --fix 2>/dev/null)
+rc=$?
+set -e
+[[ $rc -eq 3 ]] && pass "should exit 3 when only the frontmatter after line 1 is CR-terminated" \
+  || fail "--fix on a half-CRLF ledger exited $rc, expected 3"
+cmp -s "$MIX/T1.md" "$TMPDIR_TEST/mixed-T1.before" \
+  && pass "should leave a half-CRLF file byte-identical when --fix runs" \
+  || fail "--fix converted the line endings of a file it was never asked to touch"
+
+# The other side of the boundary: an all-LF frontmatter over a CRLF body is
+# stampable, because fm_set rewrites the block and yq leaves the body's bytes
+# where they are. Refusing this one would be the same overreach in the other
+# direction — a violation nobody can act on, about endings --fix never touches.
+BODY="$TMPDIR_TEST/crlfbody/tasks"
+mkdir -p "$BODY"
+printf -- '---\nid: T1\ntitle: LF frontmatter\n---\n\r\n# T1 body\r\n' >| "$BODY/T1.md"
+body_cr_before=$(tr -cd '\r' < "$BODY/T1.md" | wc -c)
+set +e
+out=$(TASKPUMP_TASKS_DIR="$BODY" "$CLI" fsck --fix 2>/dev/null)
+rc=$?
+set -e
+[[ $rc -eq 0 ]] && pass "should stamp and go clean when only the body is CR-terminated" \
+  || fail "--fix on a CRLF-body ledger exited $rc: '$out'"
+body_cr_after=$(tr -cd '\r' < "$BODY/T1.md" | wc -c)
+[[ "$body_cr_after" -eq "$body_cr_before" ]] \
+  && pass "should leave the body's carriage returns alone when --fix stamps the frontmatter" \
+  || fail "--fix changed the body CR count $body_cr_before -> $body_cr_after"
+
+# ── fsck and scrub answer for the same file the same way ─────────────────────
+echo
+echo "--- a file scrub calls invisible is never called readable by fsck ---"
+
+# Every file here is invisible to the frontier: CRLF, and frontmatter yq cannot
+# turn into a mapping. scrub has always said so. The CRLF diagnostic asserts the
+# opposite in so many words ("every verb reads it"), so if it can reach these
+# files the two verbs of one CLI give contradictory verdicts — and the one that
+# hides the tool's most important failure class is the wrong one.
+CONTRA="$TMPDIR_TEST/contra/tasks"
+mkdir -p "$CONTRA"
+printf -- '---\r\nid: T1\r\ntitle: Imported\r\ngoal: ship it: fast\r\n---\r\n\r\n# T1\r\n' >| "$CONTRA/T1.md"
+printf -- '---\r\njust a note, not a mapping\r\n---\r\n\r\n# T2\r\n' >| "$CONTRA/T2.md"
+
+set +e
+scrub_out=$(TASKPUMP_TASKS_DIR="$CONTRA" "$CLI" scrub 2>&1)
+out=$(TASKPUMP_TASKS_DIR="$CONTRA" "$CLI" fsck 2>/dev/null)
+set -e
+visible=$(TASKPUMP_TASKS_DIR="$CONTRA" "$CLI" list --json | jq -r 'length')
+[[ "$visible" -eq 0 ]] && pass "should keep both files off the frontier when yq cannot read them" \
+  || fail "$visible of 2 unreadable files reached list --json"
+# Anchored: scrub's trailing summary line names UNPARSEABLE/NO-ID too, and
+# counting it would let a one-file report pass for a two-file one.
+[[ "$(grep -cE '^scrub: (UNPARSEABLE|NO-ID) ' <<<"$scrub_out")" -eq 2 ]] \
+  && pass "should have scrub name both files invisible when yq cannot read them" \
+  || fail "scrub did not name both files: '$scrub_out'"
+grep -q 'every verb reads it' <<<"$out" \
+  && fail "fsck called a file readable that scrub calls invisible" \
+  || pass "should not call a file readable when scrub calls it invisible"
+
+# ── a duplicate key is named, never resolved ─────────────────────────────────
+# The fixture is missing a machine key on purpose, so --fix genuinely writes
+# this file. A duplicate in a file --fix skips for some unrelated reason proves
+# nothing about whether --fix would resolve one.
+DUP="$TMPDIR_TEST/dup/tasks"
+mkdir -p "$DUP"
+full_task "$DUP/T1.md" T1
+sed -i 's/^status: open$/status: open\nstatus: done/' "$DUP/T1.md"
+sed -i '/^milestone: null$/d' "$DUP/T1.md"
+set +e
+out=$(TASKPUMP_TASKS_DIR="$DUP" "$CLI" fsck --fix 2>/dev/null)
+rc=$?
+set -e
+[[ $rc -eq 3 ]] && pass "should exit 3 when a duplicate key survives --fix" \
+  || fail "--fix on a duplicate-key ledger exited $rc, expected 3"
+grep -qF "T1.md: stamped missing machine key(s): milestone" <<<"$out" \
+  && pass "should still stamp the missing keys of a file that carries a duplicate" \
+  || fail "--fix skipped the duplicate-key file entirely: '$out'"
+[[ "$(grep -c '^status:' "$DUP/T1.md")" -eq 2 ]] \
+  && pass "should leave both values of a duplicated key in place when --fix writes the file" \
+  || fail "--fix picked one of two values for a duplicated key"
+grep -qF "T1.md: duplicate key 'status'" <<<"$out" \
+  && pass "should still name the duplicate after --fix has written the file" \
+  || fail "the duplicate went unreported once --fix had written the file: '$out'"
 
 # ── the grammar is the configured one, not a baked T ─────────────────────────
 echo

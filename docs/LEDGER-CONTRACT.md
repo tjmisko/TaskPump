@@ -728,9 +728,29 @@ Checked per file:
 
 - the file begins with a `---` line and the frontmatter closes with one (§2.1),
   and what lies between them parses as a YAML mapping;
+- the line endings of the **frontmatter block** are LF. The delimiter
+  comparison strips a trailing CR first, so a CR-terminated block is reported as
+  **CRLF line endings in the frontmatter** and not as a missing delimiter — it
+  has one. This verdict is reached only after the parse and mapping checks
+  above, because it asserts the file is readable: a CRLF file yq cannot parse is
+  invisible to the frontier, which is what the checks above say and what `scrub`
+  calls UNPARSEABLE, and fsck must not answer that file with a reassurance. What
+  a readable CRLF block does cost is `--fix`, which will not stamp it: `fm_set`
+  writes LF and would convert the rest of the block with it. Convert to LF and
+  re-run, and the second pass stamps it like any other import. The check is the
+  block and its delimiters, not the whole file — a CRLF body is nothing `--fix`
+  writes to, so there is nothing to mix and nothing to report;
+- no key appears twice. A YAML mapping with `status: open` above `status: done`
+  is legal to the parser and every reader takes the **last** value, so the
+  human who reads the file top-down and the tools disagree about what it says —
+  the shape a merge conflict leaves behind. Reported, never resolved: which
+  value the author meant is not something `--fix` may guess;
 - `id` equals the filename stem (§2) and matches the configured id pattern (§7);
 - `status` is one of the six values of §4;
 - `review_role`, where present, is `reviewer` or `adjudicator` (§3 "Review");
+- `blockers` carries no empty entry. An empty string names no task: the
+  dangling-blocker check skips it and so does §6, so it is a dependency in the
+  file and in no reader;
 - every machine key of §3 that is present has its contract type, and timestamps
   have the exact shape of §3 ("Timestamps"). A machine key absent from the file
   is reported too — a reader treats it as its default, but a writer should emit
@@ -757,10 +777,23 @@ Exit codes follow scrub's convention (§10): **3** when violations were found
 **1** when fsck itself could not run. A missing tasks directory is an error,
 not a clean ledger.
 
-`--fix` stamps **missing** machine keys with their documented §3 defaults
-(`status: open`, empty lists, null claim fields, zero counters; `phase` derived
-from `id` per §7.2), and records the whole repair as one ledger commit through
-the standard commit path (§9). It never touches the body, never invents `id` or
-`title` (they have no defined default), and never rewrites a present-but-wrong
-value — those are reported and left alone, because guessing intent is how
-ledgers get corrupted.
+`--fix` stamps **missing** machine keys with their documented defaults, and
+records the whole repair as one ledger commit through the standard commit path
+(§9). Most of those defaults are the ones §3 states per field — empty lists,
+null claim fields, zero counters. Two are not, and it is worth naming where
+they actually come from, because §3 documents no default for either:
+
+- `status: open` — §3 marks `status` required, with no default. `open` is what
+  `create` writes (§5.1), and §4 makes it the only status the frontier will
+  surface; a file that reached fsck without one is a task nobody has started,
+  so `open` is the transition it never got, not a guess about its state.
+- `phase` — derived from `id` per §7.2, the same derivation `create` performs.
+  Mechanical, not a default.
+
+`--fix` stamps neither `id` nor `title`: §3 marks both required and neither has
+a source to derive from, so it reports them and stops. It never touches the
+body, never rewrites a present-but-wrong value, and never resolves a duplicate
+key — a file carrying one is still stamped if it is missing keys, but which of
+the two values survives is not a choice `--fix` makes. A file whose frontmatter
+is CRLF it does not write to at all. All of those are reported and left as they
+are, because guessing intent is how ledgers get corrupted.
