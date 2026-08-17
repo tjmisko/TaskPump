@@ -459,6 +459,100 @@ else
   printf 'SKIP: git refuses file-protocol submodules here; submodule flavor not exercised\n'
 fi
 
+# ══ Issue #45 — one pin, one workspace, both tools ═══════════════════════════
+echo "--- #45: TASKPUMP_WORKSPACE_ROOT pins the CLI's ledger, not just the pump's ---"
+
+# The G4.4 walkthrough shape (PR #39): the workspace is pinned by env because
+# $PWD proves nothing — a container, a CI step, an operator standing in ~.
+# `tp pump --dry-run` planned the pinned consumer's frontier; `tp task ready
+# --count` in the SAME shell answered 0, `via install-root` — the install's own
+# ledger. Nothing was corrupted, but 0 is the answer a human reads as "drained".
+PIN="$TMP/pinned-consumer"
+mkdir -p "$PIN/tasks"
+git -C "$PIN" init -q
+mk "$PIN/tasks" T1
+mk "$PIN/tasks" T2
+OUTSIDE="$TMP/elsewhere"; mkdir -p "$OUTSIDE"
+
+pinned() {  # pinned <args...> — tp-task from OUTSIDE the pin, pin the only clue
+  ( cd "$OUTSIDE" && env "${TP_ENV_UNSET[@]}" TASKPUMP_TASK_NOCOMMIT=1 \
+      TASKPUMP_WORKSPACE_ROOT="$PIN" "$TASK" "$@" 2>&1 )
+}
+
+got=$(pinned resolve --tasks-dir)
+[[ "$got" == "$PIN/tasks" ]] \
+  && pass "should resolve the ledger inside the pinned workspace when the pin is set and \$PWD is outside every repo" \
+  || fail "pinned resolve --tasks-dir got '$got', expected '$PIN/tasks'"
+
+got=$(pinned resolve --code-repo)
+[[ "$got" == "$PIN" ]] \
+  && pass "should point code_repo at the pinned workspace when the pin decides the workspace" \
+  || fail "pinned resolve --code-repo got '$got', expected '$PIN'"
+
+got=$(pinned resolve --all | awk '/^via/{print $2}')
+[[ "$got" == "workspace-pin" ]] \
+  && pass "should name the pin as the rung that decided when resolve --all prints via" \
+  || fail "via under the pin reads '$got', expected workspace-pin"
+
+got=$(pinned ready --count)
+[[ "$got" == "2" ]] \
+  && pass "should count the pinned workspace's open tasks when ready --count runs from outside it" \
+  || fail "ready --count under the pin got '$got', expected 2"
+
+# The asymmetry itself: two tools, one shell, one pin — one answer.
+out=$( cd "$OUTSIDE" && env "${TP_ENV_UNSET[@]}" TASKPUMP_TASK_NOCOMMIT=1 \
+        HOME="$CFGHOME" TASKPUMP_TASK="$TASK" TASKPUMP_WORKSPACE_ROOT="$PIN" \
+        "$PUMP" --no-health-gate --no-usage-gate --no-disk-gate \
+        --phases T1..T2 --dry-run 2>&1 )
+have "$out" 'open tasks in range: 2' \
+  && pass "should agree with the pump's plan when both tools read the same pin in one shell" \
+  || fail "the pump's plan and the CLI disagree under one pin:\n$out"
+
+# The cross-agent state lock is created in the LEDGER's git root, so two agents
+# on one ledger must resolve one path or they stop excluding each other.
+inside=$( cd "$PIN" && env "${TP_ENV_UNSET[@]}" TASKPUMP_TASK_NOCOMMIT=1 \
+            "$TASK" resolve --tasks-dir )
+[[ "$inside" == "$(pinned resolve --tasks-dir)" ]] \
+  && pass "should resolve one ledger path when one agent pins the workspace and another stands in it" \
+  || fail "pinned resolution and cwd resolution disagree ('$(pinned resolve --tasks-dir)' vs '$inside') — two agents on one ledger would take different locks"
+
+# The mutating-verb guard refuses the install-root FALLBACK, not a pin: naming
+# the workspace is the caller saying where the work lives, the same exemption
+# an explicit tasks dir already gets.
+out=$(pinned claim T1 --branch feat/t1); rc=$?
+[[ $rc -eq 0 ]] \
+  && pass "should let a claim through when the pin names the workspace it lands in" \
+  || fail "claim under the pin was refused (rc=$rc):\n$out"
+grep -q 'status: in_progress' "$PIN/tasks/T1.md" \
+  && pass "should write the claim into the pinned ledger when the workspace is pinned" \
+  || fail "the claim never reached $PIN/tasks/T1.md"
+
+# The pin says which WORKSPACE, not which ledger: an explicitly named tasks dir
+# is more specific and still wins, and via still names the rung that decided.
+got=$( cd "$OUTSIDE" && env "${TP_ENV_UNSET[@]}" TASKPUMP_TASK_NOCOMMIT=1 \
+        TASKPUMP_WORKSPACE_ROOT="$PIN" TASKPUMP_TASKS_DIR="$C1/planning/tasks" \
+        "$TASK" resolve --tasks-dir )
+[[ "$got" == "$C1/planning/tasks" ]] \
+  && pass "should keep an explicit tasks dir winning when a workspace pin is set alongside it" \
+  || fail "an explicit tasks dir lost to the pin: got '$got'"
+got=$( cd "$OUTSIDE" && env "${TP_ENV_UNSET[@]}" TASKPUMP_TASK_NOCOMMIT=1 \
+        TASKPUMP_WORKSPACE_ROOT="$PIN" TASKPUMP_TASKS_DIR="$C1/planning/tasks" \
+        "$TASK" resolve --all | awk '/^via/{print $2}' )
+[[ "$got" == "env" ]] \
+  && pass "should attribute the ledger to env when an explicit tasks dir outranks the pin" \
+  || fail "via with both a pin and an explicit tasks dir reads '$got', expected env"
+
+# A pin naming nothing must be loud. Falling back to the install root there is
+# the silent wrong ledger the pin was set to prevent.
+out=$( cd "$OUTSIDE" && env "${TP_ENV_UNSET[@]}" TASKPUMP_TASK_NOCOMMIT=1 \
+        TASKPUMP_WORKSPACE_ROOT="$TMP/no-such-workspace" "$TASK" ready 2>&1 ); rc=$?
+[[ $rc -ne 0 ]] \
+  && pass "should refuse instead of falling back when the pin names a missing directory" \
+  || fail "a pin naming a missing directory was ignored (rc=$rc):\n$out"
+have "$out" 'TASKPUMP_WORKSPACE_ROOT' \
+  && pass "should name the pin in the refusal when the pinned directory is missing" \
+  || fail "the refusal does not name TASKPUMP_WORKSPACE_ROOT:\n$out"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"

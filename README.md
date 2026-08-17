@@ -346,9 +346,10 @@ tp-pump: refusing to run against the TaskPump installation itself.
 
 `TASKPUMP_WORKSPACE_ROOT=/path/to/project` is that pin, for the layouts where
 `$PWD` proves nothing; a pin naming a missing directory is a loud error, never a
-fallback. It pins the **pump's** workspace only — ledger verbs still answer from
-where you stand, so run `tp task …` from inside the project (or name
-`TASKPUMP_TASKS_DIR` alongside it).
+fallback. Ledger verbs read the same pin, so `tp task ready --count` in that
+shell counts the pinned project's frontier instead of answering `0` from the
+install's own ledger — one pin, one workspace, both tools. Naming
+`TASKPUMP_TASKS_DIR` outright still wins over it, in both.
 
 ### 6. One supervised tick
 
