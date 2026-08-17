@@ -51,6 +51,16 @@ gets picked up without anyone relaunching anything. "Keep acquiring" is not a
 feature bolted on top of a queue; it is what you get for free when the queue is
 derived rather than stored.
 
+**A `WAITING` unit says why, and the why is derived too.** The plan used to
+assert a single reason — "cross-phase blockers pending" — for every phase with
+open work and an empty frontier, which sent operators hunting for an upstream
+dependency that a phase gated on its own review task never had. The reason is
+now read back out of the ledger: the review awaiting a verdict (nothing
+dispatches a review task), the upstream task and its status, the unfinished
+in-phase sibling, the branch holding a claim, a blocker with no task file — and
+when none of those explains it, that none of them does. A reason gets acted on,
+so an invented one costs the same afternoon a wrong answer would.
+
 The pump dispatches at **phase grain**. Each phase with eligible work gets one
 workspace, whose agent drains that phase's sub-tree serially — asking the ledger
 for the next task in its own phase, doing it, asking again. Phases fan out in

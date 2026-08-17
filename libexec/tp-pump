@@ -1738,12 +1738,148 @@ graduate_trunk() {
   fi
 }
 
+# ── Why a phase's open work is not eligible (issue #46) ───────────────────────
+# The plan used to ASSERT this reason: every phase with open tasks and an empty
+# frontier printed "cross-phase blockers pending". The case that surfaced it was
+# a phase gated only on its OWN review task (issue #12) — so the report was loud
+# and correct that nothing could launch, and then sent the operator hunting for
+# an upstream dependency that did not exist. An operator acts on the words, not
+# on the exit code; a wrong stated reason is the same failure as a wrong answer,
+# it just spends the reader's afternoon instead of the tool's.
+#
+# So derive it. Two reads answer every case and both go through the CLI (the
+# ledger's only reader): `list --json` for the whole ledger's status, claimant
+# and blockers, and the eligible frontier asked a SECOND time with review units
+# included. Loaded lazily and once per plan — a range that is launching cleanly
+# never pays for either read.
+declare -A WAITSNAP_STATUS WAITSNAP_CLAIMED WAITSNAP_BLOCKERS WAITSNAP_REVIEW
+declare -a WAITSNAP_IDS
+WAITSNAP_LOADED=0
+load_wait_snapshot() {
+  WAITSNAP_STATUS=(); WAITSNAP_CLAIMED=(); WAITSNAP_BLOCKERS=(); WAITSNAP_REVIEW=()
+  WAITSNAP_IDS=()
+  # The WHOLE ledger, deliberately not the range: a blocker outside --phases is
+  # exactly the cross-phase case this reason exists to name, and reading a
+  # missing record as "not done" would report a long-finished upstream as
+  # pending. Same RS-delimited record shape (and the same reason for it) as
+  # load_task_snapshot: a tab would collapse an empty claimant field and shift
+  # every field after it.
+  local id status claimed blockers
+  while IFS=$'\x1e' read -r id status claimed blockers; do
+    [[ -z "$id" ]] && continue
+    WAITSNAP_STATUS["$id"]="$status"
+    WAITSNAP_CLAIMED["$id"]="$claimed"
+    WAITSNAP_BLOCKERS["$id"]="$blockers"
+    WAITSNAP_IDS+=("$id")
+  done < <("$TASK_BIN" list --json 2>/dev/null \
+           | jq -r '.[] | [.id, .status, (.claimed_by // ""), (.blockers | join(" "))]
+                 | join("\u001e")' 2>/dev/null)
+  # A review unit is hidden from the frontier unless it is asked for, and the
+  # pump never asks — so nothing here dispatches one, and a phase can sit on it
+  # indefinitely. Rather than read `review_role` behind the CLI's back (the
+  # ledger has one reader), ask the frontier the same question twice: an id that
+  # appears only WITH --include-reviews is a review unit. That inference is
+  # sound exactly for a phase absent from the plain frontier — the only kind of
+  # phase a reason is derived for — because an ordinary eligible task would have
+  # put its phase in that frontier.
+  while IFS= read -r id; do
+    [[ -n "$id" ]] && WAITSNAP_REVIEW["$id"]=1
+  done < <("$TASK_BIN" ready --phases "$PHASES" --json --include-reviews 2>/dev/null \
+           | jq -r '.[].id' 2>/dev/null)
+  WAITSNAP_LOADED=1
+}
+
+# phase_wait_reason <phase> <open-count> — the derived tail of a WAITING line.
+#
+# Several clauses can be true at once (a phase can await a verdict AND hold a
+# claim), so they are joined rather than ranked — ranking would drop a fact the
+# operator has to act on anyway. Within one task the order is the ledger's own
+# eligibility order (review unit, then claim, then blockers), so each task
+# contributes exactly the clause `ready` skipped it for, and never two.
+phase_wait_reason() {
+  local phase="$1" oc="$2"
+  (( WAITSNAP_LOADED )) || load_wait_snapshot
+  local reviews="" cross="" siblings="" claims="" dangling="" unexplained=""
+  local -A seen=()
+  local id blk bstatus pending
+  for id in "${WAITSNAP_IDS[@]:-}"; do
+    [[ -z "$id" ]] && continue
+    [[ "${id%%.*}" == "$phase" ]] || continue
+    [[ "${WAITSNAP_STATUS[$id]:-}" == "open" ]] || continue
+    if [[ -n "${WAITSNAP_REVIEW[$id]:-}" ]]; then
+      [[ -n "${seen[r:$id]:-}" ]] || reviews+="${reviews:+, }$id"
+      seen[r:$id]=1
+      continue
+    fi
+    if [[ -n "${WAITSNAP_CLAIMED[$id]:-}" ]]; then
+      claims+="${claims:+, }$id by ${WAITSNAP_CLAIMED[$id]}"
+      continue
+    fi
+    pending=""
+    for blk in ${WAITSNAP_BLOCKERS[$id]:-}; do
+      [[ -z "$blk" ]] && continue
+      # `+set`, not `:-`: an id the ledger has no file for is a dangling edge,
+      # which is a different (and worse) fact than an unfinished blocker, and
+      # fsck is where it gets repaired.
+      if [[ -z "${WAITSNAP_STATUS[$blk]+set}" ]]; then
+        pending=1
+        [[ -n "${seen[d:$blk]:-}" ]] || dangling+="${dangling:+, }$blk"
+        seen[d:$blk]=1
+        continue
+      fi
+      bstatus="${WAITSNAP_STATUS[$blk]}"
+      # A satisfied blocker is not a reason for anything; only the unfinished
+      # ones set `pending`, and each of them independently — a done blocker
+      # listed after an open one must never clear what the open one recorded.
+      [[ "$bstatus" == "done" ]] && continue
+      pending=1
+      if [[ "${blk%%.*}" != "$phase" ]]; then
+        [[ -n "${seen[x:$blk]:-}" ]] || cross+="${cross:+, }$blk ($bstatus)"
+        seen[x:$blk]=1
+        continue
+      fi
+      # An in-phase blocker that is a review unit is reported as the review it
+      # is, not twice — once under its own clause and again as a sibling. The
+      # review inference is only asked about THIS phase's ids, where it is
+      # sound; a cross-phase id in the include-reviews frontier may simply be an
+      # ordinary eligible task of a phase that is launching.
+      if [[ -n "${WAITSNAP_REVIEW[$blk]:-}" ]]; then
+        [[ -n "${seen[r:$blk]:-}" ]] || reviews+="${reviews:+, }$blk"
+        seen[r:$blk]=1
+        continue
+      fi
+      [[ -n "${seen[i:$blk]:-}" ]] || siblings+="${siblings:+, }$blk ($bstatus)"
+      seen[i:$blk]=1
+    done
+    [[ -n "$pending" ]] && continue
+    # Open, unclaimed, no unfinished blocker — and still not in the frontier.
+    # Nothing the pump can see explains it, so say that instead of inventing a
+    # dependency: the ledger and the frontier disagree and a human has to look.
+    unexplained+="${unexplained:+, }$id"
+  done
+
+  local why=""
+  [[ -n "$reviews" ]] && why+="${why:+; }awaiting review: $reviews (the pump never dispatches a review task; record the verdict)"
+  [[ -n "$cross" ]] && why+="${why:+; }cross-phase blockers pending: $cross"
+  [[ -n "$siblings" ]] && why+="${why:+; }in-phase blockers pending: $siblings"
+  [[ -n "$claims" ]] && why+="${why:+; }claimed: $claims"
+  [[ -n "$dangling" ]] && why+="${why:+; }blockers with no task file: $dangling"
+  [[ -n "$unexplained" ]] && why+="${why:+; }open and unblocked but outside the frontier: $unexplained"
+  # The count and the walk disagree, which is a real fault (an unreadable file,
+  # a ledger read that failed, a ledger that moved under the tick) and not a
+  # dependency. Say which two answers conflict, so the next question is obvious.
+  [[ -z "$why" ]] && why="the ledger lists no open task in this phase — the count and the listing disagree"
+  printf '%s open, none eligible — %s' "$oc" "$why"
+}
+
 # ── Planning pass: classify every phase in range ───────────────────────────────
 # Sets arrays LAUNCH/RUNNING/WAITING/DONEP. Returns the plan via globals.
 declare -a PLAN_LAUNCH PLAN_RUNNING PLAN_WAITING PLAN_DONE PLAN_RESUME
 declare -A PLAN_WAIT_REASON
 compute_plan() {
   PLAN_LAUNCH=(); PLAN_RUNNING=(); PLAN_WAITING=(); PLAN_DONE=(); PLAN_RESUME=(); PLAN_WAIT_REASON=()
+  # The reason snapshot answers for ONE tick's ledger; re-read it on demand.
+  WAITSNAP_LOADED=0
   if [[ "$GRAIN" == "task" ]]; then compute_plan_task; return 0; fi
   detect_stalled_orphans
   local -A in_frontier=()
@@ -1773,13 +1909,19 @@ compute_plan() {
       # finished over committed, unfinished work.
       PLAN_RESUME+=("$p")
     elif [[ "$oc" -gt 0 ]]; then
-      # Has open tasks but none eligible — gated on incomplete cross-phase deps,
-      # unless a live container is already draining it.
+      # Has open tasks but none eligible, unless a live container is already
+      # draining it. WHY none are eligible is derived from the ledger, never
+      # assumed: a cross-phase dependency is only one of the answers (issue #46).
       if phase_live "$p"; then
         PLAN_RUNNING+=("$p")
       else
         PLAN_WAITING+=("$p")
-        PLAN_WAIT_REASON["$p"]="$oc open, none eligible — cross-phase blockers pending"
+        # Primed HERE, in the main shell: phase_wait_reason is read through a
+        # `$( )`, and a snapshot loaded inside that subshell dies with it — every
+        # waiting phase would re-read the whole ledger. Same trap
+        # load_task_snapshot documents, one caller further out.
+        (( WAITSNAP_LOADED )) || load_wait_snapshot
+        PLAN_WAIT_REASON["$p"]="$(phase_wait_reason "$p" "$oc")"
       fi
     else
       PLAN_DONE+=("$p")
@@ -1949,7 +2091,11 @@ print_plan() {
   for p in "${PLAN_RUNNING[@]:-}"; do [[ -n "$p" ]] && printf "  RUNNING  %-${w}s -> %s (live container)\n" "$p" "$(unit_branch "$p")"; done
   for p in "${PLAN_RESUME[@]:-}";  do [[ -n "$p" ]] && printf "  RESUME   %-${w}s -> %s (stalled on %s, %s; container dead, work committed)\n" \
       "$p" "$(unit_branch "$p")" "${STALL_TASK[$p]}" "${STALL_STATUS[$p]}"; done
-  for p in "${PLAN_WAITING[@]:-}"; do [[ -n "$p" ]] && printf "  WAITING  %-${w}s (%s)\n" "$p" "${PLAN_WAIT_REASON[$p]:-cross-phase blockers pending}"; done
+  # The last-resort reason names the gap itself rather than guessing at a
+  # dependency (issue #46). Every classification above records one, so reaching
+  # this default means a WAITING entry was filed with none — a pump bug, and the
+  # line has to read like one instead of like a diagnosis.
+  for p in "${PLAN_WAITING[@]:-}"; do [[ -n "$p" ]] && printf "  WAITING  %-${w}s (%s)\n" "$p" "${PLAN_WAIT_REASON[$p]:-no reason recorded — that is a pump bug, please report it}"; done
   for p in "${PLAN_DONE[@]:-}";    do [[ -n "$p" ]] && printf "  DONE     %-${w}s (%s)\n" "$p" "$done_note"; done
   echo "frontier: ${#PLAN_LAUNCH[@]} launchable, ${#PLAN_RUNNING[@]} running, ${#PLAN_RESUME[@]} resumable, ${#PLAN_WAITING[@]} waiting | open tasks in range: $(open_count)"
 }
