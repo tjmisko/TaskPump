@@ -177,8 +177,9 @@
 #                           #   CONTRIBUTING.md, or equivalent" paragraph)
 # TASKPUMP_BRIEF_TEMPLATE=  # the parameterized brief a launched agent is handed.
 #                           #   Resolution: this key (or TASKPUMP_PHASE_BRIEF_TEMPLATE),
-#                           #   then <ledger>/task-loop/briefs/_phase-drain-template.md,
-#                           #   then <install>/templates/phase-drain-brief.md
+#                           #   then <install>/templates/phase-drain-brief.md. Two rungs,
+#                           #   no probing: a template the pump was never told about is
+#                           #   not configuration, whatever directory it sits in.
 # TASKPUMP_TASK_BRIEF_TEMPLATE=
 #                           # the brief a --grain task container is handed. A DIFFERENT
 #                           #   template, not a reworded phase brief: the phase brief's
@@ -186,10 +187,9 @@
 #                           #   an agent running that at task grain would claim the very
 #                           #   siblings the pump just dispatched elsewhere.
 #                           #   Resolution: this key, then
-#                           #   <ledger>/task-loop/briefs/_task-template.md,
-#                           #   then <install>/templates/task-brief.md
+#                           #   <install>/templates/task-brief.md
 # TASKPUMP_RESUME_TEMPLATE= # resume preamble a stalled task's agent gets ahead of that
-#                           #   brief; resolves the same three ways, ending at
+#                           #   brief; resolves the same two ways, ending at
 #                           #   <install>/templates/resume-note.md
 # TASKPUMP_TASK_CLI=        # how an agent invokes the ledger CLI from inside its
 #                           #   worktree — the spelling briefs quote at the agent
