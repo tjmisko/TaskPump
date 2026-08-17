@@ -1893,6 +1893,108 @@ kill -TERM "$PUMP44" 2>/dev/null
 wait "$PUMP44" 2>/dev/null
 rm -f "$TASKS/F90.0.md" "$TASKS/F91.0.md"
 
+echo "--- Test 35: a stranded claim as the range's last work is never DRAINED (#48) ---"
+# The drain test counts `open` tasks, and a claim is not open. So an in_progress
+# task this run cannot own — claimed at the other dispatch grain, or on a branch
+# this naming scheme does not own — is invisible to it: neither reclaim nor
+# resume will touch that branch (deliberately, it is the same test that keeps
+# them off a human's), and nothing else can clear it either. While other open
+# work remained the run reached the deadlock exit (3); when the stranded claim
+# was the LAST thing in range, open_count hit 0 and the pump reported the range
+# *drained* at rc 0 over committed, unfinished work nobody is driving. That is
+# the F79 false-DRAINED arriving through the claim-ownership door instead of the
+# ledger-resolution one, and the plan told the same lie at phase grain — a phase
+# with no open tasks left was filed under DONE.
+STATE33="$TMP/pump33.state"
+stranded_fixture() {  # $1 = the branch holding the claim
+  rm -f "$TASKS"/*.md; mk F98.0 done; mkclaim F98.1 "$1"
+}
+dplan33() {  # the plan over F98; extra flags forwarded
+  PATH="$BIN:$PATH" TASKPUMP_NOTIFY_CMD=true ARACHNE_CLAIM_STALE_HOURS=99999 \
+  ARACHNE_PUMP_OPS_DIR="$TMP/noops" ARACHNE_PUMP_STATE_FILE="$STATE33" \
+  ARACHNE_POOL_CAP_FILE="$TMP/cap" ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+  STUB_LIVE="${STUB_LIVE:-}" STUB_AHEAD="${STUB_AHEAD:-3}" STUB_HEAD=aaaa111 \
+  "$PUMP" --no-health-gate --dry-run --phases F98 "$@"
+}
+loop33() {  # a REAL loop over F98 — the drain check only exists in loop mode
+  PATH="$BIN:$PATH" TASKPUMP_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 \
+  ARACHNE_CLAIM_STALE_HOURS=99999 ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
+  ARACHNE_PUMP_STATE_FILE="$STATE33" ARACHNE_POOL_CAP_FILE="$TMP/cap" \
+  ARACHNE_PUMP_LOG="$TMP/pump33.log" ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+  STUB_LIVE="" STUB_AHEAD=3 STUB_HEAD=aaaa111 STUB_GATE_RC=0 \
+  timeout 60 "$PUMP" --no-health-gate --phases F98 --tick 1 "$@"
+}
+
+# 35a: the exit code. A foreign-branch claim as the only remaining work must
+# reach the same loud stall the run reaches when open work sits beside it.
+stranded_fixture feat/somebody-else
+rm -f "$STATE33"
+rc=0; out=$(loop33 2>&1) || rc=$?
+[[ "$rc" -eq 3 ]] && pass "should exit 3 when the range's last work is a claim this run cannot own" \
+  || fail "exit=$rc, want 3 — the range was drained over a stranded claim:\n$out"
+have "$out" 'drained' \
+  && fail "the run reported the range drained over an in-flight claim:\n$out" \
+  || pass "should never report DRAINED when an in-flight claim remains in range"
+
+# 35b: the state file an operator reads during the page. `open_tasks: 0` with
+# `status: stalled` is unreadable on its own — the reason has to name the claim.
+[[ "$(jq -r '.status' "$STATE33" 2>/dev/null)" == "stalled" ]] \
+  && pass "should stamp status=stalled when a stranded claim blocks the drain" \
+  || fail "state after the stranded run: $(cat "$STATE33" 2>/dev/null)"
+have "$(jq -r '.paused_reason // empty' "$STATE33" 2>/dev/null)" 'in-flight claim' \
+  && pass "should name the in-flight claim in the stall reason when 0 open tasks remain" \
+  || fail "stall reason does not name the claim: $(jq -r '.paused_reason' "$STATE33" 2>/dev/null)"
+have "$out" 'in-flight claim' \
+  && pass "should page about the in-flight claim it stalled over" \
+  || fail "the stall page does not mention the in-flight claim:\n$out"
+
+# 35c: the plan has to say the same thing the exit code does. Filing the phase
+# under DONE would move the lie from the exit code into the plan text.
+stranded_fixture feat/somebody-else
+out=$(dplan33 2>&1)
+have "$out" 'DONE +F98' \
+  && fail "phase classified DONE while its last task is still claimed:\n$out" \
+  || pass "should not classify a phase DONE when its last task is still claimed"
+have "$out" 'WAITING +F98' && pass "should plan the stranded phase WAITING when no open tasks remain" \
+  || fail "stranded phase not WAITING:\n$out"
+have "$out" 'F98\.1 \(claimed by feat/somebody-else\)' \
+  && pass "should name the stranded task and its claimant when it explains the wait" \
+  || fail "the WAITING reason does not name the claim:\n$out"
+
+# 35d: the issue's literal repro — claimed at phase grain, run at task grain.
+# The task-grain plan already named it (`WAITING F98.1 (claimed by …)`); only
+# the drain test was blind, so the run said DRAINED under an honest plan.
+stranded_fixture feat/f98
+out=$(dplan33 --grain task 2>&1)
+have "$out" 'WAITING +F98\.1 +\(claimed by feat/f98, no live container\)' \
+  && pass "should keep naming the stranded claim at task grain when the grain switched" \
+  || fail "task-grain plan lost the stranded claim:\n$out"
+rm -f "$STATE33"
+rc=0; out=$(loop33 --grain task 2>&1) || rc=$?
+[[ "$rc" -eq 3 ]] && pass "should exit 3 when a grain switch strands the range's last claim" \
+  || fail "exit=$rc, want 3 at task grain:\n$out"
+have "$out" 'drained' \
+  && fail "task-grain run drained over the stranded claim:\n$out" \
+  || pass "should never report DRAINED at task grain while a claim is in flight"
+
+# 35e: the guard is about claims nobody is driving, not about claims. A LIVE
+# container on the claiming branch is a running phase, not a stranded one.
+stranded_fixture feat/f98
+out=$(STUB_LIVE="arachne-agent-feat-f98" dplan33 2>&1)
+have "$out" 'RUNNING +F98' && pass "should read a claim with a live container as RUNNING when no open tasks remain" \
+  || fail "live claim not RUNNING:\n$out"
+
+# 35f: and a range that genuinely finished still drains. The guard must cost the
+# happy path nothing — a false stall is the same class of wrong answer.
+rm -f "$TASKS"/*.md; mk F98.0 done; mk F98.1 done
+rm -f "$STATE33"
+rc=0; out=$(loop33 2>&1) || rc=$?
+[[ "$rc" -eq 0 ]] && pass "should still exit 0 when the range genuinely drained" \
+  || fail "exit=$rc, want 0 on a genuine drain:\n$out"
+[[ "$(jq -r '.status' "$STATE33" 2>/dev/null)" == "drained" ]] \
+  && pass "should still stamp status=drained when no claim remains in range" \
+  || fail "state after a genuine drain: $(cat "$STATE33" 2>/dev/null)"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"

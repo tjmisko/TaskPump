@@ -128,11 +128,13 @@ So a run restarted at the other grain does not recognize the in-flight claim as
 its own — the reclaim and resume passes both refuse to touch a branch this run's
 naming scheme does not own, deliberately, since that is the same test that keeps
 them off a human's branch. The stranded task shows up as `WAITING … claimed by
-feat/g3, no live container` every tick, and while other open work remains the run
-eventually reaches the deadlock exit (3). One edge is worth knowing before you
-switch: the drain test counts `open` tasks, and a stranded claim is
-`in_progress`, so if it is the **last** thing in range the run reports the range
-*drained* over it. Finish or `release` an in-flight claim before changing grain.
+feat/g3, no live container` every tick, and the run eventually reaches the
+deadlock exit (3) — with or without other open work beside it. The drain test
+asks about in-flight claims as well as `open` tasks precisely so the last claim
+in a range cannot be drained over: an `in_progress` task is committed, unfinished
+work, and calling that finished is the same false-DRAINED the resume path exists
+to prevent (issue #48). Finish or `release` an in-flight claim before changing
+grain.
 
 The cost the operator accepts is N branches instead of one, and therefore N
 merges. The opt-in integration trunk absorbs that: it composes with task grain,
@@ -330,6 +332,12 @@ deliberately not restarted.
 
 N is greater than one so a container dying mid-tick cannot trip it.
 
+A range with **zero open tasks** can reach this exit too, and must: the drain
+test asks about in-flight claims as well as open tasks, so a claim nobody is
+driving keeps the range undrained until a human finishes or releases it. The
+stall page and the state file both name the claim count, because `open_tasks: 0`
+beside `status: stalled` otherwise argues against the page it explains.
+
 **The general lesson, which outlives this pump:** an autonomous supervisor must
 be able to distinguish *drained* from *deadlocked*, and must be loud about the
 second. A system that cannot tell "nothing to do" from "nothing I can do" will
@@ -407,7 +415,7 @@ For a supervisor re-implementing these mechanisms against the same ledger:
 
 | Mechanism | Observable contract |
 |---|---|
-| 1. Frontier | Eligibility is `open ∧ blockers all done`, recomputed per query. `--count` (all open in range) vs `--count-eligible` (frontier size) are the drain test and the stall test respectively. At task grain, concurrency additionally requires disjoint declared `files:`; an empty list is exclusive. |
+| 1. Frontier | Eligibility is `open ∧ blockers all done`, recomputed per query. `--count` (all open in range) vs `--count-eligible` (frontier size) answer the drain test and the stall test respectively — with the drain test additionally requiring no `in_progress` task in range, since a claim is not `open` and unfinished work must never read as finished. At task grain, concurrency additionally requires disjoint declared `files:`; an empty list is exclusive. |
 | 2. Liveness | Never derived from task status. An orphan with no commits is released to `open`; an orphan with commits is not. |
 | 3. Gates | Exit 10 = pause launching. Exit 0 = feed. Anything else = fail open with a warning. Never kills a running agent. |
 | 4. Resume | Bounded by a no-progress counter in the ledger, reset by branch-head movement, exhausting to `needs-review`. Deadlock exits 3; drained exits 0. |

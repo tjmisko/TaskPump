@@ -553,6 +553,33 @@ phase_open_count() {
   "$TASK_BIN" ready --phase "$1" --count 2>/dev/null || echo 0
 }
 
+# The claims still in flight across the range, one `<id> <claimed_by>` per line.
+#
+# The count above cannot see these: `ready --count` counts `open` tasks, and a
+# claim is not open. That blind spot is fine for the frontier — a claimed task is
+# not launchable — and wrong for the DRAIN test, because an in_progress task is
+# unfinished work with commits on a branch, not finished work. A claim this run
+# cannot own (taken at the other dispatch grain, or on a branch this naming
+# scheme does not own) is never reclaimed and never resumed either, so nothing
+# later clears it: left invisible, it let the run call the range drained over it
+# (issue #48). Read straight from the ledger rather than derived from the plan,
+# because the drain test runs after the plan is gone.
+inflight_claims() {
+  local -A in_range=()
+  local p id status branch _rest
+  while IFS= read -r p; do [[ -n "$p" ]] && in_range["$p"]=1; done < <(pump_expand_phases "$PHASES")
+  # `|| continue` throughout, never a trailing `[[ … ]] && printf`: an and-list
+  # as the last command of the body makes the loop exit non-zero, and read
+  # through a process substitution that truncation is invisible (tasks_in_range
+  # below carries the incident this rule came from).
+  while read -r id status branch _rest; do
+    [[ "$id" != "ID" ]] || continue
+    [[ "$status" == "in_progress" ]] || continue
+    [[ -n "${in_range[${id%%.*}]:-}" ]] || continue
+    printf '%s %s\n' "$id" "$branch"
+  done < <("$TASK_BIN" list --status in_progress 2>/dev/null)
+}
+
 # Is a phase's worktree branch currently owned by a LIVE agent? (D3)
 #
 # Reads the pluggable enumeration: the runner's own `list` when it has one, the
@@ -1919,6 +1946,18 @@ compute_plan() {
   local -A in_frontier=()
   local p
   while IFS= read -r p; do [[ -n "$p" ]] && in_frontier["$p"]=1; done < <(frontier_phases)
+  # The in-flight claims, read once and bucketed by phase. `ready` cannot see a
+  # claim (it is not `open`), so without this a phase whose last remaining task
+  # is claimed has oc == 0 and reads as finished — the plan half of issue #48.
+  # Keeping it out of the per-phase loop keeps this to one ledger walk per tick.
+  local -A inflight_of=()
+  local id branch phase sep
+  while read -r id branch; do
+    [[ -n "$id" ]] || continue
+    phase="${id%%.*}"
+    sep=""; [[ -n "${inflight_of[$phase]:-}" ]] && sep=", "
+    inflight_of["$phase"]+="$sep$id (claimed by ${branch:--})"
+  done < <(inflight_claims)
   while IFS= read -r p; do
     [[ -z "$p" ]] && continue
     local oc; oc="$(phase_open_count "$p")"
@@ -1956,6 +1995,19 @@ compute_plan() {
         # load_task_snapshot documents, one caller further out.
         (( WAITSNAP_LOADED )) || load_wait_snapshot
         PLAN_WAIT_REASON["$p"]="$(phase_wait_reason "$p" "$oc")"
+      fi
+    elif [[ -n "${inflight_of[$p]:-}" ]]; then
+      # No open tasks left, but a claim here is still in flight and this run can
+      # neither reclaim nor resume it (a grain switch, a foreign branch, or
+      # --no-resume-stalled). DONE would say the phase finished; the drain test
+      # refuses that answer now (issue #48), so the plan must not print it either
+      # — the same lie in a different channel. A live container on the branch is
+      # not stranded at all, so it is asked first, exactly as the oc > 0 arm does.
+      if phase_live "$p"; then
+        PLAN_RUNNING+=("$p")
+      else
+        PLAN_WAITING+=("$p")
+        PLAN_WAIT_REASON["$p"]="no open tasks, but ${inflight_of[$p]} is still in flight"
       fi
     else
       PLAN_DONE+=("$p")
@@ -2378,18 +2430,43 @@ do_tick() {
 # hand the range to a human instead of spinning. Exits non-zero so the systemd
 # unit reports `failed` rather than sitting green while making no progress.
 stall_exit() {
-  local attention
+  local attention inflight reason
   attention=$("$TASK_BIN" list 2>/dev/null \
     | awk '$2=="blocked"||$2=="stuck"||$2=="needs-review"{n++} END{print n+0}')
-  write_state stalled "no live agents, nothing launchable, nothing resumable"
+  inflight=$(inflight_claims | wc -l | tr -d ' ')
+  reason="no live agents, nothing launchable, nothing resumable"
+  # A stall the drain test's new middle question produced (issue #48) shows the
+  # operator `open_tasks: 0` next to `status: stalled`, which on its own reads as
+  # "finished, but paged anyway". Name the claims, or the state file explains the
+  # page with the one number that argues against it.
+  (( inflight > 0 )) && reason+="; $inflight in-flight claim(s) nobody is driving"
+  write_state stalled "$reason"
+  # ops_push, not a raw git push: with no ledger repo to push to there is nothing
+  # to fail, and "ops push on stall exit failed" on the one line an operator reads
+  # during a page is a failure report for a push nobody attempted (issue #41).
   ops_push "ops push on stall exit failed"
-  pump_notify "$PHASES STALLED after $STALL_TICKS idle ticks — $(open_count) open task(s) remain but none can launch, and no orphaned claim is resumable. $attention task(s) need human review (blocked/stuck/needs-review)."
+  pump_notify "$PHASES STALLED after $STALL_TICKS idle ticks — $(open_count) open task(s) and $inflight in-flight claim(s) remain, none can launch, and no orphaned claim is resumable. $attention task(s) need human review (blocked/stuck/needs-review)."
   exit 3
 }
 
 # ── Drain check ────────────────────────────────────────────────────────────────
+# Three questions, and the middle one is issue #48's. "No open tasks and no live
+# agents" reads as finished, but a claim is neither: an in_progress task with no
+# container behind it is committed, unfinished work on a branch nobody is
+# driving. While other open work sat beside it the run still reached the
+# deadlock exit; alone in the range it drove open_count to 0 and the pump
+# announced DRAINED over it — the F79 false-DRAINED through the claim-ownership
+# door instead of the ledger-resolution one. Refusing to drain hands the range
+# to the deadlock detector instead, which is the outcome the docs already
+# promise for a stranded claim.
+#
+# Asked BEFORE the liveness count on purpose: liveness is the fail-open half of
+# this conjunction (a degraded enumeration reports every agent dead), so the
+# ledger's own answer must not depend on it.
 is_drained() {
-  [[ "$(open_count)" -eq 0 && "$(apl_count_live_agents)" -eq 0 ]]
+  [[ "$(open_count)" -eq 0 ]] || return 1
+  [[ -z "$(inflight_claims)" ]] || return 1
+  [[ "$(apl_count_live_agents)" -eq 0 ]]
 }
 
 # ── Restart-safe state (E2) ────────────────────────────────────────────────────
