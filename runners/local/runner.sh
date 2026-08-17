@@ -135,7 +135,7 @@ workspace_scope() {
   # One spelling per workspace: a caller reaching the same directory through a
   # symlink must not read as a different project than the one that wrote the
   # entry. Both sides of every comparison below come through here.
-  (CDPATH= cd -- "$r" 2>/dev/null && pwd -P) || printf '%s' "$r"
+  (CDPATH='' cd -- "$r" 2>/dev/null && pwd -P) || printf '%s' "$r"
 }
 
 registry_file() {
