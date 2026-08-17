@@ -728,8 +728,9 @@ want+=' -v @R@:@R@:ro -v @R@/.git:@R@/.git -v @R@/wt:@R@/wt -v @R@/ops:@R@/ops'
 # The trailing /entrypoint.sh is the bare ENTRYPOINT default (this launch
 # passes no TP_ENTRYPOINT): the shipped runner's own entrypoint at the path
 # the image contract bakes it (G1.5; docs/RUNNERS.md §4.0). Arachne's
-# /entrypoint-parallel.sh layout arrives only via its conf pin; the override
-# path is covered separately below.
+# /entrypoint-parallel.sh layout arrives only if a consumer sets
+# TASKPUMP_ENTRYPOINT itself — examples/arachne.conf deliberately carries no
+# such pin since issue #5 — and that override path is covered separately below.
 want+=' -w @R@/wt agentimg /entrypoint.sh'
 [[ $rc -eq 0 ]] && pass "launch exits 0 and prints the container id" || fail "launch rc=$rc:\n$got"
 if [[ "$got_norm" == "$want" ]]; then

@@ -183,8 +183,11 @@ APL_LIVENESS_RUNNER="$RUNNER"
 # --dry-run and NO_LAUNCH ticks never launch and keep working imageless.
 IMAGE="${TASKPUMP_IMAGE:-}"
 # The default names the shipped claude-docker runner's own entrypoint at the
-# path the image contract bakes it (docs/RUNNERS.md §4.0). Arachne's image
-# layout (/entrypoint-parallel.sh) survives as the examples/arachne.conf pin.
+# path the image contract bakes it (docs/RUNNERS.md §4.0). An image that bakes
+# it elsewhere must set this key itself: examples/arachne.conf dropped its
+# /entrypoint-parallel.sh pin in issue #5, because only the shipped entrypoint
+# runs the pre-flight hook, so pinning a pre-hook entrypoint leaves a
+# configured TASKPUMP_PRE_FLIGHT read by nothing.
 ENTRYPOINT="${TASKPUMP_ENTRYPOINT:-/entrypoint.sh}"
 # Building the agent image once before the drain. Unset ⇒ the default docker
 # build of the repo root; set to the empty string ⇒ skip it entirely, which is

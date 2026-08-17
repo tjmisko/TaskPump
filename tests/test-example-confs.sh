@@ -235,6 +235,93 @@ else
   fail "arachne.conf no longer configures TASKPUMP_PRE_FLIGHT (the reference consumer must exercise the hook seam)"
 fi
 
+# ── The dropped pin must stay dropped in prose too (issue #35) ────────────────
+# Issue #5 deleted the /entrypoint-parallel.sh pin from arachne.conf. The
+# comments that described that pin outlived it, so the tree kept telling
+# readers the legacy layout "arrives via the conf pin" while the conf carried
+# nothing — a reader who trusts that configures nothing and gets the shipped
+# entrypoint. Deriving the check from the conf itself is what keeps the two in
+# step: it enforces only while the conf really carries no TASKPUMP_ENTRYPOINT,
+# and the coherence assertion above owns the case where the pin comes back.
+echo "--- prose about the entrypoint pin tracks the conf (issue #35) ---"
+
+# GNU grep's \b does not compose with .* here (it silently matches nothing), so
+# the predicate spaces the verb explicitly instead.
+STALE_PIN_RE='entrypoint-parallel\.sh.* (as|via) .*pin'
+# A guard that has never been shown to go red is not a guard, it is a comment:
+# fire the predicate at the pre-#35 wording, and at a past-tense mention of the
+# historical pin that must stay legal, before trusting its silence.
+grep -qE "$STALE_PIN_RE" <<<'# layout (/entrypoint-parallel.sh) survives as the examples/arachne.conf pin.' \
+  && pass "control: the stale-pin predicate fires on the pre-fix wording" \
+  || fail "control: the stale-pin predicate MISSED the pre-fix wording — the guard is inert"
+grep -qE "$STALE_PIN_RE" <<<'# the historical drives, which pinned /entrypoint-parallel.sh here.' \
+  && fail "control: the predicate condemns a past-tense mention of the historical pin" \
+  || pass "control: the predicate leaves a past-tense mention of the historical pin alone"
+
+if [[ "$entrypoint" == "<UNSET>" ]]; then
+  for f in "$ARACHNE_CONF" "$TP_ROOT/taskpump.conf" "$PUMP" \
+           "$TP_ROOT/tests/test-entrypoint.sh" "$TP_ROOT/docs/RUNNERS.md"; do
+    rel="${f#"$TP_ROOT"/}"
+    hits="$(grep -nE "$STALE_PIN_RE" "$f" 2>/dev/null)"
+    if [[ -z "$hits" ]]; then
+      pass "should claim no live arachne.conf entrypoint pin when the conf carries none: $rel"
+    else
+      fail "$rel still says the /entrypoint-parallel.sh layout arrives via a conf pin, but arachne.conf sets no TASKPUMP_ENTRYPOINT (issue #5):\n$hits"
+    fi
+  done
+else
+  pass "arachne.conf pins TASKPUMP_ENTRYPOINT again — the coherence check above owns that case"
+fi
+
+# The contiguous run of comment lines immediately above a given line: the block
+# a reader reads as belonging to it.
+comment_run_above() {  # comment_run_above <file> <1-indexed line>
+  local f="$1" n="$2" i out=""
+  local -a lines=()
+  mapfile -t lines < "$f"
+  for (( i = n - 2; i >= 0; i-- )); do
+    [[ "${lines[i]}" == '#'* ]] || break
+    out="${lines[i]}"$'\n'"$out"
+  done
+  printf '%s' "$out"
+}
+
+# The default's own comment is where a reader lands from the code, so it must
+# carry the reason the pin is gone rather than a pointer to a pin that is not.
+ep_line="$(grep -nF 'ENTRYPOINT="${TASKPUMP_ENTRYPOINT' "$PUMP" | head -1 | cut -d: -f1)"
+if [[ -n "$ep_line" ]]; then
+  if grep -qF 'issue #5' <<<"$(comment_run_above "$PUMP" "$ep_line")"; then
+    pass "should cite issue #5 above the ENTRYPOINT default when the pin it used to name is gone"
+  else
+    fail "tp-pump's TASKPUMP_ENTRYPOINT comment does not cite issue #5 — a reader cannot tell why arachne.conf no longer pins it"
+  fi
+else
+  fail "cannot find the TASKPUMP_ENTRYPOINT default in tp-pump"
+fi
+
+# ── The dogfood conf's commented fallback owns its hazard (issue #35) ─────────
+# taskpump.conf configures TASKPUMP_PRE_FLIGHT and parks a commented
+# TASKPUMP_ENTRYPOINT fallback beneath it. Uncommenting that line recreates the
+# issue-#5 state exactly — a configured hook no entrypoint runs — so the block
+# must say so where the operator would uncomment, not only in arachne.conf.
+echo "--- taskpump.conf: the commented entrypoint fallback names its pre-flight hazard (issue #35) ---"
+
+DOGFOOD_CONF="$TP_ROOT/taskpump.conf"
+dog_ep_line="$(grep -nE '^#[[:space:]]*TASKPUMP_ENTRYPOINT=' "$DOGFOOD_CONF" | head -1 | cut -d: -f1)"
+dog_ep_value="$(grep -E '^#[[:space:]]*TASKPUMP_ENTRYPOINT=' "$DOGFOOD_CONF" | head -1 | sed 's/^#[[:space:]]*TASKPUMP_ENTRYPOINT=//')"
+if ! grep -qE '^TASKPUMP_PRE_FLIGHT=' "$DOGFOOD_CONF"; then
+  pass "taskpump.conf configures no pre-flight hook — nothing for the fallback to make inert"
+elif [[ -z "$dog_ep_line" || "$dog_ep_value" == "$SHIPPED_ENTRYPOINT" ]]; then
+  pass "taskpump.conf parks no non-shipped entrypoint fallback"
+else
+  block="$(comment_run_above "$DOGFOOD_CONF" "$dog_ep_line")"
+  if grep -qF 'TASKPUMP_PRE_FLIGHT' <<<"$block" && grep -qF 'inert' <<<"$block"; then
+    pass "should warn that uncommenting the entrypoint fallback leaves TASKPUMP_PRE_FLIGHT inert when the dogfood conf configures the hook"
+  else
+    fail "taskpump.conf's commented TASKPUMP_ENTRYPOINT=$dog_ep_value carries no warning that it makes the TASKPUMP_PRE_FLIGHT above it inert (issue #5's hazard, one uncomment away):\n$block"
+  fi
+fi
+
 echo "--- arachne.conf: the unflagged pool cap is the shipped default (issue #8) ---"
 
 JOBS_DEFAULT="$(extract_default TASKPUMP_JOBS "$TP_ROOT/libexec/tp-pump")" \
