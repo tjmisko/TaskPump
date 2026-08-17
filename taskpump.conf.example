@@ -98,7 +98,9 @@
 #                           #   directory, else the caller's worktree root — never
 #                           #   from a vendored install's own checkout, issue #32.
 #                           #   Set it to pin containers/CI; a missing directory is
-#                           #   a loud error.)
+#                           #   a loud error.) Not pump-only: `tp task` resolves its
+#                           #   ledger inside the same pin, so one pinned shell gets
+#                           #   one answer from both tools (issue #45).
 # TASKPUMP_JOBS=            # concurrent worktree pool cap (default: 4). This is the
 #                           #   key the pump reads; TASKPUMP_PUMP_JOBS is the systemd
 #                           #   unit's name for the same number, passed as --jobs.

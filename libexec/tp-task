@@ -51,7 +51,12 @@ tp_load_config
 # the claim into the *primary's* ledger — the worktree's own ledger never learns
 # about it, and the primary's silently drifts. Preferring $PWD's worktree makes
 # task state follow the workspace the work is happening in, which is what every
-# caller means.
+# caller means WHEN THEY HAVE NOT SAID OTHERWISE. A TASKPUMP_WORKSPACE_ROOT pin
+# is saying otherwise — it outranks the probes below, so in a pinned shell a
+# claim made from inside a worktree lands in the PINNED workspace's ledger, not
+# the worktree's. That is the point of a pin and it is what tp-pump has always
+# done; it is also the one way this paragraph's guarantee can be given up, so
+# an operator exporting the pin should know they are giving it up (issue #45).
 #
 # TASKPUMP_LEDGER_PROBE is the ledger's path relative to a candidate workspace
 # root. It answers "does this worktree carry a ledger of its own?" and, when no
@@ -79,6 +84,53 @@ _tp_conf_root="$TP_WS_CONF_ROOT"
 _tp_cwd_root="$TP_WS_CWD_ROOT"
 _tp_repo_root="$TP_WS_ROOT"
 _tp_resolved_via="$TP_WS_VIA"
+# TASKPUMP_WORKSPACE_ROOT pins the workspace outright, for the runs where $PWD
+# proves nothing: a container, a CI step, an operator standing in $HOME. The
+# pump has always honored it; this CLI did not, so one shell carrying one pin
+# gave two answers — `tp pump --dry-run` planned the pinned consumer's frontier
+# while `tp task ready --count` answered 0 `via install-root`, the install's own
+# ledger (issue #45). Nothing was corrupted (the guard below refuses the
+# fallback for mutating verbs, and a pump-launched agent is handed the pinned
+# derivation), but 0 is what a human reads as "drained" — a confident wrong
+# answer at the exact moment the operator is checking the two tools against
+# each other. The pin outranks the conf/cwd walk for the same reason it does in
+# the pump: it is the caller naming the workspace, over any probe. An explicit
+# tasks dir still wins — naming the ledger outright is more specific than naming
+# the workspace it usually sits in — and it wins OUTRIGHT: see the narrowing
+# below, which keeps the pin from moving anything once it has lost the ledger.
+if [[ -n "${TASKPUMP_WORKSPACE_ROOT:-}" ]]; then
+  if ! _tp_pinned_root="$(CDPATH='' cd -- "$TASKPUMP_WORKSPACE_ROOT" 2>/dev/null && pwd)"; then
+    # `die` is defined below this block, and a pin naming nothing must not fall
+    # through to the install root the way an unset pin does: a typo would then
+    # silently read the ledger the pin was set to steer away from. Checked even
+    # when an explicit tasks dir outranks the pin, exactly as tp-pump:85-90
+    # checks it: a pin naming nothing is a misconfiguration whether or not it
+    # is the rung that decides. It costs `resolve` and `--help` their answer in
+    # that one case (the check runs before argv is parsed) — acceptable only
+    # because this refusal names the key and the value that caused it, so it is
+    # its own diagnostic rather than a dead end pointing at a dead tool.
+    printf '%s: TASKPUMP_WORKSPACE_ROOT names a missing directory: %s\n' \
+      "${TASKPUMP_PROG_NAME:-tp-task}" "$TASKPUMP_WORKSPACE_ROOT" >&2
+    exit 1
+  fi
+  # The pin moves the workspace only when it is the rung that DECIDES it.
+  # $_tp_repo_root feeds TASKPUMP_CODE_REPO (below) as well as the tasks dir,
+  # so moving it under an explicit tasks dir would redirect the heartbeat's
+  # productivity meter while `via` still read `env` — a silent second effect on
+  # a rung that lost. That is the pump-launched agent's exact environment:
+  # tp-pump exports the pinned TASKPUMP_TASKS_DIR (tp-pump:154-156), the local
+  # runner cds into the agent's worktree carrying the operator's pin whole
+  # (runners/local/runner.sh), and code_repo pointed at the primary sees none
+  # of the agent's commits — productive=0 every cycle, then `stuck` at
+  # TASKPUMP_FAILURE_LIMIT on a task whose agent is committing normally, with
+  # nothing in the diagnostic naming the pin. Narrowed here rather than at the
+  # CODE_REPO default so the two derivations cannot drift apart again.
+  if [[ "$_tp_tasks_dir_explicit" -eq 0 ]]; then
+    _tp_repo_root="$_tp_pinned_root"
+    _tp_resolved_via="workspace-pin"
+  fi
+  unset _tp_pinned_root
+fi
 # When the tasks dir was handed to us outright, the workspace rung did not
 # decide it — the via diagnostic must name the rung that did, or it misleads
 # in exactly the misconfiguration case it exists for.
@@ -3044,6 +3096,9 @@ Config (env or taskpump.conf; the legacy ARACHNE_* spelling of each still works)
   Locations
     TASKPUMP_LEDGER_PROBE   ledger path relative to a workspace root, and the
                               default tasks dir  (default: tasks)
+    TASKPUMP_WORKSPACE_ROOT the workspace to resolve the ledger inside, for a
+                              run whose $PWD proves nothing. The pump reads the
+                              same pin, so both tools answer alike.
     TASKPUMP_TASKS_DIR      tasks dir            (default: <root>/<probe>)
     TASKPUMP_TASK_OUT       next-task JSON path  (default: <parent>/.next-task)
     TASKPUMP_CODE_REPO      code repo root — what heartbeat measures commits in
@@ -3081,17 +3136,24 @@ plus TASKPUMP_PHASE_SIGIL derive the phase from it. Phase grouping (--phase),
 range expansion (--phases T55..T63) and ordering are all built on that split, so
 the dot is part of the contract even though the sigil and the pattern are yours.
 
-The workspace is the directory of a DISCOVERED taskpump.conf when the ledger
-probe resolves there, else $PWD's git worktree when that worktree carries a
-ledger of its own (TASKPUMP_LEDGER_PROBE resolves there), otherwise the
-directory above this script. Since each worktree carries both its own copy of
-this CLI and its own ledger, preferring the caller's workspace keeps a claim
-made inside a worktree out of the primary checkout's ledger. A vendored
-TaskPump checkout inside a consumer never captures resolution: its own conf is
-skipped by discovery, and from inside a vendored submodule the workspace is the
-consumer's (docs/CONFIG.md, "Vendored TaskPump checkouts"). Relative paths in a
-conf anchor to the conf's workspace, never to $PWD. The config above still
-overrides; `resolve` prints what a given invocation picked.
+The workspace is TASKPUMP_WORKSPACE_ROOT when that pin is set, else the
+directory of a DISCOVERED taskpump.conf when the ledger probe resolves there,
+else $PWD's git worktree when that worktree carries a ledger of its own
+(TASKPUMP_LEDGER_PROBE resolves there), otherwise the directory above this
+script. The pin outranks both probes because it is the caller naming the
+workspace, and tp-pump honors it identically — one pinned shell, one answer.
+WITH NO PIN SET, each worktree carries both its own copy of this CLI and its
+own ledger, so preferring the caller's workspace keeps a claim made inside a
+worktree out of the primary checkout's ledger; export the pin and you trade
+that away deliberately, since the pinned workspace is then the one every verb
+answers for. Naming TASKPUMP_TASKS_DIR outright is more specific still and
+wins over both — and it wins outright, leaving TASKPUMP_CODE_REPO on the
+caller's own worktree so the heartbeat keeps measuring where the work lands.
+A vendored TaskPump checkout inside a consumer never captures resolution: its
+own conf is skipped by discovery, and from inside a vendored submodule the
+workspace is the consumer's (docs/CONFIG.md, "Vendored TaskPump checkouts").
+Relative paths in a conf anchor to the conf's workspace, never to $PWD. The
+config above still overrides; `resolve` prints what a given invocation picked.
 EOF
 }
 
@@ -3113,7 +3175,11 @@ EOF
 # fallback AND the install root is outside the caller's worktree. Read-only
 # commands keep working, deliberately — `resolve` is the diagnostic this error
 # points at, and an error that disables the tool you need to diagnose it is a
-# worse error.
+# worse error. One refusal does precede even `resolve`: a TASKPUMP_WORKSPACE_ROOT
+# naming a missing directory, checked at load time above. It is the exception
+# that proves the rule rather than a hole in it — that message names the key and
+# the value that caused it, so it IS the diagnostic and there is nothing left
+# for `resolve` to add.
 tp_require_resolved_ledger() {
   [[ "$_tp_tasks_dir_explicit" -eq 1 ]] && return 0
   [[ "$_tp_resolved_via" != "install-root" ]] && return 0

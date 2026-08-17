@@ -137,12 +137,23 @@ For where the ledger lives, strongest first:
 1. `TASKPUMP_TASKS_DIR` from the **environment** — used as given.
 2. `TASKPUMP_TASKS_DIR` from the **conf** — anchored to the conf's workspace
    as above.
-3. The **discovered conf's directory**, when `TASKPUMP_LEDGER_PROBE` resolves
+3. `TASKPUMP_WORKSPACE_ROOT` — the workspace named outright, whose
+   `TASKPUMP_LEDGER_PROBE` is then the ledger. The pin outranks both probes
+   below because it is the caller naming the workspace rather than a
+   directory answering for itself; naming a missing directory is a loud error,
+   never a fall-through. Both `tp task` and `tp pump` read it, so one pinned
+   shell gets one answer from both (issue #45). Standing in a worktree that
+   carries a ledger of its own does **not** override it — the pin is how you
+   say so, and a claim made there lands in the pinned workspace's ledger.
+   Rungs 1 and 2 win over it *outright*: when a tasks dir is named, the pin
+   decides nothing at all, including `TASKPUMP_CODE_REPO`, which stays on the
+   caller's own worktree so the heartbeat keeps measuring where the work lands.
+4. The **discovered conf's directory**, when `TASKPUMP_LEDGER_PROBE` resolves
    there (a directory carrying its own conf and ledger owns them, even inside
    a larger repo — vendored TaskPump checkouts excepted, above).
-4. **`$PWD`'s worktree root**, when the probe resolves there (for a vendored
+5. **`$PWD`'s worktree root**, when the probe resolves there (for a vendored
    TaskPump submodule, the superproject's root).
-5. The **install root** — a fallback, not an answer: mutating verbs refuse it
+6. The **install root** — a fallback, not an answer: mutating verbs refuse it
    unless the install root is the caller's own worktree (the vendored layout,
    where it is simply correct).
 
@@ -260,6 +271,7 @@ The keys a generic project actually needs.
 |---|---|
 | `TASKPUMP_TASKS_DIR` | The directory of task markdown files. The single most important key. |
 | `TASKPUMP_LEDGER_PROBE` | The path, relative to a candidate workspace, whose presence means "this workspace owns a ledger". It is how a worktree's own ledger is told apart from the primary's. A *discovered* `taskpump.conf` marks its own directory as the first candidate, ahead of `$PWD`'s worktree root — a directory carrying its own conf and ledger owns them even inside a larger TaskPump-shaped repo. `TASKPUMP_TASKS_SUBDIR` is accepted as a fallback spelling; write the canonical one. |
+| `TASKPUMP_WORKSPACE_ROOT` | The workspace this CLI resolves its ledger inside when no tasks dir is named outright — the pin for a run whose `$PWD` proves nothing (a container, a CI step, a shell in `$HOME`). The same key the pump reads (§3.2), deliberately: a shell that pins the workspace and runs both tools must not get `ready --count` = 0 `via install-root` from one and the pinned frontier from the other (issue #45). `resolve --all` then reports `via workspace-pin`, and `TASKPUMP_CODE_REPO` defaults to the pinned workspace on the same condition — name a tasks dir and the pin decides neither. `tp monitor` and `tp dag-render` do not read it yet; in a pinned shell they still answer from `$PWD`. |
 | `TASKPUMP_LEDGER_REPO` | The ledger checkout itself, when it is a repository separate from the code. |
 | `TASKPUMP_ID_PATTERN` | The regex ids must match (§[LEDGER-CONTRACT.md §7](LEDGER-CONTRACT.md#7-the-id-grammar-contract)). |
 | `TASKPUMP_CODE_REPO` | The repository whose commits the heartbeat productivity check measures. Distinct from the ledger repo — they are frequently different. |
@@ -299,7 +311,7 @@ consistent — a sigil the pattern does not accept produces tasks nothing can gr
 
 | Key | What it configures |
 |---|---|
-| `TASKPUMP_WORKSPACE_ROOT` | The workspace the pump **drives** — the default image-build context, the repository phase branches and agent worktrees are created in, the state-dir default, every `git` surface of a run. Unset, it derives from the config anchor (a discovered conf's directory, else the caller's worktree root) exactly as the ledger does — never from where the tools are installed, so a vendored TaskPump's own checkout is never mistaken for the workspace (issue #32). Set it to pin a container/CI run whose `$PWD` proves nothing. Naming a missing directory is a loud error. The install's own assets (`lib/`, `libexec/`, `gates/`, `runners/`, `templates/`, `hooks/`) stay script-relative regardless. |
+| `TASKPUMP_WORKSPACE_ROOT` | The workspace the pump **drives** — the default image-build context, the repository phase branches and agent worktrees are created in, the state-dir default, every `git` surface of a run. Unset, it derives from the config anchor (a discovered conf's directory, else the caller's worktree root) exactly as the ledger does — never from where the tools are installed, so a vendored TaskPump's own checkout is never mistaken for the workspace (issue #32). Set it to pin a container/CI run whose `$PWD` proves nothing. Naming a missing directory is a loud error. The install's own assets (`lib/`, `libexec/`, `gates/`, `runners/`, `templates/`, `hooks/`) stay script-relative regardless. Not pump-scoped: `tp task` resolves its ledger through the same pin (§3.1), so the two tools cannot answer differently in one pinned shell. |
 | `TASKPUMP_JOBS` | Concurrent pool cap. This is the key the pump reads; `TASKPUMP_PUMP_JOBS` is the systemd unit's name for the same number, which it passes as `--jobs`. |
 | `TASKPUMP_JOBS_FALLBACK` | The cap used when neither `--jobs` nor the cap file yields one. |
 | `TASKPUMP_POOL_CAP_FILE` | A file holding the live cap, re-read each tick so concurrency can be retuned mid-run. |
