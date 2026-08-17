@@ -24,7 +24,12 @@
 #
 # ── Syntax ───────────────────────────────────────────────────────────────────
 # This file is sourced by bash with allexport on, so it is `KEY=value` per line.
-# Quote any value containing spaces: `TASKPUMP_NOTIFY_CMD='notify-send -u low'`.
+# Quote any value containing spaces:
+#     TASKPUMP_NOTIFY_CMD='xargs -0 notify-send -u low TaskPump'
+# A configured notifier reads the message on stdin, which is what the xargs
+# wrapper is for: notify-send takes its summary from its arguments and never
+# reads stdin, so naming it directly drops the message. Leaving the key unset is
+# what gets you the argv-style notify-send fallback.
 #
 # ── Reading this file ────────────────────────────────────────────────────────
 # Every key is commented out and annotated with the default the tool falls back

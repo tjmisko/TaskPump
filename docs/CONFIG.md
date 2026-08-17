@@ -186,8 +186,13 @@ Quote anything containing spaces:
 
 ```bash
 TASKPUMP_TASKS_DIR=tasks
-TASKPUMP_NOTIFY_CMD='notify-send -u low'
+TASKPUMP_NOTIFY_CMD='xargs -0 notify-send -u low TaskPump'
 ```
+
+A configured notifier reads the message on **stdin**, which is what the `xargs`
+wrapper is for: `notify-send` takes its summary from its arguments and never
+reads stdin, so naming it directly drops the message. Leaving the key unset is
+what gets you the argv-style `notify-send` fallback (§3.2).
 
 Because it is sourced, it is executable code. Treat it as you would any file you
 run: do not source a `taskpump.conf` you have not read.
@@ -351,7 +356,7 @@ toolchain:
 | `TASKPUMP_SUBMODULE_PROBE` | A path that proves the ledger submodule is populated in a fresh worktree, letting the pump skip its per-worktree `git submodule update --init --recursive`. **No default**: unset, the (idempotent, cheap) init always runs. The probe is a pure optimization — and a sharp one: a path that exists for the wrong reason skips the init some *other* submodule still needs, silently. Set it only to a path that proves everything you need populated. |
 | `TASKPUMP_GATES` | Ordered list of gates to consult before launching (§[GATES.md](GATES.md)). |
 | `TASKPUMP_PRE_TICK_HOOKS` | Commands run at the start of each tick — ledger refresh, repo hygiene, contamination checks. |
-| `TASKPUMP_NOTIFY_CMD` | The command that delivers notifications. Set it to `true` to silence them. |
+| `TASKPUMP_NOTIFY_CMD` | The command that delivers notifications, which it receives on **stdin** — an argv-style notifier needs a wrapper (`xargs -0 notify-send -u low TaskPump`), and one that fails is reported rather than swallowed. Unset, the pump falls back to `notify-send <prog-name> <message>` wherever notify-send is on PATH. Set it to `true` to silence them; every message is logged either way. |
 
 `TASKPUMP_GATES` and `TASKPUMP_PRE_TICK_HOOKS` are both **newline-separated
 command lines**, and each entry's first word must be an executable path. A bare

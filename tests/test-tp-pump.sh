@@ -291,6 +291,94 @@ have "$err" 'notify command failed' \
   && fail "a notifier that exited 0 without reading the message was called a drop:\n$(grep 'notify command failed' <<<"$err")" \
   || pass "should stay silent when the notify command exits 0 without reading the message"
 
+# 8f: the value the tree hands an operator to COPY has to survive the same
+# contract. `notify-send -u low` was the shipped syntax example in
+# docs/CONFIG.md and taskpump.conf.example — argv-style, so once 8e stopped
+# swallowing the status it warned on every notice and delivered nothing, which
+# is the shape examples/arachne.conf already records having lived through. The
+# examples are re-read out of those files rather than restated here, so a
+# rewrite that reintroduces an argv-style value fails on the value's own
+# behaviour instead of on a grep for one spelling.
+NBIN="$TMP/notify-bin"; mkdir -p "$NBIN"
+NREC="$TMP/notify-send.record"
+# Faithful where it matters: the real notify-send takes its summary from argv,
+# never reads stdin, and exits 1 with exactly this line when argv carries none.
+# The short options that consume an argument are spelled out because a stub that
+# swallowed a summary as an option's value would fail a value libnotify accepts.
+cat >| "$NBIN/notify-send" <<EOF
+#!/usr/bin/env bash
+REC="$NREC"
+EOF
+cat >> "$NBIN/notify-send" <<'EOF'
+pos=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -u|-t|-a|-i|-n|-c|-h|-r|-A) shift 2 ;;
+    -*) shift ;;
+    *) pos+=("$1"); shift ;;
+  esac
+done
+[[ ${#pos[@]} -ge 1 ]] || { echo "No summary specified." >&2; exit 1; }
+printf '%s\n' "${pos[*]}" >> "$REC"
+exit 0
+EOF
+chmod +x "$NBIN/notify-send"
+
+notify_examples() {  # notify_examples <file> → each documented value, one per line
+  local match value
+  while IFS= read -r match; do
+    value="${match#TASKPUMP_NOTIFY_CMD=}"
+    value="${value#\'}"; value="${value%\'}"
+    printf '%s\n' "$value"
+  done < <(grep -oE "TASKPUMP_NOTIFY_CMD='[^']+'|TASKPUMP_NOTIFY_CMD=[^ '\"#]+" "$1")
+}
+
+# One drained tick per documented value; the record is what the stub was
+# actually handed, so "delivered" is answered by the notifier, not by the pump.
+notify_tick() {  # notify_tick <value> → the pump's stderr; delivery lands in $NREC
+  local value="$1"
+  : >| "$NREC"
+  PATH="$NBIN:$PATH" STUB_GATE_RC=0 \
+    TASKPUMP_PRE_TICK_HOOKS="$BIN/hook-quiet" TASKPUMP_HOOK_MARK_FILE="$TMP/8f.mark" \
+    TASKPUMP_NOTIFY_CMD="$value" \
+    pump_tick F55..F57 2>&1 >/dev/null
+}
+
+mk F55.0 done; mk F55.1 done; mk F56.0 done; mk F57.0 done
+# A guard that has never been shown to go red is not a guard: the pre-fix
+# example goes through the same harness first.
+err=$(notify_tick 'notify-send -u low')
+if have "$err" 'notify command failed' && ! grep -q 'drained' "$NREC"; then
+  pass "control: the pre-fix example ('notify-send -u low') still loses the drain notice and says so"
+else
+  fail "control: the stubbed notify-send swallowed an argv-style value with no summary — the harness cannot go red"
+fi
+
+for conf_doc in "$TP_ROOT/docs/CONFIG.md" "$TP_ROOT/taskpump.conf.example"; do
+  rel="${conf_doc#"$TP_ROOT"/}"
+  n=0
+  while IFS= read -r example; do
+    n=$((n + 1))
+    err=$(notify_tick "$example")
+    if have "$err" 'notify command failed'; then
+      fail "$rel documents TASKPUMP_NOTIFY_CMD='$example', which the pump reports as a dropped notification:\n$(grep 'notify command failed' <<<"$err")"
+    elif [[ "$example" == true ]]; then
+      # `true` is the documented silencer, not a delivery command: what it owes
+      # is silence, and 8e above owns the reason that silence must not be a warning.
+      pass "should stay silent when TASKPUMP_NOTIFY_CMD is the silencer $rel documents (true)"
+    elif grep -q 'drained' "$NREC"; then
+      pass "should deliver the drain notice when TASKPUMP_NOTIFY_CMD is the value $rel documents ($example)"
+    else
+      # Only notify-send is stubbed, so this arm cannot tell a value that drops
+      # the message from one that delivers it through some other program; it
+      # says so rather than naming a cause it did not establish.
+      fail "$rel documents TASKPUMP_NOTIFY_CMD='$example', which exits 0 but never handed the message to the stubbed notify-send — either the value drops what the pump feeds it on stdin, or it delivers through a program this harness does not stub yet"
+    fi
+  done < <(notify_examples "$conf_doc")
+  [[ "$n" -ge 1 ]] && pass "$rel still carries a TASKPUMP_NOTIFY_CMD example to check ($n)" \
+    || fail "$rel documents no TASKPUMP_NOTIFY_CMD value any more — this guard now verifies nothing"
+done
+
 echo "--- Test 9: disk feed-gate pauses launching (A4 / F65.3) ---"
 # Reset fixtures to a live frontier (the gate line prints regardless of fixtures).
 mk F55.0 open; mk F55.1 open F55.0; mk F56.0 open; mk F57.0 open F55.1
