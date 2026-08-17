@@ -2369,23 +2369,6 @@ if [[ -z "${GITHUB_TOKEN:-}" ]] && command -v gh >/dev/null 2>&1; then
 fi
 [[ -f "$BRIEF_TEMPLATE" ]] || die "$(missing_brief_template_msg)"
 
-# Seed the live cap file for discoverability / retuning — and, when the operator
-# typed --jobs, OVERWRITE it: the flag sets the live cap for this run (issue
-# #44). Every tick reads this file, so a number an earlier run left here used to
-# outrank the flag silently. Without the flag the file is left exactly as found;
-# it is the mid-drain retune knob and outranking a standing TASKPUMP_JOBS is its
-# whole job. Must precede the banner below, which reports what this write left.
-if [[ "$JOBS_GIVEN" -eq 1 || ! -f "$CAP_FILE" ]]; then
-  if { echo "$JOBS" >| "$CAP_FILE"; } 2>/dev/null; then
-    CAP_FILE_STAMPED=1
-  elif [[ "$JOBS_GIVEN" -eq 1 ]]; then
-    # Unwritable cap file: keep honoring the flag (effective_cap feeds banner,
-    # plan, tick and state alike) and say what that costs, rather than quietly
-    # ticking against a file the operator just tried to override.
-    warn "could not write $CAP_FILE — this run holds at --jobs $JOBS; retuning through that file is off"
-  fi
-fi
-
 # Skip the (~9 GB) image build when we will not launch containers — keeps the
 # NO_LAUNCH tick (tests / live read-only validation) side-effect-free.
 if [[ "${TASKPUMP_PUMP_NO_LAUNCH:-0}" -ne 1 ]]; then
@@ -2419,6 +2402,31 @@ if [[ "${TASKPUMP_PUMP_NO_LAUNCH:-0}" -ne 1 ]]; then
   ensure_trunk
 fi
 
+# Seed the live cap file for discoverability / retuning — and, when the operator
+# typed --jobs, OVERWRITE it: the flag sets the live cap for this run (issue
+# #44). Every tick reads this file, so a number an earlier run left here used to
+# outrank the flag silently. Without the flag the file is left exactly as found;
+# it is the mid-drain retune knob and outranking a standing TASKPUMP_JOBS is its
+# whole job.
+#
+# Placed HERE — below every startup abort, above the banner that reports what
+# this write left — for the reason the exit traps give below: a pump that never
+# ticked must not clobber a file a previous run, an operator or the disk
+# watchdog set. Written before the prerequisites, an imageless `--jobs 12` died
+# printing no banner and nothing about a cap, and left 12 behind to govern the
+# next unflagged run — issue #44's own bug shape, re-created by its fix. It also
+# precedes the watchdog start below, so the two never race for this file.
+if [[ "$JOBS_GIVEN" -eq 1 || ! -f "$CAP_FILE" ]]; then
+  if { echo "$JOBS" >| "$CAP_FILE"; } 2>/dev/null; then
+    CAP_FILE_STAMPED=1
+  elif [[ "$JOBS_GIVEN" -eq 1 ]]; then
+    # Unwritable cap file: keep honoring the flag (effective_cap feeds banner,
+    # plan, tick and state alike) and say what that costs, rather than quietly
+    # ticking against a file the operator just tried to override.
+    warn "could not write $CAP_FILE — this run holds at --jobs $JOBS; retuning through that file is off"
+  fi
+fi
+
 # Belt-and-suspenders disk discipline (A4): auto-start the disk watchdog like
 # run-parallel.sh does, so disk pressure also drops the live pool cap (cap-file
 # path) on top of the feed gate. --auto-exit retires it once no agents remain.
@@ -2431,9 +2439,14 @@ if [[ "$MODE" == "run" && "$DISK_GATE" -eq 1 && "${TASKPUMP_PUMP_NO_LAUNCH:-0}" 
 fi
 
 # The cap here is the one the ticks will use, and the parenthetical names who set
-# it: printing the flag while the ticks read the file is issue #44 exactly.
+# it: printing the flag while the ticks read the file is issue #44 exactly. The
+# stamp above is what hands authority back to the file, so a flag whose stamp
+# never landed must not advertise it — that clause would promise a retune knob
+# the warn one line up just said is off, in the change whose whole subject is
+# where a cap came from.
 CAP_NOTE="live via $CAP_FILE"
 [[ "$JOBS_GIVEN" -eq 1 ]] && CAP_NOTE="--jobs, then live via $CAP_FILE"
+[[ "$JOBS_GIVEN" -eq 1 && "$CAP_FILE_STAMPED" -eq 0 ]] && CAP_NOTE="--jobs (cap file unwritable; no live retuning)"
 log "Pump: phases=$PHASES grain=$GRAIN cap=$(effective_cap) ($CAP_NOTE) ceiling=${CEILING}% tick=${TICK}s"
 log "Singular supervisor; Ctrl-C stops feeding but leaves running agents. Monitor: $MONITOR_BIN"
 

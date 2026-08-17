@@ -424,8 +424,9 @@ One knob is worth knowing: `--jobs` *writes* `.taskpump-pool-cap` at startup and
 every tick then reads it, which is what lets `echo 1 >| .taskpump-pool-cap`
 retune a live pump mid-drain. The file outlives the run that wrote it, so an
 explicit `--jobs` overwrites whatever an earlier run left there — the flag is an
-instruction about this run. Without the flag the file wins, deliberately, and the
-startup banner prints the cap actually in force plus where it came from:
+instruction about this run, and a run that aborts at startup, before it ticks
+once, leaves the file alone. Without the flag the file wins, deliberately, and
+the startup banner prints the cap actually in force plus where it came from:
 
 ```
 [09:23:16] Pump: phases=T1..T2 grain=phase cap=1 (--jobs, then live via /repo/.taskpump-pool-cap) ceiling=95% tick=30s
