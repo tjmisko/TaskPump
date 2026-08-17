@@ -425,11 +425,17 @@ the agent's own log and the pump log are your view into it — and a stub does n
 claim its task, so the ledger keeps T1 `○ ready` while the pump counts the phase
 RUNNING. A real agent claims as its first act.
 
-One knob is worth knowing before it surprises you: `--jobs` seeds
-`.taskpump-pool-cap` and every tick then *reads* it, which is what lets
-`echo 1 >| .taskpump-pool-cap` retune a live pump. The file outlives the run that
-wrote it, so a number left by an earlier run wins over the `--jobs` you just
-passed; delete it or overwrite it when the cap looks wrong.
+One knob is worth knowing: `--jobs` *writes* `.taskpump-pool-cap` at startup and
+every tick then reads it, which is what lets `echo 1 >| .taskpump-pool-cap`
+retune a live pump mid-drain. The file outlives the run that wrote it, so an
+explicit `--jobs` overwrites whatever an earlier run left there — the flag is an
+instruction about this run, and a run that aborts at startup, before it ticks
+once, leaves the file alone. Without the flag the file wins, deliberately, and
+the startup banner prints the cap actually in force plus where it came from:
+
+```
+[09:23:16] Pump: phases=T1..T2 grain=phase cap=1 (--jobs, then live via /repo/.taskpump-pool-cap) ceiling=95% tick=30s
+```
 
 Ctrl-C stops feeding and leaves running agents alive — and stamps the state file
 on the way out, so the next reader is not misled:

@@ -1722,6 +1722,177 @@ have "$loop41" 'ops push on stall exit failed' \
   && fail "the stall exit reported a push failure with no ledger repo to push to:\n$loop41" \
   || pass "should not report a failed stall-exit push when there is no ledger repo"
 
+echo "--- Test 34: the cap the banner prints is the cap the ticks use (#44) ---"
+# The banner printed $JOBS while every tick read CAP_FILE, so a cap file left
+# behind by an earlier run silently topped the pool up to ITS number while the
+# operator was told the flag's — `--jobs 1` against a leftover 4 launched four
+# agents and said cap=1. Whichever of the two wins, the banner, the tick and the
+# state file must all name the same number.
+CAP44="$TMP/cap44"; STATE44="$TMP/pump44.state"
+mk F90.0 open; mk F91.0 open
+pump44() {  # pump44 <pump args...> — a hermetic run against $CAP44
+  TASKPUMP_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 TASKPUMP_STAGGER=0 \
+  ARACHNE_PUMP_OPS_DIR="$TMP/noops" ARACHNE_PUMP_STATE_FILE="$STATE44" \
+  ARACHNE_POOL_CAP_FILE="$CAP44" ARACHNE_PUMP_LOG="$TMP/pump44.log" \
+  ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+  "$PUMP" --no-health-gate --phases F90..F91 "$@" 2>&1
+}
+banner_cap44() { sed -n 's/.*Pump: .*cap=\([0-9][0-9]*\).*/\1/p' <<<"$1" | head -1; }
+tick_cap44()   { sed -n 's#.*live=[0-9][0-9]*/\([0-9][0-9]*\).*#\1#p' <<<"$1" | head -1; }
+
+# 34a: an explicit --jobs against a leftover cap file of 4.
+echo 4 >| "$CAP44"
+out=$(pump44 --jobs 1 --once)
+bc=$(banner_cap44 "$out"); tc=$(tick_cap44 "$out")
+[[ "$bc" == "1" ]] \
+  && pass "should print the flag's cap in the banner when --jobs 1 meets a cap file holding 4" \
+  || fail "banner cap=$bc, expected 1:\n$out"
+[[ -n "$tc" && "$tc" == "$bc" ]] \
+  && pass "should top the pool up to the banner's cap when a leftover cap file disagrees" \
+  || fail "banner said cap=$bc but the tick launched against $tc:\n$out"
+[[ "$(cat "$CAP44")" == "1" ]] \
+  && pass "should rewrite the live cap file to the flag when --jobs is explicit" \
+  || fail "cap file holds '$(cat "$CAP44")', expected 1 (the flag never reached the file the ticks read)"
+[[ "$(jq -r '.jobs' "$STATE44" 2>/dev/null)" == "1" ]] \
+  && pass "should record the effective cap in the state file when --jobs wins" \
+  || fail "state file jobs=$(jq -r '.jobs' "$STATE44" 2>/dev/null), expected 1"
+
+# 34b: no flag — the cap file is the live retune knob and keeps winning, but the
+# banner must stop claiming the default it is not using.
+echo 3 >| "$CAP44"
+out=$(pump44 --once)
+bc=$(banner_cap44 "$out"); tc=$(tick_cap44 "$out")
+[[ "$bc" == "3" ]] \
+  && pass "should print the cap file's value in the banner when no --jobs is passed" \
+  || fail "banner cap=$bc, expected 3 (the file the ticks read):\n$out"
+[[ -n "$tc" && "$tc" == "$bc" ]] \
+  && pass "should tick against the cap file when no --jobs is passed" \
+  || fail "banner said cap=$bc but the tick launched against $tc:\n$out"
+[[ "$(cat "$CAP44")" == "3" ]] \
+  && pass "should leave a mid-drain retune alone when no --jobs is passed" \
+  || fail "cap file rewritten to '$(cat "$CAP44")', expected the retuned 3"
+# The monitor renders this file: the same number, or the same lie one channel over.
+[[ "$(jq -r '.jobs' "$STATE44" 2>/dev/null)" == "3" ]] \
+  && pass "should record the cap file's value in the state file when no --jobs is passed" \
+  || fail "state file jobs=$(jq -r '.jobs' "$STATE44" 2>/dev/null), expected 3"
+
+# 34c: a dry run must predict the cap the real run would use — it exits before
+# the startup write, so it has to reason about the flag itself.
+echo 4 >| "$CAP44"
+out=$(pump44 --jobs 1 --dry-run)
+have "$out" 'plan — phases F90\.\.F91, grain phase, cap 1,' \
+  && pass "should predict the flag's cap in a dry run when a leftover cap file disagrees" \
+  || fail "dry-run plan header disagrees with the run it previews:\n$out"
+[[ "$(cat "$CAP44")" == "4" ]] \
+  && pass "should not write the cap file in a dry run when --jobs is explicit" \
+  || fail "dry run mutated the cap file to '$(cat "$CAP44")'"
+
+# 34d: with no cap file at all the shipped default still seeds it (Test 22
+# covers the path; this pins the number the banner quotes for it).
+rm -f "$CAP44"
+out=$(pump44 --once)
+bc=$(banner_cap44 "$out")
+[[ "$bc" == "4" && "$(cat "$CAP44")" == "4" ]] \
+  && pass "should seed the cap file from the default cap when no file exists" \
+  || fail "banner cap=$bc, cap file '$(cat "$CAP44" 2>/dev/null)', expected 4/4"
+
+# 34e: a startup that ABORTS must leave the cap file exactly as it found it. The
+# launch prerequisites (no image / no auth dir / no runner / failed build) die
+# after the write, printing no banner and saying nothing about a cap — so the
+# operator's whole evidence is "that command failed", and a cap file quietly
+# rewritten behind it governs the next unflagged run. That is issue #44's own
+# bug shape re-created by its fix, and it is the rule the state file already
+# states one screen below ("a pump that never ticked ... must not clobber a
+# previous run's file on a startup abort"). Every case above sets NO_LAUNCH,
+# which skips the prerequisite block wholesale; this one deliberately does not.
+echo 4 >| "$CAP44"
+abort44() {  # a real (launching) run with an existing auth dir and no image
+  TASKPUMP_NOTIFY_CMD=true TASKPUMP_STAGGER=0 \
+  TASKPUMP_AGENT_HOME="$TMP" TASKPUMP_IMAGE= \
+  ARACHNE_PUMP_OPS_DIR="$TMP/noops" ARACHNE_PUMP_STATE_FILE="$STATE44" \
+  ARACHNE_POOL_CAP_FILE="$CAP44" ARACHNE_PUMP_LOG="$TMP/pump44.log" \
+  ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+  "$PUMP" --no-health-gate --phases F90..F91 "$@" 2>&1
+}
+out=$(abort44 --jobs 12 --once); rc=$?
+[[ "$rc" -ne 0 ]] && have "$out" 'no container image configured' \
+  && pass "should abort on the missing image when --jobs is passed to a run that cannot launch" \
+  || fail "expected a prerequisite abort, got rc=$rc:\n$out"
+have "$out" 'Pump: phases=' \
+  && fail "an aborted startup printed the banner:\n$out" \
+  || pass "should print no banner when the startup aborts on a prerequisite"
+[[ "$(cat "$CAP44")" == "4" ]] \
+  && pass "should leave the live cap file untouched when the startup aborts before ticking" \
+  || fail "cap file rewritten to '$(cat "$CAP44")' by a run that never ticked, expected 4"
+# The consequence the operator actually meets: the documented unflagged form.
+out=$(pump44 --once)
+bc=$(banner_cap44 "$out")
+[[ "$bc" == "4" ]] \
+  && pass "should govern the next unflagged run by the standing cap when an earlier --jobs run aborted" \
+  || fail "next unflagged run ticks at cap=$bc — inherited from a run that never happened:\n$out"
+# Same rule with no file at all: the seeding write is a courtesy for a run that
+# is about to tick, so an abort must not leave a cap file behind either.
+rm -f "$CAP44"
+out=$(abort44 --jobs 12 --once)
+[[ ! -e "$CAP44" ]] \
+  && pass "should create no cap file at all when the startup aborts on a prerequisite" \
+  || fail "an aborted startup seeded a cap file holding '$(cat "$CAP44")':\n$out"
+
+# 34f: an unwritable cap file. The flag still wins (effective_cap holds it for
+# the process's whole life, since the stamp that hands authority back never
+# landed) — but that is precisely when the banner must NOT promise the file as
+# the live retune knob one line under a warn saying that knob is off. A wrong
+# provenance clause in the change whose purpose is provenance.
+CAP44_REAL="$CAP44"
+CAP44="$TMP/cap44-unwritable"; mkdir -p "$CAP44"   # a directory: `echo >|` fails as any user
+out=$(pump44 --jobs 2 --once)
+bc=$(banner_cap44 "$out")
+have "$out" 'could not write .*retuning through that file is off' \
+  && pass "should warn that live retuning is off when the cap file cannot be written" \
+  || fail "no unwritable-cap-file warning:\n$out"
+[[ "$bc" == "2" ]] \
+  && pass "should still tick at the flag's cap when the cap file cannot be written" \
+  || fail "banner cap=$bc, expected 2:\n$out"
+have "$out" 'Pump: .*cap=2 \(--jobs \(cap file unwritable' \
+  && pass "should name the flag alone as the cap's source when the cap file cannot be written" \
+  || fail "banner still advertises the cap file as the live source:\n$out"
+rm -rf "$CAP44"; CAP44="$CAP44_REAL"
+
+# 34g: the stamp hands authority BACK to the cap file. --jobs outranks a stale
+# file only until the flag is written into it; after that the file is the live
+# retune knob again — otherwise a supervisor started with --jobs could never be
+# throttled mid-drain, by an operator or by the disk watchdog, and the suite
+# would not notice because every case above is --once and sees one tick.
+echo 4 >| "$CAP44"
+STATE44G="$TMP/pump44g.state"; rm -f "$STATE44G"
+retune_pump() {  # loop-mode pump; the CALLER backgrounds this exact command
+  TASKPUMP_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 TASKPUMP_STAGGER=0 \
+  ARACHNE_PUMP_OPS_DIR="$TMP/noops" ARACHNE_PUMP_STATE_FILE="$STATE44G" \
+  ARACHNE_POOL_CAP_FILE="$CAP44" ARACHNE_PUMP_LOG="$TMP/pump44g.log" \
+  ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+  exec "$PUMP" --no-health-gate --phases F90..F91 --jobs 1 --tick 1
+}
+await_jobs44() {  # poll until the state file's effective cap reads $1
+  local want="$1" i
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25; do
+    [[ "$(jq -r '.jobs // empty' "$STATE44G" 2>/dev/null)" == "$want" ]] && return 0
+    sleep 0.4
+  done
+  return 1
+}
+retune_pump >/dev/null 2>&1 &
+PUMP44=$!
+await_jobs44 1 \
+  && pass "should stamp the flag into the cap file and tick against it when --jobs starts a loop" \
+  || fail "loop never ticked at the flag's cap: $(cat "$STATE44G" 2>/dev/null)"
+echo 2 >| "$CAP44"
+await_jobs44 2 \
+  && pass "should honor a mid-drain retune of the cap file when the run started with --jobs" \
+  || fail "cap file retune ignored after the startup stamp: $(cat "$STATE44G" 2>/dev/null)"
+kill -TERM "$PUMP44" 2>/dev/null
+wait "$PUMP44" 2>/dev/null
+rm -f "$TASKS/F90.0.md" "$TASKS/F91.0.md"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"
