@@ -2172,16 +2172,32 @@ write_state() {  # $1=status(running|paused|drained|stalled|stopped) $2=reason
 }
 
 # ── Notify (E5) ────────────────────────────────────────────────────────────────
-# Pluggable: ARACHNE_NOTIFY_CMD reads the message on stdin; defaults to
-# `notify-send` (desktop) when present, else a no-op (just the log line).
+# Pluggable: TASKPUMP_NOTIFY_CMD (legacy spelling ARACHNE_NOTIFY_CMD, bridged by
+# lib/config.sh) reads the message on STDIN; unset falls back to `notify-send`
+# (desktop) when present, else the log line alone.
+#
+# The two channels take the message differently on purpose — the configured
+# command reads stdin, the notify-send fallback gets argv — and that asymmetry
+# is what a plausible pin walks into: `notify-send -u low` wants a summary
+# argument and never reads stdin, so it errors on every notice. Discarding that
+# status made a whole drain's worth of notifications vanish while the pump
+# looked like it had sent them, so a configured command that fails is reported.
+# Every message is logged above this either way; the warning is what says the
+# delivery the operator asked for did not happen. The fallback stays quiet: it
+# is best-effort by definition (a headless host has no bus), nobody configured
+# it, and the log line is still the record.
 pump_notify() {
   local msg="$1"
   log "$msg"
   if [[ -n "${TASKPUMP_NOTIFY_CMD:-}" ]]; then
-    printf '%s\n' "$msg" | ${TASKPUMP_NOTIFY_CMD} >/dev/null 2>&1 || true
-  elif command -v notify-send >/dev/null 2>&1; then
+    printf '%s\n' "$msg" | ${TASKPUMP_NOTIFY_CMD} >/dev/null 2>&1 && return 0
+    warn "notify command failed; notification not delivered (TASKPUMP_NOTIFY_CMD=$TASKPUMP_NOTIFY_CMD — it must read the message on stdin)"
+    return 0
+  fi
+  if command -v notify-send >/dev/null 2>&1; then
     notify-send "$PROG_NAME" "$msg" >/dev/null 2>&1 || true
   fi
+  return 0
 }
 
 # ── Detach (E3) ────────────────────────────────────────────────────────────────

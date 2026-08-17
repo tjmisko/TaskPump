@@ -221,6 +221,30 @@ grep -qi 'drained' "$NOTIFY" && pass "drain notification fired via TASKPUMP_NOTI
 out=$(STUB_GATE_RC=0 pump_tick F55..F57 --once 2>&1 >/dev/null; STUB_GATE_RC=0 pump_tick F55..F57 --once 2>&1)
 grep -qi "resuming pump for F55..F57" <<<"$out" && pass "restart detection logs resume for same range" || fail "no resume log:\n$out"
 
+# 8e: a configured notify command that FAILS is reported, never swallowed
+# (issue #35). The two delivery channels take the message differently on
+# purpose — a configured command reads it on stdin, the notify-send fallback
+# gets it as argv — which is how a plausible pin (`notify-send -u low`, which
+# wants a summary argument and never reads stdin) errors on every notice. With
+# the status discarded, the pump looked like it had notified for a whole drain.
+mk F55.0 done; mk F55.1 done; mk F56.0 done; mk F57.0 done
+err=$(STUB_GATE_RC=0 TASKPUMP_NOTIFY_CMD=false pump_tick F55..F57 2>&1 >/dev/null)
+have "$err" 'notify command failed' \
+  && pass "should report the drop when the configured notify command fails" \
+  || fail "a failing TASKPUMP_NOTIFY_CMD was swallowed:\n$err"
+have "$err" 'TASKPUMP_NOTIFY_CMD=false' \
+  && pass "should name the command that failed when reporting the drop" \
+  || fail "the warning does not name the failing command:\n$err"
+[[ "$(grep -c 'notify command failed' <<<"$err")" -eq 1 ]] \
+  && pass "should warn once per dropped notification when a drain fires one" \
+  || fail "expected one warning per dropped notification:\n$err"
+# The delivered case must stay silent: a warning on every successful notify
+# would train an operator to ignore the line that matters.
+err=$(STUB_GATE_RC=0 TASKPUMP_NOTIFY_CMD="tee -a $NOTIFY" pump_tick F55..F57 2>&1 >/dev/null)
+have "$err" 'notify command failed' \
+  && fail "a delivered notification still warned:\n$err" \
+  || pass "should stay silent when the notify command delivers"
+
 echo "--- Test 9: disk feed-gate pauses launching (A4 / F65.3) ---"
 # Reset fixtures to a live frontier (the gate line prints regardless of fixtures).
 mk F55.0 open; mk F55.1 open F55.0; mk F56.0 open; mk F57.0 open F55.1
