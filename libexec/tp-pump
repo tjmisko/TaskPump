@@ -576,8 +576,34 @@ inflight_claims() {
     [[ "$id" != "ID" ]] || continue
     [[ "$status" == "in_progress" ]] || continue
     [[ -n "${in_range[${id%%.*}]:-}" ]] || continue
+    # `-` is the TABLE's placeholder for a null claimant, not a branch. Passing
+    # it through verbatim is how a caller ends up telling the operator a claim is
+    # held by a branch NAMED nothing; hand on the empty field the record actually
+    # carries and let the caller say which field is missing.
+    [[ "$branch" == "-" ]] && branch=""
     printf '%s %s\n' "$id" "$branch"
   done < <("$TASK_BIN" list --status in_progress 2>/dev/null)
+}
+
+# How ONE in-flight claim is spelled, in the three places that name one: the
+# derived WAITING tail, the stall state reason, the stall page. Single source
+# because the phase-grain plan's two arms each spelled it themselves, so whether
+# a stranded claim was named at all — and in which words — depended on what else
+# happened to be open in its phase (issues #46/#48). Task grain keeps its own
+# sentence (`claimed by …, no live container`), which says one more true thing:
+# there the claim IS the dispatch unit, so the unit's liveness is its own.
+#
+# An `in_progress` record with an empty `claimed_by` is a claim the ledger never
+# finished writing. The old `${branch:--}` rendered that as "claimed by -", which
+# reads as a branch NAMED nothing rather than as a missing field, so say which
+# field is missing instead.
+claim_phrase() {  # <id> [branch]
+  local id="$1" branch="${2:-}"
+  if [[ -n "$branch" ]]; then
+    printf '%s (claimed by %s)' "$id" "$branch"
+    return 0
+  fi
+  printf '%s (claimed, no branch recorded)' "$id"
 }
 
 # Is a phase's worktree branch currently owned by a LIVE agent? (D3)
@@ -1857,15 +1883,31 @@ load_wait_snapshot() {
 # operator has to act on anyway. Within one task the order is the ledger's own
 # eligibility order (review unit, then claim, then blockers), so each task
 # contributes exactly the clause `ready` skipped it for, and never two.
+#
+# The whole WAITING tail for a non-launching phase is derived here, at BOTH open
+# counts. compute_plan calls it with oc == 0 only from its in-flight arm, where
+# the claim clause below is the only one that can fire — see that arm.
 phase_wait_reason() {
   local phase="$1" oc="$2"
   (( WAITSNAP_LOADED )) || load_wait_snapshot
-  local reviews="" cross="" siblings="" claims="" dangling="" unexplained=""
+  local reviews="" cross="" siblings="" claims="" inflight="" dangling="" unexplained=""
   local -A seen=()
   local id blk bstatus pending
   for id in "${WAITSNAP_IDS[@]:-}"; do
     [[ -z "$id" ]] && continue
     [[ "${id%%.*}" == "$phase" ]] || continue
+    # A claim is `in_progress`, not `open`, so the filter below used to drop it
+    # and no clause ever named it. compute_plan named it in the one arm where the
+    # claim is the phase's LAST work; put any other open task in the phase and it
+    # vanished from the plan while --grain task still named it — one ledger, two
+    # answers to "who is holding this phase" (issues #46/#48). Derived here so
+    # both plan arms read it from one place, and so the phase-grain answer stops
+    # depending on a grain switch for whether the claim is mentioned at all.
+    if [[ "${WAITSNAP_STATUS[$id]:-}" == "in_progress" ]]; then
+      [[ -n "${seen[f:$id]:-}" ]] || inflight+="${inflight:+, }$(claim_phrase "$id" "${WAITSNAP_CLAIMED[$id]:-}")"
+      seen[f:$id]=1
+      continue
+    fi
     [[ "${WAITSNAP_STATUS[$id]:-}" == "open" ]] || continue
     if [[ -n "${WAITSNAP_REVIEW[$id]:-}" ]]; then
       [[ -n "${seen[r:$id]:-}" ]] || reviews+="${reviews:+, }$id"
@@ -1909,6 +1951,11 @@ phase_wait_reason() {
         seen[r:$blk]=1
         continue
       fi
+      # An in_progress sibling is deliberately NOT folded into the claim clause
+      # the way a review is: the two say different things about it — this one
+      # blocks the open task, that one names the branch holding it — and the
+      # review fold exists because "awaiting review" and "blocker pending" are
+      # the same fact twice, which these are not.
       [[ -n "${seen[i:$blk]:-}" ]] || siblings+="${siblings:+, }$blk ($bstatus)"
       seen[i:$blk]=1
     done
@@ -1924,13 +1971,23 @@ phase_wait_reason() {
   [[ -n "$cross" ]] && why+="${why:+; }cross-phase blockers pending: $cross"
   [[ -n "$siblings" ]] && why+="${why:+; }in-phase blockers pending: $siblings"
   [[ -n "$claims" ]] && why+="${why:+; }claimed: $claims"
+  [[ -n "$inflight" ]] && why+="${why:+; }in flight: $inflight"
   [[ -n "$dangling" ]] && why+="${why:+; }blockers with no task file: $dangling"
   [[ -n "$unexplained" ]] && why+="${why:+; }open and unblocked but outside the frontier: $unexplained"
-  # The count and the walk disagree, which is a real fault (an unreadable file,
-  # a ledger read that failed, a ledger that moved under the tick) and not a
-  # dependency. Say which two answers conflict, so the next question is obvious.
-  [[ -z "$why" ]] && why="the ledger lists no open task in this phase — the count and the listing disagree"
-  printf '%s open, none eligible — %s' "$oc" "$why"
+  if [[ "$oc" -gt 0 ]]; then
+    # The count and the walk disagree, which is a real fault (an unreadable file,
+    # a ledger read that failed, a ledger that moved under the tick) and not a
+    # dependency. Say which two answers conflict, so the next question is obvious.
+    [[ -z "$why" ]] && why="the ledger lists no open task in this phase — the count and the listing disagree"
+    printf '%s open, none eligible — %s' "$oc" "$why"
+    return 0
+  fi
+  # oc == 0: the in-flight arm. "none eligible" would be vacuous here — there is
+  # nothing open to be eligible — so the head states the count as it is, and the
+  # claim clause carries the rest. Same fault report as above when the tick's two
+  # ledger reads disagree, naming the pair that conflicts.
+  [[ -z "$why" ]] && why="the tick listed an in-flight claim in this phase and the ledger snapshot shows none — the two reads disagree"
+  printf 'no open tasks — %s' "$why"
 }
 
 # ── Planning pass: classify every phase in range ───────────────────────────────
@@ -1946,17 +2003,18 @@ compute_plan() {
   local -A in_frontier=()
   local p
   while IFS= read -r p; do [[ -n "$p" ]] && in_frontier["$p"]=1; done < <(frontier_phases)
-  # The in-flight claims, read once and bucketed by phase. `ready` cannot see a
-  # claim (it is not `open`), so without this a phase whose last remaining task
-  # is claimed has oc == 0 and reads as finished — the plan half of issue #48.
-  # Keeping it out of the per-phase loop keeps this to one ledger walk per tick.
+  # Which phases hold an in-flight claim, read once for the whole range. `ready`
+  # cannot see a claim (it is not `open`), so without this a phase whose last
+  # remaining task is claimed has oc == 0 and reads as finished — the plan half
+  # of issue #48. Keeping it out of the per-phase loop keeps this to one ledger
+  # walk per tick. Presence only: this decides WHICH arm the phase takes, and
+  # phase_wait_reason writes the sentence from the snapshot it already holds, so
+  # the claim is spelled the same however the phase got there.
   local -A inflight_of=()
-  local id branch phase sep
-  while read -r id branch; do
+  local id
+  while read -r id _; do
     [[ -n "$id" ]] || continue
-    phase="${id%%.*}"
-    sep=""; [[ -n "${inflight_of[$phase]:-}" ]] && sep=", "
-    inflight_of["$phase"]+="$sep$id (claimed by ${branch:--})"
+    inflight_of["${id%%.*}"]=1
   done < <(inflight_claims)
   while IFS= read -r p; do
     [[ -z "$p" ]] && continue
@@ -2003,11 +2061,21 @@ compute_plan() {
       # refuses that answer now (issue #48), so the plan must not print it either
       # — the same lie in a different channel. A live container on the branch is
       # not stranded at all, so it is asked first, exactly as the oc > 0 arm does.
+      #
+      # The reason is DERIVED, not written here: this arm used to hold its own
+      # sentence for a claim, which is how the phase ended up described one way
+      # when it was the phase's last work and not at all when anything else was
+      # open beside it. One derivation, so both arms say the same thing about the
+      # same claim. It costs the snapshot load in a range that is otherwise all
+      # DONE — a stranded phase is already an anomaly the operator is being sent
+      # to read, and lazy loading still spares a range that launches cleanly.
       if phase_live "$p"; then
         PLAN_RUNNING+=("$p")
       else
         PLAN_WAITING+=("$p")
-        PLAN_WAIT_REASON["$p"]="no open tasks, but ${inflight_of[$p]} is still in flight"
+        # Primed in the main shell for the reason the oc > 0 arm documents.
+        (( WAITSNAP_LOADED )) || load_wait_snapshot
+        PLAN_WAIT_REASON["$p"]="$(phase_wait_reason "$p" "$oc")"
       fi
     else
       PLAN_DONE+=("$p")
@@ -2433,19 +2501,48 @@ stall_exit() {
   local attention inflight reason
   attention=$("$TASK_BIN" list 2>/dev/null \
     | awk '$2=="blocked"||$2=="stuck"||$2=="needs-review"{n++} END{print n+0}')
-  inflight=$(inflight_claims | wc -l | tr -d ' ')
+  # The claims by name, not a tally of them. `inflight_claims` yields `<id>
+  # <branch>` pairs and this counted the lines, discarding both halves — so the
+  # operator woken at 3am was handed a number and sent back to the ledger for the
+  # two fields the pump had already read. Finishing or releasing a claim is a
+  # per-claim act; the page has to name what to act on.
+  local -a named=()
+  local cid cbranch
+  inflight=0
+  while read -r cid cbranch; do
+    [[ -n "$cid" ]] || continue
+    inflight=$((inflight + 1))
+    # Bounded, and not by taste: this string goes out through a desktop/mobile
+    # notifier that truncates, and a range with more than a handful of stranded
+    # claims is one systemic fault (a grain switch, a dead supervisor) that the
+    # count already describes — the named few identify it, and `list --status
+    # in_progress` holds the rest. An unbounded page is its own failure: a
+    # notification nobody can read explains nothing.
+    if (( ${#named[@]} < 5 )); then
+      named+=("$(claim_phrase "$cid" "$cbranch")")
+    fi
+  done < <(inflight_claims)
+  local claim_list="" phrase
+  for phrase in "${named[@]:-}"; do
+    [[ -n "$phrase" ]] || continue
+    claim_list+="${claim_list:+, }$phrase"
+  done
+  (( inflight > ${#named[@]} )) && claim_list+=", and $((inflight - ${#named[@]})) more"
   reason="no live agents, nothing launchable, nothing resumable"
   # A stall the drain test's new middle question produced (issue #48) shows the
   # operator `open_tasks: 0` next to `status: stalled`, which on its own reads as
   # "finished, but paged anyway". Name the claims, or the state file explains the
   # page with the one number that argues against it.
-  (( inflight > 0 )) && reason+="; $inflight in-flight claim(s) nobody is driving"
+  (( inflight > 0 )) && reason+="; $inflight in-flight claim(s) nobody is driving: $claim_list"
   write_state stalled "$reason"
   # ops_push, not a raw git push: with no ledger repo to push to there is nothing
   # to fail, and "ops push on stall exit failed" on the one line an operator reads
   # during a page is a failure report for a push nobody attempted (issue #41).
   ops_push "ops push on stall exit failed"
-  pump_notify "$PHASES STALLED after $STALL_TICKS idle ticks — $(open_count) open task(s) and $inflight in-flight claim(s) remain, none can launch, and no orphaned claim is resumable. $attention task(s) need human review (blocked/stuck/needs-review)."
+  # Same list in both channels, bounded the same way: the state file and the page
+  # are read minutes apart by the same person, and two different accounts of one
+  # stall is the reason to distrust both.
+  pump_notify "$PHASES STALLED after $STALL_TICKS idle ticks — $(open_count) open task(s) and $inflight in-flight claim(s) remain, none can launch, and no orphaned claim is resumable.${claim_list:+ In flight: $claim_list.} $attention task(s) need human review (blocked/stuck/needs-review)."
   exit 3
 }
 

@@ -1995,6 +1995,59 @@ rc=0; out=$(loop33 2>&1) || rc=$?
   && pass "should still stamp status=drained when no claim remains in range" \
   || fail "state after a genuine drain: $(cat "$STATE33" 2>/dev/null)"
 
+echo "--- Test 36: the stall page names the claims it stalled over (#46/#48) ---"
+# 35b pinned that the page and the state file MENTION an in-flight claim; both
+# did it with a bare count, thrown away by `inflight_claims | wc -l` from the
+# `<id> <branch>` pairs that function already yields. An operator woken at 3am by
+# the page then had to go back to the ledger for the two fields the pump had
+# already read, and the ids are exactly what "finish or release it" acts on.
+page36() { grep -F 'STALLED after' <<<"$1" | tail -1; }
+reason36() { jq -r '.paused_reason // empty' "$STATE33" 2>/dev/null; }
+
+# 36a: two stranded claims, one of them a claim the ledger never finished
+# writing (in_progress, no claimed_by). Both channels name both, identically.
+rm -f "$TASKS"/*.md; mkclaim F98.1 feat/other-1; mkclaim F98.2 ""
+rm -f "$STATE33"
+rc=0; out=$(loop33 2>&1) || rc=$?
+page="$(page36 "$out")"; reason="$(reason36)"
+want36='F98.1 (claimed by feat/other-1), F98.2 (claimed, no branch recorded)'
+[[ "$rc" -eq 3 ]] && pass "should still exit 3 when several claims are stranded in range" \
+  || fail "exit=$rc, want 3:\n$out"
+grep -qF "$want36" <<<"$page" \
+  && pass "should name every stranded claim and its branch in the stall page" \
+  || fail "the page names no claim ids: $page"
+grep -qF "$want36" <<<"$reason" \
+  && pass "should name the same claims in the state reason as in the page" \
+  || fail "state reason and page disagree about the claims: $reason"
+have "$page" 'claimed by -' \
+  && fail "an unrecorded claimant reached the page as a branch named nothing: $page" \
+  || pass "should not page about a claim held by a branch called '-'"
+
+# 36b: the bound. A page is one line through a notifier that truncates, and a
+# range holding a dozen stranded claims is one systemic fault the count already
+# describes — so the list is capped at five and says how many it did not name.
+# Both channels are capped the same way: two accounts of one stall is a reason to
+# distrust both.
+rm -f "$TASKS"/*.md
+i36=1
+while (( i36 <= 7 )); do mkclaim "F98.$i36" "feat/other-$i36"; i36=$((i36 + 1)); done
+rm -f "$STATE33"
+rc=0; out=$(loop33 2>&1) || rc=$?
+page="$(page36 "$out")"; reason="$(reason36)"
+capped36='F98.1 (claimed by feat/other-1), F98.2 (claimed by feat/other-2), F98.3 (claimed by feat/other-3), F98.4 (claimed by feat/other-4), F98.5 (claimed by feat/other-5), and 2 more'
+have "$page" '7 in-flight claim\(s\)' \
+  && pass "should still count every stranded claim when it names only the first few" \
+  || fail "the page lost the claim total: $page"
+grep -qF "$capped36" <<<"$page" \
+  && pass "should name five claims and say how many more it did not name when the range holds many" \
+  || fail "the page is not bounded as designed: $page"
+grep -qF "$capped36" <<<"$reason" \
+  && pass "should bound the state reason exactly as the page is bounded" \
+  || fail "state reason bounded differently from the page: $reason"
+have "$page" 'F98\.6|F98\.7' \
+  && fail "the page named past its own bound: $page" \
+  || pass "should not name a claim past the bound it announces"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"
