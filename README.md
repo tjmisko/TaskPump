@@ -166,10 +166,10 @@ took it, and the two grains derive different branches (`feat/t3` vs `feat/t3.4`)
 Restarting a range at the other grain leaves any in-flight claim stranded, since
 neither the reclaim nor the resume pass will touch a branch this run's naming
 scheme does not own. The plan says so every tick — `WAITING T3.4 (claimed by
-feat/t3, no live container)` — and if other open work remains the run reaches its
-deadlock exit (3). But if that claim is the *last* thing in the range, `ready
---count` sees no `open` task and the run reports the range **drained**. Finish or
-`tp task release` an in-flight claim before changing grain.
+feat/t3, no live container)` — and the run reaches its deadlock exit (3), whether
+or not other open work remains beside it: a range is never reported **drained**
+while a claim is still in flight. Finish or `tp task release` an in-flight claim
+before changing grain.
 
 ### 6. Watch
 
