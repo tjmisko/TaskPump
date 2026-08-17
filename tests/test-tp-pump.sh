@@ -227,23 +227,69 @@ grep -qi "resuming pump for F55..F57" <<<"$out" && pass "restart detection logs 
 # gets it as argv — which is how a plausible pin (`notify-send -u low`, which
 # wants a summary argument and never reads stdin) errors on every notice. With
 # the status discarded, the pump looked like it had notified for a whole drain.
+#
+# The pre-tick chain is pinned to stubs throughout 8e. Left at the default it
+# is the fs-guard, whose output depends on how dirty the checkout running this
+# suite happens to be, and whose change-fingerprint dedup carries state from
+# test 8a — so the count assertion below would answer for the host's tree
+# rather than for the drain.
+cat >| "$BIN/hook-quiet" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+# A pre-tick hook with a lot to say — a dirty tree with thousands of paths in
+# it — so that its notification is larger than the 64KiB pipe buffer.
+cat >| "$BIN/hook-flood" <<'EOF'
+#!/usr/bin/env bash
+printf 'fs-guard: untracked path %s\n' $(seq 1 8000)
+EOF
+chmod +x "$BIN/hook-quiet" "$BIN/hook-flood"
+
 mk F55.0 done; mk F55.1 done; mk F56.0 done; mk F57.0 done
-err=$(STUB_GATE_RC=0 TASKPUMP_NOTIFY_CMD=false pump_tick F55..F57 2>&1 >/dev/null)
+# The value is a command line, and a webhook notifier keeps its token in the
+# arguments (`curl -sS -f -d @- https://hooks…/SECRET`); the stand-in below is
+# shaped like one so the warning has something to leak.
+err=$(STUB_GATE_RC=0 TASKPUMP_PRE_TICK_HOOKS="$BIN/hook-quiet" \
+      TASKPUMP_HOOK_MARK_FILE="$TMP/8e.mark" \
+      TASKPUMP_NOTIFY_CMD="false https://hooks.example/T0/B0/s3cret-t0ken" \
+      pump_tick F55..F57 2>&1 >/dev/null)
 have "$err" 'notify command failed' \
   && pass "should report the drop when the configured notify command fails" \
   || fail "a failing TASKPUMP_NOTIFY_CMD was swallowed:\n$err"
-have "$err" 'TASKPUMP_NOTIFY_CMD=false' \
-  && pass "should name the command that failed when reporting the drop" \
-  || fail "the warning does not name the failing command:\n$err"
+have "$err" 'notify command failed \(exit 1\): false' \
+  && pass "should name the program and its exit status when reporting the drop" \
+  || fail "the warning does not name the failing command and status:\n$err"
+# Under --detach the pump's stderr is persisted for the life of the run (the
+# unit's journal, or $PUMP_LOG), so the warning names the program and stops
+# there rather than copying a secret out of the command line.
+have "$err" 's3cret-t0ken' \
+  && fail "the warning echoed the notify command's arguments into the log:\n$err" \
+  || pass "should keep the notify command's arguments out of the log when reporting the drop"
 [[ "$(grep -c 'notify command failed' <<<"$err")" -eq 1 ]] \
   && pass "should warn once per dropped notification when a drain fires one" \
   || fail "expected one warning per dropped notification:\n$err"
 # The delivered case must stay silent: a warning on every successful notify
 # would train an operator to ignore the line that matters.
-err=$(STUB_GATE_RC=0 TASKPUMP_NOTIFY_CMD="tee -a $NOTIFY" pump_tick F55..F57 2>&1 >/dev/null)
+err=$(STUB_GATE_RC=0 TASKPUMP_PRE_TICK_HOOKS="$BIN/hook-quiet" \
+      TASKPUMP_HOOK_MARK_FILE="$TMP/8e.mark" TASKPUMP_NOTIFY_CMD="tee -a $NOTIFY" \
+      pump_tick F55..F57 2>&1 >/dev/null)
 have "$err" 'notify command failed' \
   && fail "a delivered notification still warned:\n$err" \
   || pass "should stay silent when the notify command delivers"
+# …and so must the command that exits 0 without ever reading the message:
+# `true`, which docs/CONFIG.md names as the way to silence notifications, and
+# every argv-style notifier (`notify-send TaskPump`, terminal-notifier) that
+# really does deliver. Carried on a pipeline the writer takes a SIGPIPE from
+# the notifier's early exit, pipefail hands that 141 to the caller, and the
+# pump names a drop that did not happen. The flood hook is what makes that
+# deterministic instead of a 1-in-100 flake: a notification bigger than the
+# pipe buffer blocks the writer until the non-reading notifier is gone.
+err=$(STUB_GATE_RC=0 TASKPUMP_NOTIFY_CMD=true \
+      TASKPUMP_PRE_TICK_HOOKS="$BIN/hook-flood" TASKPUMP_HOOK_MARK_FILE="$TMP/8e-flood.mark" \
+      pump_tick F55..F57 2>&1 >/dev/null)
+have "$err" 'notify command failed' \
+  && fail "a notifier that exited 0 without reading the message was called a drop:\n$(grep 'notify command failed' <<<"$err")" \
+  || pass "should stay silent when the notify command exits 0 without reading the message"
 
 echo "--- Test 9: disk feed-gate pauses launching (A4 / F65.3) ---"
 # Reset fixtures to a live frontier (the gate line prints regardless of fixtures).

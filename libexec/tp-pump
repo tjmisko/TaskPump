@@ -2186,12 +2186,29 @@ write_state() {  # $1=status(running|paused|drained|stalled|stopped) $2=reason
 # delivery the operator asked for did not happen. The fallback stays quiet: it
 # is best-effort by definition (a headless host has no bus), nobody configured
 # it, and the log line is still the record.
+#
+# What is reported is the command's OWN exit status, which is why the message
+# arrives on a here-string and not through `printf | cmd`. Under the pipefail
+# this script runs with, a pipeline's status is the writer's too, and a
+# notifier that exits 0 without reading — `true`, the documented silencer, or
+# any argv-style desktop notifier — leaves printf writing to a closed pipe: the
+# SIGPIPE surfaces as 141 and the pump reports a drop for a notification that
+# was delivered. Claiming a failure that did not happen is the same lie as
+# swallowing one that did. Silence therefore means "the notifier did not
+# complain", which is all any exit status can tell us.
 pump_notify() {
-  local msg="$1"
+  local msg="$1" rc=0
   log "$msg"
   if [[ -n "${TASKPUMP_NOTIFY_CMD:-}" ]]; then
-    printf '%s\n' "$msg" | ${TASKPUMP_NOTIFY_CMD} >/dev/null 2>&1 && return 0
-    warn "notify command failed; notification not delivered (TASKPUMP_NOTIFY_CMD=$TASKPUMP_NOTIFY_CMD — it must read the message on stdin)"
+    ${TASKPUMP_NOTIFY_CMD} >/dev/null 2>&1 <<<"$msg" || rc=$?
+    [[ "$rc" -eq 0 ]] && return 0
+    # A notify command is a command line, and the warning names its first word
+    # only: a webhook notifier carries its token in the arguments (`curl -d @-
+    # https://hooks…/SECRET`), and under --detach this stderr is persisted for
+    # the life of the run — the unit's journal, or $PUMP_LOG on the fallback.
+    # shellcheck disable=SC2086
+    set -- ${TASKPUMP_NOTIFY_CMD}
+    warn "notify command failed (exit $rc): $1 — notification not delivered; TASKPUMP_NOTIFY_CMD takes the message on stdin, not as an argument"
     return 0
   fi
   if command -v notify-send >/dev/null 2>&1; then

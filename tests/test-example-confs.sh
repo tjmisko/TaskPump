@@ -246,8 +246,11 @@ fi
 echo "--- prose about the entrypoint pin tracks the conf (issue #35) ---"
 
 # GNU grep's \b does not compose with .* here (it silently matches nothing), so
-# the predicate spaces the verb explicitly instead.
-STALE_PIN_RE='entrypoint-parallel\.sh.* (as|via) .*pin'
+# the predicate spaces the verb explicitly instead. The alternation is the
+# prepositions a live-pin claim is actually made with — "arrives via", "survives
+# as", "comes from" — kept as a closed list because a bare "…pin…" on the same
+# line as the path would condemn the past-tense sentences that must stay legal.
+STALE_PIN_RE='entrypoint-parallel\.sh.* (as|via|from) .*pin'
 # A guard that has never been shown to go red is not a guard, it is a comment:
 # fire the predicate at the pre-#35 wording, and at a past-tense mention of the
 # historical pin that must stay legal, before trusting its silence.
@@ -257,6 +260,11 @@ grep -qE "$STALE_PIN_RE" <<<'# layout (/entrypoint-parallel.sh) survives as the 
 grep -qE "$STALE_PIN_RE" <<<'# the historical drives, which pinned /entrypoint-parallel.sh here.' \
   && fail "control: the predicate condemns a past-tense mention of the historical pin" \
   || pass "control: the predicate leaves a past-tense mention of the historical pin alone"
+# The claim is what matters, not the preposition it is made with: an edit that
+# says the same false thing another way must still trip the guard.
+grep -qE "$STALE_PIN_RE" <<<"# The /entrypoint-parallel.sh layout comes from arachne.conf's pin." \
+  && pass "control: the stale-pin predicate fires on a reworded live-pin claim" \
+  || fail "control: the predicate MISSED a reworded live-pin claim — the guard only catches one phrasing"
 
 if [[ "$entrypoint" == "<UNSET>" ]]; then
   for f in "$ARACHNE_CONF" "$TP_ROOT/taskpump.conf" "$PUMP" \
