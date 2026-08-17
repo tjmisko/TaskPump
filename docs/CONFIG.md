@@ -306,7 +306,7 @@ consistent — a sigil the pattern does not accept produces tasks nothing can gr
 | `TASKPUMP_TICK` | Seconds between supervisor ticks. |
 | `TASKPUMP_STAGGER` | Seconds between launches within a single tick. |
 | `TASKPUMP_PUMP_TASKS_DIR` | Tasks directory, independent of the ledger checkout — lets the pump be tested against a flat fixture. |
-| `TASKPUMP_PUMP_OPS_DIR` | The ledger checkout the pump refreshes and pushes. Falls back to `TASKPUMP_LEDGER_REPO`. |
+| `TASKPUMP_PUMP_OPS_DIR` | The ledger checkout the pump refreshes and pushes. Falls back to `TASKPUMP_LEDGER_REPO`. When it is not a git checkout, or has no remote, there is nothing to sync: the pump says so once at startup and skips the per-tick pull and the closing push, rather than reporting a failure every tick. |
 | `TASKPUMP_WORKTREES_DIR` | Where agent workspaces live. `TASKPUMP_PUMP_WORKTREES_DIR` overrides it for the pump alone. |
 | `TASKPUMP_BRANCH_PREFIX` | Prefix for per-phase branches. `TASKPUMP_PUMP_BRANCH_PREFIX` overrides. |
 | `TASKPUMP_BASE` | Base ref new branches are cut from. `TASKPUMP_PUMP_BASE` overrides. |

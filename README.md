@@ -388,10 +388,12 @@ tp pump --phases T1..T2 --dry-run   # LAUNCH T1, and why feeding is permitted
 tp pump --phases T1..T2 --once
 ```
 
-The tick prints the launch — agent name, lead task, and the log path under
-`.worktrees/feat/t1/` — and one warning worth decoding: `ops pull --ff-only
-failed (continuing)` is the pump trying to refresh a separate ledger checkout you
-have not configured, and is noise here. Now look at what exists:
+The run opens with one startup line worth decoding — `ledger: no separate ledger
+repo to sync (... is not a git checkout); skipping the per-tick pull and the
+closing push` is the pump noticing you keep the ledger in this repository rather
+than in a separate checkout, so it has nothing to refresh; it says that once and
+then stays quiet — and then prints the launch: agent name, lead task, and the log
+path under `.worktrees/feat/t1/`. Now look at what exists:
 
 ```bash
 tp pump --phases T1..T2 --dry-run                  # T1 is RUNNING now, not LAUNCH
