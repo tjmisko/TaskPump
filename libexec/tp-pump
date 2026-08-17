@@ -1156,20 +1156,26 @@ phase_dependencies() {
 }
 
 # ── Brief-template resolution ─────────────────────────────────────────────────
-# Three places to look, in order: what the operator configured, the consumer's
-# own template inside its ledger (Arachne's path — so an existing project keeps
-# rendering exactly what it did), and finally the generic one shipped with
-# TaskPump. Previously a missing consumer template was a hard die, which made a
-# fresh project unable to run at all until it wrote one.
+# Two places to look, in order: what the operator configured, and the generic one
+# shipped with TaskPump. Previously a missing template was a hard die, which made
+# a fresh project unable to run at all until it wrote one.
+#
+# Between those two there used to sit a third rung: $OPS_DIR/task-loop/briefs/,
+# probed unasked because that is where Arachne keeps its own prose. Extraction
+# turned it into one consumer's directory layout wired into a generic tool — for
+# every other project the path could not exist, so the rung was dead while the
+# not-found message still advertised it as somewhere the pump had looked (issue
+# #37, deferred from PR #29 to preserve golden byte-identity). It is deleted
+# here, and the reference consumer now says what it wants: examples/arachne.conf
+# pins both TASKPUMP_BRIEF_TEMPLATE and TASKPUMP_RESUME_TEMPLATE at those same
+# ledger paths, which is the migration for anyone else who relied on the probe.
 resolve_brief_template() {
   local explicit="${TASKPUMP_PHASE_BRIEF_TEMPLATE:-${TASKPUMP_BRIEF_TEMPLATE:-}}"
   [[ -n "$explicit" ]] && { printf '%s' "$explicit"; return 0; }
-  local consumer="$OPS_DIR/task-loop/briefs/_phase-drain-template.md"
-  [[ -f "$consumer" ]] && { printf '%s' "$consumer"; return 0; }
   printf '%s' "$TP_ROOT/templates/phase-drain-brief.md"
 }
 
-# The task-grain brief resolves the same three ways. It is a DIFFERENT template,
+# The task-grain brief resolves the same two ways. It is a DIFFERENT template,
 # not a re-parameterized phase brief, and the difference is load-bearing: the
 # phase brief's whole working method is the in-context `next --phase` loop, and
 # an agent running that at task grain would claim its siblings — the very tasks
@@ -1179,8 +1185,6 @@ resolve_brief_template() {
 resolve_task_brief_template() {
   local explicit="${TASKPUMP_TASK_BRIEF_TEMPLATE:-}"
   [[ -n "$explicit" ]] && { printf '%s' "$explicit"; return 0; }
-  local consumer="$OPS_DIR/task-loop/briefs/_task-template.md"
-  [[ -f "$consumer" ]] && { printf '%s' "$consumer"; return 0; }
   printf '%s' "$TP_ROOT/templates/task-brief.md"
 }
 if [[ "$GRAIN" == "task" ]]; then
@@ -1189,15 +1193,13 @@ else
   BRIEF_TEMPLATE="$(resolve_brief_template)"
 fi
 
-# The resume note resolves the same three ways, for the same reason: a consumer
-# whose agents depend on particular wording keeps it in its own ledger, while
-# the shipped default stays tool-agnostic. Symmetry matters here — the two
-# templates are read by the same agent in the same session.
+# The resume note resolves the same two ways, for the same reason: a consumer
+# whose agents depend on particular wording points TASKPUMP_RESUME_TEMPLATE at
+# it, while the shipped default stays tool-agnostic. Symmetry matters here — the
+# two templates are read by the same agent in the same session.
 resolve_resume_template() {
   local explicit="${TASKPUMP_RESUME_TEMPLATE:-}"
   [[ -n "$explicit" ]] && { printf '%s' "$explicit"; return 0; }
-  local consumer="$OPS_DIR/task-loop/briefs/_resume-note-template.md"
-  [[ -f "$consumer" ]] && { printf '%s' "$consumer"; return 0; }
   printf '%s' "$TP_ROOT/templates/resume-note.md"
 }
 RESUME_TEMPLATE="$(resolve_resume_template)"
@@ -1207,13 +1209,13 @@ RESUME_TEMPLATE="$(resolve_resume_template)"
 missing_brief_template_msg() {
   if [[ "$GRAIN" == "task" ]]; then
     printf 'task brief template not found: %s\n' "$BRIEF_TEMPLATE"
-    printf '  looked at: $TASKPUMP_TASK_BRIEF_TEMPLATE, then %s/task-loop/briefs/_task-template.md,\n' "$OPS_DIR"
-    printf '  then the one shipped at %s/templates/task-brief.md\n' "$TP_ROOT"
+    printf '  looked at: $TASKPUMP_TASK_BRIEF_TEMPLATE, then the one shipped at\n'
+    printf '  %s/templates/task-brief.md\n' "$TP_ROOT"
     return 0
   fi
   printf 'phase-drain brief template not found: %s\n' "$BRIEF_TEMPLATE"
-  printf '  looked at: $TASKPUMP_BRIEF_TEMPLATE, then %s/task-loop/briefs/_phase-drain-template.md,\n' "$OPS_DIR"
-  printf '  then the one shipped at %s/templates/phase-drain-brief.md\n' "$TP_ROOT"
+  printf '  looked at: $TASKPUMP_BRIEF_TEMPLATE, then the one shipped at\n'
+  printf '  %s/templates/phase-drain-brief.md\n' "$TP_ROOT"
 }
 
 # ── Brief rendering (D6 / F64.4; deps A3 v1) ───────────────────────────────────

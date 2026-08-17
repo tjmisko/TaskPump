@@ -983,26 +983,46 @@ out=$(STUB_LIVE="tp-agent-feat-f56" pump F56)
 have "$out" 'LAUNCH +F56' && pass "a container under another prefix is not ours" \
   || fail "foreign container claimed as ours:\n$out"
 
-echo "--- Test 21: brief-template resolution — explicit, consumer, shipped ---"
-# The consumer's own template lives in its ledger. Absent an explicit override
-# it wins, which is how an existing project keeps rendering exactly what it did.
+echo "--- Test 21: brief-template resolution — configured, then shipped, and nothing else ---"
+# Two rungs, and only two. A ledger-side ops/task-loop/briefs/_phase-drain-template.md
+# used to be probed between them, so a project that dropped a file at that path
+# had its briefs quietly replaced without ever configuring anything — and every
+# project that did NOT use that one consumer's directory layout carried a rung
+# whose path could not exist, advertised in the not-found message as somewhere it
+# had looked (issue #37). A consumer that wants its own prose says so, the way
+# examples/arachne.conf now does.
 RES="$TMP/resolve"; mkdir -p "$RES/ops/task-loop/briefs"
 printf 'consumer template for {{PHASE}}\n' >| "$RES/ops/task-loop/briefs/_phase-drain-template.md"
 out=$(ARACHNE_PUMP_OPS_DIR="$RES/ops" "$PUMP" --render-brief F55 2>&1)
-[[ "$out" == "consumer template for F55" ]] && pass "consumer's ops-side template is used when present" \
-  || fail "consumer template not chosen: '$out'"
+grep -qF 'consumer template for F55' <<<"$out" \
+  && fail "should ignore a ledger-side _phase-drain-template.md when no template is configured: '$out'" \
+  || pass "should ignore a ledger-side _phase-drain-template.md when no template is configured"
+grep -qF 'drain phase F55' <<<"$out" \
+  && pass "should render the shipped brief when the ledger carries an unconfigured template" \
+  || fail "shipped brief did not render over the ledger-side file:\n$out"
 printf 'explicit template for {{PHASE}}\n' >| "$TMP/explicit.md"
 out=$(ARACHNE_PUMP_OPS_DIR="$RES/ops" TASKPUMP_BRIEF_TEMPLATE="$TMP/explicit.md" \
       "$PUMP" --render-brief F55 2>&1)
-[[ "$out" == "explicit template for F55" ]] && pass "explicit config outranks the consumer template" \
+[[ "$out" == "explicit template for F55" ]] && pass "explicit config outranks the shipped brief" \
   || fail "explicit template not chosen: '$out'"
-# No consumer template at all used to be a hard die, which left a fresh project
-# unable to run until it wrote one. It now falls through to the shipped default.
+# No template at all used to be a hard die, which left a fresh project unable to
+# run until it wrote one. It now falls through to the shipped default.
 out=$(ARACHNE_PUMP_OPS_DIR="$TMP/no-such-ops" "$PUMP" --render-brief F55 2>&1)
 grep -qF 'F55' <<<"$out" && pass "a project with no template falls back to the shipped one" \
   || fail "shipped fallback did not render:\n$out"
-grep -qiF 'not found' <<<"$out" && fail "still dying on a missing consumer template:\n$out" \
-  || pass "no hard die on a missing consumer template"
+grep -qiF 'not found' <<<"$out" && fail "still dying on a missing template:\n$out" \
+  || pass "no hard die on a missing template"
+# The not-found message is the operator's map of the resolution order. Listing a
+# rung the code no longer walks sends them to author a file that will never be
+# read — the same wrong answer as the dead probe, printed instead of executed.
+out=$(ARACHNE_PUMP_OPS_DIR="$RES/ops" TASKPUMP_BRIEF_TEMPLATE="$TMP/no-such-template.md" \
+      "$PUMP" --render-brief F55 2>&1)
+grep -qF 'task-loop/briefs' <<<"$out" \
+  && fail "should not name the deleted ledger rung when the configured brief is missing:\n$out" \
+  || pass "should not name the deleted ledger rung when the configured brief is missing"
+grep -qF 'templates/phase-drain-brief.md' <<<"$out" \
+  && pass "should name the shipped brief when the configured one is missing" \
+  || fail "the not-found message does not name the shipped brief:\n$out"
 
 echo "--- Test 22: TASKPUMP_STATE_DIR relocates the run's dotfiles ---"
 # The state-file NAME is pinned so that half tests relocation, not the default
@@ -1303,19 +1323,24 @@ out=$(rnote ARACHNE_PUMP_OPS_DIR="$TMP/noops")
 have "$out" 'RESUME CONTEXT' && pass "the shipped resume template is the fallback" \
   || fail "shipped resume template not used:\n$out"
 
-# A consumer's own copy, beside its brief template, wins over the shipped one.
+# Same two rungs as the brief, and the same deleted third (issue #37): a file
+# sitting at the ledger-side path is not configuration, and substituting it for
+# the shipped note without being asked is a change of what a resumed agent reads.
 printf 'consumer resume note for {{TASK_ID}} on {{BRANCH}}\n' \
   >| "$RES2/ops/task-loop/briefs/_resume-note-template.md"
 out=$(rnote ARACHNE_PUMP_OPS_DIR="$RES2/ops")
-[[ "$out" == "consumer resume note for F97.1 on feat/f97" ]] \
-  && pass "a consumer's resume template wins over the shipped one" \
-  || fail "consumer resume template not chosen: '$out'"
+grep -qF 'consumer resume note for F97.1' <<<"$out" \
+  && fail "should ignore a ledger-side _resume-note-template.md when no template is configured: '$out'" \
+  || pass "should ignore a ledger-side _resume-note-template.md when no template is configured"
+have "$out" 'RESUME CONTEXT' \
+  && pass "should render the shipped resume note when the ledger carries an unconfigured one" \
+  || fail "shipped resume note did not render over the ledger-side file:\n$out"
 
-# Explicit config outranks both.
+# Explicit config outranks the shipped default.
 printf 'explicit resume note for {{TASK_ID}}\n' >| "$TMP/explicit-resume.md"
 out=$(rnote ARACHNE_PUMP_OPS_DIR="$RES2/ops" TASKPUMP_RESUME_TEMPLATE="$TMP/explicit-resume.md")
 [[ "$out" == "explicit resume note for F97.1" ]] \
-  && pass "explicit config outranks the consumer resume template" \
+  && pass "explicit config outranks the shipped resume note" \
   || fail "explicit resume template not chosen: '$out'"
 
 # {{BUILD_GATE}} is the shipped templates' name for the verification commands;

@@ -325,6 +325,27 @@ have "$out" 'declares no .files:., so you are running alone' \
   && pass "it is told the true reason it was scheduled: exclusively" \
   || fail "the empty-footprint case is unexplained:\n$out"
 
+# The task brief carried the same dead rung its phase-grain sibling did — a probe
+# of ops/task-loop/briefs/_task-template.md ahead of the shipped file (issue
+# #37). One consumer's directory layout is not a resolution rung: an unconfigured
+# file there must not silently become what the launched agent reads.
+DEADRUNG="$TMP/deadrung"; mkdir -p "$DEADRUNG/ops/task-loop/briefs"
+printf 'ledger-side task template for {{TASK_ID}}\n' \
+  >| "$DEADRUNG/ops/task-loop/briefs/_task-template.md"
+out=$(TASKPUMP_PUMP_OPS_DIR="$DEADRUNG/ops" rb G3.1)
+have "$out" 'ledger-side task template' \
+  && fail "should ignore a ledger-side _task-template.md when no template is configured:\n$out" \
+  || pass "should ignore a ledger-side _task-template.md when no template is configured"
+# And the not-found message must not send an operator to author it either.
+out=$(TASKPUMP_PUMP_OPS_DIR="$DEADRUNG/ops" \
+      TASKPUMP_TASK_BRIEF_TEMPLATE="$TMP/no-such-task-template.md" rb G3.1)
+have "$out" 'task-loop/briefs' \
+  && fail "should not name the deleted ledger rung when the configured task brief is missing:\n$out" \
+  || pass "should not name the deleted ledger rung when the configured task brief is missing"
+have "$out" 'templates/task-brief\.md' \
+  && pass "should name the shipped task brief when the configured one is missing" \
+  || fail "the not-found message does not name the shipped task brief:\n$out"
+
 echo "--- 4d. --render-brief refuses a PHASE token at task grain ---"
 # A debug path that fabricates a task brief for a phase — "your job is one task:
 # G3", pointing at tasks/G3.md, which does not exist — is a plausible-looking
