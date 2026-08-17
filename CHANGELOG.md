@@ -4,6 +4,164 @@ Notable changes to TaskPump. This project versions its **ledger contract**, not
 just its code: the rules for what constitutes a MAJOR, MINOR, or PATCH change are
 in [docs/LEDGER-CONTRACT.md §1](docs/LEDGER-CONTRACT.md#1-versioning).
 
+## Unreleased
+
+The v0.2.0 follow-up sweep: nine issues opened against the release, closed as one
+integration. The theme narrows v0.2.0's — every one of these is a tool **stating a
+reason**, and the defect in each case was that the stated reason was wrong rather
+than missing. A pull failure quoting the fetch banner that succeeded, a WAITING
+phase blamed on a cross-phase blocker it does not have, a banner naming a cap the
+ticks do not read, a DRAINED range with committed work still claimed on a branch:
+all of them exited cleanly while telling an operator something untrue.
+
+### Fixed
+
+- **The state lockfile no longer outlives the verb that took it.** A fresh
+  consumer's very first `tp task create` left `?? .taskpump-task.lock` in their
+  tree and in every `git status` after it, with nothing to say what had made it.
+  Removal is a trap rather than a call at the bottom of `main()`, because the two
+  paths that most need it never reach the bottom: `create` takes the lock before
+  its exists-check and ends at `die()` on a duplicate id, and `fsck --fix` ends at
+  a deliberate exit 3.
+
+  Unlinking a lockfile carelessly converts litter into the exact wrong answer the
+  lock exists to prevent — a waiter woken on an unlinked inode holds a lock that
+  excludes nobody, and it and the creator of the replacement both believe they are
+  alone. So removal happens only while the flock is still held and only when the
+  path still names this process's inode, acquisition re-verifies that identity
+  after every wake-up and re-acquires the file actually at the path when it does
+  not match, and the retries spend one `TASKPUMP_LOCK_WAIT` budget between them
+  rather than a fixed count (a fixed three refused seven of ten concurrent agents
+  under a measured stress run). Where an open file cannot be named there is no way
+  to prove what is being deleted, so the file is kept — the pre-fix behavior,
+  litter included. (#33)
+
+- **`tp task` honors `TASKPUMP_WORKSPACE_ROOT`.** The pump has always honored the
+  pin; the CLI did not, so one shell carrying one pin gave two answers — `tp pump
+  --dry-run` planned the pinned consumer's frontier while `tp task ready --count`
+  answered `0 via install-root`, the install's own ledger. Nothing was corrupted,
+  and `0` is what a human reads as "drained" at the exact moment they are checking
+  the two tools against each other.
+
+  The pin outranks the conf/cwd walk for the reason it does in the pump: it is the
+  caller naming the workspace, over any probe. An explicit `TASKPUMP_TASKS_DIR`
+  still wins, and now wins **outright** — the pin moves the workspace only when it
+  is the rung that decides it, narrowed at the resolution site rather than at the
+  `TASKPUMP_CODE_REPO` default so the two derivations cannot drift apart. Left
+  unconditional it redirected the heartbeat's productivity meter to the primary
+  checkout while `resolve --all` correctly printed `via env`, scoring a normally
+  committing agent `productive=0` every cycle and driving it to `status: stuck`
+  with nothing naming the pin as the cause. A pin naming a missing directory is a
+  loud refusal whether or not it is the deciding rung. (#45)
+
+- **A notification is judged by the notifier's exit status, not the pipe's.**
+  `pump_notify` fed the message through `printf | $TASKPUMP_NOTIFY_CMD` under
+  `pipefail`, so a notifier that exits 0 without reading stdin gave `printf` a
+  SIGPIPE and the pipeline's 141 made the pump report an undelivered notification
+  that had in fact been delivered — measured at 52/5000 for `true`, the value the
+  docs name as the silencer and every suite exports. The message now goes in on a
+  here-string, so the status that decides is the notifier's own (0/5000). The
+  warning that reports a notifier which drops its message names the **program**
+  and its exit status rather than the whole `TASKPUMP_NOTIFY_CMD` value, which for
+  a webhook notifier copied a credential into a stderr stream `--detach`
+  persists. (#35)
+
+- **A failed ops pull quotes git's diagnosis, not git's progress banner.** The
+  warning quoted the first non-blank line of `git pull --ff-only`, which for the
+  routine failing shape describes the step that *succeeded*: a diverged ledger
+  branch printed `— From <url>` on the first tick and a dangling `hint: Diverging
+  branches can't be fast-forwarded, you need to either:` on every tick after,
+  while git's own `fatal: Not possible to fast-forward, aborting.` was never shown
+  at all. Pointing an operator at the remote URL for a divergence is precisely the
+  confident wrong reason this warning exists to give.
+
+  It now quotes git's own diagnosis — the first `fatal:`/`error:` line — falling
+  back to the first line that is neither fetch banner nor `hint:` advice, and
+  degrading to no clause rather than to a guess. Deliberately *not* the last
+  non-blank line: a branch with no upstream states its cause as bare prose and
+  then offers four lines of remedy, so the last line is the remedy. And a pump
+  with no separate ledger repo — `OPS_DIR` missing, or a checkout with no remote —
+  now says so once at startup and skips both the per-tick pull and the closing
+  push, instead of reporting a failure every tick for a sync that was never
+  possible. A configured remote that really fails still warns every tick. (#41)
+
+- **`--jobs` sets the live cap, and the banner prints the cap the ticks use.** The
+  banner printed the flag while every tick read `TASKPUMP_POOL_CAP_FILE`, so a
+  number an earlier run or the disk watchdog left behind silently outranked the
+  operator's instruction: `--jobs 1` against a leftover `4` launched four agents
+  and reported `cap=1`. An explicit `--jobs` now stamps the cap file, and the
+  banner names which of the two set the number in force; the state file the
+  monitor renders carries the same effective cap rather than the flag.
+
+  The stamp sits below every startup abort and above the banner that reports it,
+  so a run that never ticked cannot clobber a file a previous run, an operator or
+  the watchdog set — written any earlier, an imageless `--jobs 12` died printing
+  no banner and left `12` behind to govern the next unflagged run, which is this
+  issue's own bug shape re-created by its fix. `--dry-run` predicts the cap the
+  real run would use without writing anything. An unwritable cap file keeps
+  honoring the flag and says what that costs. (#44)
+
+- **A WAITING phase's reason is derived from the ledger, not asserted.** Every
+  ineligible phase was reported as `N open, none eligible — cross-phase blockers
+  pending` regardless of what was actually holding it, and `print_plan`'s
+  last-resort default told the same story for a reason nobody had computed. A
+  phase gated on its own review task — the pump never dispatches one — was
+  therefore reported as waiting on a dependency that does not exist, sending the
+  operator to the wrong ledger entirely.
+
+  The reason is now walked out of the phase's open tasks in the ledger's own
+  eligibility order and names what is true: a review awaiting a verdict, an
+  upstream task and its status, an unfinished in-phase sibling, the claiming
+  branch, or a blocker with no task file — joined when several apply. Review-ness
+  is inferred by asking the frontier the same question twice rather than reading
+  `review_role` behind the CLI's back. When nothing in the ledger explains the
+  phase, the line says the count and the listing disagree instead of inventing a
+  dependency, and the `print_plan` default now reads as the pump bug it would
+  be. (#46)
+
+- **A range is never reported DRAINED over an in-flight claim.** `is_drained`
+  asked two questions — no open tasks, no live agents — and a claim answers
+  neither, because `ready --count` counts `status: open`. An `in_progress` task
+  this run can neither reclaim nor resume (claimed at the other dispatch grain, or
+  on a branch this naming scheme does not own) was invisible to it: while other
+  open work remained the run still reached the deadlock exit, but once the
+  stranded claim was the last thing in range `open_count` hit 0 and the pump
+  announced DRAINED at rc 0 over committed, unfinished work nobody was driving.
+
+  A third question now reads the in-range `in_progress` tasks straight from the
+  ledger, and it is asked **before** the liveness count, so the ledger's own answer
+  cannot depend on the fail-open half of the conjunction. Fixing only the exit code
+  would have moved the same lie into the plan, where a phase whose last task is
+  still claimed was filed under `DONE`, so `compute_plan` gets a matching WAITING
+  arm — RUNNING when a live container holds the branch — whose reason names the
+  task and its claimant. The stall page and the `stalled` state reason count the
+  in-flight claims too, because `open_tasks: 0` beside `status: stalled` otherwise
+  argues against the page it is explaining. (#48)
+
+### Changed
+
+- **The pump's template resolution is two rungs, not three.** All three resolvers
+  probed `$OPS_DIR/task-loop/briefs/` for a consumer-side override before falling
+  back to the shipped template, and the not-found message advertised that path.
+  The rung was live for exactly one consumer and only for the resume note, which
+  is a fact no reader of the code could have discovered; the reachable order is
+  now the configured key, then the shipped file, and the not-found text names only
+  rungs the code walks. `examples/arachne.conf` gained the
+  `TASKPUMP_RESUME_TEMPLATE` pin naming the path the probe used to find on its own
+  — the documented migration for anyone else who leaned on it — so no golden byte
+  moved. (#37)
+
+- **The runner's deliberate `INSTALL_MOUNT` passthrough hole is pinned by a
+  test.** Both halves of the issue had already landed in 57c6db3, confirmed by
+  replaying the entrypoint against that commit's parent rather than by reading it,
+  so no production code changed. The residual was that the annotation explaining
+  why `runner.sh` does *not* forward `TASKPUMP_INSTALL_MOUNT` was prose with
+  nothing checking it, while `DEFAULT_PASSTHROUGH`'s own comment argues for
+  forwarding both spellings of every key — making "add it for symmetry" a
+  plausible edit that would turn the annotation into a lie and let a host value
+  move the entrypoint's `tp` probe off the destination the runner actually
+  mounts. Three assertions now hold the hole open. (#36)
+
 ## 0.2.0 — 2026-08-14
 
 The release that makes TaskPump usable by a repository that is not Arachne. Every
