@@ -1552,7 +1552,60 @@ have "$err" 'gone41' \
   && pass "should name the reason when a configured remote genuinely fails" \
   || fail "the pull warning still carries no reason:\n$err"
 
-# 33e: the bug was per-TICK, so prove it against a real loop rather than a
+# 33e: an unreachable remote (33d) is the ONE failing shape whose first output
+# line happens to be git's error, so it proves nothing about which line gets
+# quoted. The routine failing shape here is a DIVERGED ledger branch — tp-task
+# commits task files locally on every tick while another machine pushes the
+# same branch — and there git leads with the fetch banner ("From <url>", then
+# the ref-update line) for the step that SUCCEEDED, pads the middle with `hint:`
+# advice, and puts "fatal: Not possible to fast-forward, aborting." last.
+# Quoting the first line points the operator at the remote URL and never
+# mentions the divergence: a confident wrong reason, on the one stderr line
+# this whole mechanism exists to make worth reading.
+DIV41="$TMP/ops41-diverged"
+git clone -q "$SEED41" "$DIV41" 2>/dev/null
+git -C "$SEED41" -c user.name=t -c user.email=t@e commit -q --allow-empty -m upstream-diverge
+git -C "$DIV41" -c user.name=t -c user.email=t@e commit -q --allow-empty -m local-diverge
+err=$(tick41 "$DIV41" 2>&1 >/dev/null)
+have "$err" 'ops pull --ff-only failed' \
+  && pass "should still warn when the ledger branch has diverged from its remote" \
+  || fail "a diverged ledger pull went silent:\n$err"
+have "$err" 'Not possible to fast-forward' \
+  && pass "should quote git's own error when the ledger branch has diverged" \
+  || fail "the warning does not carry git's fatal:\n$err"
+have "$err" 'failed \(continuing\) — From ' \
+  && fail "the warning names the fetch banner — a step that succeeded — as the reason:\n$err" \
+  || pass "should not name the fetch banner as the reason when the fetch succeeded"
+# Tick 2 of the same divergence: the fetch is up to date now, so git prints no
+# banner and leads with `hint: Diverging branches can't be fast-forwarded, you
+# need to either:` — a sentence that ends on a colon with its advice stripped
+# off. A persistent failure repeats every tick, so this is the line an operator
+# actually lives with; it must be the fatal, not the dangling hint.
+err=$(tick41 "$DIV41" 2>&1 >/dev/null)
+have "$err" 'Not possible to fast-forward' \
+  && pass "should quote git's error on every tick when the divergence persists" \
+  || fail "the repeated warning stopped naming git's fatal:\n$err"
+have "$err" 'failed \(continuing\) — hint:' \
+  && fail "the warning quotes git's advice instead of git's error:\n$err" \
+  || pass "should not quote git's hint advice as the reason when git named an error"
+
+# 33f: not every git failure carries a `fatal:`/`error:` line to quote. A ledger
+# checkout sitting on a branch with no upstream states its diagnosis as bare
+# prose and then offers four lines of advice, so the fallback has to be the
+# FIRST real line — the last non-blank one is the indented
+# `git branch --set-upstream-to=…` suggestion, which is advice, not cause.
+NOUP41="$TMP/ops41-noupstream"
+git clone -q "$SEED41" "$NOUP41" 2>/dev/null
+git -C "$NOUP41" checkout -q -b ledger-side-branch
+err=$(tick41 "$NOUP41" 2>&1 >/dev/null)
+have "$err" 'no tracking information' \
+  && pass "should quote git's diagnosis when the ledger branch has no upstream" \
+  || fail "the warning does not name the missing upstream:\n$err"
+have "$err" 'failed \(continuing\) — .*set-upstream-to' \
+  && fail "the warning quotes git's suggested remedy instead of the cause:\n$err" \
+  || pass "should not quote git's remedy as the reason when git stated a cause"
+
+# 33g: the bug was per-TICK, so prove it against a real loop rather than a
 # single --once process. F98.0 is open behind a blocked F98.1: nothing is
 # eligible, nothing is live, nothing is resumable, so the loop deadlock-exits
 # after STALL_EXIT_TICKS (3) ticks — a bounded multi-tick run.

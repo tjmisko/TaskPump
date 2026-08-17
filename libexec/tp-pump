@@ -2075,6 +2075,30 @@ classify_ops_sync() {
   return 0
 }
 
+# Which line of a failed git run is the REASON — deliberately NOT the first one.
+# git's combined output opens with the FETCH banner ("From <url>", then the
+# ref-update line), which describes the step that SUCCEEDED, and pads the middle
+# with `hint:` advice. Quoting line 1 therefore named the wrong thing in the
+# routine failing shape: a ledger branch DIVERGED from its remote — routine
+# because tp-task commits task files locally on every tick while another machine
+# pushes the same branch — warned "— From <url>" on the first tick and a
+# dangling "hint: Diverging branches can't be fast-forwarded, you need to
+# either:" on every tick after, while git's own "fatal: Not possible to
+# fast-forward, aborting." was never shown at all. Pointing an operator at the
+# remote URL for a divergence is precisely the confident-wrong-reason this
+# warning exists to prevent, so: quote git's diagnosis when it made one, else
+# the first line that is neither banner nor advice (a branch with no upstream
+# states its cause as bare prose and then offers four lines of remedy, so the
+# LAST line is the remedy, not the cause). Nothing quotable degrades to the bare
+# warning rather than to a guess.
+git_failure_reason() {  # git_failure_reason <combined git output>
+  local why
+  why=$(grep -m1 -E '^(fatal|error):' <<<"$1") \
+    || why=$(grep -m1 -Ev '^([[:space:]]|From |remote:|hint:|$)' <<<"$1") \
+    || why=""
+  printf '%s' "$why"
+}
+
 # Refresh the ledger before planning. Never fatal — a stale ledger still plans —
 # but a configured remote that fails is an operator-visible fact, so name it.
 ops_pull() {
@@ -2082,7 +2106,7 @@ ops_pull() {
   local out rc=0 why
   out=$(git -C "$OPS_DIR" pull --ff-only 2>&1) || rc=$?
   (( rc == 0 )) && return 0
-  why=$(grep -m1 -v '^[[:space:]]*$' <<<"$out" || true)
+  why=$(git_failure_reason "$out")
   warn "ops pull --ff-only failed (continuing)${why:+ — $why}"
   return 0
 }
