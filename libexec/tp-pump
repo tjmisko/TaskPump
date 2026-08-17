@@ -2046,10 +2046,89 @@ run_pre_tick_hooks() {
   return 0
 }
 
+# ── Ledger-repo sync (issue #41) ───────────────────────────────────────────────
+# Every tick refreshes the ledger checkout so a task file another machine pushed
+# is planned this tick, and the drain / stall-exit paths push it back. A consumer
+# with no SEPARATE ledger repo — the bring-your-own-repo shape, where OPS_DIR is
+# a missing ops/ or a purely local checkout — has nothing to sync, and the old
+# unconditional `|| warn` reported that absence as a failure every TICK seconds
+# for the life of the run. Harmless per line, corrosive in aggregate: it teaches
+# an operator to skim past pump stderr, which is the channel every loud failure
+# in this file arrives on (found in the G4.4 walkthrough rehearsal, PR #39).
+#
+# So classify the shape ONCE, at startup, and say it once there. Only a sync
+# that can never do anything is skipped; a real sync that really fails still
+# warns every tick, now carrying the reason the old one-liner discarded.
+# "OPS_DIR is the workspace" is deliberately NOT a skip condition even though
+# the issue offers it: a ledger living inside a remote-backed code repo has a
+# real pull to make, and skipping that would drop real ledger updates — the
+# remoteless case below already covers every workspace-as-ledger shape that
+# could have produced the noise.
+OPS_SYNC=1               # 1 = there is a ledger repo to pull/push
+OPS_SYNC_SKIP_REASON=""  # why not, for the one startup line
+
+classify_ops_sync() {
+  OPS_SYNC=1; OPS_SYNC_SKIP_REASON=""
+  if ! git -C "$OPS_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    OPS_SYNC=0; OPS_SYNC_SKIP_REASON="$OPS_DIR is not a git checkout"
+    return 0
+  fi
+  if [[ -z "$(git -C "$OPS_DIR" remote 2>/dev/null)" ]]; then
+    OPS_SYNC=0; OPS_SYNC_SKIP_REASON="$OPS_DIR has no git remote"
+    return 0
+  fi
+  return 0
+}
+
+# Which line of a failed git run is the REASON — deliberately NOT the first one.
+# git's combined output opens with the FETCH banner ("From <url>", then the
+# ref-update line), which describes the step that SUCCEEDED, and pads the middle
+# with `hint:` advice. Quoting line 1 therefore named the wrong thing in the
+# routine failing shape: a ledger branch DIVERGED from its remote — routine
+# because tp-task commits task files locally on every tick while another machine
+# pushes the same branch — warned "— From <url>" on the first tick and a
+# dangling "hint: Diverging branches can't be fast-forwarded, you need to
+# either:" on every tick after, while git's own "fatal: Not possible to
+# fast-forward, aborting." was never shown at all. Pointing an operator at the
+# remote URL for a divergence is precisely the confident-wrong-reason this
+# warning exists to prevent, so: quote git's diagnosis when it made one, else
+# the first line that is neither banner nor advice (a branch with no upstream
+# states its cause as bare prose and then offers four lines of remedy, so the
+# LAST line is the remedy, not the cause). Nothing quotable degrades to the bare
+# warning rather than to a guess.
+git_failure_reason() {  # git_failure_reason <combined git output>
+  local why
+  why=$(grep -m1 -E '^(fatal|error):' <<<"$1") \
+    || why=$(grep -m1 -Ev '^([[:space:]]|From |remote:|hint:|$)' <<<"$1") \
+    || why=""
+  printf '%s' "$why"
+}
+
+# Refresh the ledger before planning. Never fatal — a stale ledger still plans —
+# but a configured remote that fails is an operator-visible fact, so name it.
+ops_pull() {
+  [[ "$OPS_SYNC" -eq 1 ]] || return 0
+  local out rc=0 why
+  out=$(git -C "$OPS_DIR" pull --ff-only 2>&1) || rc=$?
+  (( rc == 0 )) && return 0
+  why=$(git_failure_reason "$out")
+  warn "ops pull --ff-only failed (continuing)${why:+ — $why}"
+  return 0
+}
+
+# Push the ledger back. Same skip, same reason: with no ledger repo, "final ops
+# push failed" is a failure report for a push that was never attempted — and it
+# lands on the drain line, the one line of a run every operator reads.
+ops_push() {  # ops_push <warning>
+  [[ "$OPS_SYNC" -eq 1 ]] || return 0
+  git -C "$OPS_DIR" push >/dev/null 2>&1 || warn "$1"
+  return 0
+}
+
 # ── One tick: scrub, plan, reclaim, gate, top up the pool to cap ───────────────
 do_tick() {
   LIVENESS_DEGRADED_TICK=0   # the degraded-liveness warning is once per tick
-  git -C "$OPS_DIR" pull --ff-only >/dev/null 2>&1 || warn "ops pull --ff-only failed (continuing)"
+  ops_pull
   # Capture rather than discard: a scrub that finds invisible task files (exit
   # 3) has the one detail worth acting on — the paths. Dropping them left the
   # operator a generic "scrub failed" every tick for days with nothing to go on,
@@ -2128,7 +2207,7 @@ stall_exit() {
   attention=$("$TASK_BIN" list 2>/dev/null \
     | awk '$2=="blocked"||$2=="stuck"||$2=="needs-review"{n++} END{print n+0}')
   write_state stalled "no live agents, nothing launchable, nothing resumable"
-  git -C "$OPS_DIR" push >/dev/null 2>&1 || warn "ops push on stall exit failed"
+  ops_push "ops push on stall exit failed"
   pump_notify "$PHASES STALLED after $STALL_TICKS idle ticks — $(open_count) open task(s) remain but none can launch, and no orphaned claim is resumable. $attention task(s) need human review (blocked/stuck/needs-review)."
   exit 3
 }
@@ -2411,6 +2490,14 @@ if [[ "${TASKPUMP_PUMP_NO_LAUNCH:-0}" -ne 1 ]]; then
   ensure_trunk
 fi
 
+# Decide once whether this pump has a ledger repo to sync at all (issue #41),
+# and disclose the answer HERE — as one startup line — instead of as a pull
+# failure every tick forever. Outside the NO_LAUNCH guard on purpose: a
+# read-only tick refreshes the ledger like any other.
+classify_ops_sync
+[[ "$OPS_SYNC" -eq 1 ]] \
+  || log "ledger: no separate ledger repo to sync ($OPS_SYNC_SKIP_REASON); skipping the per-tick pull and the closing push"
+
 # Belt-and-suspenders disk discipline (A4): auto-start the disk watchdog like
 # run-parallel.sh does, so disk pressure also drops the live pool cap (cap-file
 # path) on top of the feed gate. --auto-exit retires it once no agents remain.
@@ -2497,7 +2584,7 @@ done
 # Graduate the integration trunk as one auto/trunk → main PR (A3, no-op when
 # --integration-trunk is off), then push canonical ops/.
 graduate_trunk
-git -C "$OPS_DIR" push >/dev/null 2>&1 || warn "final ops push failed"
+ops_push "final ops push failed"
 write_state drained ""
 # Tally non-done terminal states that need a human (blocked / stuck / needs-review).
 attention=$("$TASK_BIN" list 2>/dev/null \

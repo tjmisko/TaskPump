@@ -1569,6 +1569,159 @@ wait "$PUMP32" 2>/dev/null
   && pass "a completed drain keeps status=drained (trap does not clobber it)" \
   || fail "drain state clobbered: $(cat "$STATE32" 2>/dev/null)"
 
+echo "--- Test 33: the ledger-repo sync is quiet when there is no ledger repo (issue #41) ---"
+# do_tick used to run `git -C "$OPS_DIR" pull --ff-only >/dev/null 2>&1 || warn`
+# unconditionally. A consumer with no SEPARATE ledger repo — the bring-your-own-
+# repo shape, where OPS_DIR is a missing ops/ or a remoteless checkout — got
+# "ops pull --ff-only failed (continuing)" every tick, forever, with no reason
+# attached. Harmless in itself, and that is the danger: it trains an operator to
+# skim past pump stderr, which is the one channel the loud-failure discipline
+# depends on. The shape is decided once at startup; a REAL pull that really
+# fails must still warn, and now say why.
+rm -f "$TASKS"/*.md; mk F55.0 open
+STATE41="$TMP/pump41.state"
+tick41() {  # tick41 <ops-dir> [extra pump args] — one hermetic --once tick
+  TASKPUMP_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 \
+  ARACHNE_PUMP_OPS_DIR="$1" ARACHNE_PUMP_STATE_FILE="$STATE41" \
+  ARACHNE_POOL_CAP_FILE="$TMP/cap" ARACHNE_PUMP_LOG="$TMP/pump41.log" \
+  ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" STUB_LIVE="" STUB_GATE_RC=0 \
+  "$PUMP" --no-health-gate --once --phases F55 "${@:2}"
+}
+
+# 33a: OPS_DIR does not exist at all — the default $REPO_ROOT/ops of a consumer
+# who never had a ledger submodule. There is nothing to pull, so nothing failed.
+err=$(tick41 "$TMP/no-such-ops-41" 2>&1 >/dev/null)
+have "$err" 'ops pull' \
+  && fail "should not warn about the ops pull when the ledger repo does not exist:\n$err" \
+  || pass "should stay silent on stderr when OPS_DIR is not a git checkout"
+out=$(tick41 "$TMP/no-such-ops-41" 2>/dev/null)
+have "$out" 'no separate ledger repo' \
+  && pass "should name the no-ledger-repo shape once at startup when OPS_DIR is not a git checkout" \
+  || fail "startup said nothing about the skipped pull:\n$out"
+have "$out" 'not a git checkout' \
+  && pass "should say why the ledger sync is skipped when OPS_DIR is not a git checkout" \
+  || fail "the startup line does not name the reason:\n$out"
+
+# 33b: OPS_DIR is a real checkout with no remote — a local-only ledger. A pull
+# has nowhere to pull from, and never will.
+NOREM41="$TMP/ops41-noremote"
+git init -q -b main "$NOREM41"
+git -C "$NOREM41" -c user.name=t -c user.email=t@e commit -q --allow-empty -m seed
+err=$(tick41 "$NOREM41" 2>&1 >/dev/null)
+have "$err" 'ops pull' \
+  && fail "should not warn about the ops pull when the ledger repo has no remote:\n$err" \
+  || pass "should stay silent on stderr when the ledger repo has no remote"
+out=$(tick41 "$NOREM41" 2>/dev/null)
+have "$out" 'no git remote' \
+  && pass "should say why the ledger sync is skipped when the ledger repo has no remote" \
+  || fail "the startup line does not name the remoteless ledger repo:\n$out"
+
+# 33c: a configured ledger repo IS still pulled — the fix must not silence the
+# sync wholesale. Seed a commit upstream and prove the tick fast-forwards to it.
+SEED41="$TMP/seed41"
+git init -q -b main "$SEED41"
+git -C "$SEED41" -c user.name=t -c user.email=t@e commit -q --allow-empty -m seed
+OPS41="$TMP/ops41"
+git clone -q "$SEED41" "$OPS41" 2>/dev/null
+git -C "$SEED41" -c user.name=t -c user.email=t@e commit -q --allow-empty -m upstream-work
+before41=$(git -C "$OPS41" rev-parse HEAD)
+tick41 "$OPS41" >/dev/null 2>&1
+[[ "$(git -C "$OPS41" rev-parse HEAD)" != "$before41" ]] \
+  && pass "should still fast-forward the ledger repo when one is configured" \
+  || fail "the tick stopped pulling a real ledger repo (still at $before41)"
+out=$(tick41 "$OPS41" 2>/dev/null)
+have "$out" 'no separate ledger repo' \
+  && fail "a real ledger repo was classified as absent:\n$out" \
+  || pass "should not announce a skipped sync when the ledger repo is real"
+
+# 33d: a real remote that genuinely fails still warns — every tick, loudly, and
+# now with the reason the old one-line warning threw away.
+BROKE41="$TMP/ops41-broken"
+git clone -q "$SEED41" "$BROKE41" 2>/dev/null
+git -C "$BROKE41" remote set-url origin "$TMP/gone41.git"
+err=$(tick41 "$BROKE41" 2>&1 >/dev/null)
+have "$err" 'ops pull --ff-only failed' \
+  && pass "should still warn when a configured remote genuinely fails" \
+  || fail "a real pull failure went silent:\n$err"
+have "$err" 'gone41' \
+  && pass "should name the reason when a configured remote genuinely fails" \
+  || fail "the pull warning still carries no reason:\n$err"
+
+# 33e: an unreachable remote (33d) is the ONE failing shape whose first output
+# line happens to be git's error, so it proves nothing about which line gets
+# quoted. The routine failing shape here is a DIVERGED ledger branch — tp-task
+# commits task files locally on every tick while another machine pushes the
+# same branch — and there git leads with the fetch banner ("From <url>", then
+# the ref-update line) for the step that SUCCEEDED, pads the middle with `hint:`
+# advice, and puts "fatal: Not possible to fast-forward, aborting." last.
+# Quoting the first line points the operator at the remote URL and never
+# mentions the divergence: a confident wrong reason, on the one stderr line
+# this whole mechanism exists to make worth reading.
+DIV41="$TMP/ops41-diverged"
+git clone -q "$SEED41" "$DIV41" 2>/dev/null
+git -C "$SEED41" -c user.name=t -c user.email=t@e commit -q --allow-empty -m upstream-diverge
+git -C "$DIV41" -c user.name=t -c user.email=t@e commit -q --allow-empty -m local-diverge
+err=$(tick41 "$DIV41" 2>&1 >/dev/null)
+have "$err" 'ops pull --ff-only failed' \
+  && pass "should still warn when the ledger branch has diverged from its remote" \
+  || fail "a diverged ledger pull went silent:\n$err"
+have "$err" 'Not possible to fast-forward' \
+  && pass "should quote git's own error when the ledger branch has diverged" \
+  || fail "the warning does not carry git's fatal:\n$err"
+have "$err" 'failed \(continuing\) — From ' \
+  && fail "the warning names the fetch banner — a step that succeeded — as the reason:\n$err" \
+  || pass "should not name the fetch banner as the reason when the fetch succeeded"
+# Tick 2 of the same divergence: the fetch is up to date now, so git prints no
+# banner and leads with `hint: Diverging branches can't be fast-forwarded, you
+# need to either:` — a sentence that ends on a colon with its advice stripped
+# off. A persistent failure repeats every tick, so this is the line an operator
+# actually lives with; it must be the fatal, not the dangling hint.
+err=$(tick41 "$DIV41" 2>&1 >/dev/null)
+have "$err" 'Not possible to fast-forward' \
+  && pass "should quote git's error on every tick when the divergence persists" \
+  || fail "the repeated warning stopped naming git's fatal:\n$err"
+have "$err" 'failed \(continuing\) — hint:' \
+  && fail "the warning quotes git's advice instead of git's error:\n$err" \
+  || pass "should not quote git's hint advice as the reason when git named an error"
+
+# 33f: not every git failure carries a `fatal:`/`error:` line to quote. A ledger
+# checkout sitting on a branch with no upstream states its diagnosis as bare
+# prose and then offers four lines of advice, so the fallback has to be the
+# FIRST real line — the last non-blank one is the indented
+# `git branch --set-upstream-to=…` suggestion, which is advice, not cause.
+NOUP41="$TMP/ops41-noupstream"
+git clone -q "$SEED41" "$NOUP41" 2>/dev/null
+git -C "$NOUP41" checkout -q -b ledger-side-branch
+err=$(tick41 "$NOUP41" 2>&1 >/dev/null)
+have "$err" 'no tracking information' \
+  && pass "should quote git's diagnosis when the ledger branch has no upstream" \
+  || fail "the warning does not name the missing upstream:\n$err"
+have "$err" 'failed \(continuing\) — .*set-upstream-to' \
+  && fail "the warning quotes git's suggested remedy instead of the cause:\n$err" \
+  || pass "should not quote git's remedy as the reason when git stated a cause"
+
+# 33g: the bug was per-TICK, so prove it against a real loop rather than a
+# single --once process. F98.0 is open behind a blocked F98.1: nothing is
+# eligible, nothing is live, nothing is resumable, so the loop deadlock-exits
+# after STALL_EXIT_TICKS (3) ticks — a bounded multi-tick run.
+rm -f "$TASKS"/*.md; mk F98.0 open F98.1; mk F98.1 blocked
+loop41=$(TASKPUMP_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 TASKPUMP_STAGGER=0 \
+  ARACHNE_PUMP_OPS_DIR="$TMP/no-such-ops-41" ARACHNE_PUMP_STATE_FILE="$STATE41" \
+  ARACHNE_POOL_CAP_FILE="$TMP/cap" ARACHNE_PUMP_LOG="$TMP/pump41.log" \
+  ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" STUB_LIVE="" STUB_GATE_RC=0 \
+  "$PUMP" --no-health-gate --phases F98 --tick 1 2>&1)
+n41=$(grep -c 'ops pull' <<<"$loop41")
+[[ "$n41" -eq 0 ]] \
+  && pass "should not repeat the pull warning per tick when there is no ledger repo" \
+  || fail "the loop warned about the ops pull $n41 time(s):\n$loop41"
+n41=$(grep -c 'no separate ledger repo' <<<"$loop41")
+[[ "$n41" -eq 1 ]] \
+  && pass "should disclose the skipped sync exactly once per run, not once per tick" \
+  || fail "the startup disclosure appeared $n41 time(s) across a multi-tick run:\n$loop41"
+have "$loop41" 'ops push on stall exit failed' \
+  && fail "the stall exit reported a push failure with no ledger repo to push to:\n$loop41" \
+  || pass "should not report a failed stall-exit push when there is no ledger repo"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"
