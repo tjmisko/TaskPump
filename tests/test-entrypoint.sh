@@ -828,6 +828,32 @@ grep -qF -- '-e TASKPUMP_PRE_FLIGHT=' <<<"$got" \
   && fail "passthrough embeds the variable's VALUE in docker argv" \
   || pass "passthrough forwards the name only; the value stays in the environment"
 
+# ── TASKPUMP_INSTALL_MOUNT: the deliberate hole in the passthrough set ─────────
+# The negative half of the passthrough rule, and the only half nothing pinned
+# (issue #36). The key names where the ENTRYPOINT looks for the installation,
+# while the runner fixes where it actually mounts one in its own -v line: a host
+# value forwarded across would move the tp probe off the real mount point and
+# the container would report a missing task CLI for a path the operator never
+# named — the wrong-answer shape §4.5 exists to prevent. So it is a test seam /
+# custom-runner override only, and setting it in taskpump.conf is inert BY
+# DESIGN. That inertness is the surprising half of the contract, which is why
+# the entrypoint's env-contract table now says so outright; these cases keep
+# that sentence true, because a later "forward every key for symmetry" edit to
+# DEFAULT_PASSTHROUGH would silently turn it into a lie.
+got=$(launch_line TASKPUMP_INSTALL_MOUNT=/elsewhere TP_INSTALL_MOUNT=/elsewhere)
+grep -qE -- '-e (TASKPUMP|TP)_INSTALL_MOUNT' <<<"$got" \
+  && fail "should keep TASKPUMP_INSTALL_MOUNT out of the container when the runner's environment carries it, but the shipped passthrough forwarded it:\n$got" \
+  || pass "should keep TASKPUMP_INSTALL_MOUNT out of the container when the runner's environment carries it"
+grep -qF -- ':/opt/taskpump:ro' <<<"$(norm_line "$got")" \
+  && pass "should still mount the installation at /opt/taskpump when TASKPUMP_INSTALL_MOUNT names another path" \
+  || fail "the install mount moved with the host variable:\n$(norm_line "$got")"
+# The table row is the operator-facing half of the same contract: without the
+# annotation it reads as an ordinary tunable, which is how the inert-key report
+# arrived in the first place.
+grep -A9 '^#   TASKPUMP_INSTALL_MOUNT' "$EP" | grep -q 'NOT forwarded' \
+  && pass "should annotate TASKPUMP_INSTALL_MOUNT as not forwarded when the env-contract table lists it" \
+  || fail "the entrypoint's env-contract row for TASKPUMP_INSTALL_MOUNT no longer says it is NOT forwarded"
+
 # Legacy-only inputs must produce the same line as canonical-only inputs.
 got_legacy=$(run_runner launch DOCKER=/bin/echo \
   WORKSPACE_PATH="$R6/wt" REPO_ROOT="$R6" \
