@@ -240,6 +240,13 @@ PHASES=""
 # The supervisor's own default cap. Callers that set nothing at all fall back to
 # pump-lib's TASKPUMP_JOBS_FALLBACK instead; see the note there.
 JOBS="${TASKPUMP_JOBS:-${JOBS:-4}}"
+# Did THIS invocation type --jobs? A conf/env cap is a standing preference the
+# live cap file may legitimately outrank; a flag is an instruction about this one
+# run, and effective_cap() below is where that difference is spent (issue #44).
+# CAP_FILE_STAMPED flips once the startup write has put the flag INTO the cap
+# file, after which the file is the single authority again.
+JOBS_GIVEN=0
+CAP_FILE_STAMPED=0
 CEILING="${TASKPUMP_USAGE_CEILING:-95}"
 GRAIN="phase"
 TICK="${TASKPUMP_TICK:-${POOL_TICK:-30}}"
@@ -330,7 +337,7 @@ while [[ $# -gt 0 ]]; do
     --phase=*)  PHASES="${1#--phase=}"; shift;;
     --jobs|-j)
       [[ "${2:-}" =~ ^[0-9]+$ ]] || die "--jobs needs a non-negative integer"
-      JOBS="$2"; shift 2;;
+      JOBS="$2"; JOBS_GIVEN=1; shift 2;;
     --usage-ceiling)
       [[ "${2:-}" =~ ^[0-9]+$ ]] || die "--usage-ceiling needs an integer"
       CEILING="$2"; shift 2;;
@@ -503,6 +510,28 @@ pump_in_list() {
   local needle="$1" item
   for item in ${2:-}; do [[ "$item" == "$needle" ]] && return 0; done
   return 1
+}
+
+# The concurrency cap actually in force — the ONE number the banner, the plan
+# header, the launch loop and the state file all have to quote (issue #44).
+#
+# The banner used to print $JOBS while every tick read CAP_FILE, so a cap file
+# left behind by an earlier run silently topped the pool up to ITS number:
+# `--jobs 1` over a stale 4 launched four agents under a "cap=1" banner, and the
+# operator only found out by counting containers.
+#
+# An explicit --jobs is an instruction about THIS run, so it outranks that file:
+# the real-run startup stamps the flag into CAP_FILE and sets CAP_FILE_STAMPED,
+# after which the file is authoritative again and a mid-drain
+# `echo 3 >| .taskpump-pool-cap` still retunes a live pump. Until the stamp lands
+# — --dry-run and --list exit before it, and an unwritable cap file never gets it
+# — the flag is what this run will use, so it is what every surface must report.
+effective_cap() {
+  if [[ "$JOBS_GIVEN" -eq 1 && "$CAP_FILE_STAMPED" -eq 0 ]]; then
+    printf '%s\n' "$JOBS"
+    return 0
+  fi
+  JOBS=$JOBS apl_read_cap
 }
 
 # Distinct phases present in the live eligible frontier (have ≥1 launchable task).
@@ -1929,7 +1958,7 @@ compute_plan_task() {
 print_plan() {
   compute_plan
   local gate_line; if feed_gate; then gate_line="GATE: feed-ok"; else gate_line="GATE: PAUSED — $GATE_REASON"; fi
-  echo "$PROG_NAME plan — phases $PHASES, grain $GRAIN, cap $(JOBS=$JOBS apl_read_cap), ceiling $CEILING%"
+  echo "$PROG_NAME plan — phases $PHASES, grain $GRAIN, cap $(effective_cap), ceiling $CEILING%"
   echo "$gate_line"
   # What a feeding gate had to say — a Claude gate skipping on a host with no
   # Claude credentials, say. Indented under the gate line because it explains
@@ -2079,7 +2108,7 @@ do_tick() {
   fi
 
   local cap have launched=0 p
-  cap="$(JOBS=$JOBS apl_read_cap)"
+  cap="$(effective_cap)"
   have="$(apl_count_live_agents)"
   for p in "${PLAN_LAUNCH[@]:-}"; do
     [[ -z "$p" ]] && continue
@@ -2154,8 +2183,11 @@ write_state() {  # $1=status(running|paused|drained|stalled|stopped) $2=reason
   local status="${1:-running}" reason="${2:-}"
   PUMP_LAST_STATUS="$status"
   PUMP_LAST_REASON="$reason"
+  # `jobs` is the cap in force, not the flag: the monitor renders this file, and
+  # a run whose cap file says 4 must not present the operator's --jobs 1 there
+  # either (issue #44 — same lie, second channel).
   jq -n \
-    --arg phases "$PHASES" --argjson jobs "$JOBS" --argjson ceiling "$CEILING" \
+    --arg phases "$PHASES" --argjson jobs "$(effective_cap)" --argjson ceiling "$CEILING" \
     --arg grain "$GRAIN" --arg started "$PUMP_STARTED_AT" \
     --arg last_tick "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --argjson live "$(apl_count_live_agents)" --argjson open "$(open_count)" \
@@ -2337,8 +2369,22 @@ if [[ -z "${GITHUB_TOKEN:-}" ]] && command -v gh >/dev/null 2>&1; then
 fi
 [[ -f "$BRIEF_TEMPLATE" ]] || die "$(missing_brief_template_msg)"
 
-# Seed the live cap file for discoverability / retuning.
-[[ -f "$CAP_FILE" ]] || echo "$JOBS" >| "$CAP_FILE" 2>/dev/null || true
+# Seed the live cap file for discoverability / retuning — and, when the operator
+# typed --jobs, OVERWRITE it: the flag sets the live cap for this run (issue
+# #44). Every tick reads this file, so a number an earlier run left here used to
+# outrank the flag silently. Without the flag the file is left exactly as found;
+# it is the mid-drain retune knob and outranking a standing TASKPUMP_JOBS is its
+# whole job. Must precede the banner below, which reports what this write left.
+if [[ "$JOBS_GIVEN" -eq 1 || ! -f "$CAP_FILE" ]]; then
+  if { echo "$JOBS" >| "$CAP_FILE"; } 2>/dev/null; then
+    CAP_FILE_STAMPED=1
+  elif [[ "$JOBS_GIVEN" -eq 1 ]]; then
+    # Unwritable cap file: keep honoring the flag (effective_cap feeds banner,
+    # plan, tick and state alike) and say what that costs, rather than quietly
+    # ticking against a file the operator just tried to override.
+    warn "could not write $CAP_FILE — this run holds at --jobs $JOBS; retuning through that file is off"
+  fi
+fi
 
 # Skip the (~9 GB) image build when we will not launch containers — keeps the
 # NO_LAUNCH tick (tests / live read-only validation) side-effect-free.
@@ -2384,7 +2430,11 @@ if [[ "$MODE" == "run" && "$DISK_GATE" -eq 1 && "${TASKPUMP_PUMP_NO_LAUNCH:-0}" 
   log "disk watchdog started (cap-file path; log: $DISK_WATCHDOG_LOG)"
 fi
 
-log "Pump: phases=$PHASES grain=$GRAIN cap=$JOBS (live via $CAP_FILE) ceiling=${CEILING}% tick=${TICK}s"
+# The cap here is the one the ticks will use, and the parenthetical names who set
+# it: printing the flag while the ticks read the file is issue #44 exactly.
+CAP_NOTE="live via $CAP_FILE"
+[[ "$JOBS_GIVEN" -eq 1 ]] && CAP_NOTE="--jobs, then live via $CAP_FILE"
+log "Pump: phases=$PHASES grain=$GRAIN cap=$(effective_cap) ($CAP_NOTE) ceiling=${CEILING}% tick=${TICK}s"
 log "Singular supervisor; Ctrl-C stops feeding but leaves running agents. Monitor: $MONITOR_BIN"
 
 # ── Exit honesty (issue #22) ───────────────────────────────────────────────────

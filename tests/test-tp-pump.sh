@@ -1474,6 +1474,81 @@ wait "$PUMP32" 2>/dev/null
   && pass "a completed drain keeps status=drained (trap does not clobber it)" \
   || fail "drain state clobbered: $(cat "$STATE32" 2>/dev/null)"
 
+echo "--- Test 33: the cap the banner prints is the cap the ticks use (#44) ---"
+# The banner printed $JOBS while every tick read CAP_FILE, so a cap file left
+# behind by an earlier run silently topped the pool up to ITS number while the
+# operator was told the flag's — `--jobs 1` against a leftover 4 launched four
+# agents and said cap=1. Whichever of the two wins, the banner, the tick and the
+# state file must all name the same number.
+CAP44="$TMP/cap44"; STATE44="$TMP/pump44.state"
+mk F90.0 open; mk F91.0 open
+pump44() {  # pump44 <pump args...> — a hermetic run against $CAP44
+  TASKPUMP_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 TASKPUMP_STAGGER=0 \
+  ARACHNE_PUMP_OPS_DIR="$TMP/noops" ARACHNE_PUMP_STATE_FILE="$STATE44" \
+  ARACHNE_POOL_CAP_FILE="$CAP44" ARACHNE_PUMP_LOG="$TMP/pump44.log" \
+  ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+  "$PUMP" --no-health-gate --phases F90..F91 "$@" 2>&1
+}
+banner_cap44() { sed -n 's/.*Pump: .*cap=\([0-9][0-9]*\).*/\1/p' <<<"$1" | head -1; }
+tick_cap44()   { sed -n 's#.*live=[0-9][0-9]*/\([0-9][0-9]*\).*#\1#p' <<<"$1" | head -1; }
+
+# 33a: an explicit --jobs against a leftover cap file of 4.
+echo 4 >| "$CAP44"
+out=$(pump44 --jobs 1 --once)
+bc=$(banner_cap44 "$out"); tc=$(tick_cap44 "$out")
+[[ "$bc" == "1" ]] \
+  && pass "should print the flag's cap in the banner when --jobs 1 meets a cap file holding 4" \
+  || fail "banner cap=$bc, expected 1:\n$out"
+[[ -n "$tc" && "$tc" == "$bc" ]] \
+  && pass "should top the pool up to the banner's cap when a leftover cap file disagrees" \
+  || fail "banner said cap=$bc but the tick launched against $tc:\n$out"
+[[ "$(cat "$CAP44")" == "1" ]] \
+  && pass "should rewrite the live cap file to the flag when --jobs is explicit" \
+  || fail "cap file holds '$(cat "$CAP44")', expected 1 (the flag never reached the file the ticks read)"
+[[ "$(jq -r '.jobs' "$STATE44" 2>/dev/null)" == "1" ]] \
+  && pass "should record the effective cap in the state file when --jobs wins" \
+  || fail "state file jobs=$(jq -r '.jobs' "$STATE44" 2>/dev/null), expected 1"
+
+# 33b: no flag — the cap file is the live retune knob and keeps winning, but the
+# banner must stop claiming the default it is not using.
+echo 3 >| "$CAP44"
+out=$(pump44 --once)
+bc=$(banner_cap44 "$out"); tc=$(tick_cap44 "$out")
+[[ "$bc" == "3" ]] \
+  && pass "should print the cap file's value in the banner when no --jobs is passed" \
+  || fail "banner cap=$bc, expected 3 (the file the ticks read):\n$out"
+[[ -n "$tc" && "$tc" == "$bc" ]] \
+  && pass "should tick against the cap file when no --jobs is passed" \
+  || fail "banner said cap=$bc but the tick launched against $tc:\n$out"
+[[ "$(cat "$CAP44")" == "3" ]] \
+  && pass "should leave a mid-drain retune alone when no --jobs is passed" \
+  || fail "cap file rewritten to '$(cat "$CAP44")', expected the retuned 3"
+# The monitor renders this file: the same number, or the same lie one channel over.
+[[ "$(jq -r '.jobs' "$STATE44" 2>/dev/null)" == "3" ]] \
+  && pass "should record the cap file's value in the state file when no --jobs is passed" \
+  || fail "state file jobs=$(jq -r '.jobs' "$STATE44" 2>/dev/null), expected 3"
+
+# 33c: a dry run must predict the cap the real run would use — it exits before
+# the startup write, so it has to reason about the flag itself.
+echo 4 >| "$CAP44"
+out=$(pump44 --jobs 1 --dry-run)
+have "$out" 'plan — phases F90\.\.F91, grain phase, cap 1,' \
+  && pass "should predict the flag's cap in a dry run when a leftover cap file disagrees" \
+  || fail "dry-run plan header disagrees with the run it previews:\n$out"
+[[ "$(cat "$CAP44")" == "4" ]] \
+  && pass "should not write the cap file in a dry run when --jobs is explicit" \
+  || fail "dry run mutated the cap file to '$(cat "$CAP44")'"
+
+# 33d: with no cap file at all the shipped default still seeds it (Test 22
+# covers the path; this pins the number the banner quotes for it).
+rm -f "$CAP44"
+out=$(pump44 --once)
+bc=$(banner_cap44 "$out")
+[[ "$bc" == "4" && "$(cat "$CAP44")" == "4" ]] \
+  && pass "should seed the cap file from the default cap when no file exists" \
+  || fail "banner cap=$bc, cap file '$(cat "$CAP44" 2>/dev/null)', expected 4/4"
+rm -f "$TASKS/F90.0.md" "$TASKS/F91.0.md"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"
