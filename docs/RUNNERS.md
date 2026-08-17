@@ -85,11 +85,23 @@ alive, instead of the supervisor inferring it by scraping container names.
 runner.sh list
 ```
 
-**Inputs:** none per agent. `list` is called once per tick with no task, no
-workspace and no container name in hand, so it may read only what `stop` already
-reads from configuration — for the shipped runner, the agent-name prefix
-(`TP_AGENT_PREFIX`, or the shared `TASKPUMP_AGENT_PREFIX`). A runner that demands
-launch-shaped input is uncallable at exactly the moment it is needed.
+**Inputs:** none per agent. `list` is called once per tick with no task and no
+container name in hand, so it may read only what `stop` already reads from
+configuration — for the shipped runners, the agent-name prefix
+(`TP_AGENT_PREFIX`, or the shared `TASKPUMP_AGENT_PREFIX`) and the workspace
+whose fleet is being asked about (`TP_REPO_ROOT`, or `TASKPUMP_REPO_ROOT`). Both
+name a *fleet*, not an agent; a runner that demands launch-shaped input is
+uncallable at exactly the moment it is needed.
+
+The workspace is there because names are not unique on a host. Agent names are
+`<prefix><branch-slug>` (§2), so two projects that share a branch convention
+name the same agent, and a runner whose view of its fleet is host-wide will hand
+back one that belongs to the other project — which the supervisor then reports
+as its own RUNNING phase and never drains (issue #40). A runner that can tell
+whose agent is whose should answer for the workspace it was asked about. One
+that cannot must still answer, and the supervisor lives with the collision:
+never reporting an agent that IS the caller's is the worse failure, because that
+is how a live agent gets launched a second time.
 
 **Output:** the name of every live agent, one per line. These must be the names
 `launch` created (`<prefix><slug>`, §2), so the existing name→branch mapping
@@ -211,8 +223,8 @@ doing, use a runner that sandboxes, and read §4 first.
 ### 3.2 How it keeps track
 
 A container runtime remembers the name→process mapping for you. Nothing does
-that for a bare process, so this runner writes one itself — `<name> <pgid>` per
-line, in a registry file:
+that for a bare process, so this runner writes one itself — `<name> <pgid>
+<workspace-root>` per line, in a registry file:
 
 | Knob | Default |
 |---|---|
@@ -220,8 +232,8 @@ line, in a registry file:
 | `TASKPUMP_LOCAL_STOP_GRACE_S` | `10` — seconds between `TERM` and `KILL` |
 | `TASKPUMP_AGENT_LOG_NAME` | `.taskpump-agent.log`, inside the workspace |
 
-Two details there are load-bearing, and both look like implementation choices
-until they bite:
+Three details there are load-bearing, and all of them look like implementation
+choices until they bite:
 
 - **The recorded id is a process GROUP, not a pid.** An agent spawns children — a
   language server, a test run, a subagent. Killing only the leader leaves them
@@ -234,6 +246,18 @@ until they bite:
   as gone. The obvious `kill -0` implementation reports a long-dead agent as
   live forever: `stop` never finishes, `list` never prunes, and the pump never
   relaunches the phase.
+- **Every entry records the workspace it was launched for**, and `list` and
+  `stop` answer for one workspace at a time. The registry is host-global by
+  default and the prefix is shared, so two projects on one host name the same
+  agent the moment they share a branch convention — and before this field, the
+  second project's pump read the first's live agent as its own RUNNING phase and
+  drained nothing for the rest of the run (issue #40), while its `stop` would
+  have killed the other project's agent outright. Two workspaces may hold the
+  same name at once; that is the collision the field exists to survive, not one
+  to resolve. An entry that records *no* workspace — written by an older runner,
+  or by a caller that named none — cannot be proven foreign and stays visible to
+  everybody, because hiding an agent that IS the caller's is how a live agent
+  gets launched twice.
 
 `list` prunes what it walks, so the registry holds the live set and does not
 accumulate. `launch` refuses to start a second agent under a live name — the one
@@ -286,6 +310,11 @@ The two things that are easy to get wrong are both in §1.3: an empty fleet must
 print **nothing** (not a blank line), and a failure to enumerate must exit
 non-zero rather than look like an empty fleet. And whatever you start, **name it
 `<prefix><branch-slug>`** (§2) — the fallback enumeration still depends on it.
+That name is not unique on a host, though, so if your runner can record which
+workspace an agent belongs to (`TP_REPO_ROOT` is handed to `launch`, and to
+`list` and `stop` as configuration), have `list` answer for the workspace it was
+asked about; otherwise two projects sharing a branch convention will read each
+other's agents as their own.
 
 ---
 

@@ -56,11 +56,16 @@
 #   TP_RESUME_NOTE    ARACHNE_RESUME_NOTE resume preamble, or empty
 #   TP_MODEL          AGENT_MODEL         model alias, forwarded as-is
 #   TP_MAX_TURNS      MAX_TURNS           turn cap, forwarded as-is
-#   TP_REPO_ROOT      REPO_ROOT           the primary checkout
+#   TP_REPO_ROOT      REPO_ROOT           the primary checkout — and the fleet
+#                                         this agent belongs to; see below
 #
 # Configuration `stop` and `list` read — no per-launch input, because the pump
 # asks `list` once per tick with no task in hand (docs/RUNNERS.md §1.3):
 #
+#   TP_REPO_ROOT      TASKPUMP_REPO_ROOT / REPO_ROOT — the workspace whose fleet
+#                                is being asked about. Configuration, not
+#                                per-agent input: it names a project, exactly as
+#                                the prefix names a fleet.
 #   TASKPUMP_LOCAL_REGISTRY   —  the registry file. Default:
 #                                $TASKPUMP_STATE_DIR/.taskpump-local-agents when
 #                                a state dir is configured, else
@@ -82,6 +87,22 @@
 # them running and holding the workspace. `setsid` puts the session in its own
 # group so one signal reaches the whole tree, and so an agent that outlives this
 # runner is not attached to its terminal.
+#
+# ── And why every entry records a workspace ──────────────────────────────────
+#
+# The registry is host-global by default and the agent prefix is shared, so two
+# projects on one host agree on agent NAMES the moment they agree on a branch
+# convention: both call it <prefix>feat-f80. Found live in the G4.4 rehearsal
+# (issue #40) — the second repo's pump read the first repo's still-running agent
+# as its own RUNNING phase, and drained nothing for the rest of the run. A
+# `docker ps` fleet has the same shape of collision; here we can simply record
+# who an agent belongs to, so each line is `<name> <pgid> <workspace-root>` and
+# `list` and `stop` answer for one workspace at a time.
+#
+# The one thing this must never do is hide an agent that IS ours: the supervisor
+# would then launch a second one on the same worktree, which is the destructive
+# half of the same bug. So an entry that records no workspace (written before
+# this field existed) cannot be proven foreign, and stays visible to everybody.
 
 set -euo pipefail
 
@@ -105,6 +126,18 @@ first_set() {
   printf ''
 }
 
+# workspace_scope — the workspace this invocation speaks for, canonicalised, or
+# empty when the caller named none. `launch` is handed it as TP_REPO_ROOT
+# already; `list` and `stop` read it as configuration.
+workspace_scope() {
+  local r; r="$(first_set TP_REPO_ROOT TASKPUMP_REPO_ROOT REPO_ROOT)"
+  [[ -n "$r" ]] || return 0
+  # One spelling per workspace: a caller reaching the same directory through a
+  # symlink must not read as a different project than the one that wrote the
+  # entry. Both sides of every comparison below come through here.
+  (CDPATH= cd -- "$r" 2>/dev/null && pwd -P) || printf '%s' "$r"
+}
+
 registry_file() {
   local r; r="$(first_set TASKPUMP_LOCAL_REGISTRY TP_LOCAL_REGISTRY)"
   if [[ -z "$r" ]]; then
@@ -119,16 +152,37 @@ registry_file() {
 }
 
 # ── Registry ──────────────────────────────────────────────────────────────────
-# One line per agent: `<name> <pgid>`. Rewritten through a temp file so a reader
-# never sees a half-written registry, and serialised by a mkdir lock — mkdir is
-# atomic on every filesystem worth running on, and needs no flock.
+# One line per agent: `<name> <pgid> <workspace-root>`. Rewritten through a temp
+# file so a reader never sees a half-written registry, and serialised by a mkdir
+# lock — mkdir is atomic on every filesystem worth running on, and needs no
+# flock.
 
-REG=""; LOCK=""
+REG=""; LOCK=""; SCOPE=""
 
 reg_init() {
   REG="$(registry_file)"
   LOCK="$REG.lock"
+  SCOPE="$(workspace_scope)"
   mkdir -p "$(dirname "$REG")" 2>/dev/null || true
+}
+
+# in_scope <recorded-workspace> — is this entry part of the fleet this
+# invocation is asking about? Its own workspace, yes. Anything unknown, also
+# yes: an entry from before this field existed cannot be proven foreign, and an
+# invocation that was told no workspace cannot prove anything about anyone. Both
+# of those fall back to the pre-scope answer (everyone) on purpose — reporting
+# somebody else's agent is a wrong answer, but failing to report our own is a
+# DOUBLE LAUNCH, and the two are not the same size of mistake.
+in_scope() {
+  [[ -z "$SCOPE" || -z "$1" || "$1" == "$SCOPE" ]]
+}
+
+# reg_line <name> <pgid> [workspace] — one registry line. The workspace field is
+# omitted rather than left blank when there is none, so an entry this runner
+# only passed through comes back out byte-identical.
+reg_line() {
+  [[ -n "${3:-}" ]] || { printf '%s %s\n' "$1" "$2"; return 0; }
+  printf '%s %s %s\n' "$1" "$2" "$3"
 }
 
 reg_lock() {
@@ -172,12 +226,30 @@ alive() {
   kill -0 -- "-$pgid" 2>/dev/null
 }
 
-# reg_pgid <name> — the recorded group id, or empty.
+# reg_pgid <name> — the recorded group id of THIS workspace's agent of that
+# name, or empty. Another project's agent of the same name is not an answer to
+# this question.
 reg_pgid() {
   [[ -f "$REG" ]] || return 0
-  local n p
-  while read -r n p _rest; do
-    [[ "$n" == "$1" ]] && { printf '%s' "$p"; return 0; }
+  local n p root
+  while read -r n p root; do
+    [[ "$n" == "$1" ]] && in_scope "$root" && { printf '%s' "$p"; return 0; }
+  done < "$REG"
+  return 0
+}
+
+# reg_owner <name> — the workspace some OTHER project recorded an agent of this
+# name against, or empty. Only meaningful once reg_pgid has come back empty, and
+# it exists so a refusal can say whose agent it found instead of claiming there
+# is none.
+reg_owner() {
+  [[ -f "$REG" ]] || return 0
+  local n p root
+  while read -r n p root; do
+    [[ "$n" == "$1" && -n "$root" ]] || continue
+    in_scope "$root" && continue
+    printf '%s' "$root"
+    return 0
   done < "$REG"
   return 0
 }
@@ -189,27 +261,32 @@ reg_write() {
   mv -f "$tmp" "$REG"
 }
 
-# reg_drop <name> — remove one entry.
+# reg_drop <name> — remove this workspace's entry of that name. Another
+# project's line of the same name is copied through untouched, field for field.
 reg_drop() {
   [[ -f "$REG" ]] || return 0
-  local name="$1" n p
-  { while read -r n p _rest; do
-      [[ -z "$n" || "$n" == "$name" ]] && continue
-      printf '%s %s\n' "$n" "$p"
+  local name="$1" n p root
+  { while read -r n p root; do
+      [[ -z "$n" ]] && continue
+      [[ "$n" == "$name" ]] && in_scope "$root" && continue
+      reg_line "$n" "$p" "$root"
     done < "$REG"
   } | reg_write
 }
 
-# reg_put <name> <pgid> — record an entry, replacing any stale one of that name.
+# reg_put <name> <pgid> — record an entry against this workspace, replacing any
+# stale one of that name HERE. Two projects may hold the same name at once; that
+# is the collision this field exists to survive, not one to resolve.
 reg_put() {
-  local name="$1" pgid="$2" n p
+  local name="$1" pgid="$2" n p root
   { if [[ -f "$REG" ]]; then
-      while read -r n p _rest; do
-        [[ -z "$n" || "$n" == "$name" ]] && continue
-        printf '%s %s\n' "$n" "$p"
+      while read -r n p root; do
+        [[ -z "$n" ]] && continue
+        [[ "$n" == "$name" ]] && in_scope "$root" && continue
+        reg_line "$n" "$p" "$root"
       done < "$REG"
     fi
-    printf '%s %s\n' "$name" "$pgid"
+    reg_line "$name" "$pgid" "$SCOPE"
   } | reg_write
 }
 
@@ -321,6 +398,20 @@ do_stop() {
   reg_init
   local pgid; pgid="$(reg_pgid "$name")"
 
+  # A name this workspace does not hold, but another one does. Signalling it
+  # would tear down a live agent belonging to a different project — the
+  # destructive half of the cross-repo name collision — and calling it "not
+  # recorded" would be a wrong stated reason for a right refusal. So: neither.
+  # This fleet has no agent by that name, which is exactly what §1.2's success
+  # means, and the warning says whose it actually is.
+  local owner=""
+  [[ -n "$pgid" ]] || owner="$(reg_owner "$name")"
+  if [[ -n "$owner" ]]; then
+    warn "an agent named $name belongs to the workspace $owner, not $SCOPE; refusing to signal another workspace's agent"
+    printf '%s\n' "$name"
+    return 0
+  fi
+
   # Both "already gone" shapes are success (docs/RUNNERS.md §1.2): never
   # recorded, and recorded but already exited. The entry goes either way — a
   # teardown that leaves a tombstone behind would have list pruning it later, and
@@ -371,13 +462,17 @@ do_list() {
   # whether to fall back (docs/RUNNERS.md §1.3).
   [[ -r "$REG" ]] || die "cannot read the agent registry at $REG"
 
-  local live_names=() live_lines=() n p
-  while read -r n p _rest; do
+  # Two different sets, and conflating them is the bug this split exists to
+  # avoid: what survives PRUNING is every live agent on the host (a dead pgid is
+  # dead for everyone, so anyone may reap the line), while what is REPORTED is
+  # only this workspace's fleet.
+  local live_names=() live_lines=() n p root
+  while read -r n p root; do
     [[ -z "$n" ]] && continue
-    if alive "$p"; then
-      live_names+=("$n")
-      live_lines+=("$n $p")
-    fi
+    alive "$p" || continue
+    live_lines+=("$(reg_line "$n" "$p" "$root")")
+    in_scope "$root" || continue
+    live_names+=("$n")
   done < "$REG"
 
   # Prune while we are here: an agent that exits on its own leaves an entry no

@@ -39,11 +39,16 @@ RUNNER="$TP_ROOT/runners/local/runner.sh"
 
 WORK=$(mktemp -d)
 cleanup() {
-  # Never leave a stub agent behind, whatever the suite did.
-  local n p
-  [[ -f "$WORK/registry" ]] && while read -r n p _rest; do
-    [[ "$p" =~ ^[0-9]+$ ]] && kill -KILL -- "-$p" 2>/dev/null
-  done < "$WORK/registry"
+  # Never leave a stub agent behind, whatever the suite did. Both registries:
+  # the suite's own, and the host-global default the two-repo section drives
+  # through a fixture XDG_STATE_HOME.
+  local reg n p
+  for reg in "$WORK/registry" "$WORK/xdg/taskpump/local-agents"; do
+    [[ -f "$reg" ]] || continue
+    while read -r n p _rest; do
+      [[ "$p" =~ ^[0-9]+$ ]] && kill -KILL -- "-$p" 2>/dev/null
+    done < "$reg"
+  done
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -255,6 +260,98 @@ out=$(launch tp-agent-feat-e 'sleep 60' 2>&1); rc=$?
   || fail "a duplicate launch was allowed (rc=$rc):\n$out"
 TP_CONTAINER_NAME=tp-agent-feat-e bash "$RUNNER" stop >/dev/null 2>&1
 
+echo "--- one host, two repos: an agent belongs to the workspace it was launched for ---"
+# Issue #40, found live in the G4.4 rehearsal. The registry is host-global by
+# default and the agent prefix is shared, so the moment two projects agree on a
+# branch convention their agent NAMES collide — and the second repo's supervisor
+# read the first repo's live agent as its own RUNNING phase. That is the
+# false-liveness family: work confidently reported as running that belongs to
+# another project entirely. The workspace an agent was launched for is recorded,
+# and it is what tells the two fleets apart.
+
+WT_A=$(mkdir -p "$WORK/repo-a" && CDPATH= cd -- "$WORK/repo-a" && pwd -P)
+WT_B=$(mkdir -p "$WORK/repo-b" && CDPATH= cd -- "$WORK/repo-b" && pwd -P)
+
+launch_for() {   # launch_for <workspace-root> <name> <agent-cmd>
+  TP_REPO_ROOT="$1" TP_WORKSPACE="$1" TP_CONTAINER_NAME="$2" TASKPUMP_LOCAL_AGENT_CMD="$3" \
+    bash "$RUNNER" launch
+}
+list_for() { TP_REPO_ROOT="$1" bash "$RUNNER" list; }
+stop_for() { TP_REPO_ROOT="$1" TP_CONTAINER_NAME="$2" bash "$RUNNER" stop; }
+# The name alone is ambiguous once two repos use it, which is the whole subject
+# of this section — so the fixture reads pgids by (name, workspace).
+pgid_for() { awk -v n="$2" -v r="$1" '$1 == n && $3 == r { print $2 }' "$TASKPUMP_LOCAL_REGISTRY" 2>/dev/null; }
+
+SHARED=tp-agent-feat-shared
+launch_for "$WT_A" "$SHARED" 'sleep 60' >/dev/null
+PG_SHARED_A=$(pgid_for "$WT_A" "$SHARED")
+[[ -n "$PG_SHARED_A" ]] \
+  && pass "should record the workspace an agent was launched for when it launches one" \
+  || fail "no workspace-scoped entry for $SHARED:\n$(cat "$TASKPUMP_LOCAL_REGISTRY")"
+
+out=$(list_for "$WT_B")
+[[ "$out" != *"$SHARED"* ]] \
+  && pass "should hide another workspace's agent when a second repo lists the shared registry" \
+  || fail "repo B adopted repo A's agent: '$out'"
+
+out=$(list_for "$WT_A")
+[[ "$out" == *"$SHARED"* ]] \
+  && pass "should still report its own agent when the workspace matches" \
+  || fail "repo A lost sight of its own agent: '$out'"
+
+# The name is free in repo B, because repo B has no agent by it. Refusing here
+# would be the mirror-image wrong answer: a project unable to launch a phase
+# because an unrelated project happens to be draining a branch of the same name.
+out=$(launch_for "$WT_B" "$SHARED" 'sleep 60' 2>&1); rc=$?
+[[ $rc -eq 0 ]] \
+  && pass "should allow the launch when the live agent of that name belongs to another workspace" \
+  || fail "repo B could not launch its own $SHARED (rc=$rc):\n$out"
+
+PG_SHARED_B=$(pgid_for "$WT_B" "$SHARED")
+[[ -n "$PG_SHARED_B" && "$PG_SHARED_B" != "$PG_SHARED_A" ]] \
+  && pass "should keep both repos' entries when two workspaces run the same agent name" \
+  || fail "repo B's entry is missing or aliased repo A's (a=$PG_SHARED_A b=$PG_SHARED_B):\n$(cat "$TASKPUMP_LOCAL_REGISTRY")"
+
+# stop is the destructive half of the same identity bug: a teardown that matched
+# on the name alone would reach into another project and kill a live agent.
+out=$(stop_for "$WT_B" "$SHARED" 2>&1); rc=$?
+[[ $rc -eq 0 ]] && pass "should succeed when a repo stops its own agent of a shared name" \
+  || fail "stop failed (rc=$rc):\n$out"
+group_alive "$PG_SHARED_A" \
+  && pass "should leave the other workspace's agent running when one repo stops that name" \
+  || fail "repo B's stop killed repo A's agent (pgid $PG_SHARED_A)"
+group_alive "$PG_SHARED_B" \
+  && fail "repo B's own agent survived its stop (pgid $PG_SHARED_B)" \
+  || pass "should stop its own agent when both repos share the name"
+
+out=$(list_for "$WT_A")
+[[ "$out" == *"$SHARED"* ]] \
+  && pass "should keep reporting its own agent when the other repo tore its own down" \
+  || fail "repo A's agent vanished with repo B's teardown: '$out'"
+
+# A teardown that finds only another workspace's entry must say so. "No agent
+# named X is recorded" would be a wrong stated reason — the agent IS recorded,
+# just not here — and a wrong reason is the failure this repo exists to refuse.
+err=$(TP_REPO_ROOT="$WT_B" TP_CONTAINER_NAME="$SHARED" bash "$RUNNER" stop 2>&1 >/dev/null); rc=$?
+[[ $rc -eq 0 ]] && grep -q "$WT_A" <<<"$err" \
+  && pass "should name the owning workspace when asked to stop another repo's agent" \
+  || fail "the refusal did not say whose agent it is (rc=$rc):\n$err"
+
+# An entry written before the workspace was recorded cannot be proven foreign,
+# and the destructive mistake is the other one: hiding an agent that IS ours
+# makes the supervisor launch a second one on the same worktree. So an unscoped
+# entry stays visible to everybody.
+launch_for "$WT_A" tp-agent-feat-legacy 'sleep 60' >/dev/null
+PG_LEGACY=$(pgid_for "$WT_A" tp-agent-feat-legacy)
+sed -i "s|^tp-agent-feat-legacy $PG_LEGACY .*$|tp-agent-feat-legacy $PG_LEGACY|" "$TASKPUMP_LOCAL_REGISTRY"
+out=$(list_for "$WT_B")
+[[ "$out" == *tp-agent-feat-legacy* ]] \
+  && pass "should still report an entry that records no workspace when it cannot be proven foreign" \
+  || fail "an unscoped entry went invisible, which is how a live agent gets launched twice: '$out'"
+
+stop_for "$WT_A" tp-agent-feat-legacy >/dev/null 2>&1
+stop_for "$WT_A" "$SHARED" >/dev/null 2>&1
+
 echo "--- the contract this runner claims ---"
 
 out=$(run contract 2>&1)
@@ -379,6 +476,96 @@ grep -qE 'RUNNING +F80' <<<"$plan" \
   || fail "the pump lost sight of a live agent:\n$plan"
 
 TP_CONTAINER_NAME="$E2E_NAME" TASKPUMP_LOCAL_REGISTRY="$E2E_REG" bash "$RUNNER" stop >/dev/null 2>&1
+
+echo "--- two repos, one host: the second pump must not adopt the first's agent ---"
+# The reproduction from issue #40, end to end and with nothing pinned that a
+# consumer would not pin: two projects, the default agent prefix, and the
+# runner's DEFAULT registry — the host-global file both of them resolve. Their
+# phase F80 slugs to the same branch, so both would name their agent
+# tp-agent-feat-f80. The second pump must plan its OWN launch; adopting the
+# first repo's agent means reporting a phase RUNNING that no one is draining
+# here, and leaving F80 undrained for the rest of the run.
+
+XREPO_XDG="$WORK/xdg"
+xrepo_repo() {  # xrepo_repo <dir> — a fixture consumer with a root-level ledger
+  local dir="$1"
+  mkdir -p "$dir/tasks"
+  git -C "$dir" init -q -b main 2>/dev/null || git -C "$dir" init -q
+  git -C "$dir" config user.email t@example.com
+  git -C "$dir" config user.name Test
+  printf 'fixture\n' >| "$dir/README.md"
+  git -C "$dir" add README.md
+  git -C "$dir" commit -qm "fixture"
+  git -C "$dir" branch -M main 2>/dev/null || true
+  cp "$E2E_TASKS/F80.0.md" "$dir/tasks/F80.0.md"
+}
+# No TASKPUMP_LOCAL_REGISTRY and no TASKPUMP_STATE_DIR: the runner resolves
+# $XDG_STATE_HOME/taskpump/local-agents, which is the one file both repos share.
+xrepo_tick() {  # xrepo_tick <repo> [pump args…]
+  local repo="$1"; shift
+  ( cd "$repo" || exit 1
+    env -u WORKSPACE_PATH -u TP_WORKSPACE -u TP_CONTAINER_NAME -u ARACHNE_CONTAINER_NAME \
+        -u TASKPUMP_LOCAL_REGISTRY \
+      XDG_STATE_HOME="$XREPO_XDG" \
+      TASKPUMP_NO_CONF=1 \
+      TASKPUMP_NOTIFY_CMD=true \
+      TASKPUMP_TASKS_DIR="$repo/tasks" \
+      TASKPUMP_ID_PATTERN='^F[0-9]+(\.[0-9]+)?$' \
+      TASKPUMP_PHASE_SIGIL=F \
+      TASKPUMP_PUMP_OPS_DIR="$repo/ops" \
+      TASKPUMP_PUMP_STATE_FILE="$repo/pump.state" \
+      TASKPUMP_POOL_CAP_FILE="$repo/cap" \
+      TASKPUMP_PUMP_LOG="$repo/pump.log" \
+      TASKPUMP_PHASE_BRIEF_TEMPLATE="$E2E/brief.md" \
+      TASKPUMP_PUMP_WORKTREES_DIR="$repo/.worktrees" \
+      TASKPUMP_AGENT_HOME="$E2E/home" \
+      TASKPUMP_USAGE_CACHE="$E2E/usage-cache.json" \
+      TASKPUMP_TASK_NOCOMMIT=1 \
+      TASKPUMP_RUNNER="$REPO/runners/local/runner.sh" \
+      TASKPUMP_LOCAL_AGENT_CMD='sleep 120' \
+      TASKPUMP_DOCKER="$E2E/there-is-no-docker-here" \
+      TASKPUMP_IMAGE=unused-by-a-process-runner \
+      TASKPUMP_IMAGE_BUILD= \
+      "$PUMP" --no-health-gate --no-disk-gate --phases F80 "${@:---once}" 2>&1
+  )
+}
+
+# Canonical paths: the pump derives its workspace root from git, and the runner
+# canonicalises what it records, so the fixture has to compare against the same
+# spelling rather than whatever mktemp handed back.
+mkdir -p "$E2E/consumer-a" "$E2E/consumer-b"
+XREPO_A=$(CDPATH= cd -- "$E2E/consumer-a" && pwd -P)
+XREPO_B=$(CDPATH= cd -- "$E2E/consumer-b" && pwd -P)
+xrepo_repo "$XREPO_A"; xrepo_repo "$XREPO_B"
+XREPO_REG="$XREPO_XDG/taskpump/local-agents"
+
+out=$(xrepo_tick "$XREPO_A"); rc=$?
+[[ $rc -eq 0 ]] && pass "the first consumer's tick completes on the default registry" \
+  || fail "consumer A's tick failed (rc=$rc):\n$out"
+PG_XA=$(awk -v n="$E2E_NAME" -v r="$XREPO_A" '$1 == n && $3 == r { print $2 }' "$XREPO_REG" 2>/dev/null)
+[[ -n "$PG_XA" ]] && pass "consumer A's agent is recorded against consumer A's workspace" \
+  || fail "no scoped entry for consumer A:\n$(cat "$XREPO_REG" 2>/dev/null)"
+
+plan=$(xrepo_tick "$XREPO_B" --dry-run)
+grep -qE 'LAUNCH +F80' <<<"$plan" \
+  && pass "should plan its own launch when another repo's live agent carries the same name" \
+  || fail "the second pump adopted the first repo's agent:\n$plan"
+
+out=$(xrepo_tick "$XREPO_B"); rc=$?
+[[ $rc -eq 0 ]] && pass "the second consumer's tick completes too" \
+  || fail "consumer B's tick failed (rc=$rc):\n$out"
+PG_XB=$(awk -v n="$E2E_NAME" -v r="$XREPO_B" '$1 == n && $3 == r { print $2 }' "$XREPO_REG" 2>/dev/null)
+[[ -n "$PG_XB" && "$PG_XB" != "$PG_XA" ]] \
+  && pass "should launch a second agent of its own when the name collides across repos" \
+  || fail "consumer B launched nothing of its own (a=$PG_XA b=$PG_XB):\n$(cat "$XREPO_REG" 2>/dev/null)"
+group_alive "$PG_XA" \
+  && pass "should leave the first consumer's agent untouched when the second one drains" \
+  || fail "consumer A's agent died when consumer B ticked (pgid $PG_XA)"
+
+TP_REPO_ROOT="$XREPO_A" TP_CONTAINER_NAME="$E2E_NAME" TASKPUMP_LOCAL_REGISTRY="$XREPO_REG" \
+  bash "$RUNNER" stop >/dev/null 2>&1
+TP_REPO_ROOT="$XREPO_B" TP_CONTAINER_NAME="$E2E_NAME" TASKPUMP_LOCAL_REGISTRY="$XREPO_REG" \
+  bash "$RUNNER" stop >/dev/null 2>&1
 
 echo
 printf 'Tests: %d  Passed: %d  Failed: %d\n' "$((PASS + FAIL))" "$PASS" "$FAIL"
