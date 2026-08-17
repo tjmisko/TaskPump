@@ -130,10 +130,10 @@ full_task "$BAD/T24.1.md" T24.1 open '[T24]'
 sed -i 's/^resume_head_sha: null$/resume_head_sha: null\nreview_of: T24\nreview_role: reviewer/' "$BAD/T24.1.md"
 full_task "$BAD/T25.md" T25 open '[T24]'
 # T26: CRLF line endings — the shape an externally-authored DAG arrives in, and
-# fsck's core audience. yq's front-matter mode parses it, so the frontier and
-# every other verb read it fine; the delimiters are `---`, just CR-terminated.
-# fsck called it "no YAML frontmatter", which sent an importer hunting for a
-# delimiter that is right there.
+# fsck's core audience. yq's front-matter mode parses it, so the frontier reads
+# it fine; the delimiters are `---`, just CR-terminated. fsck called it "no YAML
+# frontmatter", which sent an importer hunting for a delimiter that is right
+# there.
 full_task "$BAD/T26.md" T26
 sed -i 's/$/\r/' "$BAD/T26.md"
 # T27: the same machine key twice — the classic merge-conflict artifact. yq's
@@ -146,12 +146,13 @@ sed -i 's/^files: \[\]$/files: []\nfiles: [src\/a.txt]/' "$BAD/T27.md"
 # eligibility predicate (§6), so the edge is inert in every reader — but it
 # reads as a dependency in the file, and nothing said otherwise.
 full_task "$BAD/T28.md" T28 open '[""]'
-# T29/T30: CRLF files yq CANNOT read. The CRLF diagnostic asserts that yq parses
-# the file and every verb reads it, so it must lose to the parse and mapping
-# checks — these are the invisible-to-the-frontier class scrub calls UNPARSEABLE
-# and NO-ID, and answering them with "every verb reads it" is fsck contradicting
-# scrub about the same file. T29 is the unquoted-colon import (the F45.15 shape)
-# in its Windows spelling; T30 is the README-in-the-tasks-dir case, CR-terminated.
+# T29/T30: CRLF files yq CANNOT read. Both CRLF diagnostics assert that yq
+# reads the block and list/next/ready/scrub see the task, so they must lose to
+# the parse and mapping checks — these are the invisible-to-the-frontier class
+# scrub calls UNPARSEABLE and NO-ID, and answering one of them with a
+# readability claim is fsck contradicting scrub about the same file. T29 is the
+# unquoted-colon import (the F45.15 shape) in its Windows spelling; T30 is the
+# README-in-the-tasks-dir case, CR-terminated.
 printf -- '---\r\nid: T29\r\ntitle: Imported\r\ngoal: ship it: fast\r\n---\r\n\r\n# T29\r\n' >| "$BAD/T29.md"
 printf -- '---\r\njust a note, not a mapping\r\n---\r\n\r\n# T30\r\n' >| "$BAD/T30.md"
 # T31: an LF opening delimiter over CRLF frontmatter — the file the CR-tolerant
@@ -175,6 +176,15 @@ full_task "$BAD/T33.md" T33
 awk 'body { printf "%s\r\n", $0; next } { print } NR > 1 && $0 == "---" { body = 1 }' \
   "$BAD/T33.md" >| "$TMPDIR_TEST/T33.tmp"
 mv "$TMPDIR_TEST/T33.tmp" "$BAD/T33.md"
+# T34: the CR on the keys and NOT on either delimiter. Every other CRLF shape
+# here hides the block from lib/dag-layout.awk, which matches its delimiters as
+# /^---[ \t]*$/; this one it finds, and then carries the CR into every value it
+# reads. Same repair, different damage, so the two are separate lines — the
+# whole point of the check is telling this file's owner what is true of it.
+full_task "$BAD/T34.md" T34
+awk '$0 == "---" { print; next } { printf "%s\r\n", $0 }' \
+  "$BAD/T34.md" >| "$TMPDIR_TEST/T34.tmp"
+mv "$TMPDIR_TEST/T34.tmp" "$BAD/T34.md"
 
 set +e
 out=$(TASKPUMP_TASKS_DIR="$BAD" "$CLI" fsck 2>/dev/null)
@@ -209,7 +219,7 @@ expect_line "T25.md: blocks on 'T24', which is under live review, but not on tha
 grep -q 'T24\.1\.md: blocks' <<<"$out" \
   && fail "the chain's own reviewer was reported as bypassing its gate" \
   || pass "a chain member blocking on its own subject is not a bypass"
-expect_line "T26.md: CRLF line endings" \
+expect_line "T26.md: CRLF line endings in the frontmatter, delimiters included" \
   "should name CRLF line endings when a task file is CR-terminated"
 grep -q 'T26\.md: no YAML frontmatter' <<<"$out" \
   && fail "a CRLF file was still reported as having no frontmatter" \
@@ -223,20 +233,25 @@ expect_line "T28.md: blockers contains an empty entry" \
 expect_line "T29.md: frontmatter is not valid YAML" \
   "should name the YAML error when a CRLF file's frontmatter does not parse"
 grep -q 'T29\.md: CRLF line endings' <<<"$out" \
-  && fail "an unparseable CRLF file was told every verb reads it" \
-  || pass "should not claim every verb reads it when yq cannot parse the CRLF file"
+  && fail "an unparseable CRLF file was told the frontier reads it" \
+  || pass "should not claim the frontier reads it when yq cannot parse the CRLF file"
 expect_line "T30.md: frontmatter is not a YAML mapping" \
   "should name the missing mapping when a CRLF file's frontmatter is a scalar"
 grep -q 'T30\.md: CRLF line endings' <<<"$out" \
-  && fail "a scalar-frontmatter CRLF file was told every verb reads it" \
-  || pass "should not claim every verb reads it when the CRLF frontmatter is no mapping"
-expect_line "T31.md: CRLF line endings" \
+  && fail "a scalar-frontmatter CRLF file was told the frontier reads it" \
+  || pass "should not claim the frontier reads it when the CRLF frontmatter is no mapping"
+expect_line "T31.md: CRLF line endings in the frontmatter, delimiters included" \
   "should name CRLF line endings when only the frontmatter after line 1 is CR-terminated"
-expect_line "T32.md: CRLF line endings" \
+expect_line "T32.md: CRLF line endings in the frontmatter, delimiters included" \
   "should name CRLF line endings when only the closing delimiter is CR-terminated"
 grep -q 'T33\.md' <<<"$out" \
   && fail "an all-LF frontmatter over a CRLF body was reported" \
   || pass "should report nothing when the CRLF is in the body and not the frontmatter"
+expect_line "T34.md: CRLF line endings on the frontmatter keys" \
+  "should name the keys when they carry the CR and both --- delimiters are bare"
+grep -q 'T34\.md: CRLF line endings in the frontmatter, delimiters included' <<<"$out" \
+  && fail "a bare-delimiter file was told its delimiters are CR-terminated" \
+  || pass "should not blame the delimiters when the delimiters are bare"
 
 # The cycle: one line, all three members, anchored deterministically.
 cycle_lines=$(grep -c 'blocker cycle' <<<"$out" || true)
@@ -458,15 +473,136 @@ body_cr_after=$(tr -cd '\r' < "$BODY/T1.md" | wc -c)
   && pass "should leave the body's carriage returns alone when --fix stamps the frontmatter" \
   || fail "--fix changed the body CR count $body_cr_before -> $body_cr_after"
 
+# ── a CRLF file is audited in full, and the second pass holds no surprises ───
+echo
+echo "--- CRLF: every other check still runs, and the re-run is a strict subset ---"
+
+# The first cut of this returned as soon as it had classified the endings, so a
+# CRLF file got the CRLF line and NO other check. An operator who did exactly
+# what the line said and converted the endings then met a second, DIFFERENT
+# report — the id mismatch and the dangling blocker had been in the file all
+# along and were suppressed. Advice whose result is a fresh diagnosis is worse
+# than no advice, so both runs are pinned: run one names everything, run two
+# names run one minus the line-endings line and nothing else.
+AUD="$TMPDIR_TEST/audit/tasks"
+mkdir -p "$AUD"
+full_task "$AUD/T40.md" T41 open '[T99]'      # CRLF + wrong id + dangling blocker
+sed -i 's/$/\r/' "$AUD/T40.md"
+
+set +e
+first=$(TASKPUMP_TASKS_DIR="$AUD" "$CLI" fsck 2>/dev/null)
+rc=$?
+set -e
+[[ $rc -eq 3 ]] && pass "should exit 3 for a CRLF file that carries other violations" \
+  || fail "CRLF-plus-violations fsck exited $rc, expected 3"
+if grep -qF "T40.md: CRLF line endings" <<<"$first" \
+   && grep -qF "T40.md: id 'T41' does not match the filename stem 'T40'" <<<"$first" \
+   && grep -qF "T40.md: blocker 'T99' names no task" <<<"$first"; then
+  pass "should report every other violation alongside the CRLF one when a CRLF file also has a wrong id and a dangling blocker"
+else
+  fail "the CRLF file's other violations were suppressed: '$first'"
+fi
+
+sed -i 's/\r$//' "$AUD/T40.md"
+set +e
+second=$(TASKPUMP_TASKS_DIR="$AUD" "$CLI" fsck 2>/dev/null)
+rc=$?
+set -e
+[[ $rc -eq 3 ]] && pass "should still exit 3 once the endings are converted and the rest remains" \
+  || fail "post-conversion fsck exited $rc, expected 3"
+[[ "$second" == "$(grep -v 'CRLF line endings' <<<"$first")" ]] \
+  && pass "should report the same violation set minus the CRLF line when the operator converts the endings and re-runs" \
+  || fail "the re-run was not the first run minus its CRLF line — first: '$first' second: '$second'"
+
+# The two checks that read the file a second time rather than $fm_json — the
+# duplicate-key walk goes back to yq, and the empty-blocker count to jq — are
+# pinned separately: both sit below the endings verdict, and both are exactly
+# what an imported Windows ledger arrives carrying.
+AUD2="$TMPDIR_TEST/audit2/tasks"
+mkdir -p "$AUD2"
+full_task "$AUD2/T45.md" T45 open '[""]'
+sed -i 's/^status: open$/status: open\nstatus: done/' "$AUD2/T45.md"
+sed -i 's/$/\r/' "$AUD2/T45.md"
+set +e
+out=$(TASKPUMP_TASKS_DIR="$AUD2" "$CLI" fsck 2>/dev/null)
+set -e
+grep -qF "T45.md: duplicate key 'status'" <<<"$out" \
+  && grep -qF "T45.md: blockers contains an empty entry" <<<"$out" \
+  && pass "should still name a duplicate key and an empty blocker when the file is CRLF" \
+  || fail "a CRLF file's duplicate key or empty blocker went unreported: '$out'"
+
+# ── the CRLF lines, asserted against what the tools measurably do ────────────
+echo
+echo "--- CRLF: the diagnostic is pinned to measured behaviour, not to phrasing ---"
+
+# Both CRLF lines make claims about OTHER tools, and the claim that got the
+# first cut rejected ("every verb reads it") had never been measured against
+# one. So each clause is driven here: the yq-backed verbs the lines say see the
+# task, and lib/dag-layout.awk — the renderer's parser, and the monitor's GRAPH
+# tab through it — which the lines say loses it.
+MEAS="$TMPDIR_TEST/measured/tasks"
+mkdir -p "$MEAS"
+full_task "$MEAS/T50.md" T50                    # CR everywhere, delimiters included
+sed -i 's/$/\r/' "$MEAS/T50.md"
+full_task "$MEAS/T51.md" T51                    # CR on the keys, delimiters bare
+awk '$0 == "---" { print; next } { printf "%s\r\n", $0 }' \
+  "$MEAS/T51.md" >| "$TMPDIR_TEST/T51.tmp"
+mv "$TMPDIR_TEST/T51.tmp" "$MEAS/T51.md"
+# The downstream task carries its blockers in BLOCK style on purpose: the awk
+# parser reads `blockers:` plus `  - id` lines and a flow list parses as no
+# blockers at all (see write_blockers), so a flow-style fixture would prove
+# nothing about which edges survive.
+full_task "$MEAS/T52.md" T52
+sed -i 's|^blockers: \[\]$|blockers:\n  - T50\n  - T51|' "$MEAS/T52.md"
+
+got=$(TASKPUMP_TASKS_DIR="$MEAS" "$CLI" list --json | jq -r '[.[].id] | sort | join(",")')
+[[ "$got" == "T50,T51,T52" ]] \
+  && pass "should have list --json return both CRLF tasks, as the diagnostic says" \
+  || fail "list --json returned '$got'"
+got=$(TASKPUMP_TASKS_DIR="$MEAS" "$CLI" ready --count-eligible)
+[[ "$got" == "2" ]] \
+  && pass "should have the ready frontier hold both CRLF tasks, as the diagnostic says" \
+  || fail "ready --count-eligible got '$got', expected 2"
+got=$(TASKPUMP_TASKS_DIR="$MEAS" TASKPUMP_TASK_OUT="$TMPDIR_TEST/.next-crlf" \
+      "$CLI" next --branch feat/crlf 2>/dev/null | jq -r .id)
+[[ "$got" == "T50" ]] && pass "should have next dispatch a CRLF task, as the diagnostic says" \
+  || fail "next got '$got', expected T50"
+set +e
+scrub_out=$(TASKPUMP_TASKS_DIR="$MEAS" "$CLI" scrub 2>&1)
+rc=$?
+set -e
+[[ $rc -eq 0 ]] && ! grep -qE 'UNPARSEABLE|NO-ID' <<<"$scrub_out" \
+  && pass "should have scrub call neither CRLF task invisible, as the diagnostic says" \
+  || fail "scrub exited $rc saying: '$scrub_out'"
+
+IDX="$TMPDIR_TEST/dag-index.tsv"
+TASKPUMP_TASKS_DIR="$MEAS" TASKPUMP_PUMP_STATE_FILE="$TMPDIR_TEST/no-such.state" \
+  "$TP_ROOT/libexec/tp-dag-render" --phases T50..T59 --no-color \
+  --index-file "$IDX" >/dev/null 2>&1
+dag_ids=$(cut -f1 "$IDX")
+grep -qxF 'T50' <<<"$dag_ids" \
+  && fail "the DAG drew a task whose --- delimiters are CR-terminated" \
+  || pass "should be absent from the DAG when the CR is on the delimiters, as the diagnostic says"
+grep -qF $'T51\r' <<<"$dag_ids" \
+  && pass "should be drawn under a CR-bearing id when the CR is on the keys, as the diagnostic says" \
+  || fail "the keys-CRLF task's DAG id was not CR-bearing: '$dag_ids'"
+# Field 10 of the node table is the blocker column, `<id>:<status>` with "?" for
+# an id the layout never saw — the edge the graph could not draw.
+edges=$(awk -F'\t' '$1 == "T52" { print $10 }' "$IDX")
+[[ "$edges" == "T50:?|T51:?" ]] \
+  && pass "should drop every edge into a CRLF task, as the diagnostic says" \
+  || fail "T52's DAG blocker column was '$edges', expected both edges unresolved"
+
 # ── fsck and scrub answer for the same file the same way ─────────────────────
 echo
 echo "--- a file scrub calls invisible is never called readable by fsck ---"
 
 # Every file here is invisible to the frontier: CRLF, and frontmatter yq cannot
-# turn into a mapping. scrub has always said so. The CRLF diagnostic asserts the
-# opposite in so many words ("every verb reads it"), so if it can reach these
-# files the two verbs of one CLI give contradictory verdicts — and the one that
-# hides the tool's most important failure class is the wrong one.
+# turn into a mapping. scrub has always said so. Both CRLF diagnostics assert
+# the opposite in so many words ("list/next/ready/scrub see this task"), so if
+# either can reach these files the two verbs of one CLI give contradictory
+# verdicts — and the one that hides the tool's most important failure class is
+# the wrong one.
 CONTRA="$TMPDIR_TEST/contra/tasks"
 mkdir -p "$CONTRA"
 printf -- '---\r\nid: T1\r\ntitle: Imported\r\ngoal: ship it: fast\r\n---\r\n\r\n# T1\r\n' >| "$CONTRA/T1.md"
@@ -484,7 +620,7 @@ visible=$(TASKPUMP_TASKS_DIR="$CONTRA" "$CLI" list --json | jq -r 'length')
 [[ "$(grep -cE '^scrub: (UNPARSEABLE|NO-ID) ' <<<"$scrub_out")" -eq 2 ]] \
   && pass "should have scrub name both files invisible when yq cannot read them" \
   || fail "scrub did not name both files: '$scrub_out'"
-grep -q 'every verb reads it' <<<"$out" \
+grep -q 'see this task' <<<"$out" \
   && fail "fsck called a file readable that scrub calls invisible" \
   || pass "should not call a file readable when scrub calls it invisible"
 

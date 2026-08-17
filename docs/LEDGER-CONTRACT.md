@@ -730,16 +730,34 @@ Checked per file:
   and what lies between them parses as a YAML mapping;
 - the line endings of the **frontmatter block** are LF. The delimiter
   comparison strips a trailing CR first, so a CR-terminated block is reported as
-  **CRLF line endings in the frontmatter** and not as a missing delimiter — it
-  has one. This verdict is reached only after the parse and mapping checks
-  above, because it asserts the file is readable: a CRLF file yq cannot parse is
-  invisible to the frontier, which is what the checks above say and what `scrub`
-  calls UNPARSEABLE, and fsck must not answer that file with a reassurance. What
-  a readable CRLF block does cost is `--fix`, which will not stamp it: `fm_set`
-  writes LF and would convert the rest of the block with it. Convert to LF and
-  re-run, and the second pass stamps it like any other import. The check is the
-  block and its delimiters, not the whole file — a CRLF body is nothing `--fix`
-  writes to, so there is nothing to mix and nothing to report;
+  **CRLF line endings** and not as a missing delimiter — it has one. That
+  verdict is reached only after the parse and mapping checks above, because it
+  asserts the block is readable: a CRLF file yq cannot parse is invisible to the
+  frontier, which is what the checks above say and what `scrub` calls
+  UNPARSEABLE, and fsck must not answer that file with a reassurance. What a
+  readable CRLF block costs is a second reader and a stamp:
+  - every yq-backed read returns the same value it would for an LF file — YAML
+    normalizes CRLF, block scalars included — so `list`, `ready`, `next`,
+    `scrub` and the `fm_get` calls behind them see the task normally;
+  - `lib/dag-layout.awk` — the DAG renderer's parser, and the monitor's GRAPH
+    tab through it — matches its delimiters as `/^---[ \t]*$/` and never strips
+    a CR off a value. A CR on a **delimiter** is therefore a delimiter that
+    parser never counts: it sees no block open and close, and the task is absent
+    from the graph altogether. A CR on the **keys** alone leaves it drawing the
+    task from values that still carry theirs — an id read that way (`T1\r`)
+    matches no other task's blocker, so the node lands detached. The two are
+    separate report lines because they are different damage, though the repair
+    is the same;
+  - `--fix` will not stamp it: `fm_set` writes LF, so stamping one key would
+    convert the whole block's endings with it. Convert to LF and re-run, and
+    that pass stamps it like any other import;
+
+  Withholding the stamp is the **only** thing a CRLF file is spared. Every
+  other check runs on it and every violation it carries is reported in the same
+  run, so converting the endings and re-running turns up nothing the first run
+  had not already named. The check is the block and its delimiters, not the
+  whole file — a CRLF body is nothing `--fix` writes to, so there is nothing to
+  mix and nothing to report;
 - no key appears twice. A YAML mapping with `status: open` above `status: done`
   is legal to the parser and every reader takes the **last** value, so the
   human who reads the file top-down and the tools disagree about what it says —
