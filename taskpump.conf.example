@@ -74,7 +74,8 @@
 # TASKPUMP_LOCK_WAIT=       # seconds to wait for the state lock (default: 120)
 # TASKPUMP_LOCK_NAME=       # the state lockfile's name, created in the ledger's git
 #                           #   root and flock-shared by inode across containers —
-#                           #   every concurrent agent must resolve the same name
+#                           #   every concurrent agent must resolve the same name.
+#                           #   Removed when the verb that took it exits
 #                           #   (default: .taskpump-task.lock)
 # TASKPUMP_COMMITTER_NAME=  # identity for ledger commits (default: tp-task)
 # TASKPUMP_COMMITTER_EMAIL= # (default: task@taskpump.local)

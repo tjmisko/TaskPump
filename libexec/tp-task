@@ -359,22 +359,93 @@ git_commit_state() {
 # closing the claim race and preventing index.lock contention. Held for the
 # lifetime of the process via FD 9 (auto-released on exit). Degrades to a no-op
 # where flock is unavailable (e.g. a stock macOS host).
+#
+# The FILE is removed when the process that took it exits (issue #33): a
+# consumer's first contact with the ledger CLI used to end with an unexplained
+# `?? .taskpump-task.lock` in their tree, and every `git status` after it.
+# Removal is safe only under both halves of a protocol, because a lockfile
+# unlinked carelessly stops being a lock: unlink ONLY while still holding the
+# flock, and ONLY when the path still names the inode this process locked
+# (_tp_lock_is_at_path). Then no holder's file can be unlinked out from under
+# it, and a waiter that inherits a lock on a file which has since left the tree
+# finds out the moment it wakes and re-acquires the file that is really there.
+# Drop either half and two agents hold flocks on two different inodes while
+# both believe they are alone — the claim race this lock exists to close.
+_tp_state_lockfile=""
+
+# True when <path> is the very file fd 9 has open, by device+inode. `-ef` is
+# bash's own same-file test (no stat(1) flavor to get wrong), and
+# /proc/self/fd/9 is how an open file names itself; for a file that has been
+# unlinked the link no longer resolves, so the answer is a truthful "no".
+_tp_lock_is_at_path() {
+  [[ "$1" -ef /proc/self/fd/9 ]]
+}
+
+# Removal is a trap, not a call at the bottom of main(): `create` takes the
+# lock before its exists-check and ends at die() on a duplicate, `fsck --fix`
+# ends at a deliberate exit 3, and neither ever reaches the end of dispatch.
+# A verb killed by a signal still leaves the file; the next verb to take the
+# lock removes it, so the litter is bounded at one file rather than one per run.
+_tp_release_state_lock() {
+  [[ -n "$_tp_state_lockfile" ]] || return 0
+  if _tp_lock_is_at_path "$_tp_state_lockfile"; then
+    rm -f -- "$_tp_state_lockfile" 2>/dev/null || dbg "could not remove $_tp_state_lockfile"
+  fi
+  _tp_state_lockfile=""
+  return 0
+}
+
 acquire_state_lock() {
   [[ "$TASKPUMP_TASK_NOCOMMIT" == "1" ]] && return 0
   command -v flock >/dev/null 2>&1 || { dbg "flock unavailable; no state lock"; return 0; }
-  local root lockfile
+  local root lockfile budget deadline wait_s
   root=$(git -C "$TASKPUMP_TASKS_DIR" rev-parse --show-toplevel 2>/dev/null || echo "")
   lockfile="${root:-/tmp}/$TASKPUMP_LOCK_NAME"
-  # Open fd 9 to the lockfile for the lifetime of the process. The `2>/dev/null`
-  # MUST be scoped to a brace group: `exec 9>… 2>/dev/null` with no command would
-  # apply 2>/dev/null to the *current shell permanently*, silently swallowing all
-  # subsequent stderr (every warning + `die` reason). The brace group restores
-  # fd 2 after the open while leaving fd 9 (set by exec) in place.
-  { exec 9>"$lockfile"; } 2>/dev/null || { dbg "cannot open lockfile $lockfile"; return 0; }
-  if ! flock -w "$TASKPUMP_LOCK_WAIT" 9; then
-    die "could not acquire state lock ($lockfile) within ${TASKPUMP_LOCK_WAIT}s"
-  fi
-  dbg "acquired state lock $lockfile"
+  # ONE budget for the whole acquisition, not one per attempt. Under a real
+  # drain every departing agent removes this file, and each departure wakes the
+  # next waiter onto an inode that has already left the tree — with twelve
+  # agents the unlucky one re-queues once per departure ahead of it, so a fixed
+  # retry count fails them outright (seven of ten, measured). Retrying is
+  # still *waiting for the same lock*, and TASKPUMP_LOCK_WAIT is the wait the
+  # operator was promised, so the retries spend that budget and the timeout
+  # keeps its one diagnostic. The first attempt passes the pin through verbatim
+  # — a fractional or otherwise non-integer pin is flock's to interpret, and is
+  # simply worth no retry budget here.
+  budget=${TASKPUMP_LOCK_WAIT%%.*}
+  [[ "$budget" =~ ^[0-9]+$ ]] || budget=0
+  deadline=$(( SECONDS + budget ))
+  wait_s=$TASKPUMP_LOCK_WAIT
+  while :; do
+    # Open fd 9 to the lockfile for the lifetime of the process. The `2>/dev/null`
+    # MUST be scoped to a brace group: `exec 9>… 2>/dev/null` with no command would
+    # apply 2>/dev/null to the *current shell permanently*, silently swallowing all
+    # subsequent stderr (every warning + `die` reason). The brace group restores
+    # fd 2 after the open while leaving fd 9 (set by exec) in place.
+    { exec 9>"$lockfile"; } 2>/dev/null || { dbg "cannot open lockfile $lockfile"; return 0; }
+    if ! flock -w "$wait_s" 9; then
+      die "could not acquire state lock ($lockfile) within ${TASKPUMP_LOCK_WAIT}s"
+    fi
+    # Where an open file cannot be named there is no way to prove the identity
+    # removal depends on, so hold the lock and keep the file — the pre-#33
+    # behavior, litter included. A cleanup that cannot prove what it is
+    # deleting is worse than the mess it tidies.
+    if [[ ! -d /proc/self/fd ]]; then
+      dbg "acquired state lock $lockfile (kept: cannot name an open file here)"
+      return 0
+    fi
+    if _tp_lock_is_at_path "$lockfile"; then
+      _tp_state_lockfile=$lockfile
+      trap _tp_release_state_lock EXIT
+      dbg "acquired state lock $lockfile"
+      return 0
+    fi
+    # We were waiting on a file the holder ahead of us unlinked as it left. The
+    # flock we now hold is on an inode nothing else will ever open, so it
+    # excludes nobody: take the file that is actually at the path instead.
+    wait_s=$(( deadline - SECONDS ))
+    (( wait_s > 0 )) || die "could not acquire state lock ($lockfile) within ${TASKPUMP_LOCK_WAIT}s"
+    dbg "state lockfile $lockfile was replaced while we waited; re-acquiring (${wait_s}s left)"
+  done
 }
 
 # ── Subcommands ───────────────────────────────────────────────────────────────
@@ -2997,7 +3068,8 @@ Config (env or taskpump.conf; the legacy ARACHNE_* spelling of each still works)
     TASKPUMP_CLAIM_STALE_HOURS   heartbeat staleness threshold     (default: 24)
     TASKPUMP_LOCK_WAIT      seconds to wait for the state lock    (default: 120)
     TASKPUMP_LOCK_NAME      the state lockfile's name, created in the ledger's
-                              git root         (default: .taskpump-task.lock)
+                              git root and removed when the verb that took it
+                              exits             (default: .taskpump-task.lock)
   Misc
     TASKPUMP_TASK_NOCOMMIT=1  skip commits and the state lock (fixture mode)
     TASKPUMP_TASK_DEBUG=1     print debug traces
