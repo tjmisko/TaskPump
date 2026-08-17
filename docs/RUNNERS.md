@@ -257,7 +257,12 @@ choices until they bite:
   to resolve. An entry that records *no* workspace — written by an older runner,
   or by a caller that named none — cannot be proven foreign and stays visible to
   everybody, because hiding an agent that IS the caller's is how a live agent
-  gets launched twice.
+  gets launched twice. Removing a line goes by `(name, pgid)` for the same
+  reason: a delete that matched on the name alone would unregister the other
+  workspace's *running* agent, which hides it just as thoroughly. And a `stop`
+  handed a name it cannot attribute — two entries match, none of them this
+  workspace's — is §1.2's ambiguous case and exits non-zero naming both, rather
+  than signalling whichever the file lists first.
 
 `list` prunes what it walks, so the registry holds the live set and does not
 accumulate. `launch` refuses to start a second agent under a live name — the one

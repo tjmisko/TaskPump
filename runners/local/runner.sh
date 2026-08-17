@@ -103,6 +103,13 @@
 # would then launch a second one on the same worktree, which is the destructive
 # half of the same bug. So an entry that records no workspace (written before
 # this field existed) cannot be proven foreign, and stays visible to everybody.
+#
+# Two consequences of one name now covering two agents, and both are the same
+# rule read from different ends. Removing a line goes by (name, pgid) and never
+# by name alone, because a name-matching delete would unregister an agent that is
+# still running — hiding it exactly as above. And a `stop` that cannot attribute
+# the name it was given refuses (§1.2's ambiguous case) instead of signalling
+# whichever entry the file happens to list first.
 
 set -euo pipefail
 
@@ -231,10 +238,44 @@ alive() {
 # this question.
 reg_pgid() {
   [[ -f "$REG" ]] || return 0
-  local n p root
+  local n p root inherited=""
   while read -r n p root; do
-    [[ "$n" == "$1" ]] && in_scope "$root" && { printf '%s' "$p"; return 0; }
+    [[ "$n" == "$1" ]] || continue
+    # An entry that names OUR workspace outranks one that names none, wherever
+    # they sit in the file. Taking the first match instead lets a legacy line —
+    # another project's, written before this field existed — answer for our
+    # agent: stop would signal that project's process and leave ours running,
+    # and launch would read its long-dead pgid and start a second agent on our
+    # worktree. Order in a file nobody sorts is not evidence of ownership.
+    [[ -n "$SCOPE" && "$root" == "$SCOPE" ]] && { printf '%s' "$p"; return 0; }
+    in_scope "$root" || continue
+    [[ -n "$inherited" ]] || inherited="$p"
   done < "$REG"
+  printf '%s' "$inherited"
+}
+
+# reg_ambiguous <name> — the entries this invocation could mean, listed for a
+# human, and printed ONLY when there is more than one and none of them is
+# provably ours. §1.2 makes an ambiguous name a non-zero exit rather than a
+# silent guess, and two workspaces holding one name is precisely the state the
+# workspace field exists to survive: a teardown that picked by file order would
+# stop one live agent, report success for the name, and leave the other running.
+reg_ambiguous() {
+  [[ -f "$REG" ]] || return 0
+  local n p root count=0 list=""
+  while read -r n p root; do
+    [[ "$n" == "$1" ]] || continue
+    [[ -n "$SCOPE" && "$root" == "$SCOPE" ]] && return 0
+    in_scope "$root" || continue
+    count=$((count + 1))
+    [[ -z "$list" ]] || list="$list, "
+    if [[ -n "$root" ]]; then
+      list="${list}pgid $p in $root"
+    else
+      list="${list}pgid $p with no workspace recorded"
+    fi
+  done < "$REG"
+  (( count > 1 )) && printf '%s' "$list"
   return 0
 }
 
@@ -261,33 +302,37 @@ reg_write() {
   mv -f "$tmp" "$REG"
 }
 
-# reg_drop <name> — remove this workspace's entry of that name. Another
-# project's line of the same name is copied through untouched, field for field.
-reg_drop() {
+# reg_without <name> <pgid> — the registry on stdout, minus the ONE entry that
+# is exactly that name at exactly that pgid. Every removal here goes by identity
+# and never by name alone: two workspaces may hold one name, so a name-matching
+# delete unregisters an agent that is still running, and an agent that runs
+# unrecorded is one the supervisor launches a second time — the destructive half
+# of issue #40, arrived at from the other side. A caller that has no pgid to name
+# (nothing was recorded) removes nothing.
+reg_without() {
   [[ -f "$REG" ]] || return 0
-  local name="$1" n p root
-  { while read -r n p root; do
-      [[ -z "$n" ]] && continue
-      [[ "$n" == "$name" ]] && in_scope "$root" && continue
-      reg_line "$n" "$p" "$root"
-    done < "$REG"
-  } | reg_write
+  local name="$1" pgid="${2:-}" n p root
+  while read -r n p root; do
+    [[ -z "$n" ]] && continue
+    [[ "$n" == "$name" && -n "$pgid" && "$p" == "$pgid" ]] && continue
+    reg_line "$n" "$p" "$root"
+  done < "$REG"
 }
 
-# reg_put <name> <pgid> — record an entry against this workspace, replacing any
-# stale one of that name HERE. Two projects may hold the same name at once; that
-# is the collision this field exists to survive, not one to resolve.
+# reg_drop <name> <pgid> — remove the entry stop just dealt with. Any other
+# line, this workspace's or another project's, is copied through untouched,
+# field for field.
+reg_drop() {
+  [[ -f "$REG" ]] || return 0
+  reg_without "$1" "$2" | reg_write
+}
+
+# reg_put <name> <pgid> [stale-pgid] — record an entry against this workspace,
+# retiring the stale one launch found and judged dead. Two projects may hold the
+# same name at once; that is the collision this field exists to survive, not one
+# to resolve.
 reg_put() {
-  local name="$1" pgid="$2" n p root
-  { if [[ -f "$REG" ]]; then
-      while read -r n p root; do
-        [[ -z "$n" ]] && continue
-        [[ "$n" == "$name" ]] && in_scope "$root" && continue
-        reg_line "$n" "$p" "$root"
-      done < "$REG"
-    fi
-    reg_line "$name" "$pgid" "$SCOPE"
-  } | reg_write
+  { reg_without "$1" "${3:-}"; reg_line "$1" "$2" "$SCOPE"; } | reg_write
 }
 
 usage() {
@@ -383,7 +428,9 @@ do_launch() {
   [[ -n "$pgid" ]] || die "the agent did not start within 5s (see $log)"
 
   reg_lock
-  reg_put "$name" "$pgid"
+  # `$existing` is the entry the duplicate check found and proved dead (empty
+  # when there was none), and it is the only line this launch may retire.
+  reg_put "$name" "$pgid" "$existing"
   reg_unlock
 
   # The handle is the NAME, not the pid: it is what the pump already knows the
@@ -396,6 +443,15 @@ do_stop() {
   [[ -n "$name" ]] || die "TP_CONTAINER_NAME is required"
 
   reg_init
+
+  # §1.2's third condition, and the only one this runner can now meet: the name
+  # is AMBIGUOUS. Nothing but file order separates two entries this invocation
+  # cannot attribute, so signalling one of them would kill an agent chosen at
+  # random and report success for the name the other one still answers to.
+  local clash; clash="$(reg_ambiguous "$name")"
+  [[ -z "$clash" ]] \
+    || die "the name $name is recorded against more than one agent ($clash); this invocation cannot tell which one it means, and signalling one by file order could kill another workspace's agent"
+
   local pgid; pgid="$(reg_pgid "$name")"
 
   # A name this workspace does not hold, but another one does. Signalling it
@@ -423,7 +479,7 @@ do_stop() {
   fi
   if ! alive "$pgid"; then
     warn "agent $name (pgid $pgid) has already exited"
-    reg_lock; reg_drop "$name"; reg_unlock
+    reg_lock; reg_drop "$name" "$pgid"; reg_unlock
     printf '%s\n' "$name"
     return 0
   fi
@@ -450,7 +506,7 @@ do_stop() {
     die "agent $name (pgid $pgid) survived TERM and KILL"
   fi
 
-  reg_lock; reg_drop "$name"; reg_unlock
+  reg_lock; reg_drop "$name" "$pgid"; reg_unlock
   printf '%s\n' "$name"
 }
 

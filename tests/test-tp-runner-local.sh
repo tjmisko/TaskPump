@@ -37,6 +37,13 @@ RUNNER="$TP_ROOT/runners/local/runner.sh"
 # shellcheck source=tests/suite-prologue.sh
 . "$SCRIPT_DIR/suite-prologue.sh"
 
+# The prologue scrubs by namespace, and this is the one control input the runner
+# reads under a bare name: TP_REPO_ROOT's legacy twin decides which fleet `list`
+# and `stop` answer for, so an inherited REPO_ROOT — every pump-launched agent
+# session exports one — would silently scope the sections below that mean to run
+# unscoped.
+unset REPO_ROOT
+
 WORK=$(mktemp -d)
 cleanup() {
   # Never leave a stub agent behind, whatever the suite did. Both registries:
@@ -351,6 +358,86 @@ out=$(list_for "$WT_B")
 
 stop_for "$WT_A" tp-agent-feat-legacy >/dev/null 2>&1
 stop_for "$WT_A" "$SHARED" >/dev/null 2>&1
+
+echo "--- a name two workspaces hold is a name no unscoped caller can act on ---"
+# The other end of the same identity rule. Once two live agents share a name, an
+# invocation that names no workspace cannot say which one it means — and the two
+# ways of guessing are both destructive: signalling by file order kills whichever
+# project was written first, and dropping the entries by NAME unregisters the
+# survivor, which is how a running agent goes invisible and gets launched a
+# second time on its own worktree. §1.2 already answers this: an ambiguous name
+# is a non-zero exit, not a silent guess.
+
+launch_for "$WT_A" "$SHARED" 'sleep 60' >/dev/null
+launch_for "$WT_B" "$SHARED" 'sleep 60' >/dev/null
+PG_SHARED_A=$(pgid_for "$WT_A" "$SHARED")
+PG_SHARED_B=$(pgid_for "$WT_B" "$SHARED")
+
+err=$(env -u REPO_ROOT TP_CONTAINER_NAME="$SHARED" bash "$RUNNER" stop 2>&1 >/dev/null); rc=$?
+[[ $rc -ne 0 ]] \
+  && pass "should refuse when a stop names an agent two workspaces hold and no workspace of its own" \
+  || fail "an unscoped stop picked one of two agents by file order (rc=$rc):\n$err"
+grep -q "$WT_A" <<<"$err" && grep -q "$WT_B" <<<"$err" \
+  && pass "should name both holders of the name when it refuses an ambiguous stop" \
+  || fail "the refusal named neither workspace it could not choose between:\n$err"
+group_alive "$PG_SHARED_A" && group_alive "$PG_SHARED_B" \
+  && pass "should signal neither agent when it refuses an ambiguous stop" \
+  || fail "the refused stop killed something (a=$PG_SHARED_A b=$PG_SHARED_B)"
+
+# The registry is the half that goes wrong quietly: an entry dropped for a live
+# agent takes it out of `list`, and the supervisor launches over it.
+out=$(list_for "$WT_A"); out2=$(list_for "$WT_B")
+[[ "$out" == *"$SHARED"* && "$out2" == *"$SHARED"* ]] \
+  && pass "should leave both workspaces' entries recorded when it refuses an ambiguous stop" \
+  || fail "an entry was dropped for a live agent (a='$out' b='$out2'):\n$(cat "$TASKPUMP_LOCAL_REGISTRY")"
+
+# The scoped caller is never ambiguous: it can prove which entry is its own.
+out=$(stop_for "$WT_B" "$SHARED" 2>&1); rc=$?
+[[ $rc -eq 0 ]] \
+  && pass "should still stop its own agent when the caller names the workspace that holds it" \
+  || fail "a scoped stop was refused as ambiguous (rc=$rc):\n$out"
+out=$(list_for "$WT_A")
+[[ "$out" == *"$SHARED"* ]] \
+  && pass "should keep the other workspace's entry when a scoped stop removes its own" \
+  || fail "repo A's live entry went with repo B's teardown: '$out'"
+
+# And with one holder left the name is unambiguous again, so the pre-scope
+# invocation — no workspace anywhere — works exactly as it always did.
+out=$(env -u REPO_ROOT TP_CONTAINER_NAME="$SHARED" bash "$RUNNER" stop 2>&1); rc=$?
+[[ $rc -eq 0 ]] \
+  && pass "should stop the only agent of that name when an unscoped caller asks" \
+  || fail "an unscoped stop failed on an unambiguous name (rc=$rc):\n$out"
+wait_gone "$PG_SHARED_A"
+group_alive "$PG_SHARED_A" \
+  && fail "the unscoped stop reported success without stopping pgid $PG_SHARED_A" \
+  || pass "should have actually torn the agent down when it reports success"
+
+# An entry that records no workspace is visible to everybody (above), but it is
+# not evidence about anybody: our own entry outranks it however the file is
+# ordered. The state is what a mixed-version fleet leaves behind — an older
+# runner still writing two-field lines beside ours — so the fixture builds it the
+# way the older runner would, by taking the field back off an entry that already
+# exists. Ordered first, which is the order that lets it answer for us.
+ORDER=tp-agent-feat-order
+launch_for "$WT_A" "$ORDER" 'sleep 60' >/dev/null
+launch_for "$WT_B" "$ORDER" 'sleep 60' >/dev/null
+PG_ORDER_A=$(pgid_for "$WT_A" "$ORDER")
+PG_ORDER_B=$(pgid_for "$WT_B" "$ORDER")
+[[ -n "$PG_ORDER_A" && -n "$PG_ORDER_B" ]] \
+  || fail "the fixture did not get two entries for $ORDER (a=$PG_ORDER_A b=$PG_ORDER_B):\n$(cat "$TASKPUMP_LOCAL_REGISTRY")"
+sed -i "s|^$ORDER $PG_ORDER_A .*$|$ORDER $PG_ORDER_A|" "$TASKPUMP_LOCAL_REGISTRY"
+
+stop_for "$WT_B" "$ORDER" >/dev/null 2>&1
+wait_gone "$PG_ORDER_B"
+group_alive "$PG_ORDER_B" \
+  && fail "repo B's stop signalled the unscoped entry instead of its own (pgid $PG_ORDER_B)" \
+  || pass "should stop its own agent when an entry recording no workspace is listed first"
+group_alive "$PG_ORDER_A" \
+  && pass "should leave the unscoped entry's agent running when a scoped stop passes it over" \
+  || fail "repo B's stop killed the agent behind the unscoped entry (pgid $PG_ORDER_A)"
+
+env -u REPO_ROOT TP_CONTAINER_NAME="$ORDER" bash "$RUNNER" stop >/dev/null 2>&1
+wait_gone "$PG_ORDER_A"
 
 echo "--- the contract this runner claims ---"
 
