@@ -348,7 +348,9 @@ tp-pump: refusing to run against the TaskPump installation itself.
 `$PWD` proves nothing; a pin naming a missing directory is a loud error, never a
 fallback. Ledger verbs read the same pin, so `tp task ready --count` in that
 shell counts the pinned project's frontier instead of answering `0` from the
-install's own ledger — one pin, one workspace, both tools. Naming
+install's own ledger — one pin, one workspace, `tp pump` and `tp task` alike.
+It outranks `$PWD`, so in a pinned shell a claim made from inside a worktree
+lands in the pinned workspace's ledger; that is the trade a pin buys. Naming
 `TASKPUMP_TASKS_DIR` outright still wins over it, in both.
 
 ### 6. One supervised tick
