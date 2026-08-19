@@ -272,8 +272,10 @@
 #                           #   before the feed gate, so a paused run keeps freeing space.
 #                           #   The pressure-driven one is TASKPUMP_PANIC_RECLAIM below.
 # TASKPUMP_GATES=           # ordered, newline-separated list of gate COMMAND LINES —
-#                           #   each entry's first word must be an executable path; a
-#                           #   non-executable entry is skipped with a warning.
+#                           #   each entry's first word must be the path to an executable
+#                           #   FILE; an entry that is not (a bare name, a comma list, a
+#                           #   directory, an unresolvable relative path) refuses the run
+#                           #   at startup rather than being skipped with a warning.
 #                           #   (default: gates/claude-token-fresh, `<usage bin> --gate`,
 #                           #   gates/disk-low — each included only while its own
 #                           #   enable flag is 1; gates/net-health joins first when
@@ -342,6 +344,8 @@
 #                           #   suppresses the background disk watchdog, which is
 #                           #   guarded on the same switch — exactly what
 #                           #   --no-disk-gate does, standingly rather than per run.
+#                           #   0 or 1 only: tp-pump refuses any other value by name,
+#                           #   because every gate reads this key as a number.
 # TASKPUMP_DISK_WATCHDOG=   # path to the watchdog the gate consults
 #                           #   (default: <install>/libexec/tp-disk-watchdog)
 # The floor itself is TASKPUMP_DISK_PAUSE_GB, under the watchdog section below.
@@ -352,6 +356,7 @@
 #                           #   gate as 0, so an entry kept in a custom TASKPUMP_GATES
 #                           #   disables itself too. --no-usage-gate is the same
 #                           #   instruction for one run, and wins over the key.
+#                           #   0 or 1 only, as TASKPUMP_DISK_GATE above.
 # TASKPUMP_USAGE=           # path to the usage-gate binary
 #                           #   (default: <install>/gates/claude-usage)
 # TASKPUMP_USAGE_CEILING=   # utilization percent at which to pause launching (default: 95)

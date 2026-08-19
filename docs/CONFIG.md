@@ -495,9 +495,12 @@ toolchain:
 | `TASKPUMP_NOTIFY_CMD` | `tp pump` | unset ⇒ `notify-send <prog-name> <message>` wherever notify-send is on PATH | The command that delivers notifications, which it receives on **stdin** — see the recipes below. Unset, the pump falls back to `notify-send <prog-name> <message>` wherever notify-send is on PATH. Set it to `true` to silence them; every message is logged either way. |
 
 `TASKPUMP_GATES` and `TASKPUMP_PRE_TICK_HOOKS` are both **newline-separated
-command lines**, and each entry's first word must be an executable path. A bare
-gate name, or a comma-separated list, is skipped with a warning rather than run —
-which reads as "the gate passed".
+command lines**, and each entry's first word must be the path to an executable
+file. A bare name, a comma-separated list, an unresolvable relative path or a
+directory **refuses the run** at startup — exit 1, before any mode, naming the
+entry and the key it came from. It used to be skipped with a warning and then
+reported as `GATE: feed-ok`, which reads as "the gate passed"
+([GATES.md §1.0](GATES.md#10-how-taskpump_gates-is-spelled-and-how-it-fails)).
 
 **The unset `TASKPUMP_BUILD_GATE` runs `cargo`.** `run_build_gate` in
 `libexec/tp-pump` uses a configured command *instead of* its default, not in
@@ -673,7 +676,7 @@ container the shipped runner starts.
 | Key | Read by | Default | What it configures |
 |---|---|---|---|
 | `TASKPUMP_GATES` | `tp pump` | `gates/claude-token-fresh`, `<usage bin> --gate`, `gates/disk-low` — plus `gates/net-health` at the head when `TASKPUMP_HEALTH_GATE=1` | The ordered gate list. A configured value replaces the chain outright and is used verbatim. |
-| `TASKPUMP_USAGE_GATE` | `tp pump`, `gates/claude-usage` | `1` | Whether the usage gate is in the default chain and answers. `0` drops `<usage bin> --gate` from the chain and reaches the gate as `0`, so a `claude-usage` entry kept in a custom `TASKPUMP_GATES` disables itself too. `--no-usage-gate` forces `0` for one run. |
+| `TASKPUMP_USAGE_GATE` | `tp pump`, `gates/claude-usage` | `1` | Whether the usage gate is in the default chain and answers. `0` drops `<usage bin> --gate` from the chain and reaches the gate as `0`, so a `claude-usage` entry kept in a custom `TASKPUMP_GATES` disables itself too. `--no-usage-gate` forces `0` for one run. `0` or `1` only — any other value is refused by name at startup. |
 | `TASKPUMP_USAGE` | `tp pump`, `tp monitor` | `<install>/gates/claude-usage` | The binary that answers the usage question. |
 | `TASKPUMP_USAGE_CEILING` | `tp pump`, `gates/claude-usage` | `95` | The utilization percent at which launching pauses. `--usage-ceiling` overrides for a run. |
 | `TASKPUMP_USAGE_ENDPOINT` | `gates/claude-usage` | `https://api.anthropic.com/api/oauth/usage` | The OAuth usage endpoint. |
@@ -684,11 +687,11 @@ container the shipped runner starts.
 | `TASKPUMP_USAGE_DEBUG` | `gates/claude-usage` | `0` | `1` traces the probe to stderr. |
 | `TASKPUMP_TOKEN_GATE` | `lib/pump-lib.sh` (`gates/claude-token-fresh`) | `1` | `0` makes the credential-freshness gate answer feed-ok without looking. The pump does not export this one, so it works. |
 | `TASKPUMP_TOKEN_MARGIN_S` | `lib/pump-lib.sh` | `600` | Seconds of token TTL headroom the gate wants. |
-| `TASKPUMP_HEALTH_GATE` | `tp pump`, `gates/net-health` | `0` under the pump; `1` when the gate is run standalone | Whether the host-health gate runs. It ships off: `1` puts it at the head of the default chain. A `net-health` entry in a custom `TASKPUMP_GATES` still needs this key to probe. |
+| `TASKPUMP_HEALTH_GATE` | `tp pump`, `gates/net-health` | `0` under the pump; `1` when the gate is run standalone | Whether the host-health gate runs. It ships off: `1` puts it at the head of the default chain. A `net-health` entry in a custom `TASKPUMP_GATES` still needs this key to probe. `0` or `1` only — any other value is refused by name at startup. |
 | `TASKPUMP_HEALTH_WINDOW` | `tp pump`, `gates/net-health` | `120` | How many seconds back the gate looks. |
 | `TASKPUMP_HEALTH_PROBE_CMD` | `lib/pump-lib.sh` | empty ⇒ `journalctl -k -b 0 --since '<window> sec ago'` | The command whose output is searched. |
 | `TASKPUMP_HEALTH_SIGNATURES` | `lib/pump-lib.sh` | `Failed to alloc SKB\|Firmware reported general error\|Timeout on response for query command` | The failure signatures it matches. The shipped set is one machine's WiFi firmware; a consumer enabling the gate on other hardware replaces them. |
-| `TASKPUMP_DISK_GATE` | `tp pump`, `lib/pump-lib.sh`, `gates/disk-low` | `1` | Whether the low-disk gate is in the default chain and answers. Its floor is `TASKPUMP_DISK_PAUSE_GB`, shared with the watchdog (§3.7). `0` also suppresses the auto-started disk watchdog, exactly as `--no-disk-gate` does — the spawn is guarded on the same switch. |
+| `TASKPUMP_DISK_GATE` | `tp pump`, `lib/pump-lib.sh`, `gates/disk-low` | `1` | Whether the low-disk gate is in the default chain and answers. Its floor is `TASKPUMP_DISK_PAUSE_GB`, shared with the watchdog (§3.7). `0` also suppresses the auto-started disk watchdog, exactly as `--no-disk-gate` does — the spawn is guarded on the same switch. `0` or `1` only — any other value is refused by name at startup. |
 | `TASKPUMP_DISK_WATCHDOG` | `tp pump`, `gates/disk-low`, `lib/pump-lib.sh` | `<install>/libexec/tp-disk-watchdog` | The watchdog binary the gate asks for the free-space answer. |
 
 **All four enable-flags mean the same thing under `tp pump` and standalone.**
@@ -704,6 +707,22 @@ a standing preference, the flag is about one run, and the flag wins when both
 are given. One consequence worth knowing: `TASKPUMP_DISK_GATE=0` now also
 suppresses the auto-started disk watchdog, because that spawn is guarded on the
 same switch ([PUMP-MECHANISMS.md §3](PUMP-MECHANISMS.md#3-budget-gated-launching-that-never-kills-in-flight-work)).
+
+**And the vocabulary is `0` or `1`, checked.** All three switches the pump reads
+— `TASKPUMP_HEALTH_GATE`, `TASKPUMP_USAGE_GATE`, `TASKPUMP_DISK_GATE` — are
+numeric, because every consumer of them in the tree tests them arithmetically
+(`gates/disk-low`, `gates/claude-usage`, `lib/pump-lib.sh`). There is no word
+form: `TASKPUMP_USAGE_GATE=false` is `tp pump: TASKPUMP_USAGE_GATE must be 0 or 1
+(got 'false')` and exit 1, before any mode. Empty or unset means the default. The
+check reads the environment rather than the value after flags, so
+`--no-usage-gate` does not paper over a key that would be unreadable on the next
+run without it. The reason it is a refusal and not a shrug: an unreadable switch
+used to reach a `[[ … -eq 1 ]]` test, where under `set -u` it either killed the
+run with a raw bash trace or — inside the command substitution that assembles
+the chain — killed only that subshell, silently truncating the gate list and
+leaving the run to report `GATE: feed-ok` over gates nobody turned off. The pump
+now compares its own three as strings as well, so the refusal is the diagnosis
+rather than the only thing standing between a typo and that.
 
 ### 3.5 Monitor — `tp monitor`
 

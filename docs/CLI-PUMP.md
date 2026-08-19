@@ -37,7 +37,7 @@ actually accepts — which is not uniform, and the irregularity has teeth (§1.1
 | `--no-health-gate` | no value | Drops `net-health` from the default chain and exports `TASKPUMP_HEALTH_GATE=0`. |
 | `--no-usage-gate` | no value | Drops `claude-usage --gate` from the default chain and exports `TASKPUMP_USAGE_GATE=0`. `TASKPUMP_USAGE_GATE=0` in the environment or a conf does the same thing standingly; the flag wins when both are given. |
 | `--no-disk-gate` | no value | Drops `disk-low` from the default chain **and** suppresses the auto-started disk watchdog (§9). `TASKPUMP_DISK_GATE=0` does the same thing standingly, watchdog included — it is the same switch. |
-| `--dry-run` | no value | Print the gate chain and the plan; launch nothing; exit 0. |
+| `--dry-run` | no value | Print the gate chain and the plan; launch nothing; exit 0 — or exit 1 on any of the misconfigurations §6 lists, the gate and hook chains included, because the mode you confirm a chain in has to be able to say no. |
 | `--list` | no value | Print the plan only; exit 0. |
 | `--once` | no value | Run one real tick, stamp `stopped`, exit 0. |
 | `--render-brief <unit>` | space or `=` | Debug: render the brief for one unit to stdout, exit 0. |
@@ -206,7 +206,7 @@ The pump is also a consumer of the protocol, and these are the ones it reads:
 | any gate | `10` | Pause launching. The gate's combined output becomes the pause reason (first `10` short-circuits the chain). |
 | any gate | `0` with output | **Fed, but collected as a note.** Surfaced only by `print_plan`, indented under the `GATE:` line — never in the tick log, because a persistent condition would print every tick for days. |
 | any gate | anything else | Fail open: warn, feed anyway. |
-| a non-executable gate | — | Skipped with a warning. |
+| a gate that is no longer executable | — | Skipped with a warning, **mid-drain only** — an entry that was already unrunnable at startup refused the run (§6), so this is a gate deleted or un-`chmod`'d while the drain was in flight. The warning on stderr is the whole disclosure: a real run prints no `GATE:` line to hang a note under. |
 | `tp task resume-attempt` | `10` | The no-progress budget is spent: escalate to `needs-review` and notify once. |
 | `tp task scrub` | `3` | Re-emit each `UNPARSEABLE`/`NO-ID` line as `ledger integrity: …`. Any other non-zero scrub status is a flat `scrub failed (continuing)`. |
 | the liveness source | `75` | Degraded enumeration. One warning per tick, and the two **absence-driven** passes (orphan reclaim, stall detection) are skipped for that tick. |
@@ -431,8 +431,9 @@ All of these are exit 1, and all of them fire before any launch:
 | `bad phase range '<x>'` | The spec is expanded and validated **in the main shell**, up front. Every later consumer reads the expander through a process substitution, where `die` would kill only the subshell — a malformed range would be reported and then ignored, leaving the pump to idle green against an empty phase list. |
 | a branch-prefix whose slug cannot round-trip | The agent name is the branch with `/` → `-`, and liveness is read back out of those names. Checked once at tick zero, because the prefix is a property of the configuration, not of any one launch. |
 | a unit-name collision at `--grain task` | `validate_unit_names` runs before **every** mode, `--dry-run` included: a plan showing two tasks launching onto one agent name is a wrong plan, and finding that out at launch time is too late. |
-| `gate entry is not an executable path: <x>` | Every entry of the gate chain in force is checked before any mode, `--dry-run` included. An entry that cannot run used to be skipped with one warning and then reported as `GATE: feed-ok` for the rest of the run — a gate the operator configured, believes in, and does not have ([GATES.md §1.0](GATES.md#10-how-taskpump_gates-is-spelled-and-how-it-fails)). |
-| `pre-tick hook entry is not an executable path: <x>` | The same check on `TASKPUMP_PRE_TICK_HOOKS`, where the same typo silently disables `fs-guard`. |
+| `gate entry is not an executable file: <x>` | Every entry of the gate chain in force is checked before any mode, `--dry-run` included: each line's first word must be a regular file with the execute bit (a directory passes `-x` and is refused too). An entry that cannot run used to be skipped with one warning and then reported as `GATE: feed-ok` for the rest of the run — a gate the operator configured, believes in, and does not have ([GATES.md §1.0](GATES.md#10-how-taskpump_gates-is-spelled-and-how-it-fails)). The refusal names the key that produced the entry, which is not always the chain: the default chain's usage entry comes from `TASKPUMP_USAGE`. |
+| `pre-tick hook entry is not an executable file: <x>` | The same check on `TASKPUMP_PRE_TICK_HOOKS`, where the same typo silently disables `fs-guard`. |
+| `TASKPUMP_<X>_GATE must be 0 or 1 (got '<v>')` | The three gate enable switches are numeric keys — every gate in the tree tests them arithmetically — so `false`, `no` and `off` are refused by name rather than read. Checked against the environment, so passing the matching `--no-*-gate` flag does not hide an unreadable key. |
 | no `~/.claude`, no `TASKPUMP_IMAGE`, no executable runner | Launch prerequisites. Skipped entirely under `TASKPUMP_PUMP_NO_LAUNCH=1` and never checked by `--dry-run`/`--list`, so a read-only plan works on a host with none of them. |
 | a missing brief template | Checked for the render modes and for real runs. |
 
@@ -459,8 +460,11 @@ gates: claude-token-fresh -> claude-usage -> disk-low
 
 Basenames only — a custom entry's arguments do not show, so `claude-usage --gate`
 and `claude-usage --gate --ceiling 50` print identically. Every entry on that
-line resolved to an executable, because a chain containing one that did not
-would have refused the run before printing anything (§6).
+line resolved to an executable *file*, because a chain containing one that did
+not would have refused the run before printing anything (§6). One name per
+**line** of the chain, though, and only each line's first word is checked — two
+gates written on one line are one entry, and the line shows the first of them
+([GATES.md §1.0](GATES.md#10-how-taskpump_gates-is-spelled-and-how-it-fails)).
 
 **What every gate sees.** The pump exports a fixed set before running the chain,
 not "its configuration" wholesale: `TASKPUMP_HEALTH_GATE`, `TASKPUMP_USAGE_GATE`,
@@ -478,9 +482,11 @@ Everything else a gate wants, it discovers for itself the way any tool does.
 default chain is `hooks/gitignore-repair` then `hooks/fs-guard`;
 `TASKPUMP_PRE_TICK_HOOKS` replaces it. Each entry is a command line. For each:
 
-- a non-executable entry **refuses the run** at startup, before any mode (§6) —
-  the same rule the gate chain is held to, and for the same reason: a hook that
-  is skipped is indistinguishable from a hook that ran and found nothing;
+- an entry whose first word is not an executable file **refuses the run** at
+  startup, before any mode (§6) — the same rule the gate chain is held to, and
+  for the same reason: a hook that is skipped is indistinguishable from a hook
+  that ran and found nothing. A hook that stops being executable *mid*-drain is
+  skipped with one warning per tick instead, as a gate is;
 - the workspace root is **appended** to whatever words the entry itself carries,
   and `TP_REPO_ROOT` is exported alongside. A bare `hooks/fs-guard` therefore
   reads the root as `$1`; an entry written `myhook --strict` reads it as `$2`;
@@ -737,12 +743,21 @@ prose puts them:
 
 The counter in step 10 reads the **outcome** of steps 9, not the plan from step
 6: a tick that ends with no live agent and nothing started is an idle tick,
-whatever the cause — an empty frontier, a pool cap of 0, or N launches that all
-failed. It records why, and `stall_exit` quotes that back (`the pool cap is 0,
-so N launchable unit(s) were never started`; `every launch attempt failed — N
-unit(s) planned, none started; last: <the last refusal>`), because "nothing
-launchable" said over a plan that was full is a page pointing at the wrong thing.
-Anything that starts, and any live agent, resets it to zero.
+whatever the cause — an empty frontier, a pool cap of 0, N launches that all
+failed, or N units refused before any launch was attempted. It records which,
+and `stall_exit` quotes that back:
+
+- `nothing launchable, nothing resumable`
+- `the pool cap is 0, so N launchable unit(s) were never started`
+- `every launch attempt failed — N unit(s) planned, none started; last: <the
+  last refusal>` — at least one launch was attempted, and all of them failed
+- `N unit(s) planned, none started; last: <the last refusal>` — nothing started
+  and no launch was attempted, which is what a resume the budget retired looks
+  like: it escalates to `needs-review` and pages without reaching the launcher
+
+"Nothing launchable" said over a plan that was full is a page pointing at the
+wrong thing, and so is "every launch attempt failed" over a tick that attempted
+none. Anything that starts, and any live agent, resets the counter to zero.
 
 Then, outside the tick: `is_drained` (three questions — no open task, no
 in-flight claim, no live agent) breaks the loop; otherwise `STALL_TICKS >=

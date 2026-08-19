@@ -719,7 +719,10 @@ lose:
 > implement it. **For a consumer writing code against TaskPump today, the tools
 > are authoritative and this note is what to key on**; the frozen table states
 > the intended protocol, and reconciling the two is a behaviour change, which a
-> PATCH release may not make. Both divergences are filed as bugs.
+> PATCH release may not make. The first two entries below are divergences and
+> are filed as bugs; the third is not a divergence at all but a deliberate
+> widening, recorded here because the table's parenthetical would otherwise read
+> as the whole rule.
 
 **Neither `tp task` nor `tp pump` ever exits 2.** Row `2 | any tool | Bad CLI
 arguments` does not hold for the two tools this contract is about. Both route
@@ -768,10 +771,10 @@ says what it finished doing.
 `3 | tp pump` glosses the deadlock as "nothing live, launchable, or resumable
 for N consecutive ticks". The pump asks the question one step later: nothing
 live and **nothing started**, for N consecutive ticks. The narrower predicate
-was the literal implementation once, and it answered "not deadlocked" in the two
-cases where the supervisor is most stuck — a pool cap of 0, and launches that
-fail every tick — because in both the plan stays full of work that never starts.
-The code and its meaning are unchanged (`3` is deadlock: page a human, restart
+was the literal implementation once, and it answered "not deadlocked" whenever
+the plan stayed full of work that never started — a pool cap of 0, launches that
+fail every tick, a resume the budget has retired. The code and its meaning are
+unchanged (`3` is deadlock: page a human, restart
 under `Restart=on-failure`); only the set of conditions that reach it is
 complete now. The reason string in the state file names which one it was.
 
