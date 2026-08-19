@@ -202,7 +202,7 @@ grep -q 'All 1 suite(s) passed' <<<"$out" \
 
 # ── 6. Run state: a fixture must not write the caller's checkout (B16) ───────
 echo
-echo "--- run state: the pump's hook mark file is redirected out of any repo ---"
+echo "--- run state: the pump's hook mark file is redirected out of the checkout ---"
 
 # The leak the other four sections do not cover runs the OTHER way. tp-pump
 # resolves its dotfiles to $TASKPUMP_STATE_DIR, defaulting to the workspace
@@ -211,9 +211,8 @@ echo "--- run state: the pump's hook mark file is redirected out of any repo ---
 # suites are running FROM. run_pre_tick_hooks WRITES the mark file when the
 # hooks have something to say and `rm -f`s it when they go quiet, so on
 # 2026-08-19 a suite run deleted and rewrote the operator's live
-# .taskpump-fsguard.notified. Every one of those files is gitignored, so
-# run-all.sh's status probe reported the run green; its state manifest is the
-# other half of the fix.
+# .taskpump-fsguard.notified. .gitignore lists that name, so run-all.sh's status
+# probe reported the run green; its state manifest is the other half of the fix.
 PUMP="$TP_ROOT/libexec/tp-pump"
 
 mark=$(bash -c '. "$1"; printf "%s" "${TASKPUMP_HOOK_MARK_FILE:-<unset>}"' _ "$PROLOGUE")

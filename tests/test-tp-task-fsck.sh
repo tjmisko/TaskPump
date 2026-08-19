@@ -677,8 +677,9 @@ echo
 echo "--- every shipped fixture ledger passes its own fsck ---"
 # docs/LEDGER-CONTRACT.md §11.1 calls fsck "the executable form of this
 # contract", and tests/fixtures/generic-project is the reference ledger — the
-# tree every README quickstart example runs against and the shape a consumer
-# copies for their own project. It shipped exiting 3: T1's completed_by_commits
+# tree README's "Try it without a project" section runs against, the one CI's
+# generic-consumer smoke drives, and the shape a consumer copies for their own
+# project. It shipped exiting 3: T1's completed_by_commits
 # held an all-digit sha, which YAML types as a NUMBER, so the §3 type check saw
 # an int where it requires a list of sha strings — and `--fix` could not repair
 # it, because a present-but-wrong value is never rewritten. The sha now carries
