@@ -74,9 +74,8 @@ probe.
 
 **`TASKPUMP_GATES` is a newline-separated list of command lines, and each
 entry's first word must be an executable path.** Not a name, not a
-comma-separated list. An entry whose first word is not an executable is
-**skipped with a warning** and never consulted — which, on the gate seam, reads
-as the gate having passed.
+comma-separated list. **An entry whose first word is not an executable refuses
+the run** — exit 1, before any mode, `--dry-run` included.
 
 ```bash
 # Right — one per line, each an executable path, arguments after it. A relative
@@ -87,46 +86,58 @@ $HOME/code/TaskPump/gates/claude-usage --gate --ceiling 80
 ```
 
 ```bash
-# Wrong, and silently so. Each of these consults ZERO gates:
+# Wrong. Each of these now refuses to start, naming the entry:
 TASKPUMP_GATES='disk-low,my-gate,claude-usage'   # one entry, not three
 TASKPUMP_GATES='disk-low'                        # a bare name; nothing searches PATH
 ```
 
-Both wrong forms produce a `tp-pump: gate not executable, skipping: …` line on
-stderr and then a cheerful `GATE: feed-ok` for the rest of the run. The comma
-form is the worse of the two, because the pump reads the whole string as **one**
-entry — so a chain an operator believed was three gates deep is a completely
-unmetered pump, and nothing in the plan says so.
-
-Nothing in the plan says so including the place you would look. `--dry-run`
-prints the chain as a `gates:` line (§4), and that line is built from the same
-strings *before* the executability check — so a wired gate and a skipped one
-print identically:
-
 ```
-$ tp pump --phases T1..T9 --dry-run
-gates: disk-low,my-gate,claude-usage         ← looks like a chain
-tp-pump: gate not executable, skipping: disk-low,my-gate,claude-usage
+$ TASKPUMP_GATES='disk-low' tp pump --phases T1..T9 --dry-run
+tp-pump: gate entry is not an executable path: disk-low
+  (from TASKPUMP_GATES)
+Each line of the chain is one command line whose FIRST WORD is the path to an
+executable; arguments follow it on the same line. A bare name does not work —
+nothing searches $PATH — and a comma-separated list is read as a single entry,
+not as several:
 …
-GATE: feed-ok                                ← nothing was consulted
+$ echo $?
+1
 ```
 
-So read the warning, not the `gates:` line. The confirmation that a gate is
-genuinely wired is its own output appearing indented under `GATE:` (§4), or the
-gate actually pausing.
+**Why a refusal and not a warning.** Until this release both wrong forms
+produced one `tp-pump: gate not executable, skipping: …` line on stderr and then
+a cheerful `GATE: feed-ok` for the rest of the run. The comma form was the worse
+of the two, because the pump reads the whole string as **one** entry — so a
+chain an operator believed was three gates deep was a completely unmetered pump.
+And nothing in the plan said so, including the place you would look: `--dry-run`
+prints the chain as a `gates:` line (§4), built from the same strings *before*
+the executability check, so a wired gate and a skipped one printed identically —
+`gates: my-gate` over a gate that was never consulted. A gate that silently does
+not run is worse than no gate at all, because the operator believes they are
+protected. So the pump treats it as what it is: a misconfiguration of the run,
+refused at startup like every other one (§6 of
+[CLI-PUMP.md](CLI-PUMP.md#6-what-the-pump-refuses-before-it-starts)).
 
-The relative form deserves the same suspicion for the same reason. `GATES` is
-not one of the keys the config core anchors to the conf's own directory, so
-`scripts/my-gate` is resolved against `$PWD` — which means the identical
-configuration runs the gate from the repository root and silently skips it from
-a subdirectory, printing `gates: my-gate` either way:
+The relative form is caught by the same rule, and it is the case worth knowing
+about. `GATES` is not one of the keys the config core anchors to the conf's own
+directory, so `scripts/my-gate` is resolved against `$PWD` — which means the
+identical configuration finds the gate from the repository root and cannot find
+it from a subdirectory. That used to be a silent skip in one of the two
+directories; it is now a refusal there:
 
 ```
 $ cd ~/project     && tp pump --phases T1 --dry-run   # …  my-gate: <its reason>
-$ cd ~/project/sub && tp pump --phases T1 --dry-run   # …  gate not executable, skipping: scripts/my-gate
+$ cd ~/project/sub && tp pump --phases T1 --dry-run   # gate entry is not an executable path: scripts/my-gate
 ```
 
 An absolute path costs nothing and cannot do that.
+
+One thing the refusal cannot catch: a gate that stops being executable **during**
+a multi-day drain — deleted, or its mount gone. That is still a skip, because
+halting a running drain over it would be worse, but it is now disclosed on both
+channels: the warning on stderr as before, and a `<gate>: SKIPPED — no longer
+executable, NOT consulted` note under the `GATE:` line where §4 shows the chain
+explaining itself.
 
 ### 1.1 Two rules that are not negotiable
 
@@ -385,12 +396,18 @@ TASKPUMP_GATES="/opt/taskpump/gates/disk-low
 /opt/taskpump/gates/claude-usage --gate --ceiling 80"
 ```
 
-Check it before you trust it. The gate you just added should appear in
-`--dry-run` **and** produce no `gate not executable, skipping:` warning:
+Check it before you trust it — and the check is an exit code now, not a grep for
+a warning that may have scrolled past. `--dry-run` refuses a chain it could not
+run, so a zero exit means every entry resolved to something executable, and the
+`gates:` line names them in consultation order:
 
 ```bash
-tp pump --phases T1..T9 --dry-run 2>&1 | grep -E 'gates:|skipping'
+tp pump --phases T1..T9 --dry-run >/dev/null && echo 'chain resolves'
+tp pump --phases T1..T9 --dry-run | grep '^gates:'
 ```
+
+The same `gates:` line is logged at the top of a real run, from the same code,
+so what you confirmed here is checkable against what the run consulted.
 
 `gates/example-gate` is a working copy of the protocol with nothing in it —
 start from that file rather than from this snippet if you would rather edit than
@@ -461,9 +478,12 @@ TASKPUMP_PRE_TICK_HOOKS="/opt/taskpump/hooks/gitignore-repair
 | **Exit `0`** | fine |
 | **Non-zero** | the pump warns and carries on with the tick — a hook can never skip a tick |
 
-The list is parsed by exactly the same rule as `TASKPUMP_GATES`
-(§1.0): newline-separated command lines, first word an executable path, a
-non-executable entry skipped with a warning.
+The list is parsed and validated by exactly the same rule as `TASKPUMP_GATES`
+(§1.0): newline-separated command lines, first word an executable path, and an
+entry that is not executable **refuses the run** at startup. It matters at least
+as much here as it does for a gate — `TASKPUMP_PRE_TICK_HOOKS=fs-guard` used to
+be a silent way to switch off the contamination guard, one warning per tick in a
+log nobody reads.
 
 **What is different from a gate is the output handling, and it is the part
 worth copying.** A hook's output is logged, and it is sent to the notifier

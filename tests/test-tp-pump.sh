@@ -1312,9 +1312,14 @@ have "$out" 'the second gate would also pause' && pass "reordering changes which
 out=$(gate_plan "$(printf '%s\n%s\n' "$GBIN/broken" "$GBIN/feed-ok")" 2>&1)
 have "$out" 'GATE: feed-ok' && pass "a gate that errors fails OPEN" || fail "broken gate halted feeding:\n$out"
 have "$out" 'failed \(rc=7\)' && pass "a broken gate is reported, not swallowed" || fail "no warning for a broken gate:\n$out"
-out=$(gate_plan "$GBIN/not-a-real-gate" 2>&1)
-have "$out" 'gate not executable' && pass "a missing gate is reported" || fail "missing gate silent:\n$out"
-have "$out" 'GATE: feed-ok' && pass "a missing gate fails OPEN" || fail "missing gate halted feeding:\n$out"
+# A gate that cannot RUN is a different thing from a gate that runs and errors,
+# and it takes the opposite answer. Failing open on a broken meter keeps a
+# multi-day drain alive; failing open on an entry that was never a gate hands
+# the operator a chain they configured, believe in, and do not have. That one
+# refuses the run — see Test 24d.
+rc=0; out=$(gate_plan "$GBIN/not-a-real-gate" 2>&1) || rc=$?
+[[ "$rc" -ne 0 ]] && pass "a missing gate refuses the run" || fail "missing gate did not refuse (rc=$rc):\n$out"
+have "$out" 'GATE: feed-ok' && fail "missing gate still fed:\n$out" || pass "a missing gate never reaches feed-ok"
 
 # A tool that prefixes every diagnostic with its own name should not have to
 # special-case this path.
@@ -1439,6 +1444,74 @@ have "$out" 'disk watchdog started' \
   || pass "should suppress the disk watchdog when --no-disk-gate is passed"
 rm -f "$TASKS/F97.0.md"
 
+echo "--- Test 24d: a gate or hook entry that cannot run refuses the run ---"
+# TASKPUMP_GATES and TASKPUMP_PRE_TICK_HOOKS are newline-separated command lines
+# whose first word must be an executable PATH. Every other shape used to cost
+# one `not executable, skipping` line on stderr and then a cheerful
+# `GATE: feed-ok` for the rest of the run — and the `gates:` line, built from the
+# same strings without the executability test, agreed with the operator that the
+# chain was wired. A gate that silently does not run is worse than no gate,
+# because the operator believes they are metered. So it refuses.
+rc=0; out=$(gate_plan 'claude-usage' 2>&1) || rc=$?
+[[ "$rc" -eq 1 ]] && pass "should refuse to start when a gate entry is a bare name" \
+  || fail "a bare gate name did not refuse (rc=$rc):\n$out"
+have "$out" 'gate entry is not an executable path: claude-usage' \
+  && pass "should name the offending gate entry in the refusal" \
+  || fail "the refusal does not name the entry:\n$out"
+have "$out" 'FIRST WORD is the path to an' \
+  && pass "should say what a valid gate entry looks like" \
+  || fail "the refusal does not say what a valid entry is:\n$out"
+have "$out" 'GATE: feed-ok' \
+  && fail "a chain that could not run still reported feed-ok:\n$out" \
+  || pass "should never report feed-ok for a chain it could not run"
+
+# The comma form is the worse of the two: the whole string is read as ONE entry,
+# so a chain the operator believed was three gates deep consulted zero — and the
+# plan named the last one, the basename of the blob.
+rc=0; out=$(gate_plan "$GBIN/feed-ok,$GBIN/pause-quota" 2>&1) || rc=$?
+[[ "$rc" -eq 1 ]] && pass "should refuse a comma-separated gate list, which is read as one entry" \
+  || fail "a comma-separated chain did not refuse (rc=$rc):\n$out"
+
+# A relative first word is resolved against the pump's working directory, so the
+# same conf runs the gate from the repo root and used to skip it silently from
+# any subdirectory. Unresolvable is now a refusal wherever it happens.
+rc=0; out=$(gate_plan 'gates/no-such-gate' 2>&1) || rc=$?
+[[ "$rc" -eq 1 ]] && pass "should refuse a relative gate path that does not resolve from here" \
+  || fail "an unresolvable relative gate path did not refuse (rc=$rc):\n$out"
+
+# The same rule, the same refusal, on the hook chain — where the typo disables
+# fs-guard, the contamination guard, rather than a meter.
+rc=0; out=$(TASKPUMP_PRE_TICK_HOOKS='fs-guard' pump F56 2>&1) || rc=$?
+[[ "$rc" -eq 1 ]] && pass "should refuse to start when a pre-tick hook entry is a bare name" \
+  || fail "a bare hook name did not refuse (rc=$rc):\n$out"
+have "$out" 'pre-tick hook entry is not an executable path: fs-guard' \
+  && pass "should name the offending hook entry in the refusal" \
+  || fail "the hook refusal does not name the entry:\n$out"
+
+# It costs the working configurations nothing. The shipped defaults start, an
+# executable chain starts, and "replace the chain with nothing" is still legal.
+out=$("$PUMP" --dry-run --phases F56 2>&1)
+have "$out" 'GATE:' && pass "should still start on the shipped default gate and hook chains" \
+  || fail "the default chains were refused:\n$out"
+out=$(TASKPUMP_GATES=' ' TASKPUMP_PRE_TICK_HOOKS=' ' pump F56 2>&1)
+have "$out" '^gates: \(none\)$' && pass "should still accept a chain deliberately replaced with nothing" \
+  || fail "an empty chain was refused:\n$out"
+
+# And the two surfaces have to agree about what this run consults: an operator
+# confirms a chain with --dry-run and then starts the real run, so only ever
+# naming it in one of the two makes the confirmation uncheckable.
+mk F97.0 done
+chain24d="$(printf '%s\n%s\n' "$TP_ROOT/gates/example-gate" "$GBIN/feed-ok")"
+dry24d=$(TASKPUMP_GATES="$chain24d" pump F97 2>&1 | grep -m1 '^gates: ')
+run24d=$(TASKPUMP_GATES="$chain24d" real_run 2>&1 | sed -n 's/^\[[0-9:]*\] \(gates: .*\)$/\1/p' | head -1)
+[[ "$dry24d" == 'gates: example-gate -> feed-ok' ]] \
+  && pass "should name every entry of a custom chain in the dry-run gates line" \
+  || fail "dry-run gates line wrong: '$dry24d'"
+[[ -n "$run24d" && "$run24d" == "$dry24d" ]] \
+  && pass "should name the same chain on a real run as --dry-run printed" \
+  || fail "dry-run said '$dry24d'; the real run said '$run24d'"
+rm -f "$TASKS/F97.0.md"
+
 echo "--- Test 25: pre-tick hooks are a chain too ---"
 HBIN="$TMP/hooks"; mkdir -p "$HBIN"
 cat >| "$HBIN/quiet" <<'EOF'
@@ -1495,8 +1568,8 @@ out=$(TASKPUMP_PRE_TICK_HOOKS="$(printf '%s\n%s\n' "$HBIN/broken" "$HBIN/noisy")
 have "$out" "hook '.*broken' failed \\(rc=4\\)" && pass "a failing hook is reported" || fail "no warning for a failing hook:\n$out"
 have "$out" 'HOOK-SAYS' && pass "a failing hook does not stop the chain" || fail "chain stopped at the failure:\n$out"
 have "$out" 'GATE: feed-ok|tick:|PAUSED' && pass "the tick continues past a failing hook" || fail "tick aborted:\n$out"
-out=$(TASKPUMP_PRE_TICK_HOOKS="$HBIN/nope" hook_tick)
-have "$out" 'hook not executable' && pass "a missing hook is reported" || fail "missing hook silent:\n$out"
+rc=0; out=$(TASKPUMP_PRE_TICK_HOOKS="$HBIN/nope" hook_tick) || rc=$?
+[[ "$rc" -ne 0 ]] && pass "a missing hook refuses the run" || fail "missing hook did not refuse (rc=$rc):\n$out"
 
 # The default chain is still the two shipped hooks.
 have "$(default_hooks_of_pump)" 'gitignore-repair' && pass "gitignore-repair is in the default chain" \
@@ -1636,9 +1709,13 @@ echo "--- Test 30b2: the plan shows a gate that fed but had something to say ---
 # and the plan must SAY they skipped, because "GATE: feed-ok" on its own cannot
 # tell an operator whether the chain checked and approved or had nothing to
 # check. Those are opposite facts about how protected the run is.
+# The usage entry is dropped by its own switch, so the SHIPPED token gate is the
+# only thing in the chain. (This used to point TASKPUMP_USAGE at a nonexistent
+# path and rely on the unrunnable entry being skipped — which is now a startup
+# refusal, and was never the switch for turning a gate off.)
 NOCREDHOME="$TMP/no-credentials-home"; mkdir -p "$NOCREDHOME"
 out=$(TASKPUMP_AGENT_HOME="$NOCREDHOME" TASKPUMP_USAGE_CACHE="$TMP/no-usage-cache.json" \
-      TASKPUMP_USAGE_GATE=1 TASKPUMP_USAGE=/nonexistent-so-the-real-gate-runs \
+      TASKPUMP_USAGE_GATE=0 \
       "$PUMP" --no-health-gate --no-disk-gate --dry-run --phases F55 2>&1); rc=$?
 [[ $rc -eq 0 ]] && pass "a host with no Claude credentials still plans (exit 0)" \
   || fail "the plan failed without credentials (rc=$rc):\n$out"

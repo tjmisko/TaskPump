@@ -428,6 +428,8 @@ All of these are exit 1, and all of them fire before any launch:
 | `bad phase range '<x>'` | The spec is expanded and validated **in the main shell**, up front. Every later consumer reads the expander through a process substitution, where `die` would kill only the subshell — a malformed range would be reported and then ignored, leaving the pump to idle green against an empty phase list. |
 | a branch-prefix whose slug cannot round-trip | The agent name is the branch with `/` → `-`, and liveness is read back out of those names. Checked once at tick zero, because the prefix is a property of the configuration, not of any one launch. |
 | a unit-name collision at `--grain task` | `validate_unit_names` runs before **every** mode, `--dry-run` included: a plan showing two tasks launching onto one agent name is a wrong plan, and finding that out at launch time is too late. |
+| `gate entry is not an executable path: <x>` | Every entry of the gate chain in force is checked before any mode, `--dry-run` included. An entry that cannot run used to be skipped with one warning and then reported as `GATE: feed-ok` for the rest of the run — a gate the operator configured, believes in, and does not have ([GATES.md §1.0](GATES.md#10-how-taskpump_gates-is-spelled-and-how-it-fails)). |
+| `pre-tick hook entry is not an executable path: <x>` | The same check on `TASKPUMP_PRE_TICK_HOOKS`, where the same typo silently disables `fs-guard`. |
 | no `~/.claude`, no `TASKPUMP_IMAGE`, no executable runner | Launch prerequisites. Skipped entirely under `TASKPUMP_PUMP_NO_LAUNCH=1` and never checked by `--dry-run`/`--list`, so a read-only plan works on a host with none of them. |
 | a missing brief template | Checked for the render modes and for real runs. |
 
@@ -443,14 +445,19 @@ All of these are exit 1, and all of them fire before any launch:
 are in unless their flag drops them. A configured `TASKPUMP_GATES` **replaces the
 whole chain** and is used verbatim — including, note, that a `net-health` entry in
 a custom chain still needs `TASKPUMP_HEALTH_GATE=1` to actually probe.
-`--dry-run` prints the chain as basenames in consultation order:
+`--dry-run` prints the chain as basenames in consultation order, and a real run
+logs the identical line at startup from the same function — the mode you confirm
+a chain in and the mode that spends money must not describe the chain
+differently:
 
 ```
 gates: claude-token-fresh -> claude-usage -> disk-low
 ```
 
 Basenames only — a custom entry's arguments do not show, so `claude-usage --gate`
-and `claude-usage --gate --ceiling 50` print identically.
+and `claude-usage --gate --ceiling 50` print identically. Every entry on that
+line resolved to an executable, because a chain containing one that did not
+would have refused the run before printing anything (§6).
 
 **What every gate sees.** The pump exports a fixed set before running the chain,
 not "its configuration" wholesale: `TASKPUMP_HEALTH_GATE`, `TASKPUMP_USAGE_GATE`,
@@ -468,7 +475,9 @@ Everything else a gate wants, it discovers for itself the way any tool does.
 default chain is `hooks/gitignore-repair` then `hooks/fs-guard`;
 `TASKPUMP_PRE_TICK_HOOKS` replaces it. Each entry is a command line. For each:
 
-- a non-executable entry is skipped with a warning;
+- a non-executable entry **refuses the run** at startup, before any mode (§6) —
+  the same rule the gate chain is held to, and for the same reason: a hook that
+  is skipped is indistinguishable from a hook that ran and found nothing;
 - the workspace root is **appended** to whatever words the entry itself carries,
   and `TP_REPO_ROOT` is exported alongside. A bare `hooks/fs-guard` therefore
   reads the root as `$1`; an entry written `myhook --strict` reads it as `$2`;
