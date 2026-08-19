@@ -11,6 +11,12 @@
 # This suite pins the derivation: every ineligibility the ledger's own
 # eligibility predicate can produce gets named, with the ids the operator has to
 # act on, and nothing else gets called a cross-phase blocker.
+#
+# It also pins the one fact `ready` cannot produce at all — an in-flight claim,
+# which is `in_progress` and therefore not `open`. That clause is named here at
+# both open counts because the plan has two arms for it, and a phase described
+# one way with other work beside it and another way alone is the same defect as
+# describing it wrongly (issues #46/#48).
 set -uo pipefail
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
@@ -156,6 +162,54 @@ out=$(pump F55)
 have "$out" 'WAITING +F55 +\(1 open, none eligible — claimed: F55\.0 by feat/f55\)' \
   && pass "should name the claimant when an open task is held by a branch with no live container" \
   || fail "F55's reason does not name the claimant:\n$out"
+
+echo "--- an open task and a stranded claim in the same phase ---"
+# The #48/#46 interaction. A claim is `in_progress`, not `open`, so the walk
+# below used to skip it and no clause named it; compute_plan named it in the one
+# arm where the claim is the phase's LAST work. Put any other open task in the
+# phase and the claim appeared nowhere in the phase-grain plan — while --grain
+# task named it every tick off the same ledger. The operator's answer to "who is
+# holding this phase" must not depend on a grain switch.
+fresh_tasks
+mk F55.0 open F56.0
+mk F55.1 in_progress "" feat/foreign
+mk F56.0 open
+out=$(pump F55)
+have "$out" 'WAITING +F55 +\(1 open, none eligible — cross-phase blockers pending: F56\.0 \(open\); in flight: F55\.1 \(claimed by feat/foreign\)\)' \
+  && pass "should name the in-flight claim and its branch when open work sits beside it" \
+  || fail "F55's reason drops the stranded claim:\n$out"
+tout=$(pump F55 --grain task)
+have "$tout" 'WAITING +F55\.1 +\(claimed by feat/foreign, no live container\)' \
+  && pass "should give the same claim and branch at task grain when the grain switches" \
+  || fail "the task-grain plan and the phase-grain plan disagree about F55.1:\n$tout"
+
+echo "--- the claim is the phase's last remaining work ---"
+# The other arm of the same question. compute_plan used to spell this sentence
+# itself, so one claim had two descriptions depending on what else was open
+# beside it; both arms now read the clause off this derivation.
+fresh_tasks
+mk F55.0 done
+mk F55.1 in_progress "" feat/foreign
+out=$(pump F55)
+have "$out" 'WAITING +F55 +\(no open tasks — in flight: F55\.1 \(claimed by feat/foreign\)\)' \
+  && pass "should describe the claim the same way when it is the phase's only remaining work" \
+  || fail "the no-open-tasks arm describes the claim differently:\n$out"
+
+echo "--- a claim the ledger never finished writing ---"
+# status in_progress with no claimed_by. The old rendering printed the table's
+# own `-` placeholder, which reads as a branch NAMED nothing rather than as a
+# field the ledger is missing.
+fresh_tasks
+mk F55.0 open F56.0
+mk F55.1 in_progress
+mk F56.0 open
+out=$(pump F55)
+have "$out" 'in flight: F55\.1 \(claimed, no branch recorded\)' \
+  && pass "should say which field is missing when an in-flight claim records no branch" \
+  || fail "F55's reason does not name the unrecorded claimant:\n$out"
+have "$out" 'claimed by -' \
+  && fail "an unrecorded claimant still renders as a branch named nothing:\n$out" \
+  || pass "should not render an unrecorded claimant as a branch called '-'"
 
 echo "--- a blocker with no task file ---"
 fresh_tasks

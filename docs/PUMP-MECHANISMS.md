@@ -59,7 +59,12 @@ now read back out of the ledger: the review awaiting a verdict (nothing
 dispatches a review task), the upstream task and its status, the unfinished
 in-phase sibling, the branch holding a claim, a blocker with no task file — and
 when none of those explains it, that none of them does. A reason gets acted on,
-so an invented one costs the same afternoon a wrong answer would.
+so an invented one costs the same afternoon a wrong answer would. The claim
+clause is derived at every open count, including zero: an `in_progress` task is
+not `open`, so the frontier cannot report one at all, and a phase-grain plan that
+named a stranded claim only when it was the phase's last work answered "who is
+holding this phase" differently depending on what else happened to be open
+(issues #46/#48).
 
 The pump dispatches at **phase grain**. Each phase with eligible work gets one
 workspace, whose agent drains that phase's sub-tree serially — asking the ledger
@@ -127,14 +132,16 @@ is derived from the grain: `feat/g3` at phase grain, `feat/g3.4` at task grain.
 So a run restarted at the other grain does not recognize the in-flight claim as
 its own — the reclaim and resume passes both refuse to touch a branch this run's
 naming scheme does not own, deliberately, since that is the same test that keeps
-them off a human's branch. The stranded task shows up as `WAITING … claimed by
-feat/g3, no live container` every tick, and the run eventually reaches the
-deadlock exit (3) — with or without other open work beside it. The drain test
-asks about in-flight claims as well as `open` tasks precisely so the last claim
-in a range cannot be drained over: an `in_progress` task is committed, unfinished
-work, and calling that finished is the same false-DRAINED the resume path exists
-to prevent (issue #48). Finish or `release` an in-flight claim before changing
-grain.
+them off a human's branch. The stranded task shows up every tick at whichever
+grain is running — `WAITING G3.4 (claimed by feat/g3, no live container)` at task
+grain, `WAITING G3 (… in flight: G3.4 (claimed by feat/g3))` at phase grain,
+whether or not other open work sits in the phase beside it — and the run
+eventually reaches the deadlock exit (3), with or without that other work. The
+drain test asks about in-flight claims as well as `open` tasks precisely so the
+last claim in a range cannot be drained over: an `in_progress` task is committed,
+unfinished work, and calling that finished is the same false-DRAINED the resume
+path exists to prevent (issue #48). Finish or `release` an in-flight claim
+before changing grain.
 
 The cost the operator accepts is N branches instead of one, and therefore N
 merges. The opt-in integration trunk absorbs that: it composes with task grain,
@@ -335,8 +342,11 @@ N is greater than one so a container dying mid-tick cannot trip it.
 A range with **zero open tasks** can reach this exit too, and must: the drain
 test asks about in-flight claims as well as open tasks, so a claim nobody is
 driving keeps the range undrained until a human finishes or releases it. The
-stall page and the state file both name the claim count, because `open_tasks: 0`
-beside `status: stalled` otherwise argues against the page it explains.
+stall page and the state file both name the claims themselves — id and claiming
+branch, the first five and a count of the rest, identically in both channels —
+because `open_tasks: 0` beside `status: stalled` otherwise argues against the
+page it explains, and finishing or releasing a claim is a per-claim act that a
+tally cannot be performed on.
 
 **The general lesson, which outlives this pump:** an autonomous supervisor must
 be able to distinguish *drained* from *deadlocked*, and must be loud about the
