@@ -137,6 +137,12 @@
 #                           #   tp-disk-watchdog, restoring a cap it has no other record of
 # TASKPUMP_POOL_CAP_FILE=   # live-editable pool cap, re-read each tick
 #                           #   (default: <state dir>/.taskpump-pool-cap)
+# TASKPUMP_POOL_CAP_STALE_SEC=  # how long a cap file holding 0 stays believable without
+#                           #   being refreshed (default: 900). A 0 is a HELD pause: the
+#                           #   disk watchdog re-stamps it every poll and hands it back
+#                           #   on exit, so one this old is not being held any more, and
+#                           #   is ignored (loudly) and cleared. 0 = never expire. A
+#                           #   POSITIVE cap never expires either way.
 # TASKPUMP_TICK=            # seconds between supervisor ticks (default: 30)
 # TASKPUMP_STAGGER=         # seconds between launches within one tick (default: 3)
 # TASKPUMP_PUMP_TASKS_DIR=  # tasks dir for the pump alone, independent of the ledger
@@ -266,6 +272,18 @@
 #                           #   the workspace as its cwd, e.g. 'cargo clean'
 #                           #   (default: empty = the reclaim pass and the tp-cleanup
 #                           #   --targets sweep are no-ops that log themselves unconfigured)
+# TASKPUMP_RECLAIM_DIR=     # the build-output dir that marks a workspace as worth
+#                           #   reclaiming, and the one tp-cleanup --status measures
+#                           #   (default: target). A PROBE, not the thing deleted: set it
+#                           #   to whatever your build writes (build, dist,
+#                           #   node_modules), or to empty to run TASKPUMP_RECLAIM_CMD in
+#                           #   every idle workspace. EMPTY ALSO DROPS THE LAST
+#                           #   PRECONDITION ON THE PRIMARY CHECKOUT under
+#                           #   --include-primary, which the disk watchdog's PANIC sweep
+#                           #   always passes: name the primary root in
+#                           #   TASKPUMP_EXTRA_BUSY_DIRS if a human may be building there.
+#                           #   Read by tp-cleanup only — the pump's per-tick pass still
+#                           #   hardcodes target/.
 # TASKPUMP_DISK_RECLAIM=    # 0 = switch off the pump's per-tick reclaim of FINISHED
 #                           #   phases' build output (default: 1). Not disk-pressure
 #                           #   conditional despite the name — the pass runs every tick,
@@ -523,14 +541,16 @@
 #                           #   caller's repo — unset, a sweep run from your project
 #                           #   measures TaskPump's own checkout and reports success.
 # TASKPUMP_RECLAIM_PRIMARY= # 1 = same as --include-primary (default: 0)
-# EXTRA_BUSY_DIRS=          # newline-separated workspace roots --targets must also
-#                           #   skip. A listed primary root is skipped even under
+# TASKPUMP_EXTRA_BUSY_DIRS= # newline-separated workspace roots --targets must also
+#                           #   skip, so a workspace that is mid-compile keeps its build
+#                           #   output. A listed primary root is skipped even under
 #                           #   --include-primary. (default: empty)
-#                           #   NOTE THE MISSING PREFIX: tp-cleanup reads the bare name,
-#                           #   and nothing maps TASKPUMP_EXTRA_BUSY_DIRS onto it, so the
-#                           #   prefixed spelling silently reclaims the workspace you
-#                           #   meant to protect. The bare name works from this file
-#                           #   (it is sourced with allexport) and from the environment.
+#                           #   The bare EXTRA_BUSY_DIRS is the legacy spelling and still
+#                           #   works; the two lists are UNIONED, never ranked (the disk
+#                           #   guard passes the bare name on its command line while a
+#                           #   conf carries this one, so ranking them would unprotect a
+#                           #   workspace somebody named). The skip line names the
+#                           #   spelling that matched, or both.
 # TASKPUMP_STOP_GRACE_SEC=  # container stop grace period, seconds (default: 30)
 
 # ── Agent watchdog (tp agent-watchdog) ───────────────────────────────────────
@@ -561,9 +581,11 @@
 #                           #   its own stdout.
 # TASKPUMP_ORIGINAL_CAP=    # the cap to restore once free space recovers (default: the
 #                           #   cap file's contents at startup, else
-#                           #   TASKPUMP_JOBS_FALLBACK). Nothing in the tree writes it;
-#                           #   it is the watchdog's own key, for a caller that starts
-#                           #   the watchdog with the cap already lowered.
+#                           #   TASKPUMP_JOBS_FALLBACK). A cap file holding 0 is NOT
+#                           #   taken as that default — 0 is somebody else's pause, and a
+#                           #   watchdog that adopted it would "recover" to zero.
+#                           #   Nothing in the tree writes this key; it is for a caller
+#                           #   that starts the watchdog with the cap already lowered.
 
 # ── systemd unit (systemd/taskpump-pump.service) ─────────────────────────────
 # Read only by the unit file, which turns them into command-line flags. They are

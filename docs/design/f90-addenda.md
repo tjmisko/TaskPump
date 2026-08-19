@@ -35,8 +35,9 @@ drain, and both cross the F90.4 cutover live (all verified 2026-08-12):
   --check'` with `Environment=ARACHNE_REPO=%h/Projects/Arachne`. The guard
   script delegates all reclaim to `$REPO_ROOT/scripts/arachne-cleanup`
   (`arachne-disk-guard:50`, invoked at `:152`), passing compiler-busy
-  workspaces via `EXTRA_BUSY_DIRS` — a knob TaskPump's `tp cleanup` still
-  honours as `TASKPUMP_EXTRA_BUSY_DIRS`.
+  workspaces via `EXTRA_BUSY_DIRS` — the legacy spelling of a knob TaskPump's
+  `tp cleanup` honours under both names, canonically
+  `TASKPUMP_EXTRA_BUSY_DIRS`.
 - **`arachne-switchboard-recorder.service` is `active`**
   (`ExecStart=%h/go/bin/arachne-switchboard-recorder -interval 5s`). Its match
   contract is `NamePrefix = "arachne-agent"`
