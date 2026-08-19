@@ -1,13 +1,20 @@
 #!/bin/bash
-# test-arachne-cleanup.sh -- fixture tests for the disk-reclaim path:
-#   * arachne-cleanup --targets reclaims worktree target/ dirs (only when a
-#     reclaim command is configured; unconfigured it touches nothing), skips any
-#     worktree with a live agent container, and (with --include-primary) also
-#     reclaims the primary checkout's target/.
-#   * arachne-disk-watchdog's PANIC state invokes that reclaim before pruning
-#     docker, gated by PANIC_RECLAIM_TARGETS.
-# Everything runs in --dry-run against a throwaway fixture tree with a stub
-# `docker` and a stub `arachne-cleanup`, so no real target/ is ever deleted.
+# test-tp-cleanup.sh -- fixture tests for the disk-reclaim path:
+#   * `tp cleanup --targets` runs the CONFIGURED reclaim command in each idle
+#     workspace the TASKPUMP_RECLAIM_DIR probe selects (unconfigured it touches
+#     nothing and says so), skips any workspace with a live agent container or on
+#     an extra-busy list, and with --include-primary reaches the primary checkout.
+#   * `tp cleanup --stuck` maps a container to its task through the ledger's live
+#     claim, and refuses an id it cannot safely hand on.
+#   * `tp disk-watchdog`'s PANIC state invokes that reclaim before pruning
+#     docker (gated by PANIC_RECLAIM_TARGETS), and its pool-cap pause is
+#     re-stamped while held and handed back when the loop exits.
+# Everything runs against a throwaway fixture tree ($FIX, removed on exit) with a
+# stub `docker` and — for the watchdog tests — a stub `tp-cleanup` in a copied
+# install. Most invocations are --dry-run; the ones that are not (the reclaim
+# accounting, the two injection repros, the watchdog's cap-file behaviour) act
+# only inside that fixture, and their reclaim command is `test -f ok` / `echo`,
+# never a delete.
 set -uo pipefail
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
@@ -30,8 +37,9 @@ WATCHDOG="$TP_ROOT/libexec/tp-disk-watchdog"
 export TASKPUMP_AGENT_PREFIX=arachne-agent-
 
 # Reference pin (G1.7): the --targets sweep runs only when a reclaim command is
-# configured — the bare default touches nothing. The sweep's cargo-shaped
-# target/ logic is exercised under the examples/arachne.conf pin; Test 0 checks
+# configured — the bare default touches nothing. This is the value
+# examples/arachne.conf pins, and every --targets test below is --dry-run unless
+# it says otherwise, so it is planned and rendered rather than run. Test 0 checks
 # the unconfigured no-op.
 export TASKPUMP_RECLAIM_CMD='cargo clean'
 
@@ -45,8 +53,12 @@ assert_no()  { [[ "$2" != *"$3"* ]] && pass "$1" || { fail "$1"; echo "  expecte
 FIX="$(mktemp -d)"
 trap 'rm -rf "$FIX"' EXIT
 
-# ── Fixture tree: two worktree target/ dirs + a primary target/. feat/a has a
-#    Cargo.toml (cargo-clean branch), feat/b does not (rm -rf fallback branch).
+# ── Fixture tree: two worktree target/ dirs + a primary target/, which is what
+#    the default TASKPUMP_RECLAIM_DIR probe selects on. The Cargo.toml files are
+#    inert now — they used to pick between a hardcoded `cargo clean` and a
+#    hardcoded `rm -rf`, the pair B9 replaced with the configured command — and
+#    are kept only so the assertions that no such hardcoding returned have
+#    something to be wrong about.
 mkdir -p "$FIX/.worktrees/feat/a/target" "$FIX/.worktrees/feat/b/target" "$FIX/target"
 : > "$FIX/.worktrees/feat/a/target/x"; : > "$FIX/.worktrees/feat/a/Cargo.toml"
 : > "$FIX/.worktrees/feat/b/target/x"
