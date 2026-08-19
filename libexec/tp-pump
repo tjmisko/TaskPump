@@ -26,8 +26,11 @@
 #     tick once its container has exited, so a multi-day drain's disk footprint
 #     stays bounded — when TASKPUMP_RECLAIM_CMD names how; unconfigured, the
 #     pass is a no-op (TASKPUMP_DISK_RECLAIM=0 disables it entirely).
-#   * Drains: exits only when no open task remains in range AND no live agent
-#     container remains, then pushes the ledger and emits a summary.
+#   * Drains: exits only when THREE things are true of the range at once — no
+#     open task, no in-flight claim, and no live agent container — then pushes
+#     the ledger and emits a summary. The middle question is issue #48's: an
+#     in_progress task is committed, unfinished work, and draining over it is
+#     the false-DRAINED this supervisor exists to refuse.
 #
 # Usage:
 #   tp pump --phases F55..F63 --jobs 4 --usage-ceiling 95 --grain phase
@@ -3016,7 +3019,7 @@ fi
 while true; do
   do_tick
   if is_drained; then
-    log "range $PHASES drained: no open tasks and no live agents remain."
+    log "range $PHASES drained: no open tasks, no in-flight claims, and no live agents remain."
     break
   fi
   if (( STALL_TICKS >= STALL_EXIT_TICKS )); then
