@@ -4,5 +4,5 @@ arachne-pump plan — phases F55..F57, grain phase, cap 4, ceiling 95%
 GATE: PAUSED — 97% of the 5-hour window used (ceiling 95%)
   LAUNCH   F55    -> feat/f55
   LAUNCH   F56    -> feat/f56
-  WAITING  F57    (1 open, none eligible — cross-phase blockers pending)
+  WAITING  F57    (1 open, none eligible — cross-phase blockers pending: F55.1 (open))
 frontier: 2 launchable, 0 running, 0 resumable, 1 waiting | open tasks in range: 4

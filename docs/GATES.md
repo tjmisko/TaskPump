@@ -23,14 +23,39 @@ A gate is **an executable**. Anything runnable works — a shell script, a compi
 binary, a Python file — because the interface is the process interface.
 
 **Input:** none required. A gate reads whatever it needs from the environment and
-the filesystem. The pump passes its configuration through, so a gate sees the
-same `TASKPUMP_*` keys everything else does.
+the filesystem. A gate is a child of the pump, so it inherits the whole resolved
+configuration — every `TASKPUMP_*` key everything else sees, already discovered,
+already promoted from its legacy spelling.
+
+The pump additionally exports a handful of keys *derived from this run's flags*,
+so a gate reads the value actually in force rather than the one in the file:
+
+| Exported | Why a gate cares |
+|---|---|
+| `TASKPUMP_USAGE_CEILING` | `--usage-ceiling 80` reaches the gate as `80`; nothing wrote it to a conf. |
+| `TASKPUMP_HEALTH_GATE`, `TASKPUMP_USAGE_GATE`, `TASKPUMP_DISK_GATE` | The run's own enable switches, so a gate kept in a custom chain can still honour them (§2.1 — note the pump *overwrites* two of these). |
+| `TASKPUMP_HEALTH_WINDOW`, `TASKPUMP_USAGE_RESET_FILE`, `TASKPUMP_DISK_WATCHDOG` | The shipped gates' plumbing: `net-health`'s journal window, and two paths the pump has already resolved so a gate never has to guess where they are. |
+| `TASKPUMP_CREDENTIALS` | Derived from the agent home **only when unset** — an operator's own value is never clobbered by a derivation of itself. |
+
+None of that is required of your gate. It is what is *there*, and a third-party
+gate that wants the run's ceiling rather than the file's should read the first
+row.
 
 **Output:** one line of human-readable reason on stdout or stderr, naming *what*
-is wrong and, where possible, *what clears it*. The pump surfaces this line to
-the operator and in the monitor, so it is the entire explanation anyone gets for
+is wrong and, where possible, *what clears it*. Both streams are captured
+together — the tools that predate this contract write their reason to stderr —
+so it does not matter which you pick. The pump surfaces this line to the
+operator and in the monitor, so it is the entire explanation anyone gets for
 why a run stopped feeding. `disk 7GB free, below the 10GB floor` is a good
 reason. `gate failed` is not.
+
+A leading `<toolname>: ` is stripped before display, and only when it is a bare
+token — so a tool that prefixes every diagnostic it emits does not have to
+special-case this path, while a reason that merely *contains* a colon is left
+intact. A gate that **fed** but had something to say is not lost either: its
+line is collected and printed indented under the `GATE:` line in `--dry-run`
+(§4), not into the tick log, because a persistent condition that logged every
+tick would print for days.
 
 **Exit code:**
 
@@ -44,6 +69,64 @@ Gates are consulted in the order given by `TASKPUMP_GATES`. The **first** gate t
 return 10 short-circuits: its reason becomes the pause reason, and later gates are
 not run. Order gates cheapest-first, so a local file check runs before a network
 probe.
+
+### 1.0 How `TASKPUMP_GATES` is spelled, and how it fails
+
+**`TASKPUMP_GATES` is a newline-separated list of command lines, and each
+entry's first word must be an executable path.** Not a name, not a
+comma-separated list. An entry whose first word is not an executable is
+**skipped with a warning** and never consulted — which, on the gate seam, reads
+as the gate having passed.
+
+```bash
+# Right — one per line, each an executable path, arguments after it. A relative
+# path is resolved against the directory you run the pump from.
+TASKPUMP_GATES="$HOME/code/TaskPump/gates/disk-low
+$HOME/code/TaskPump/gates/claude-usage --gate --ceiling 80
+./scripts/my-gate"
+```
+
+```bash
+# Wrong, and silently so. Each of these consults ZERO gates:
+TASKPUMP_GATES='disk-low,my-gate,claude-usage'   # one entry, not three
+TASKPUMP_GATES='disk-low'                        # a bare name; nothing searches PATH
+```
+
+Both wrong forms produce a `tp-pump: gate not executable, skipping: …` line on
+stderr and then a cheerful `GATE: feed-ok` for the rest of the run. The comma
+form is the worse of the two, because the pump reads the whole string as **one**
+entry — so a chain an operator believed was three gates deep is a completely
+unmetered pump, and nothing in the plan says so.
+
+Nothing in the plan says so including the place you would look. `--dry-run`
+prints the chain as a `gates:` line (§4), and that line is built from the same
+strings *before* the executability check — so a wired gate and a skipped one
+print identically:
+
+```
+$ tp pump --phases T1..T9 --dry-run
+gates: disk-low,my-gate,claude-usage         ← looks like a chain
+tp-pump: gate not executable, skipping: disk-low,my-gate,claude-usage
+…
+GATE: feed-ok                                ← nothing was consulted
+```
+
+So read the warning, not the `gates:` line. The confirmation that a gate is
+genuinely wired is its own output appearing indented under `GATE:` (§4), or the
+gate actually pausing.
+
+The relative form deserves the same suspicion for the same reason. `GATES` is
+not one of the keys the config core anchors to the conf's own directory, so
+`scripts/my-gate` is resolved against `$PWD` — which means the identical
+configuration runs the gate from the repository root and silently skips it from
+a subdirectory, printing `gates: my-gate` either way:
+
+```
+$ cd ~/project     && tp pump --phases T1 --dry-run   # …  my-gate: <its reason>
+$ cd ~/project/sub && tp pump --phases T1 --dry-run   # …  gate not executable, skipping: scripts/my-gate
+```
+
+An absolute path costs nothing and cannot do that.
 
 ### 1.1 Two rules that are not negotiable
 
@@ -78,12 +161,43 @@ With no `TASKPUMP_GATES` configured, the pump consults **the default chain**:
 
 > `claude-token-fresh` → `claude-usage` → `disk-low`
 
-— credential freshness, plan utilization, free disk, in that order, each
-droppable via its own `--no-*-gate` flag or enable key. `net-health` also ships,
-but as **consumer-enabled** hardware policy: it joins the chain (first) only
-when `TASKPUMP_HEALTH_GATE=1` — see its section below. `tp pump --dry-run`
-prints the active chain as a `gates:` line, so what is actually wired is one
-command away.
+— credential freshness, plan utilization, free disk, in that order.
+`net-health` also ships, but as **consumer-enabled** hardware policy: it joins
+the chain (first) only when `TASKPUMP_HEALTH_GATE=1` — see its section below.
+`tp pump --dry-run` prints the active chain as a `gates:` line, subject to
+§1.0's caveat about what that line does and does not prove.
+
+A configured `TASKPUMP_GATES` **replaces the whole chain** and is used verbatim.
+The three disable flags still export their switches, so a gate that honours them
+keeps working in a custom chain — which is also why a `net-health` entry you add
+by hand still needs `TASKPUMP_HEALTH_GATE=1` to actually probe anything.
+
+### 2.1 Turning a default gate off is not symmetric
+
+Three different mechanisms hide behind "turn the gate off", and only one of them
+does what the phrase suggests. This is the shape of it today, and it is worth a
+minute because two of the three are traps:
+
+| Gate | Flag | Conf key | What the key actually does |
+|---|---|---|---|
+| `net-health` | `--no-health-gate` | `TASKPUMP_HEALTH_GATE=1` | Works, and is the only way *in*: the gate is off by default and the key is what adds it to the chain. The flag is the way back out, and it wins over the key — `--no-health-gate` drops the gate from the chain even when the key asked for it. |
+| `claude-usage` | `--no-usage-gate` | `TASKPUMP_USAGE_GATE` | **Nothing.** The pump initialises this switch to 1 unconditionally and re-exports it to every gate, overwriting whatever the conf or the environment said. |
+| `disk-low` | `--no-disk-gate` | `TASKPUMP_DISK_GATE` | **Nothing**, for the same reason — and the flag additionally suppresses the background disk watchdog ([PUMP-MECHANISMS.md §3](PUMP-MECHANISMS.md#3-budget-gated-launching-that-never-kills-in-flight-work)). |
+| `claude-token-fresh` | — | `TASKPUMP_TOKEN_GATE=0` | Reaches the gate, which returns "feed" immediately and **silently** (`lib/pump-lib.sh:516` returns before any output). But there is **no `--no-token-gate` flag**, and the gate is emitted into the default chain unconditionally, so it stays on the `gates:` line whether it is doing anything or not. Do not read a `skipped:` line as the sign of a disabled gate — that note means the gate ran and could not find usable credentials. |
+
+Demonstrated, not inferred: a run started with `TASKPUMP_DISK_GATE=0
+TASKPUMP_USAGE_GATE=0 TASKPUMP_TOKEN_GATE=0` in its environment hands a probe
+gate `disk_gate=1 usage_gate=1 token_gate=0`.
+
+So: **to drop the usage or disk gate, pass the flag.** Setting the key looks
+like it worked — no warning, no diagnostic — and the gate goes on metering. And
+do not read a missing gate off the `gates:` line for the token gate: disabling
+it leaves it in the chain, answering "feed" from inside.
+
+This is a divergence between the tools and the keys `docs/CONFIG.md` documents,
+not a design. It is filed as a bug; a patch release may not change which
+switches work, but it can stop the documentation from promising the ones that
+do not.
 
 ### `claude-usage` — plan utilization
 
@@ -105,6 +219,17 @@ no fresh cache all report utilization as unknown and feed.
 
 Configured by `TASKPUMP_USAGE_CEILING` and the `TASKPUMP_USAGE_*` plumbing keys.
 No token ever appears on a command line or in output.
+
+**It is also a user-runnable command**, and the only shipped gate that is:
+`tp usage` execs it, so the meter behind a pause is readable by hand without
+starting a pump. Besides `--gate` it answers `--percent` (the binding
+utilization as an integer, or the literal `unknown`), `--json` (the full
+reading — the per-window figures, their reset times, and the `windows[]` array
+the monitor draws its bars from), and `--scan-logs <glob>`, which reads a
+"limit reached / resets at" line out of agent logs and arms the reset backstop
+from it. `tp usage --percent` is the fastest answer to "why did feeding stop";
+[CLI-TOOLS.md](CLI-TOOLS.md) has the flag-level detail, and `tp usage --help`
+is the copy that ships with the binary and cannot go stale.
 
 **On a host with no Claude credentials it skips**, feeding with one line:
 
@@ -181,6 +306,20 @@ It shares its threshold with the disk watchdog, so the "pause launching" floor
 and the "reclaim now" floor are one knob rather than two that can disagree.
 Reclaim is separate from the gate: pausing buys time, reclaiming buys space.
 
+Structurally it is the thinnest gate here — a delegate to
+`tp disk-watchdog --gate`, which owns the threshold and answers it in one shot
+with no loop, no cap-file write and no logging. Keeping one source for that
+number is the point, because the watchdog *also* drives the live pool cap from
+disk pressure, and a gate with its own private idea of "low" would fight it. It
+fails open when the watchdog binary is missing or not executable, per §1.1.
+
+The gate is only the polite half of the pump's disk discipline. The other half
+is that a real run **starts that watchdog as a background process**, and at a
+second, lower threshold it deletes build output rather than merely declining to
+launch — see
+[PUMP-MECHANISMS.md §3](PUMP-MECHANISMS.md#3-budget-gated-launching-that-never-kills-in-flight-work),
+which is worth reading before an unattended drain.
+
 ### `net-health` — host network wedge (shipped, consumer-enabled)
 
 Pauses when the kernel journal shows a driver wedge signature within a recent
@@ -236,11 +375,26 @@ fi
 exit 0
 ```
 
-Then add it to the ordered list:
+Then add it to the ordered list — one command line per line, each starting with
+an executable path (§1.0), and remember that naming the key at all replaces the
+default chain, so anything you still want has to be named too:
 
 ```bash
-TASKPUMP_GATES='disk-low,my-gate,claude-usage'
+TASKPUMP_GATES="/opt/taskpump/gates/disk-low
+./scripts/my-gate
+/opt/taskpump/gates/claude-usage --gate --ceiling 80"
 ```
+
+Check it before you trust it. The gate you just added should appear in
+`--dry-run` **and** produce no `gate not executable, skipping:` warning:
+
+```bash
+tp pump --phases T1..T9 --dry-run 2>&1 | grep -E 'gates:|skipping'
+```
+
+`gates/example-gate` is a working copy of the protocol with nothing in it —
+start from that file rather than from this snippet if you would rather edit than
+type.
 
 Checklist for a gate you intend to run unattended:
 
@@ -265,13 +419,98 @@ Gates are ordinary executables, so test them by running them:
 ./gates/my-gate; echo "exit=$?"
 ```
 
+Every shipped gate also answers `-h` / `--help` with its own header, which is
+where its configuration keys and its fail-open conditions are written down.
+
 Against the pump, `--dry-run` prints the active chain, the plan including the
 gate decision, and its reason — and launches nothing:
 
 ```bash
 tp pump --phases T1..T9 --dry-run
 # gates: claude-token-fresh -> claude-usage -> disk-low
+# GATE: feed-ok
+#   claude-token-fresh: skipped: no claude credentials at /home/you/.claude/.credentials.json
 ```
 
-That is the fastest way to confirm a gate is wired, ordered where you expect, and
-saying what you think it says.
+The `gates:` line and the indented ones are different kinds of evidence, and
+only one of them is worth much. `gates:` is the configured *list*, echoed back
+before anything runs, so it proves you spelled the key in a form the pump could
+split and nothing more — §1.0 shows it printing an entirely unwired chain. The
+lines indented beneath `GATE:` come from gates that actually ran and had
+something to say. That is the confirmation.
+
+---
+
+## 5. The third seam — pre-tick hooks
+
+Gates and runners are the two seams everybody knows about. There is a third,
+with the same shape — an executable, replaced by configuration — and it runs
+every tick before the pump plans anything:
+
+```bash
+TASKPUMP_PRE_TICK_HOOKS="/opt/taskpump/hooks/gitignore-repair
+/opt/taskpump/hooks/fs-guard"
+```
+
+**The contract:**
+
+| | |
+|---|---|
+| **Input** | the repo root as `$1`, plus `TP_REPO_ROOT` in the environment and the whole inherited configuration |
+| **Output** | anything worth telling the operator, on stdout or stderr (captured together) |
+| **Exit `0`** | fine |
+| **Non-zero** | the pump warns and carries on with the tick — a hook can never skip a tick |
+
+The list is parsed by exactly the same rule as `TASKPUMP_GATES`
+(§1.0): newline-separated command lines, first word an executable path, a
+non-executable entry skipped with a warning.
+
+**What is different from a gate is the output handling, and it is the part
+worth copying.** A hook's output is logged, and it is sent to the notifier
+**only when the text changes** since the last tick. The fingerprint lives in a
+marker file, so the deduplication survives a supervisor restart, and a hook that
+goes quiet clears the marker so the next occurrence notifies again. Without
+that, a hook reporting a *persistent* condition — and every condition these
+hooks report is persistent until a human fixes it — would fire a desktop
+notification every tick for days. That is not a nuisance so much as a
+correctness problem for the notifier: an operator who learns to dismiss the
+pump's notifications will dismiss the one that mattered.
+
+The two shipped hooks are the default chain, in this order:
+
+- **`gitignore-repair`** — un-ignores the worktrees directory, from either
+  direction. The `gh worktree` extension appends a bare `.worktrees/` line to
+  `.gitignore` on every `worktree create`, which lands after the intentional
+  negations and re-ignores every worktree; and an operator-global
+  `core.excludesFile` can do the same from below, which it heals by appending
+  negations to the repository's own `info/exclude`. It matters because **the
+  pump refuses to launch into a gitignored worktree** — so without this hook the
+  failure is a run that launches nothing, and the cause is in a file nobody
+  edited on purpose.
+- **`fs-guard`** — reads `git status --porcelain` on the primary checkout and
+  reports every dirty path outside an allowlist: `.worktrees/`, the ledger
+  checkout at `ops/`, and the integration trunk's lock and quarantine files.
+  Agents work in worktrees and the reference runner mounts the primary
+  read-only, so this should always be silent. It is the regression detector for
+  that arrangement: if a future mount change hands a container a writable
+  primary tree, edits start appearing where no agent should be able to make
+  them, and this is what says so.
+
+  Note what that allowlist is made of, because it decides how you fix a false
+  alarm. It has **no entry for the supervisor's own state files** — those stay
+  quiet only because `git status` does not report ignored paths, which is why
+  README's adoption steps hand you an ignore list rather than an allowlist. So
+  a new run file that nobody thought to ignore reports as primary
+  contamination, every tick, and pushes a notification the first time. Adding
+  it to `.gitignore` is usually the right repair; `TASKPUMP_FS_GUARD_ALLOWLIST`
+  replaces the whole pattern and is the wrong tool for one file.
+
+A third hook ships and is **not** in the default chain: `hooks/agent-preflight`
+is TaskPump's own container pre-flight — the in-container, project-shaped half
+of a launch, installing an `iptables` egress allowlist and smoke-testing the
+image. It is a `TASKPUMP_PRE_FLIGHT` hook, run by the entrypoint inside the
+container ([RUNNERS.md §4.4](RUNNERS.md#44-the-pre-flight-hook)), not a pre-tick
+hook, and it is here as a worked example of what that other seam is for.
+
+Setting `TASKPUMP_PRE_TICK_HOOKS` replaces the default chain, exactly as
+`TASKPUMP_GATES` does — including replacing it with nothing.

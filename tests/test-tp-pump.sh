@@ -221,6 +221,206 @@ grep -qi 'drained' "$NOTIFY" && pass "drain notification fired via TASKPUMP_NOTI
 out=$(STUB_GATE_RC=0 pump_tick F55..F57 --once 2>&1 >/dev/null; STUB_GATE_RC=0 pump_tick F55..F57 --once 2>&1)
 grep -qi "resuming pump for F55..F57" <<<"$out" && pass "restart detection logs resume for same range" || fail "no resume log:\n$out"
 
+# 8e: a configured notify command that FAILS is reported, never swallowed
+# (issue #35). The two delivery channels take the message differently on
+# purpose — a configured command reads it on stdin, the notify-send fallback
+# gets it as argv — which is how a plausible pin (`notify-send -u low`, which
+# wants a summary argument and never reads stdin) errors on every notice. With
+# the status discarded, the pump looked like it had notified for a whole drain.
+#
+# The pre-tick chain is pinned to stubs throughout 8e. Left at the default it
+# is the fs-guard, whose output depends on how dirty the checkout running this
+# suite happens to be, and whose change-fingerprint dedup carries state from
+# test 8a — so the count assertion below would answer for the host's tree
+# rather than for the drain.
+cat >| "$BIN/hook-quiet" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+# A pre-tick hook with a lot to say — a dirty tree with thousands of paths in
+# it — so that its notification is larger than the 64KiB pipe buffer.
+cat >| "$BIN/hook-flood" <<'EOF'
+#!/usr/bin/env bash
+printf 'fs-guard: untracked path %s\n' $(seq 1 8000)
+EOF
+chmod +x "$BIN/hook-quiet" "$BIN/hook-flood"
+
+mk F55.0 done; mk F55.1 done; mk F56.0 done; mk F57.0 done
+# The value is a command line, and a webhook notifier keeps its token in the
+# arguments (`curl -sS -f -d @- https://hooks…/SECRET`); the stand-in below is
+# shaped like one so the warning has something to leak.
+err=$(STUB_GATE_RC=0 TASKPUMP_PRE_TICK_HOOKS="$BIN/hook-quiet" \
+      TASKPUMP_HOOK_MARK_FILE="$TMP/8e.mark" \
+      TASKPUMP_NOTIFY_CMD="false https://hooks.example/T0/B0/s3cret-t0ken" \
+      pump_tick F55..F57 2>&1 >/dev/null)
+have "$err" 'notify command failed' \
+  && pass "should report the drop when the configured notify command fails" \
+  || fail "a failing TASKPUMP_NOTIFY_CMD was swallowed:\n$err"
+have "$err" 'notify command failed \(exit 1\): false' \
+  && pass "should name the program and its exit status when reporting the drop" \
+  || fail "the warning does not name the failing command and status:\n$err"
+# Under --detach the pump's stderr is persisted for the life of the run (the
+# unit's journal, or $PUMP_LOG), so the warning names the program and stops
+# there rather than copying a secret out of the command line.
+have "$err" 's3cret-t0ken' \
+  && fail "the warning echoed the notify command's arguments into the log:\n$err" \
+  || pass "should keep the notify command's arguments out of the log when reporting the drop"
+[[ "$(grep -c 'notify command failed' <<<"$err")" -eq 1 ]] \
+  && pass "should warn once per dropped notification when a drain fires one" \
+  || fail "expected one warning per dropped notification:\n$err"
+# The delivered case must stay silent: a warning on every successful notify
+# would train an operator to ignore the line that matters.
+err=$(STUB_GATE_RC=0 TASKPUMP_PRE_TICK_HOOKS="$BIN/hook-quiet" \
+      TASKPUMP_HOOK_MARK_FILE="$TMP/8e.mark" TASKPUMP_NOTIFY_CMD="tee -a $NOTIFY" \
+      pump_tick F55..F57 2>&1 >/dev/null)
+have "$err" 'notify command failed' \
+  && fail "a delivered notification still warned:\n$err" \
+  || pass "should stay silent when the notify command delivers"
+# …and so must the command that exits 0 without ever reading the message:
+# `true`, which docs/CONFIG.md names as the way to silence notifications, and
+# every argv-style notifier (`notify-send TaskPump`, terminal-notifier) that
+# really does deliver. Carried on a pipeline the writer takes a SIGPIPE from
+# the notifier's early exit, pipefail hands that 141 to the caller, and the
+# pump names a drop that did not happen. The flood hook is what makes that
+# deterministic instead of a 1-in-100 flake: a notification bigger than the
+# pipe buffer blocks the writer until the non-reading notifier is gone.
+err=$(STUB_GATE_RC=0 TASKPUMP_NOTIFY_CMD=true \
+      TASKPUMP_PRE_TICK_HOOKS="$BIN/hook-flood" TASKPUMP_HOOK_MARK_FILE="$TMP/8e-flood.mark" \
+      pump_tick F55..F57 2>&1 >/dev/null)
+have "$err" 'notify command failed' \
+  && fail "a notifier that exited 0 without reading the message was called a drop:\n$(grep 'notify command failed' <<<"$err")" \
+  || pass "should stay silent when the notify command exits 0 without reading the message"
+
+# 8f: the value the tree hands an operator to COPY has to survive the same
+# contract. `notify-send -u low` was the shipped syntax example in
+# docs/CONFIG.md and taskpump.conf.example — argv-style, so once 8e stopped
+# swallowing the status it warned on every notice and delivered nothing, which
+# is the shape examples/arachne.conf already records having lived through. The
+# examples are re-read out of those files rather than restated here, so a
+# rewrite that reintroduces an argv-style value fails on the value's own
+# behaviour instead of on a grep for one spelling.
+#
+# Every program a documented value names is stubbed, and every stub appends what
+# it was handed to one record, so the question this asks is the one the harness
+# can answer: did the message the pump wrote to stdin reach the notifier's own
+# hands. Whether the notifier's own back end is reachable — a session bus for
+# notify-send, a syslog socket for logger — is a property of the host, not of
+# the value, and is docs/CONFIG.md §3.2's to state rather than this suite's to
+# assert.
+NBIN="$TMP/notify-bin"; mkdir -p "$NBIN"
+NREC="$TMP/notify.record"
+# Faithful where it matters: the real notify-send takes its summary from argv,
+# never reads stdin, and exits 1 with exactly this line when argv carries none.
+# The short options that consume an argument are spelled out because a stub that
+# swallowed a summary as an option's value would fail a value libnotify accepts.
+cat >| "$NBIN/notify-send" <<EOF
+#!/usr/bin/env bash
+REC="$NREC"
+EOF
+cat >> "$NBIN/notify-send" <<'EOF'
+pos=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -u|-t|-a|-i|-n|-c|-h|-r|-A) shift 2 ;;
+    -*) shift ;;
+    *) pos+=("$1"); shift ;;
+  esac
+done
+[[ ${#pos[@]} -ge 1 ]] || { echo "No summary specified." >&2; exit 1; }
+# libnotify takes a summary and an optional body, and NOTHING else. Accepting
+# any count here made the stub pass `xargs notify-send …` without -0 — the exact
+# trap docs/CONFIG.md's paragraph exists to warn about, which fails exit 123 on
+# a real host — so the guard went green on the one value it most needed to catch.
+[[ ${#pos[@]} -le 2 ]] || { echo "Invalid number of options." >&2; exit 1; }
+printf '%s\n' "${pos[*]}" >> "$REC"
+exit 0
+EOF
+chmod +x "$NBIN/notify-send"
+
+# logger(1) is the other half of the same contract and the headless value the
+# docs now lead with, so it is stubbed on the same terms: util-linux's logger
+# takes the message from argv when argv carries one and reads stdin only when it
+# does not, which is the distinction this whole test exists to police. Stubbed
+# rather than real because the real one needs a syslog socket, and a suite that
+# passed or failed on whether the host runs a journal would be measuring the
+# host.
+cat >| "$NBIN/logger" <<EOF
+#!/usr/bin/env bash
+REC="$NREC"
+EOF
+cat >> "$NBIN/logger" <<'EOF'
+pos=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -t|-p|-n|-u|-f|-P|--tag|--priority) shift 2 ;;
+    --) shift; pos+=("$@"); break ;;
+    -*) shift ;;
+    *) pos+=("$1"); shift ;;
+  esac
+done
+if [[ ${#pos[@]} -gt 0 ]]; then printf '%s\n' "${pos[*]}" >> "$REC"; else cat >> "$REC"; fi
+exit 0
+EOF
+chmod +x "$NBIN/logger"
+
+notify_examples() {  # notify_examples <file> → each documented value, once, one per line
+  local match value
+  # sort -u because a file documents one value in more than one place — the
+  # syntax example and the key's own entry — and that is one value to check.
+  while IFS= read -r match; do
+    value="${match#TASKPUMP_NOTIFY_CMD=}"
+    value="${value#\'}"; value="${value%\'}"
+    printf '%s\n' "$value"
+  done < <(grep -oE "TASKPUMP_NOTIFY_CMD='[^']+'|TASKPUMP_NOTIFY_CMD=[^ '\"#]+" "$1") | sort -u
+}
+
+# One drained tick per documented value; the record is what the stub was
+# actually handed, so "delivered" is answered by the notifier, not by the pump.
+notify_tick() {  # notify_tick <value> → the pump's stderr; delivery lands in $NREC
+  local value="$1"
+  : >| "$NREC"
+  PATH="$NBIN:$PATH" STUB_GATE_RC=0 \
+    TASKPUMP_PRE_TICK_HOOKS="$BIN/hook-quiet" TASKPUMP_HOOK_MARK_FILE="$TMP/8f.mark" \
+    TASKPUMP_NOTIFY_CMD="$value" \
+    pump_tick F55..F57 2>&1 >/dev/null
+}
+
+mk F55.0 done; mk F55.1 done; mk F56.0 done; mk F57.0 done
+# A guard that has never been shown to go red is not a guard: the pre-fix
+# example goes through the same harness first.
+err=$(notify_tick 'notify-send -u low')
+if have "$err" 'notify command failed' && ! grep -q 'drained' "$NREC"; then
+  pass "control: the pre-fix example ('notify-send -u low') still loses the drain notice and says so"
+else
+  fail "control: the stubbed notify-send swallowed an argv-style value with no summary — the harness cannot go red"
+fi
+
+for conf_doc in "$TP_ROOT/docs/CONFIG.md" "$TP_ROOT/taskpump.conf.example"; do
+  rel="${conf_doc#"$TP_ROOT"/}"
+  n=0
+  while IFS= read -r example; do
+    n=$((n + 1))
+    err=$(notify_tick "$example")
+    if have "$err" 'notify command failed'; then
+      fail "$rel documents TASKPUMP_NOTIFY_CMD='$example', which the pump reports as a dropped notification:\n$(grep 'notify command failed' <<<"$err")"
+    elif [[ "$example" == true ]]; then
+      # `true` is the documented silencer, not a delivery command: what it owes
+      # is silence, and 8e above owns the reason that silence must not be a warning.
+      pass "should stay silent when TASKPUMP_NOTIFY_CMD is the silencer $rel documents (true)"
+    elif grep -q 'drained' "$NREC"; then
+      pass "should hand the drain notice to its notifier when TASKPUMP_NOTIFY_CMD is the value $rel documents ($example)"
+    else
+      # Only the notifiers the docs name are stubbed, so this arm cannot tell a
+      # value that drops the message from one that delivers it through some
+      # other program; it says so rather than naming a cause it did not
+      # establish.
+      fail "$rel documents TASKPUMP_NOTIFY_CMD='$example', which exits 0 but never handed the message to a notifier this harness stubs (notify-send, logger) — either the value drops what the pump feeds it on stdin, or it delivers through a program this harness does not stub yet"
+    fi
+  done < <(notify_examples "$conf_doc")
+  [[ "$n" -ge 1 ]] && pass "$rel still carries a TASKPUMP_NOTIFY_CMD example to check ($n)" \
+    || fail "$rel documents no TASKPUMP_NOTIFY_CMD value any more — this guard now verifies nothing"
+done
+
 echo "--- Test 9: disk feed-gate pauses launching (A4 / F65.3) ---"
 # Reset fixtures to a live frontier (the gate line prints regardless of fixtures).
 mk F55.0 open; mk F55.1 open F55.0; mk F56.0 open; mk F57.0 open F55.1
@@ -341,7 +541,12 @@ else
   printf 'SKIP: mount guard — no runner at %s yet (lands on integration)\n' "$RUNNER_SH"
 fi
 # The pump must no longer carry mounts of its own: launching is the runner's.
-grep -qE -- '-v +"' "$PUMP" && fail "the pump still mounts things itself" \
+# A mount SPEC is what this looks for, so the colon is part of the pattern:
+# `-v "$X:$Y"` is a mount, `command -v "$prog"` is a lookup, and the older bare
+# `-v +"` matched both — it went red the first time this file asked whether a
+# configured notifier exists before running it (pump_notify). Widening it back
+# would trade a guard that names mounts for one that names quotes.
+grep -qE -- '-v +"[^"]*:' "$PUMP" && fail "the pump still mounts things itself" \
   || pass "the pump carries no container mounts"
 
 echo "--- Test 12b: the runner contract the pump exports ---"
@@ -913,26 +1118,46 @@ out=$(STUB_LIVE="tp-agent-feat-f56" pump F56)
 have "$out" 'LAUNCH +F56' && pass "a container under another prefix is not ours" \
   || fail "foreign container claimed as ours:\n$out"
 
-echo "--- Test 21: brief-template resolution — explicit, consumer, shipped ---"
-# The consumer's own template lives in its ledger. Absent an explicit override
-# it wins, which is how an existing project keeps rendering exactly what it did.
+echo "--- Test 21: brief-template resolution — configured, then shipped, and nothing else ---"
+# Two rungs, and only two. A ledger-side ops/task-loop/briefs/_phase-drain-template.md
+# used to be probed between them, so a project that dropped a file at that path
+# had its briefs quietly replaced without ever configuring anything — and every
+# project that did NOT use that one consumer's directory layout carried a rung
+# whose path could not exist, advertised in the not-found message as somewhere it
+# had looked (issue #37). A consumer that wants its own prose says so, the way
+# examples/arachne.conf now does.
 RES="$TMP/resolve"; mkdir -p "$RES/ops/task-loop/briefs"
 printf 'consumer template for {{PHASE}}\n' >| "$RES/ops/task-loop/briefs/_phase-drain-template.md"
 out=$(ARACHNE_PUMP_OPS_DIR="$RES/ops" "$PUMP" --render-brief F55 2>&1)
-[[ "$out" == "consumer template for F55" ]] && pass "consumer's ops-side template is used when present" \
-  || fail "consumer template not chosen: '$out'"
+grep -qF 'consumer template for F55' <<<"$out" \
+  && fail "should ignore a ledger-side _phase-drain-template.md when no template is configured: '$out'" \
+  || pass "should ignore a ledger-side _phase-drain-template.md when no template is configured"
+grep -qF 'drain phase F55' <<<"$out" \
+  && pass "should render the shipped brief when the ledger carries an unconfigured template" \
+  || fail "shipped brief did not render over the ledger-side file:\n$out"
 printf 'explicit template for {{PHASE}}\n' >| "$TMP/explicit.md"
 out=$(ARACHNE_PUMP_OPS_DIR="$RES/ops" TASKPUMP_BRIEF_TEMPLATE="$TMP/explicit.md" \
       "$PUMP" --render-brief F55 2>&1)
-[[ "$out" == "explicit template for F55" ]] && pass "explicit config outranks the consumer template" \
+[[ "$out" == "explicit template for F55" ]] && pass "explicit config outranks the shipped brief" \
   || fail "explicit template not chosen: '$out'"
-# No consumer template at all used to be a hard die, which left a fresh project
-# unable to run until it wrote one. It now falls through to the shipped default.
+# No template at all used to be a hard die, which left a fresh project unable to
+# run until it wrote one. It now falls through to the shipped default.
 out=$(ARACHNE_PUMP_OPS_DIR="$TMP/no-such-ops" "$PUMP" --render-brief F55 2>&1)
 grep -qF 'F55' <<<"$out" && pass "a project with no template falls back to the shipped one" \
   || fail "shipped fallback did not render:\n$out"
-grep -qiF 'not found' <<<"$out" && fail "still dying on a missing consumer template:\n$out" \
-  || pass "no hard die on a missing consumer template"
+grep -qiF 'not found' <<<"$out" && fail "still dying on a missing template:\n$out" \
+  || pass "no hard die on a missing template"
+# The not-found message is the operator's map of the resolution order. Listing a
+# rung the code no longer walks sends them to author a file that will never be
+# read — the same wrong answer as the dead probe, printed instead of executed.
+out=$(ARACHNE_PUMP_OPS_DIR="$RES/ops" TASKPUMP_BRIEF_TEMPLATE="$TMP/no-such-template.md" \
+      "$PUMP" --render-brief F55 2>&1)
+grep -qF 'task-loop/briefs' <<<"$out" \
+  && fail "should not name the deleted ledger rung when the configured brief is missing:\n$out" \
+  || pass "should not name the deleted ledger rung when the configured brief is missing"
+grep -qF 'templates/phase-drain-brief.md' <<<"$out" \
+  && pass "should name the shipped brief when the configured one is missing" \
+  || fail "the not-found message does not name the shipped brief:\n$out"
 
 echo "--- Test 22: TASKPUMP_STATE_DIR relocates the run's dotfiles ---"
 # The state-file NAME is pinned so that half tests relocation, not the default
@@ -1233,19 +1458,24 @@ out=$(rnote ARACHNE_PUMP_OPS_DIR="$TMP/noops")
 have "$out" 'RESUME CONTEXT' && pass "the shipped resume template is the fallback" \
   || fail "shipped resume template not used:\n$out"
 
-# A consumer's own copy, beside its brief template, wins over the shipped one.
+# Same two rungs as the brief, and the same deleted third (issue #37): a file
+# sitting at the ledger-side path is not configuration, and substituting it for
+# the shipped note without being asked is a change of what a resumed agent reads.
 printf 'consumer resume note for {{TASK_ID}} on {{BRANCH}}\n' \
   >| "$RES2/ops/task-loop/briefs/_resume-note-template.md"
 out=$(rnote ARACHNE_PUMP_OPS_DIR="$RES2/ops")
-[[ "$out" == "consumer resume note for F97.1 on feat/f97" ]] \
-  && pass "a consumer's resume template wins over the shipped one" \
-  || fail "consumer resume template not chosen: '$out'"
+grep -qF 'consumer resume note for F97.1' <<<"$out" \
+  && fail "should ignore a ledger-side _resume-note-template.md when no template is configured: '$out'" \
+  || pass "should ignore a ledger-side _resume-note-template.md when no template is configured"
+have "$out" 'RESUME CONTEXT' \
+  && pass "should render the shipped resume note when the ledger carries an unconfigured one" \
+  || fail "shipped resume note did not render over the ledger-side file:\n$out"
 
-# Explicit config outranks both.
+# Explicit config outranks the shipped default.
 printf 'explicit resume note for {{TASK_ID}}\n' >| "$TMP/explicit-resume.md"
 out=$(rnote ARACHNE_PUMP_OPS_DIR="$RES2/ops" TASKPUMP_RESUME_TEMPLATE="$TMP/explicit-resume.md")
 [[ "$out" == "explicit resume note for F97.1" ]] \
-  && pass "explicit config outranks the consumer resume template" \
+  && pass "explicit config outranks the shipped resume note" \
   || fail "explicit resume template not chosen: '$out'"
 
 # {{BUILD_GATE}} is the shipped templates' name for the verification commands;
@@ -1473,6 +1703,485 @@ wait "$PUMP32" 2>/dev/null
 [[ "$(jq -r '.status' "$STATE32" 2>/dev/null)" == "drained" ]] \
   && pass "a completed drain keeps status=drained (trap does not clobber it)" \
   || fail "drain state clobbered: $(cat "$STATE32" 2>/dev/null)"
+
+echo "--- Test 33: the ledger-repo sync is quiet when there is no ledger repo (issue #41) ---"
+# do_tick used to run `git -C "$OPS_DIR" pull --ff-only >/dev/null 2>&1 || warn`
+# unconditionally. A consumer with no SEPARATE ledger repo — the bring-your-own-
+# repo shape, where OPS_DIR is a missing ops/ or a remoteless checkout — got
+# "ops pull --ff-only failed (continuing)" every tick, forever, with no reason
+# attached. Harmless in itself, and that is the danger: it trains an operator to
+# skim past pump stderr, which is the one channel the loud-failure discipline
+# depends on. The shape is decided once at startup; a REAL pull that really
+# fails must still warn, and now say why.
+rm -f "$TASKS"/*.md; mk F55.0 open
+STATE41="$TMP/pump41.state"
+tick41() {  # tick41 <ops-dir> [extra pump args] — one hermetic --once tick
+  TASKPUMP_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 \
+  ARACHNE_PUMP_OPS_DIR="$1" ARACHNE_PUMP_STATE_FILE="$STATE41" \
+  ARACHNE_POOL_CAP_FILE="$TMP/cap" ARACHNE_PUMP_LOG="$TMP/pump41.log" \
+  ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" STUB_LIVE="" STUB_GATE_RC=0 \
+  "$PUMP" --no-health-gate --once --phases F55 "${@:2}"
+}
+
+# 33a: OPS_DIR does not exist at all — the default $REPO_ROOT/ops of a consumer
+# who never had a ledger submodule. There is nothing to pull, so nothing failed.
+err=$(tick41 "$TMP/no-such-ops-41" 2>&1 >/dev/null)
+have "$err" 'ops pull' \
+  && fail "should not warn about the ops pull when the ledger repo does not exist:\n$err" \
+  || pass "should stay silent on stderr when OPS_DIR is not a git checkout"
+out=$(tick41 "$TMP/no-such-ops-41" 2>/dev/null)
+have "$out" 'no separate ledger repo' \
+  && pass "should name the no-ledger-repo shape once at startup when OPS_DIR is not a git checkout" \
+  || fail "startup said nothing about the skipped pull:\n$out"
+have "$out" 'not a git checkout' \
+  && pass "should say why the ledger sync is skipped when OPS_DIR is not a git checkout" \
+  || fail "the startup line does not name the reason:\n$out"
+
+# 33b: OPS_DIR is a real checkout with no remote — a local-only ledger. A pull
+# has nowhere to pull from, and never will.
+NOREM41="$TMP/ops41-noremote"
+git init -q -b main "$NOREM41"
+git -C "$NOREM41" -c user.name=t -c user.email=t@e commit -q --allow-empty -m seed
+err=$(tick41 "$NOREM41" 2>&1 >/dev/null)
+have "$err" 'ops pull' \
+  && fail "should not warn about the ops pull when the ledger repo has no remote:\n$err" \
+  || pass "should stay silent on stderr when the ledger repo has no remote"
+out=$(tick41 "$NOREM41" 2>/dev/null)
+have "$out" 'no git remote' \
+  && pass "should say why the ledger sync is skipped when the ledger repo has no remote" \
+  || fail "the startup line does not name the remoteless ledger repo:\n$out"
+
+# 33c: a configured ledger repo IS still pulled — the fix must not silence the
+# sync wholesale. Seed a commit upstream and prove the tick fast-forwards to it.
+SEED41="$TMP/seed41"
+git init -q -b main "$SEED41"
+git -C "$SEED41" -c user.name=t -c user.email=t@e commit -q --allow-empty -m seed
+OPS41="$TMP/ops41"
+git clone -q "$SEED41" "$OPS41" 2>/dev/null
+git -C "$SEED41" -c user.name=t -c user.email=t@e commit -q --allow-empty -m upstream-work
+before41=$(git -C "$OPS41" rev-parse HEAD)
+tick41 "$OPS41" >/dev/null 2>&1
+[[ "$(git -C "$OPS41" rev-parse HEAD)" != "$before41" ]] \
+  && pass "should still fast-forward the ledger repo when one is configured" \
+  || fail "the tick stopped pulling a real ledger repo (still at $before41)"
+out=$(tick41 "$OPS41" 2>/dev/null)
+have "$out" 'no separate ledger repo' \
+  && fail "a real ledger repo was classified as absent:\n$out" \
+  || pass "should not announce a skipped sync when the ledger repo is real"
+
+# 33d: a real remote that genuinely fails still warns — every tick, loudly, and
+# now with the reason the old one-line warning threw away.
+BROKE41="$TMP/ops41-broken"
+git clone -q "$SEED41" "$BROKE41" 2>/dev/null
+git -C "$BROKE41" remote set-url origin "$TMP/gone41.git"
+err=$(tick41 "$BROKE41" 2>&1 >/dev/null)
+have "$err" 'ops pull --ff-only failed' \
+  && pass "should still warn when a configured remote genuinely fails" \
+  || fail "a real pull failure went silent:\n$err"
+have "$err" 'gone41' \
+  && pass "should name the reason when a configured remote genuinely fails" \
+  || fail "the pull warning still carries no reason:\n$err"
+
+# 33e: an unreachable remote (33d) is the ONE failing shape whose first output
+# line happens to be git's error, so it proves nothing about which line gets
+# quoted. The routine failing shape here is a DIVERGED ledger branch — tp-task
+# commits task files locally on every tick while another machine pushes the
+# same branch — and there git leads with the fetch banner ("From <url>", then
+# the ref-update line) for the step that SUCCEEDED, pads the middle with `hint:`
+# advice, and puts "fatal: Not possible to fast-forward, aborting." last.
+# Quoting the first line points the operator at the remote URL and never
+# mentions the divergence: a confident wrong reason, on the one stderr line
+# this whole mechanism exists to make worth reading.
+DIV41="$TMP/ops41-diverged"
+git clone -q "$SEED41" "$DIV41" 2>/dev/null
+git -C "$SEED41" -c user.name=t -c user.email=t@e commit -q --allow-empty -m upstream-diverge
+git -C "$DIV41" -c user.name=t -c user.email=t@e commit -q --allow-empty -m local-diverge
+err=$(tick41 "$DIV41" 2>&1 >/dev/null)
+have "$err" 'ops pull --ff-only failed' \
+  && pass "should still warn when the ledger branch has diverged from its remote" \
+  || fail "a diverged ledger pull went silent:\n$err"
+have "$err" 'Not possible to fast-forward' \
+  && pass "should quote git's own error when the ledger branch has diverged" \
+  || fail "the warning does not carry git's fatal:\n$err"
+have "$err" 'failed \(continuing\) — From ' \
+  && fail "the warning names the fetch banner — a step that succeeded — as the reason:\n$err" \
+  || pass "should not name the fetch banner as the reason when the fetch succeeded"
+# Tick 2 of the same divergence: the fetch is up to date now, so git prints no
+# banner and leads with `hint: Diverging branches can't be fast-forwarded, you
+# need to either:` — a sentence that ends on a colon with its advice stripped
+# off. A persistent failure repeats every tick, so this is the line an operator
+# actually lives with; it must be the fatal, not the dangling hint.
+err=$(tick41 "$DIV41" 2>&1 >/dev/null)
+have "$err" 'Not possible to fast-forward' \
+  && pass "should quote git's error on every tick when the divergence persists" \
+  || fail "the repeated warning stopped naming git's fatal:\n$err"
+have "$err" 'failed \(continuing\) — hint:' \
+  && fail "the warning quotes git's advice instead of git's error:\n$err" \
+  || pass "should not quote git's hint advice as the reason when git named an error"
+
+# 33f: not every git failure carries a `fatal:`/`error:` line to quote. A ledger
+# checkout sitting on a branch with no upstream states its diagnosis as bare
+# prose and then offers four lines of advice, so the fallback has to be the
+# FIRST real line — the last non-blank one is the indented
+# `git branch --set-upstream-to=…` suggestion, which is advice, not cause.
+NOUP41="$TMP/ops41-noupstream"
+git clone -q "$SEED41" "$NOUP41" 2>/dev/null
+git -C "$NOUP41" checkout -q -b ledger-side-branch
+err=$(tick41 "$NOUP41" 2>&1 >/dev/null)
+have "$err" 'no tracking information' \
+  && pass "should quote git's diagnosis when the ledger branch has no upstream" \
+  || fail "the warning does not name the missing upstream:\n$err"
+have "$err" 'failed \(continuing\) — .*set-upstream-to' \
+  && fail "the warning quotes git's suggested remedy instead of the cause:\n$err" \
+  || pass "should not quote git's remedy as the reason when git stated a cause"
+
+# 33g: the bug was per-TICK, so prove it against a real loop rather than a
+# single --once process. F98.0 is open behind a blocked F98.1: nothing is
+# eligible, nothing is live, nothing is resumable, so the loop deadlock-exits
+# after STALL_EXIT_TICKS (3) ticks — a bounded multi-tick run.
+rm -f "$TASKS"/*.md; mk F98.0 open F98.1; mk F98.1 blocked
+loop41=$(TASKPUMP_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 TASKPUMP_STAGGER=0 \
+  ARACHNE_PUMP_OPS_DIR="$TMP/no-such-ops-41" ARACHNE_PUMP_STATE_FILE="$STATE41" \
+  ARACHNE_POOL_CAP_FILE="$TMP/cap" ARACHNE_PUMP_LOG="$TMP/pump41.log" \
+  ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" STUB_LIVE="" STUB_GATE_RC=0 \
+  "$PUMP" --no-health-gate --phases F98 --tick 1 2>&1)
+n41=$(grep -c 'ops pull' <<<"$loop41")
+[[ "$n41" -eq 0 ]] \
+  && pass "should not repeat the pull warning per tick when there is no ledger repo" \
+  || fail "the loop warned about the ops pull $n41 time(s):\n$loop41"
+n41=$(grep -c 'no separate ledger repo' <<<"$loop41")
+[[ "$n41" -eq 1 ]] \
+  && pass "should disclose the skipped sync exactly once per run, not once per tick" \
+  || fail "the startup disclosure appeared $n41 time(s) across a multi-tick run:\n$loop41"
+have "$loop41" 'ops push on stall exit failed' \
+  && fail "the stall exit reported a push failure with no ledger repo to push to:\n$loop41" \
+  || pass "should not report a failed stall-exit push when there is no ledger repo"
+
+echo "--- Test 34: the cap the banner prints is the cap the ticks use (#44) ---"
+# The banner printed $JOBS while every tick read CAP_FILE, so a cap file left
+# behind by an earlier run silently topped the pool up to ITS number while the
+# operator was told the flag's — `--jobs 1` against a leftover 4 launched four
+# agents and said cap=1. Whichever of the two wins, the banner, the tick and the
+# state file must all name the same number.
+CAP44="$TMP/cap44"; STATE44="$TMP/pump44.state"
+mk F90.0 open; mk F91.0 open
+pump44() {  # pump44 <pump args...> — a hermetic run against $CAP44
+  TASKPUMP_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 TASKPUMP_STAGGER=0 \
+  ARACHNE_PUMP_OPS_DIR="$TMP/noops" ARACHNE_PUMP_STATE_FILE="$STATE44" \
+  ARACHNE_POOL_CAP_FILE="$CAP44" ARACHNE_PUMP_LOG="$TMP/pump44.log" \
+  ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+  "$PUMP" --no-health-gate --phases F90..F91 "$@" 2>&1
+}
+banner_cap44() { sed -n 's/.*Pump: .*cap=\([0-9][0-9]*\).*/\1/p' <<<"$1" | head -1; }
+tick_cap44()   { sed -n 's#.*live=[0-9][0-9]*/\([0-9][0-9]*\).*#\1#p' <<<"$1" | head -1; }
+
+# 34a: an explicit --jobs against a leftover cap file of 4.
+echo 4 >| "$CAP44"
+out=$(pump44 --jobs 1 --once)
+bc=$(banner_cap44 "$out"); tc=$(tick_cap44 "$out")
+[[ "$bc" == "1" ]] \
+  && pass "should print the flag's cap in the banner when --jobs 1 meets a cap file holding 4" \
+  || fail "banner cap=$bc, expected 1:\n$out"
+[[ -n "$tc" && "$tc" == "$bc" ]] \
+  && pass "should top the pool up to the banner's cap when a leftover cap file disagrees" \
+  || fail "banner said cap=$bc but the tick launched against $tc:\n$out"
+[[ "$(cat "$CAP44")" == "1" ]] \
+  && pass "should rewrite the live cap file to the flag when --jobs is explicit" \
+  || fail "cap file holds '$(cat "$CAP44")', expected 1 (the flag never reached the file the ticks read)"
+[[ "$(jq -r '.jobs' "$STATE44" 2>/dev/null)" == "1" ]] \
+  && pass "should record the effective cap in the state file when --jobs wins" \
+  || fail "state file jobs=$(jq -r '.jobs' "$STATE44" 2>/dev/null), expected 1"
+
+# 34b: no flag — the cap file is the live retune knob and keeps winning, but the
+# banner must stop claiming the default it is not using.
+echo 3 >| "$CAP44"
+out=$(pump44 --once)
+bc=$(banner_cap44 "$out"); tc=$(tick_cap44 "$out")
+[[ "$bc" == "3" ]] \
+  && pass "should print the cap file's value in the banner when no --jobs is passed" \
+  || fail "banner cap=$bc, expected 3 (the file the ticks read):\n$out"
+[[ -n "$tc" && "$tc" == "$bc" ]] \
+  && pass "should tick against the cap file when no --jobs is passed" \
+  || fail "banner said cap=$bc but the tick launched against $tc:\n$out"
+[[ "$(cat "$CAP44")" == "3" ]] \
+  && pass "should leave a mid-drain retune alone when no --jobs is passed" \
+  || fail "cap file rewritten to '$(cat "$CAP44")', expected the retuned 3"
+# The monitor renders this file: the same number, or the same lie one channel over.
+[[ "$(jq -r '.jobs' "$STATE44" 2>/dev/null)" == "3" ]] \
+  && pass "should record the cap file's value in the state file when no --jobs is passed" \
+  || fail "state file jobs=$(jq -r '.jobs' "$STATE44" 2>/dev/null), expected 3"
+
+# 34c: a dry run must predict the cap the real run would use — it exits before
+# the startup write, so it has to reason about the flag itself.
+echo 4 >| "$CAP44"
+out=$(pump44 --jobs 1 --dry-run)
+have "$out" 'plan — phases F90\.\.F91, grain phase, cap 1,' \
+  && pass "should predict the flag's cap in a dry run when a leftover cap file disagrees" \
+  || fail "dry-run plan header disagrees with the run it previews:\n$out"
+[[ "$(cat "$CAP44")" == "4" ]] \
+  && pass "should not write the cap file in a dry run when --jobs is explicit" \
+  || fail "dry run mutated the cap file to '$(cat "$CAP44")'"
+
+# 34d: with no cap file at all the shipped default still seeds it (Test 22
+# covers the path; this pins the number the banner quotes for it).
+rm -f "$CAP44"
+out=$(pump44 --once)
+bc=$(banner_cap44 "$out")
+[[ "$bc" == "4" && "$(cat "$CAP44")" == "4" ]] \
+  && pass "should seed the cap file from the default cap when no file exists" \
+  || fail "banner cap=$bc, cap file '$(cat "$CAP44" 2>/dev/null)', expected 4/4"
+
+# 34e: a startup that ABORTS must leave the cap file exactly as it found it. The
+# launch prerequisites (no image / no auth dir / no runner / failed build) die
+# after the write, printing no banner and saying nothing about a cap — so the
+# operator's whole evidence is "that command failed", and a cap file quietly
+# rewritten behind it governs the next unflagged run. That is issue #44's own
+# bug shape re-created by its fix, and it is the rule the state file already
+# states one screen below ("a pump that never ticked ... must not clobber a
+# previous run's file on a startup abort"). Every case above sets NO_LAUNCH,
+# which skips the prerequisite block wholesale; this one deliberately does not.
+echo 4 >| "$CAP44"
+abort44() {  # a real (launching) run with an existing auth dir and no image
+  TASKPUMP_NOTIFY_CMD=true TASKPUMP_STAGGER=0 \
+  TASKPUMP_AGENT_HOME="$TMP" TASKPUMP_IMAGE= \
+  ARACHNE_PUMP_OPS_DIR="$TMP/noops" ARACHNE_PUMP_STATE_FILE="$STATE44" \
+  ARACHNE_POOL_CAP_FILE="$CAP44" ARACHNE_PUMP_LOG="$TMP/pump44.log" \
+  ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+  "$PUMP" --no-health-gate --phases F90..F91 "$@" 2>&1
+}
+out=$(abort44 --jobs 12 --once); rc=$?
+[[ "$rc" -ne 0 ]] && have "$out" 'no container image configured' \
+  && pass "should abort on the missing image when --jobs is passed to a run that cannot launch" \
+  || fail "expected a prerequisite abort, got rc=$rc:\n$out"
+have "$out" 'Pump: phases=' \
+  && fail "an aborted startup printed the banner:\n$out" \
+  || pass "should print no banner when the startup aborts on a prerequisite"
+[[ "$(cat "$CAP44")" == "4" ]] \
+  && pass "should leave the live cap file untouched when the startup aborts before ticking" \
+  || fail "cap file rewritten to '$(cat "$CAP44")' by a run that never ticked, expected 4"
+# The consequence the operator actually meets: the documented unflagged form.
+out=$(pump44 --once)
+bc=$(banner_cap44 "$out")
+[[ "$bc" == "4" ]] \
+  && pass "should govern the next unflagged run by the standing cap when an earlier --jobs run aborted" \
+  || fail "next unflagged run ticks at cap=$bc — inherited from a run that never happened:\n$out"
+# Same rule with no file at all: the seeding write is a courtesy for a run that
+# is about to tick, so an abort must not leave a cap file behind either.
+rm -f "$CAP44"
+out=$(abort44 --jobs 12 --once)
+[[ ! -e "$CAP44" ]] \
+  && pass "should create no cap file at all when the startup aborts on a prerequisite" \
+  || fail "an aborted startup seeded a cap file holding '$(cat "$CAP44")':\n$out"
+
+# 34f: an unwritable cap file. The flag still wins (effective_cap holds it for
+# the process's whole life, since the stamp that hands authority back never
+# landed) — but that is precisely when the banner must NOT promise the file as
+# the live retune knob one line under a warn saying that knob is off. A wrong
+# provenance clause in the change whose purpose is provenance.
+CAP44_REAL="$CAP44"
+CAP44="$TMP/cap44-unwritable"; mkdir -p "$CAP44"   # a directory: `echo >|` fails as any user
+out=$(pump44 --jobs 2 --once)
+bc=$(banner_cap44 "$out")
+have "$out" 'could not write .*retuning through that file is off' \
+  && pass "should warn that live retuning is off when the cap file cannot be written" \
+  || fail "no unwritable-cap-file warning:\n$out"
+[[ "$bc" == "2" ]] \
+  && pass "should still tick at the flag's cap when the cap file cannot be written" \
+  || fail "banner cap=$bc, expected 2:\n$out"
+have "$out" 'Pump: .*cap=2 \(--jobs \(cap file unwritable' \
+  && pass "should name the flag alone as the cap's source when the cap file cannot be written" \
+  || fail "banner still advertises the cap file as the live source:\n$out"
+rm -rf "$CAP44"; CAP44="$CAP44_REAL"
+
+# 34g: the stamp hands authority BACK to the cap file. --jobs outranks a stale
+# file only until the flag is written into it; after that the file is the live
+# retune knob again — otherwise a supervisor started with --jobs could never be
+# throttled mid-drain, by an operator or by the disk watchdog, and the suite
+# would not notice because every case above is --once and sees one tick.
+echo 4 >| "$CAP44"
+STATE44G="$TMP/pump44g.state"; rm -f "$STATE44G"
+retune_pump() {  # loop-mode pump; the CALLER backgrounds this exact command
+  TASKPUMP_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 TASKPUMP_STAGGER=0 \
+  ARACHNE_PUMP_OPS_DIR="$TMP/noops" ARACHNE_PUMP_STATE_FILE="$STATE44G" \
+  ARACHNE_POOL_CAP_FILE="$CAP44" ARACHNE_PUMP_LOG="$TMP/pump44g.log" \
+  ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+  exec "$PUMP" --no-health-gate --phases F90..F91 --jobs 1 --tick 1
+}
+await_jobs44() {  # poll until the state file's effective cap reads $1
+  local want="$1" i
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25; do
+    [[ "$(jq -r '.jobs // empty' "$STATE44G" 2>/dev/null)" == "$want" ]] && return 0
+    sleep 0.4
+  done
+  return 1
+}
+retune_pump >/dev/null 2>&1 &
+PUMP44=$!
+await_jobs44 1 \
+  && pass "should stamp the flag into the cap file and tick against it when --jobs starts a loop" \
+  || fail "loop never ticked at the flag's cap: $(cat "$STATE44G" 2>/dev/null)"
+echo 2 >| "$CAP44"
+await_jobs44 2 \
+  && pass "should honor a mid-drain retune of the cap file when the run started with --jobs" \
+  || fail "cap file retune ignored after the startup stamp: $(cat "$STATE44G" 2>/dev/null)"
+kill -TERM "$PUMP44" 2>/dev/null
+wait "$PUMP44" 2>/dev/null
+rm -f "$TASKS/F90.0.md" "$TASKS/F91.0.md"
+
+echo "--- Test 35: a stranded claim as the range's last work is never DRAINED (#48) ---"
+# The drain test counts `open` tasks, and a claim is not open. So an in_progress
+# task this run cannot own — claimed at the other dispatch grain, or on a branch
+# this naming scheme does not own — is invisible to it: neither reclaim nor
+# resume will touch that branch (deliberately, it is the same test that keeps
+# them off a human's), and nothing else can clear it either. While other open
+# work remained the run reached the deadlock exit (3); when the stranded claim
+# was the LAST thing in range, open_count hit 0 and the pump reported the range
+# *drained* at rc 0 over committed, unfinished work nobody is driving. That is
+# the F79 false-DRAINED arriving through the claim-ownership door instead of the
+# ledger-resolution one, and the plan told the same lie at phase grain — a phase
+# with no open tasks left was filed under DONE.
+STATE33="$TMP/pump33.state"
+stranded_fixture() {  # $1 = the branch holding the claim
+  rm -f "$TASKS"/*.md; mk F98.0 done; mkclaim F98.1 "$1"
+}
+dplan33() {  # the plan over F98; extra flags forwarded
+  PATH="$BIN:$PATH" TASKPUMP_NOTIFY_CMD=true ARACHNE_CLAIM_STALE_HOURS=99999 \
+  ARACHNE_PUMP_OPS_DIR="$TMP/noops" ARACHNE_PUMP_STATE_FILE="$STATE33" \
+  ARACHNE_POOL_CAP_FILE="$TMP/cap" ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+  STUB_LIVE="${STUB_LIVE:-}" STUB_AHEAD="${STUB_AHEAD:-3}" STUB_HEAD=aaaa111 \
+  "$PUMP" --no-health-gate --dry-run --phases F98 "$@"
+}
+loop33() {  # a REAL loop over F98 — the drain check only exists in loop mode
+  PATH="$BIN:$PATH" TASKPUMP_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 \
+  ARACHNE_CLAIM_STALE_HOURS=99999 ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
+  ARACHNE_PUMP_STATE_FILE="$STATE33" ARACHNE_POOL_CAP_FILE="$TMP/cap" \
+  ARACHNE_PUMP_LOG="$TMP/pump33.log" ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+  STUB_LIVE="" STUB_AHEAD=3 STUB_HEAD=aaaa111 STUB_GATE_RC=0 \
+  timeout 60 "$PUMP" --no-health-gate --phases F98 --tick 1 "$@"
+}
+
+# 35a: the exit code. A foreign-branch claim as the only remaining work must
+# reach the same loud stall the run reaches when open work sits beside it.
+stranded_fixture feat/somebody-else
+rm -f "$STATE33"
+rc=0; out=$(loop33 2>&1) || rc=$?
+[[ "$rc" -eq 3 ]] && pass "should exit 3 when the range's last work is a claim this run cannot own" \
+  || fail "exit=$rc, want 3 — the range was drained over a stranded claim:\n$out"
+have "$out" 'drained' \
+  && fail "the run reported the range drained over an in-flight claim:\n$out" \
+  || pass "should never report DRAINED when an in-flight claim remains in range"
+
+# 35b: the state file an operator reads during the page. `open_tasks: 0` with
+# `status: stalled` is unreadable on its own — the reason has to name the claim.
+[[ "$(jq -r '.status' "$STATE33" 2>/dev/null)" == "stalled" ]] \
+  && pass "should stamp status=stalled when a stranded claim blocks the drain" \
+  || fail "state after the stranded run: $(cat "$STATE33" 2>/dev/null)"
+have "$(jq -r '.paused_reason // empty' "$STATE33" 2>/dev/null)" 'in-flight claim' \
+  && pass "should name the in-flight claim in the stall reason when 0 open tasks remain" \
+  || fail "stall reason does not name the claim: $(jq -r '.paused_reason' "$STATE33" 2>/dev/null)"
+have "$out" 'in-flight claim' \
+  && pass "should page about the in-flight claim it stalled over" \
+  || fail "the stall page does not mention the in-flight claim:\n$out"
+
+# 35c: the plan has to say the same thing the exit code does. Filing the phase
+# under DONE would move the lie from the exit code into the plan text.
+stranded_fixture feat/somebody-else
+out=$(dplan33 2>&1)
+have "$out" 'DONE +F98' \
+  && fail "phase classified DONE while its last task is still claimed:\n$out" \
+  || pass "should not classify a phase DONE when its last task is still claimed"
+have "$out" 'WAITING +F98' && pass "should plan the stranded phase WAITING when no open tasks remain" \
+  || fail "stranded phase not WAITING:\n$out"
+have "$out" 'F98\.1 \(claimed by feat/somebody-else\)' \
+  && pass "should name the stranded task and its claimant when it explains the wait" \
+  || fail "the WAITING reason does not name the claim:\n$out"
+
+# 35d: the issue's literal repro — claimed at phase grain, run at task grain.
+# The task-grain plan already named it (`WAITING F98.1 (claimed by …)`); only
+# the drain test was blind, so the run said DRAINED under an honest plan.
+stranded_fixture feat/f98
+out=$(dplan33 --grain task 2>&1)
+have "$out" 'WAITING +F98\.1 +\(claimed by feat/f98, no live container\)' \
+  && pass "should keep naming the stranded claim at task grain when the grain switched" \
+  || fail "task-grain plan lost the stranded claim:\n$out"
+rm -f "$STATE33"
+rc=0; out=$(loop33 --grain task 2>&1) || rc=$?
+[[ "$rc" -eq 3 ]] && pass "should exit 3 when a grain switch strands the range's last claim" \
+  || fail "exit=$rc, want 3 at task grain:\n$out"
+have "$out" 'drained' \
+  && fail "task-grain run drained over the stranded claim:\n$out" \
+  || pass "should never report DRAINED at task grain while a claim is in flight"
+
+# 35e: the guard is about claims nobody is driving, not about claims. A LIVE
+# container on the claiming branch is a running phase, not a stranded one.
+stranded_fixture feat/f98
+out=$(STUB_LIVE="arachne-agent-feat-f98" dplan33 2>&1)
+have "$out" 'RUNNING +F98' && pass "should read a claim with a live container as RUNNING when no open tasks remain" \
+  || fail "live claim not RUNNING:\n$out"
+
+# 35f: and a range that genuinely finished still drains. The guard must cost the
+# happy path nothing — a false stall is the same class of wrong answer.
+rm -f "$TASKS"/*.md; mk F98.0 done; mk F98.1 done
+rm -f "$STATE33"
+rc=0; out=$(loop33 2>&1) || rc=$?
+[[ "$rc" -eq 0 ]] && pass "should still exit 0 when the range genuinely drained" \
+  || fail "exit=$rc, want 0 on a genuine drain:\n$out"
+[[ "$(jq -r '.status' "$STATE33" 2>/dev/null)" == "drained" ]] \
+  && pass "should still stamp status=drained when no claim remains in range" \
+  || fail "state after a genuine drain: $(cat "$STATE33" 2>/dev/null)"
+
+echo "--- Test 36: the stall page names the claims it stalled over (#46/#48) ---"
+# 35b pinned that the page and the state file MENTION an in-flight claim; both
+# did it with a bare count, thrown away by `inflight_claims | wc -l` from the
+# `<id> <branch>` pairs that function already yields. An operator woken at 3am by
+# the page then had to go back to the ledger for the two fields the pump had
+# already read, and the ids are exactly what "finish or release it" acts on.
+page36() { grep -F 'STALLED after' <<<"$1" | tail -1; }
+reason36() { jq -r '.paused_reason // empty' "$STATE33" 2>/dev/null; }
+
+# 36a: two stranded claims, one of them a claim the ledger never finished
+# writing (in_progress, no claimed_by). Both channels name both, identically.
+rm -f "$TASKS"/*.md; mkclaim F98.1 feat/other-1; mkclaim F98.2 ""
+rm -f "$STATE33"
+rc=0; out=$(loop33 2>&1) || rc=$?
+page="$(page36 "$out")"; reason="$(reason36)"
+want36='F98.1 (claimed by feat/other-1), F98.2 (claimed, no branch recorded)'
+[[ "$rc" -eq 3 ]] && pass "should still exit 3 when several claims are stranded in range" \
+  || fail "exit=$rc, want 3:\n$out"
+grep -qF "$want36" <<<"$page" \
+  && pass "should name every stranded claim and its branch in the stall page" \
+  || fail "the page names no claim ids: $page"
+grep -qF "$want36" <<<"$reason" \
+  && pass "should name the same claims in the state reason as in the page" \
+  || fail "state reason and page disagree about the claims: $reason"
+have "$page" 'claimed by -' \
+  && fail "an unrecorded claimant reached the page as a branch named nothing: $page" \
+  || pass "should not page about a claim held by a branch called '-'"
+
+# 36b: the bound. A page is one line through a notifier that truncates, and a
+# range holding a dozen stranded claims is one systemic fault the count already
+# describes — so the list is capped at five and says how many it did not name.
+# Both channels are capped the same way: two accounts of one stall is a reason to
+# distrust both.
+rm -f "$TASKS"/*.md
+i36=1
+while (( i36 <= 7 )); do mkclaim "F98.$i36" "feat/other-$i36"; i36=$((i36 + 1)); done
+rm -f "$STATE33"
+rc=0; out=$(loop33 2>&1) || rc=$?
+page="$(page36 "$out")"; reason="$(reason36)"
+capped36='F98.1 (claimed by feat/other-1), F98.2 (claimed by feat/other-2), F98.3 (claimed by feat/other-3), F98.4 (claimed by feat/other-4), F98.5 (claimed by feat/other-5), and 2 more'
+have "$page" '7 in-flight claim\(s\)' \
+  && pass "should still count every stranded claim when it names only the first few" \
+  || fail "the page lost the claim total: $page"
+grep -qF "$capped36" <<<"$page" \
+  && pass "should name five claims and say how many more it did not name when the range holds many" \
+  || fail "the page is not bounded as designed: $page"
+grep -qF "$capped36" <<<"$reason" \
+  && pass "should bound the state reason exactly as the page is bounded" \
+  || fail "state reason bounded differently from the page: $reason"
+have "$page" 'F98\.6|F98\.7' \
+  && fail "the page named past its own bound: $page" \
+  || pass "should not name a claim past the bound it announces"
 
 echo
 echo "=============================================="

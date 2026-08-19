@@ -333,11 +333,23 @@ apl_live_agent_names_strict() {
 APL_RUNNER_LIST_CAP="${APL_RUNNER_LIST_CAP-}"
 
 # apl__runner_list <runner> — ask a runner for its live agents. Passes the fleet
-# prefix and the container runtime, which are the only inputs `list` may read
-# (docs/RUNNERS.md §1.3), and keeps the runner's exit status.
+# prefix, the workspace whose fleet is being asked about, and the container
+# runtime, which are the only inputs `list` may read (docs/RUNNERS.md §1.3), and
+# keeps the runner's exit status.
+#
+# The workspace is REPO_ROOT, read from the sourcing script the same way JOBS
+# and CAP_FILE are. It is what tells two projects' agents apart on one host:
+# names are `<prefix><branch-slug>`, so two repos that share a branch convention
+# name the same agent, and a runner with a host-global view of its fleet
+# (runners/local's registry, a `docker ps` on the shared daemon) hands back
+# somebody else's — which the supervisor then reports as its own RUNNING phase
+# (issue #40). Empty when the caller keeps no workspace, which asks for the
+# unscoped answer this always gave.
 apl__runner_list() {
   TP_AGENT_PREFIX="$(apl_agent_prefix)" \
   TASKPUMP_AGENT_PREFIX="$(apl_agent_prefix)" \
+  TP_REPO_ROOT="${REPO_ROOT:-}" \
+  TASKPUMP_REPO_ROOT="${REPO_ROOT:-}" \
   TASKPUMP_DOCKER="$(apl_docker)" \
   DOCKER="$(apl_docker)" \
   "$1" list

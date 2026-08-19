@@ -10,27 +10,43 @@
 # primary checkout's copy of a tool from inside a worktree still operates on the
 # worktree. Set TASKPUMP_CONFIG to name a file explicitly and skip the walk.
 #
-# A missing config file is normal: every key below has a default baked into the
-# tool that reads it.
+# A missing config file is normal: nearly every key below has a default baked
+# into the tool that reads it. The few with none say so in their own entry, and
+# two of those — TASKPUMP_IMAGE and TASKPUMP_LOCAL_AGENT_CMD — are required for a
+# real launch and abort loudly rather than guess.
 #
 # ── Precedence ───────────────────────────────────────────────────────────────
 #   environment  >  taskpump.conf  >  tool default
 #
-# Legacy ARACHNE_* names are honored everywhere during the transition. An
-# ARACHNE_X in the environment sets TASKPUMP_X and still outranks this file;
-# every TASKPUMP_X set here is mirrored to ARACHNE_X, so a config written in
-# canonical names reaches a tool that still reads the legacy spelling. Where
-# both spellings are in the environment, TASKPUMP_X wins.
+# Legacy ARACHNE_* names are honored during the transition. An ARACHNE_X in the
+# ENVIRONMENT sets TASKPUMP_X and still outranks this file; every TASKPUMP_X set
+# here is mirrored to ARACHNE_X, so a config written in canonical names reaches a
+# tool that still reads the legacy spelling. Where both spellings are in the
+# environment, TASKPUMP_X wins. Three limits, all in docs/CONFIG.md §2: an
+# ARACHNE_* name written IN THIS FILE never bridges (the snapshot that makes
+# environment outrank file is taken before the file is sourced); ARACHNE_CONFIG
+# names no config file and silently moves the conf anchor; and TP_* names are not
+# bridged at all — they are the pump-to-runner handoff's own spelling.
 #
 # ── Syntax ───────────────────────────────────────────────────────────────────
 # This file is sourced by bash with allexport on, so it is `KEY=value` per line.
-# Quote any value containing spaces: `TASKPUMP_NOTIFY_CMD='notify-send -u low'`.
+# Quote any value containing spaces:
+#     TASKPUMP_NOTIFY_CMD='logger -t taskpump'
+# The notifier here is logger and not anything desktop because this line is
+# about the quoting and gets copied by people who are not reading it for
+# notifications: a configured notifier reads the message on stdin, which logger
+# does and an argv-style desktop notifier does not, and it has to work headless,
+# which is where a long run lives. The key's own entry below has the desktop
+# wrapper and what it needs.
 #
 # ── Reading this file ────────────────────────────────────────────────────────
 # Every key is commented out and annotated with the default the tool falls back
 # to. Uncomment only what you need to change. Where two spellings resolve to one
-# setting, the canonical name is the one listed and its accepted fallback is
-# named in the description — set the canonical one.
+# setting, the name LISTED is the one to set and any other spelling is named in
+# the description — usually the canonical TASKPUMP_ name, but not always: where
+# the code reads only the other one, the working spelling is what is listed and
+# the description says so in capitals. docs/CONFIG.md names each tool that reads
+# a key, which is the question behind most of those cases.
 #
 # Anything a consumer never sets — values the pump hands its runner, or the
 # runner hands the container — is listed at the very bottom under "Runtime
@@ -48,17 +64,28 @@
 # TASKPUMP_TASKS_DIR=       # directory of task files (default: <repo root>/$TASKPUMP_LEDGER_PROBE)
 # TASKPUMP_LEDGER_PROBE=    # path, relative to a candidate workspace, whose presence
 #                           #   means "this workspace owns a ledger" — how a worktree's
-#                           #   own ledger is told from the primary's
-#                           #   (default: tasks; TASKPUMP_TASKS_SUBDIR accepted)
-# TASKPUMP_LEDGER_REPO=     # the ledger checkout the pump refreshes and pushes
-#                           #   (default: <repo root>/ops)
+#                           #   own ledger is told from the primary's (default: tasks).
+#                           #   TASKPUMP_TASKS_SUBDIR is its fallback spelling and a
+#                           #   TRAP: tp-pump, tp-monitor and tp-dag-render honour it,
+#                           #   tp-task does not (it defaults LEDGER_PROBE before
+#                           #   resolution runs), so setting it moves three tools'
+#                           #   ledger and not the ledger CLI's. See docs/CONFIG.md
+#                           #   §3.1. Set this key, never that one.
+# TASKPUMP_LEDGER_REPO=     # the ledger CHECKOUT the pump refreshes and pushes, and the
+#                           #   root the container resolves its ledger paths against
+#                           #   (default: <repo root>/ops). Read by tp-pump and the
+#                           #   entrypoint, not by tp-task — the ledger DIRECTORY is
+#                           #   TASKPUMP_TASKS_DIR above.
 # TASKPUMP_CODE_REPO=       # repo whose commits the heartbeat productivity check
 #                           #   measures — the code, not the ledger (default: the
 #                           #   resolved repo root)
 # TASKPUMP_TASK_OUT=        # JSON "next task" surface file
 #                           #   (default: <parent of tasks dir>/.next-task)
-# TASKPUMP_TASK_EXT=        # task-file extension (default: .md;
-#                           #   TASKPUMP_TASK_FILE_EXT accepted)
+# TASKPUMP_TASK_EXT=        # the task-file extension tp-monitor, tp-dag-render and the
+#                           #   container entrypoint SCAN for (default: .md). tp-task
+#                           #   hardcodes .md and never reads this, so setting it points
+#                           #   the readers at files the writer does not create
+#                           #   (TASKPUMP_TASK_FILE_EXT is accepted in the container only)
 # TASKPUMP_ID_PATTERN=      # regex `create` validates a new id against
 #                           #   (default: ^T[0-9]+(\.[0-9]+)?$)
 # TASKPUMP_TASK_PUSH=       # 1 = git push after each state commit (default: 0;
@@ -74,7 +101,8 @@
 # TASKPUMP_LOCK_WAIT=       # seconds to wait for the state lock (default: 120)
 # TASKPUMP_LOCK_NAME=       # the state lockfile's name, created in the ledger's git
 #                           #   root and flock-shared by inode across containers —
-#                           #   every concurrent agent must resolve the same name
+#                           #   every concurrent agent must resolve the same name.
+#                           #   Removed when the verb that took it exits
 #                           #   (default: .taskpump-task.lock)
 # TASKPUMP_COMMITTER_NAME=  # identity for ledger commits (default: tp-task)
 # TASKPUMP_COMMITTER_EMAIL= # (default: task@taskpump.local)
@@ -97,12 +125,16 @@
 #                           #   directory, else the caller's worktree root — never
 #                           #   from a vendored install's own checkout, issue #32.
 #                           #   Set it to pin containers/CI; a missing directory is
-#                           #   a loud error.)
+#                           #   a loud error.) Not pump-only: `tp task` resolves its
+#                           #   ledger inside the same pin, so one pinned shell gets
+#                           #   one answer from both tools (issue #45).
 # TASKPUMP_JOBS=            # concurrent worktree pool cap (default: 4). This is the
 #                           #   key the pump reads; TASKPUMP_PUMP_JOBS is the systemd
 #                           #   unit's name for the same number, passed as --jobs.
-# TASKPUMP_JOBS_FALLBACK=   # cap used when neither --jobs nor the cap file yields one
-#                           #   (default: 6)
+# TASKPUMP_JOBS_FALLBACK=   # cap apl_read_cap falls back to for a caller that passes
+#                           #   none (default: 6). The pump ALWAYS passes its own JOBS,
+#                           #   so this cannot decide a pump run — its live consumer is
+#                           #   tp-disk-watchdog, restoring a cap it has no other record of
 # TASKPUMP_POOL_CAP_FILE=   # live-editable pool cap, re-read each tick
 #                           #   (default: <state dir>/.taskpump-pool-cap)
 # TASKPUMP_TICK=            # seconds between supervisor ticks (default: 30)
@@ -113,9 +145,15 @@
 #                           #   derivation tp task and tp monitor use)
 # TASKPUMP_PUMP_OPS_DIR=    # ledger checkout the pump refreshes and pushes
 #                           #   (default: TASKPUMP_LEDGER_REPO, else <repo root>/ops)
-# TASKPUMP_WORKTREES_DIR=   # where agent worktrees live. The pump reads it as a path,
-#                           #   the monitor and cleanup as a bare directory name
-#                           #   (defaults: <repo root>/.worktrees and .worktrees)
+# TASKPUMP_WORKTREES_DIR=   # where agent worktrees live — under two incompatible
+#                           #   contracts. tp-pump and tp-cleanup read it as a PATH
+#                           #   (default: <repo root>/.worktrees); tp-monitor reads it as
+#                           #   a bare NAME and builds <repo root>/<name> (default:
+#                           #   .worktrees). An absolute value hands the monitor
+#                           #   <repo root>//abs/path; a bare name leaves the other two
+#                           #   with a cwd-relative path (it is not anchored like the
+#                           #   ledger keys). Prefer TASKPUMP_PUMP_WORKTREES_DIR for the
+#                           #   path and leave this one to the monitor.
 # TASKPUMP_PUMP_WORKTREES_DIR=  # pump-only override of the above
 # TASKPUMP_BRANCH_PREFIX=   # prefix for per-phase branches (default: feat/;
 #                           #   TASKPUMP_PUMP_BRANCH_PREFIX overrides for the pump)
@@ -125,7 +163,10 @@
 #                           #   (default: 3; TASKPUMP_PUMP_RESUME_MAX overrides)
 # TASKPUMP_STALL_EXIT_TICKS=  # consecutive deadlocked ticks before exiting 3
 #                           #   (default: 3; TASKPUMP_PUMP_STALL_EXIT_TICKS overrides)
-# TASKPUMP_PUMP_QUARANTINE_FILE=  # phases held out of the frontier
+# TASKPUMP_PUMP_QUARANTINE_FILE=  # append-only record of merges the integration trunk
+#                           #   refused: one `<unit> <sha> <reason>` line per failure,
+#                           #   read once to paste into the graduation PR body. NOT an
+#                           #   exclusion list — a phase named here is still dispatched
 #                           #   (default: <state dir>/.auto-trunk-quarantine)
 # TASKPUMP_PUMP_MONITOR=    # 0 = do not hand the terminal to the monitor after
 #                           #   --detach (default: 1)
@@ -134,15 +175,27 @@
 # TASKPUMP_PUMP_NO_GH=      # 1 = skip all gh CLI calls (default: 0)
 # TASKPUMP_NOTIFY_CMD=      # command that reads a notification on stdin. Unset falls
 #                           #   back to notify-send when present, else log only. Set to
-#                           #   `true` to silence.
+#                           #   `true` to silence. A desktop popup needs a wrapper and a
+#                           #   session bus to deliver to:
+#                           #   TASKPUMP_NOTIFY_CMD='xargs -0 notify-send -u low TaskPump'
+#                           #   (without -0, xargs splits the message at whitespace into
+#                           #   extra positionals notify-send rejects). Headless —
+#                           #   enable-linger, ssh — there is no bus and every notice
+#                           #   fails, so there use
+#                           #   TASKPUMP_NOTIFY_CMD='logger -t taskpump'
 # TASKPUMP_PUMP_PROG_NAME=  # the name the pump answers to as itself — diagnostics,
 #                           #   the plan header, the notify title, the transient
 #                           #   systemd unit (default: tp-pump)
 
 # ── Run state and file names (tp pump) ───────────────────────────────────────
-# One knob moves every dotfile a run drops; each name is still individually
+# One knob moves every dotfile the PUMP drops; each name is still individually
 # overridable.
-# TASKPUMP_STATE_DIR=       # where the run's dotfiles live (default: the repo root)
+# TASKPUMP_STATE_DIR=       # where the run's dotfiles live (default: the repo root).
+#                           #   It moves the writer, not the readers: tp-monitor derives
+#                           #   the pump state file from the PRIMARY CHECKOUT's root and
+#                           #   tp-dag-render from its own repo root — neither reads this
+#                           #   key — so a moved state dir also needs an absolute
+#                           #   TASKPUMP_PUMP_STATE_FILE, which both sides honour.
 # TASKPUMP_PUMP_STATE_FILE= # absolute path of the supervisor state file, overriding
 #                           #   both the state dir and the name below
 #                           #   (default: <state dir>/<TASKPUMP_PUMP_STATE_NAME>)
@@ -166,9 +219,16 @@
 # ── Project-shaped behavior (tp pump) ────────────────────────────────────────
 # The keys that make the pump fit a language and a toolchain. None of them ship
 # with a toolchain baked in; a consumer names its own commands here.
-# TASKPUMP_BUILD_GATE=      # command that must pass before work is integrated
-#                           #   (default: empty = no build gate;
-#                           #   TASKPUMP_PUMP_BUILD_CMD overrides for the merge queue)
+# TASKPUMP_BUILD_GATE=      # command that must pass before work is integrated. UNSET IS
+#                           #   NOT "no gate": with --integration-trunk the pump then runs
+#                           #   `cargo check --workspace`, then ./smoke_test.sh if the
+#                           #   worktree has one. On a non-Rust project that can only
+#                           #   fail, and every merge is reset --hard, quarantined
+#                           #   "build red", and the lead task flipped to needs-review.
+#                           #   Set it — to your own command, or to `true` to integrate
+#                           #   ungated. (TASKPUMP_PUMP_BUILD_CMD overrides for the
+#                           #   merge queue; a configured command REPLACES the default,
+#                           #   it does not run alongside it.)
 # TASKPUMP_VERIFY_CMDS=     # newline-separated commands a task must leave green,
 #                           #   quoted into the brief (default: empty — the brief's
 #                           #   verify sections are dropped until a consumer sets it)
@@ -177,8 +237,9 @@
 #                           #   CONTRIBUTING.md, or equivalent" paragraph)
 # TASKPUMP_BRIEF_TEMPLATE=  # the parameterized brief a launched agent is handed.
 #                           #   Resolution: this key (or TASKPUMP_PHASE_BRIEF_TEMPLATE),
-#                           #   then <ledger>/task-loop/briefs/_phase-drain-template.md,
-#                           #   then <install>/templates/phase-drain-brief.md
+#                           #   then <install>/templates/phase-drain-brief.md. Two rungs,
+#                           #   no probing: a template the pump was never told about is
+#                           #   not configuration, whatever directory it sits in.
 # TASKPUMP_TASK_BRIEF_TEMPLATE=
 #                           # the brief a --grain task container is handed. A DIFFERENT
 #                           #   template, not a reworded phase brief: the phase brief's
@@ -186,10 +247,9 @@
 #                           #   an agent running that at task grain would claim the very
 #                           #   siblings the pump just dispatched elsewhere.
 #                           #   Resolution: this key, then
-#                           #   <ledger>/task-loop/briefs/_task-template.md,
-#                           #   then <install>/templates/task-brief.md
+#                           #   <install>/templates/task-brief.md
 # TASKPUMP_RESUME_TEMPLATE= # resume preamble a stalled task's agent gets ahead of that
-#                           #   brief; resolves the same three ways, ending at
+#                           #   brief; resolves the same two ways, ending at
 #                           #   <install>/templates/resume-note.md
 # TASKPUMP_TASK_CLI=        # how an agent invokes the ledger CLI from inside its
 #                           #   worktree — the spelling briefs quote at the agent
@@ -206,7 +266,11 @@
 #                           #   the workspace as its cwd, e.g. 'cargo clean'
 #                           #   (default: empty = the reclaim pass and the tp-cleanup
 #                           #   --targets sweep are no-ops that log themselves unconfigured)
-# TASKPUMP_DISK_RECLAIM=    # 0 = never reclaim build dirs on disk pressure (default: 1)
+# TASKPUMP_DISK_RECLAIM=    # 0 = switch off the pump's per-tick reclaim of FINISHED
+#                           #   phases' build output (default: 1). Not disk-pressure
+#                           #   conditional despite the name — the pass runs every tick,
+#                           #   before the feed gate, so a paused run keeps freeing space.
+#                           #   The pressure-driven one is TASKPUMP_PANIC_RECLAIM below.
 # TASKPUMP_GATES=           # ordered, newline-separated list of gate COMMAND LINES —
 #                           #   each entry's first word must be an executable path; a
 #                           #   non-executable entry is skipped with a warning.
@@ -252,7 +316,9 @@
 # a specific WiFi firmware wedge. Shipped but OFF by default; a consumer whose
 # hardware needs it opts in.
 # TASKPUMP_HEALTH_GATE=     # 1 puts the gate at the head of the default chain
-#                           #   (default: 0 — the gate is not consulted)
+#                           #   (default under tp-pump: 0 — the gate is not consulted;
+#                           #   gates/net-health run by hand defaults to 1). A net-health
+#                           #   entry in a custom TASKPUMP_GATES still needs this key.
 # TASKPUMP_HEALTH_WINDOW=   # how far back to look, seconds (default: 120)
 # TASKPUMP_HEALTH_PROBE_CMD=  # command whose output is searched (default: empty =
 #                           #   `journalctl -k -b 0 --since '<window> sec ago'`)
@@ -263,17 +329,27 @@
 # ── Gate: claude-token-fresh (gates/claude-token-fresh) ──────────────────────
 # TASKPUMP_TOKEN_GATE=      # 0 disables the gate (default: 1)
 # TASKPUMP_TOKEN_MARGIN_S=  # seconds of TTL headroom the gate wants (default: 600)
-# TASKPUMP_CREDENTIALS=     # credentials file to read and copy from
-#                           #   (default: $HOME/.claude/.credentials.json)
+# TASKPUMP_CREDENTIALS=     # host credentials file: the freshness gate checks its
+#                           #   expiry, the usage gate pulls its OAuth token
+#                           #   (default: $HOME/.claude/.credentials.json; under the pump,
+#                           #   <TASKPUMP_AGENT_HOME>/.credentials.json — derived only
+#                           #   when unset, so a value set here is never clobbered).
+#                           #   What the container copies is TASKPUMP_AGENT_HOME.
 
 # ── Gate: disk-low (gates/disk-low) ──────────────────────────────────────────
-# TASKPUMP_DISK_GATE=       # 0 disables the low-disk feed gate (default: 1)
+# TASKPUMP_DISK_GATE=       # 0 disables the low-disk feed gate for a HAND-RUN gate
+#                           #   (default: 1). Under tp-pump it decides nothing: the pump
+#                           #   hardcodes 1 and exports it over your value, so only
+#                           #   --no-disk-gate (or dropping the gate from TASKPUMP_GATES)
+#                           #   takes it out of the chain.
 # TASKPUMP_DISK_WATCHDOG=   # path to the watchdog the gate consults
 #                           #   (default: <install>/libexec/tp-disk-watchdog)
 # The floor itself is TASKPUMP_DISK_PAUSE_GB, under the watchdog section below.
 
 # ── Gate: claude-usage (gates/claude-usage) ──────────────────────────────────
-# TASKPUMP_USAGE_GATE=      # 0 disables the usage gate (default: 1)
+# TASKPUMP_USAGE_GATE=      # 0 disables the usage gate for a HAND-RUN gate (default: 1).
+#                           #   Under tp-pump it decides nothing, exactly as
+#                           #   TASKPUMP_DISK_GATE above: use --no-usage-gate.
 # TASKPUMP_USAGE=           # path to the usage-gate binary
 #                           #   (default: <install>/gates/claude-usage)
 # TASKPUMP_USAGE_CEILING=   # utilization percent at which to pause launching (default: 95)
@@ -298,15 +374,23 @@
 # TASKPUMP_IMAGE=           # container image name. NO DEFAULT: a real run aborts
 #                           #   loudly when unset — a wrong silent image is worse
 #                           #   than a loud missing one. --dry-run needs no image.
-# TASKPUMP_IMAGE_BUILD=     # command that builds the image before the first launch
-#                           #   (default: unset = never built)
+# TASKPUMP_IMAGE_BUILD=     # command that builds the image before the first launch.
+#                           #   The tree's only +set-tested key: UNSET runs the default
+#                           #   `docker build -t <image> <workspace>`; SET BUT EMPTY
+#                           #   skips the build, which is what a runner pulling a
+#                           #   prebuilt image wants. Since this file is sourced with
+#                           #   allexport, uncommenting the line above with no value IS
+#                           #   the second case, not the first.
 # TASKPUMP_ENTRYPOINT=      # in-image entrypoint path (default: /entrypoint.sh —
 #                           #   where the image contract bakes the shipped runner's
 #                           #   entrypoint.sh; see docs/RUNNERS.md)
 # TASKPUMP_AGENT_PREFIX=    # container-name prefix, INCLUDING the trailing dash —
 #                           #   liveness enumeration matches on it, so it must be
-#                           #   distinctive on the host (default: tp-agent-;
-#                           #   the dashless TASKPUMP_AGENT_CONTAINER_PREFIX accepted)
+#                           #   distinctive on the host (default: tp-agent-).
+#                           #   TASKPUMP_AGENT_CONTAINER_PREFIX is a fallback spelling
+#                           #   ONLY tp-monitor honours: set it alone and the monitor
+#                           #   watches one prefix while the pump launches, enumerates
+#                           #   and reclaims under another.
 # TASKPUMP_AGENT_MODEL=     # model alias forwarded to each agent (default: opus)
 # TASKPUMP_MAX_TURNS=       # turn cap for a phase-drain session (default: 600)
 # TASKPUMP_TASK_MAX_TURNS=  # turn cap for a --grain task session, which claims ONE task
@@ -322,7 +406,12 @@
 #                           #   project-shaped. Non-zero exit aborts the launch with 75.
 #                           #   (default: none)
 # TASKPUMP_CONTAINER_USER=  # user the session runs as (default: dev)
-# TASKPUMP_CONTAINER_HOME=  # its home (default: /home/<container user>)
+# TASKPUMP_CONTAINER_HOME=  # its home (default: /home/<container user>; the shipped
+#                           #   hooks/agent-preflight defaults the same key to a
+#                           #   hardcoded /home/dev, so changing the user and relying on
+#                           #   that hook lands the merged settings in a home the session
+#                           #   never reads — runners/claude-docker/preflight-example.sh
+#                           #   follows the entrypoint and does not)
 # TASKPUMP_WORKSPACE_TASK_CLI=  # the ledger CLI the container invokes: absolute, or
 #                           #   workspace-relative, or a bare command found on PATH
 #                           #   (default: tp — startup fails loudly if it is absent)
@@ -337,6 +426,30 @@
 #                           #   (default: /tmp/claude-home-json/.claude.json)
 # TASKPUMP_RO_PROBE_FILE=   # filename used to prove the primary mount is read-only
 #                           #   (default: .taskpump-rotest)
+# TASKPUMP_INSTALL_MOUNT=   # where a TaskPump install is mounted in the image; its bin/
+#                           #   is prepended to PATH (default: /opt/taskpump). The shipped
+#                           #   runner deliberately does not forward it, so setting it
+#                           #   HERE is inert — it is for an image, or a caller that
+#                           #   mounts an install and passes the variable itself.
+
+# ── Runner: local processes (runners/local/runner.sh) ────────────────────────
+# An alternative runner that starts an agent as a bare process instead of a
+# container. It never sources lib/config.sh, so THIS FILE DOES NOT REACH IT when
+# it is run by hand (`runner.sh list`, `runner.sh stop`) — only the environment
+# does. Under a pump launch it inherits the pump's loaded environment and these
+# values arrive normally.
+# TASKPUMP_LOCAL_AGENT_CMD= # REQUIRED for `launch`: the shell command that runs one
+#                           #   agent session, run through bash -c in the workspace.
+#                           #   NO default — a plausible-but-wrong guess at your agent
+#                           #   would fail far from here (TP_LOCAL_AGENT_CMD accepted)
+# TASKPUMP_LOCAL_REGISTRY=  # the `<name> <pgid> <workspace>` registry that gives a bare
+#                           #   process the name→process mapping a container runtime has
+#                           #   for free (default: <state dir>/.taskpump-local-agents
+#                           #   when TASKPUMP_STATE_DIR is set, else
+#                           #   ${XDG_STATE_HOME:-$HOME/.local/state}/taskpump/local-agents;
+#                           #   TP_LOCAL_REGISTRY accepted)
+# TASKPUMP_LOCAL_STOP_GRACE_S=  # seconds between the TERM to the process group and the
+#                           #   KILL (default: 10; TP_LOCAL_STOP_GRACE_S accepted)
 
 # ── Monitor (tp monitor) ─────────────────────────────────────────────────────
 # TASKPUMP_MONITOR_BIN=     # path to the monitor the pump hands off to
@@ -344,7 +457,10 @@
 # TASKPUMP_MONITOR_REPO_ROOT=  # checkout whose worktrees to report on (default: the
 #                           #   caller's repo root)
 # TASKPUMP_MONITOR_MAIN_ROOT=  # primary checkout, used for cache keys and notes
-# TASKPUMP_MONITOR_INTERVAL=  # --watch refresh seconds; fractional ok (default: 1)
+# TASKPUMP_MONITOR_INTERVAL=  # redraw period in seconds; fractional ok (default: 1).
+#                           #   Watching is the tty default, so this is an ordinary
+#                           #   `tp monitor`'s refresh rate (--watch is a deprecated
+#                           #   alias for it; --glance is the one-frame opt-out)
 # TASKPUMP_MONITOR_TITLE=   # title-line text (default: TaskPump)
 # TASKPUMP_MONITOR_COLS=    # terminal width override (default: the real width)
 # TASKPUMP_MONITOR_LINES=   # terminal height override (default: the real height)
@@ -395,12 +511,19 @@
 #                           #   (default: gawk)
 
 # ── Cleanup (tp cleanup) ─────────────────────────────────────────────────────
-# TASKPUMP_CLEANUP_REPO_ROOT=  # repo whose worktrees get swept (default: the caller's
-#                           #   repo root)
+# TASKPUMP_CLEANUP_REPO_ROOT=  # repo whose worktrees get swept. DEFAULT: THE INSTALL
+#                           #   ROOT (the parent of the invoked script's dir), not the
+#                           #   caller's repo — unset, a sweep run from your project
+#                           #   measures TaskPump's own checkout and reports success.
 # TASKPUMP_RECLAIM_PRIMARY= # 1 = same as --include-primary (default: 0)
-# TASKPUMP_EXTRA_BUSY_DIRS= # newline-separated workspace roots --targets must also
+# EXTRA_BUSY_DIRS=          # newline-separated workspace roots --targets must also
 #                           #   skip. A listed primary root is skipped even under
 #                           #   --include-primary. (default: empty)
+#                           #   NOTE THE MISSING PREFIX: tp-cleanup reads the bare name,
+#                           #   and nothing maps TASKPUMP_EXTRA_BUSY_DIRS onto it, so the
+#                           #   prefixed spelling silently reclaims the workspace you
+#                           #   meant to protect. The bare name works from this file
+#                           #   (it is sourced with allexport) and from the environment.
 # TASKPUMP_STOP_GRACE_SEC=  # container stop grace period, seconds (default: 30)
 
 # ── Agent watchdog (tp agent-watchdog) ───────────────────────────────────────
@@ -412,7 +535,9 @@
 #                           #   zero-agent checks (default: 3)
 
 # ── Disk watchdog (tp disk-watchdog) ─────────────────────────────────────────
-# TASKPUMP_DISK_REPO_ROOT=  # repo the watchdog measures and reclaims within
+# TASKPUMP_DISK_REPO_ROOT=  # repo the watchdog measures and reclaims within. Same
+#                           #   default as TASKPUMP_CLEANUP_REPO_ROOT above, and the same
+#                           #   hazard: it is the INSTALL root unless you set it.
 # TASKPUMP_DISK_MOUNT=      # mount to measure (default: /)
 # TASKPUMP_DISK_PROBE=      # command reporting free space
 #                           #   (default: df --output=avail -BG '<mount>')
@@ -423,8 +548,15 @@
 # TASKPUMP_DISK_RECOVER_GB= # free above this → restore the original cap (default: 20)
 # TASKPUMP_DISK_COOLDOWN=   # seconds to wait after a reclaim before another (default: 180)
 # TASKPUMP_PANIC_RECLAIM=   # 0 = prune only, never clean build dirs (default: 1)
-# TASKPUMP_DISK_WATCHDOG_LOG=  # its log path
-#                           #   (default: <state dir>/.taskpump-disk-watchdog.log)
+# TASKPUMP_DISK_WATCHDOG_LOG=  # where TP-PUMP redirects the watchdog it auto-starts
+#                           #   (default: <state dir>/.taskpump-disk-watchdog.log). The
+#                           #   watchdog itself does not read it; run by hand it logs to
+#                           #   its own stdout.
+# TASKPUMP_ORIGINAL_CAP=    # the cap to restore once free space recovers (default: the
+#                           #   cap file's contents at startup, else
+#                           #   TASKPUMP_JOBS_FALLBACK). Nothing in the tree writes it;
+#                           #   it is the watchdog's own key, for a caller that starts
+#                           #   the watchdog with the cap already lowered.
 
 # ── systemd unit (systemd/taskpump-pump.service) ─────────────────────────────
 # Read only by the unit file, which turns them into command-line flags. They are
@@ -441,7 +573,9 @@
 # launch. They are listed so the contract is readable in one place.
 #
 #   TASKPUMP_WORKSPACE_PATH   the workspace this agent was assigned
-#   TASKPUMP_REPO_ROOT        the primary checkout, mounted read-only
+#   TASKPUMP_REPO_ROOT        the primary checkout, mounted read-only — and, for
+#                             runners/local's `list` and `stop`, the workspace whose
+#                             fleet is being asked about (issue #40)
 #   TASKPUMP_BRANCH           the branch the agent works on
 #   TASKPUMP_PHASE            the phase it drains
 #   TASKPUMP_TASK_ID          the lead task it is assigned
@@ -449,7 +583,8 @@
 #                             (TASKPUMP_BRIEF_TEMPLATE is the configurable one)
 #   TASKPUMP_RESUME_NOTE      host path of the RENDERED resume preamble
 #                             (TASKPUMP_RESUME_TEMPLATE is the configurable one)
-#   TASKPUMP_ORIGINAL_CAP     the pool cap the disk watchdog must restore
+#   TASKPUMP_CONTAINER_NAME   the agent's name (runners/local exports it; the container
+#                             runner names the container from TP_CONTAINER_NAME)
 #   TASKPUMP_NOW_S            clock override; the test suites' seam
 #   TASKPUMP_ENTRYPOINT_TEST_MODE  entrypoint test seam: `plan` resolves and prints,
 #                             `preflight` also runs the hook — neither starts a session

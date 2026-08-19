@@ -34,7 +34,7 @@ TP_CONFIG_SUFFIXES=(
   TASKS_DIR TASK_OUT CODE_REPO LEDGER_PROBE LEDGER_REPO TASKS_SUBDIR
   PUMP_TASKS_DIR PUMP_OPS_DIR SUBMODULE_PROBE ID_PATTERN PHASE_SIGIL
   BRIEF_TEMPLATE PHASE_BRIEF_TEMPLATE TASK_BRIEF_TEMPLATE RESUME_TEMPLATE
-  TASK_NOCOMMIT CONFIG
+  TASK_NOCOMMIT CONFIG WORKSPACE_ROOT
 )
 TP_ENV_UNSET=()
 for _suffix in "${TP_CONFIG_SUFFIXES[@]}"; do
@@ -458,6 +458,208 @@ if git -C "$C3" -c protocol.file.allow=always submodule add -q "$TPSRC" taskpump
 else
   printf 'SKIP: git refuses file-protocol submodules here; submodule flavor not exercised\n'
 fi
+
+# ══ Issue #45 — one pin, one workspace, both tools ═══════════════════════════
+echo "--- #45: TASKPUMP_WORKSPACE_ROOT pins the CLI's ledger, not just the pump's ---"
+
+# The G4.4 walkthrough shape (PR #39): the workspace is pinned by env because
+# $PWD proves nothing — a container, a CI step, an operator standing in ~.
+# `tp pump --dry-run` planned the pinned consumer's frontier; `tp task ready
+# --count` in the SAME shell answered 0, `via install-root` — the install's own
+# ledger. Nothing was corrupted, but 0 is the answer a human reads as "drained".
+PIN="$TMP/pinned-consumer"
+mkdir -p "$PIN/tasks"
+git -C "$PIN" init -q
+mk "$PIN/tasks" T1
+mk "$PIN/tasks" T2
+OUTSIDE="$TMP/elsewhere"; mkdir -p "$OUTSIDE"
+
+pinned() {  # pinned <args...> — tp-task from OUTSIDE the pin, pin the only clue
+  ( cd "$OUTSIDE" && env "${TP_ENV_UNSET[@]}" TASKPUMP_TASK_NOCOMMIT=1 \
+      TASKPUMP_WORKSPACE_ROOT="$PIN" "$TASK" "$@" 2>&1 )
+}
+
+got=$(pinned resolve --tasks-dir)
+[[ "$got" == "$PIN/tasks" ]] \
+  && pass "should resolve the ledger inside the pinned workspace when the pin is set and \$PWD is outside every repo" \
+  || fail "pinned resolve --tasks-dir got '$got', expected '$PIN/tasks'"
+
+got=$(pinned resolve --code-repo)
+[[ "$got" == "$PIN" ]] \
+  && pass "should point code_repo at the pinned workspace when the pin decides the workspace" \
+  || fail "pinned resolve --code-repo got '$got', expected '$PIN'"
+
+got=$(pinned resolve --all | awk '/^via/{print $2}')
+[[ "$got" == "workspace-pin" ]] \
+  && pass "should name the pin as the rung that decided when resolve --all prints via" \
+  || fail "via under the pin reads '$got', expected workspace-pin"
+
+got=$(pinned ready --count)
+[[ "$got" == "2" ]] \
+  && pass "should count the pinned workspace's open tasks when ready --count runs from outside it" \
+  || fail "ready --count under the pin got '$got', expected 2"
+
+# The asymmetry itself: two tools, one shell, one pin — one answer. Compared
+# against the CLI's own count rather than a literal, so the assertion is the
+# two-tool comparison its name promises: a literal passes on an unfixed CLI.
+cli_count=$(pinned ready --count)
+out=$( cd "$OUTSIDE" && env "${TP_ENV_UNSET[@]}" TASKPUMP_TASK_NOCOMMIT=1 \
+        HOME="$CFGHOME" TASKPUMP_TASK="$TASK" TASKPUMP_WORKSPACE_ROOT="$PIN" \
+        "$PUMP" --no-health-gate --no-usage-gate --no-disk-gate \
+        --phases T1..T2 --dry-run 2>&1 )
+[[ "$cli_count" == "2" ]] && have "$out" "open tasks in range: $cli_count" \
+  && pass "should agree with the pump's plan when both tools read the same pin in one shell" \
+  || fail "the pump's plan and the CLI disagree under one pin (CLI said '$cli_count'):\n$out"
+
+# The cross-agent state lock is created in the git root of the RESOLVED ledger,
+# so two agents on one ledger must resolve one tasks dir or they derive two
+# lockfiles and stop excluding each other. The tasks dir is the input the lock
+# path is computed from; asserting it is stronger than asserting the path.
+inside=$( cd "$PIN" && env "${TP_ENV_UNSET[@]}" TASKPUMP_TASK_NOCOMMIT=1 \
+            "$TASK" resolve --tasks-dir )
+[[ "$inside" == "$(pinned resolve --tasks-dir)" ]] \
+  && pass "should resolve one ledger path when one agent pins the workspace and another stands in it" \
+  || fail "pinned resolution and cwd resolution disagree ('$(pinned resolve --tasks-dir)' vs '$inside') — two agents on one ledger would take different locks"
+
+# The mutating-verb guard refuses the install-root FALLBACK, not a pin: naming
+# the workspace is the caller saying where the work lives, the same exemption
+# an explicit tasks dir already gets.
+out=$(pinned claim T1 --branch feat/t1); rc=$?
+[[ $rc -eq 0 ]] \
+  && pass "should let a claim through when the pin names the workspace it lands in" \
+  || fail "claim under the pin was refused (rc=$rc):\n$out"
+grep -q 'status: in_progress' "$PIN/tasks/T1.md" \
+  && pass "should write the claim into the pinned ledger when the workspace is pinned" \
+  || fail "the claim never reached $PIN/tasks/T1.md"
+
+# The pin says which WORKSPACE, not which ledger: an explicitly named tasks dir
+# is more specific and still wins, and via still names the rung that decided.
+got=$( cd "$OUTSIDE" && env "${TP_ENV_UNSET[@]}" TASKPUMP_TASK_NOCOMMIT=1 \
+        TASKPUMP_WORKSPACE_ROOT="$PIN" TASKPUMP_TASKS_DIR="$C1/planning/tasks" \
+        "$TASK" resolve --tasks-dir )
+[[ "$got" == "$C1/planning/tasks" ]] \
+  && pass "should keep an explicit tasks dir winning when a workspace pin is set alongside it" \
+  || fail "an explicit tasks dir lost to the pin: got '$got'"
+got=$( cd "$OUTSIDE" && env "${TP_ENV_UNSET[@]}" TASKPUMP_TASK_NOCOMMIT=1 \
+        TASKPUMP_WORKSPACE_ROOT="$PIN" TASKPUMP_TASKS_DIR="$C1/planning/tasks" \
+        "$TASK" resolve --all | awk '/^via/{print $2}' )
+[[ "$got" == "env" ]] \
+  && pass "should attribute the ledger to env when an explicit tasks dir outranks the pin" \
+  || fail "via with both a pin and an explicit tasks dir reads '$got', expected env"
+
+# A pin naming nothing must be loud. Falling back to the install root there is
+# the silent wrong ledger the pin was set to prevent.
+out=$( cd "$OUTSIDE" && env "${TP_ENV_UNSET[@]}" TASKPUMP_TASK_NOCOMMIT=1 \
+        TASKPUMP_WORKSPACE_ROOT="$TMP/no-such-workspace" "$TASK" ready 2>&1 ); rc=$?
+[[ $rc -ne 0 ]] \
+  && pass "should refuse instead of falling back when the pin names a missing directory" \
+  || fail "a pin naming a missing directory was ignored (rc=$rc):\n$out"
+have "$out" 'TASKPUMP_WORKSPACE_ROOT' \
+  && pass "should name the pin in the refusal when the pinned directory is missing" \
+  || fail "the refusal does not name TASKPUMP_WORKSPACE_ROOT:\n$out"
+
+echo "--- #45: the pin outranks a \$PWD that carries its own ledger ---"
+
+# The precedence this change actually creates, and the riskiest shape in it:
+# the pin names one workspace while $PWD stands in a WORKTREE of another that
+# carries a ledger of its own. Before the fix the cwd probe answered and a
+# claim landed in the worktree's ledger; now the pin answers and it lands in
+# the pinned one. That is the intended direction — the caller naming the
+# workspace outranks a directory answering for itself — but it is a live
+# behaviour change in a repo whose agents each run in their own worktree, so
+# it is asserted here rather than left to be discovered.
+PINP="$TMP/pin-primary"
+mkdir -p "$PINP/tasks"
+git -C "$PINP" init -q
+mk "$PINP/tasks" T1
+git -C "$PINP" -c user.name=t -c user.email=t@e add -A
+git -C "$PINP" -c user.name=t -c user.email=t@e commit -qm seed
+PINW="$TMP/pin-worktree"
+git -C "$PINP" -c user.name=t -c user.email=t@e worktree add -q -b feat/pin "$PINW"
+# The worktree's own ledger, deliberately divergent: one extra open task, so a
+# count alone tells which of the two answered.
+mk "$PINW/tasks" T2
+
+in_wt() {  # in_wt <args...> — pinned at PINP while standing in PINP's worktree
+  ( cd "$PINW" && env "${TP_ENV_UNSET[@]}" TASKPUMP_TASK_NOCOMMIT=1 \
+      TASKPUMP_WORKSPACE_ROOT="$PINP" "$TASK" "$@" 2>&1 )
+}
+
+got=$(in_wt resolve --tasks-dir)
+[[ "$got" == "$PINP/tasks" ]] \
+  && pass "should resolve the pinned workspace's ledger when the pin names one workspace and \$PWD stands in another that carries its own ledger" \
+  || fail "pin vs cwd resolved '$got', expected '$PINP/tasks'"
+
+got=$(in_wt resolve --all | awk '/^via/{print $2}')
+[[ "$got" == "workspace-pin" ]] \
+  && pass "should name workspace-pin as the deciding rung when the pin outranks a cwd worktree carrying its own ledger" \
+  || fail "via with a pin and a ledger-carrying cwd reads '$got', expected workspace-pin"
+
+got=$(in_wt ready --count)
+[[ "$got" == "1" ]] \
+  && pass "should count the pinned workspace's frontier when \$PWD's own ledger holds a different one" \
+  || fail "ready --count with a pin and a ledger-carrying cwd got '$got', expected 1 (the worktree's own ledger holds 2)"
+
+out=$(in_wt claim T1 --branch feat/pin); rc=$?
+[[ $rc -eq 0 ]] && grep -q 'status: in_progress' "$PINP/tasks/T1.md" \
+  && pass "should land a claim in the pinned workspace's ledger when the caller stands in a worktree with its own" \
+  || fail "the claim did not reach $PINP/tasks/T1.md (rc=$rc):\n$out"
+
+# `--help` is where an operator decides whether keeping the pin exported is
+# safe, so the sentence promising the worktree guarantee must carry the one
+# condition that revokes it. Stated unqualified, it is a confident wrong reason
+# printed three lines under the rung that breaks it. Matched by sentence rather
+# than by wording: the guarantee may be phrased any way, it may not be phrased
+# without the pin.
+help_sentence=$( env "${TP_ENV_UNSET[@]}" "$TASK" --help 2>&1 | tr '\n' ' ' \
+                 | sed 's/\. /.\n/g' | grep -F "out of the primary checkout's ledger" | head -1 )
+[[ -n "$help_sentence" ]] && have "$help_sentence" 'pin' \
+  && pass "should qualify the worktree-safety guarantee with the pin that revokes it when --help states it" \
+  || fail "--help promises the worktree guarantee without naming the pin that overrides it: '$help_sentence'"
+
+echo "--- #45: an explicit tasks dir strands the pin, code_repo included ---"
+
+# The pin moves the workspace only when it is the rung that DECIDES it. The
+# workspace root feeds TASKPUMP_CODE_REPO as well as the tasks dir, so a pin
+# that moved it under an explicit tasks dir would redirect the heartbeat's
+# productivity meter while `via` still read `env` — the losing rung acting
+# anyway, invisibly. This is the pump-launched agent's exact environment:
+# tp-pump exports the pinned TASKPUMP_TASKS_DIR, the local runner cds into the
+# agent's worktree carrying the operator's pin whole, and neither sets
+# TASKPUMP_CODE_REPO.
+HBP="$TMP/hb-primary"
+mkdir -p "$HBP/tasks"
+git -C "$HBP" init -q
+mk "$HBP/tasks" T1
+: >| "$HBP/seed"
+git -C "$HBP" -c user.name=t -c user.email=t@e add -A
+git -C "$HBP" -c user.name=t -c user.email=t@e commit -qm seed
+HBW="$TMP/hb-worktree"
+git -C "$HBP" -c user.name=t -c user.email=t@e worktree add -q -b feat/hb "$HBW"
+
+agent() {  # agent <args...> — what a pump-launched local-runner agent sees
+  ( cd "$HBW" && env "${TP_ENV_UNSET[@]}" TASKPUMP_TASK_NOCOMMIT=1 \
+      TASKPUMP_WORKSPACE_ROOT="$HBP" TASKPUMP_TASKS_DIR="$HBP/tasks" \
+      "$TASK" "$@" 2>&1 )
+}
+
+got=$(agent resolve --code-repo)
+[[ "$got" == "$HBW" ]] \
+  && pass "should leave code_repo on the caller's own worktree when an explicit tasks dir outranks the pin" \
+  || fail "code_repo under a stranded pin got '$got', expected '$HBW' — the pin moved a derivation on a rung it lost"
+
+# The consequence, end to end, because "code_repo moved" reads as cosmetic
+# until you watch it verdict a working agent. Three of these in a row and
+# scrub writes status: stuck on a task whose agent is committing normally.
+agent claim T1 --branch feat/hb >/dev/null
+agent heartbeat T1 --start >/dev/null
+: >| "$HBW/agent-work.txt"
+git -C "$HBW" -c user.name=a -c user.email=a@e add -A
+git -C "$HBW" -c user.name=a -c user.email=a@e commit -qm "agent work"
+out=$(agent heartbeat T1 --end)
+have "$out" 'productive=1' && have "$out" 'failures=0' \
+  && pass "should credit an agent's own worktree commits when a pinned pump launched it with an explicit tasks dir" \
+  || fail "heartbeat scored a committing agent unproductive under a stranded pin:\n$out"
 
 echo
 echo "=============================================="

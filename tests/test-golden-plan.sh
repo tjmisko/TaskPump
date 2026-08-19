@@ -142,12 +142,18 @@ TASKS="$REPO/ops/task-loop/tasks"
 BRIEFS="$REPO/ops/task-loop/briefs"
 mkdir -p "$TASKS" "$BRIEFS"
 cp "$GOLDEN/consumer-brief-template.md" "$BRIEFS/_phase-drain-template.md"
-# The resume note the same way. Both templates resolve consumer-side-first, so
-# what this pins is the CONSUMER's wording, not whichever generic default
-# TaskPump happens to ship — which is the point: the byte-identity promise is
-# Arachne's to keep, in its own ledger, and the shipped default stays something
-# a second consumer can actually use. These two files are also the migration:
-# they are what Arachne drops into ops/task-loop/briefs/ to keep its prose.
+# The resume note the same way. What these two files pin is the CONSUMER's
+# wording, not whichever generic default TaskPump happens to ship — which is the
+# point: the byte-identity promise is Arachne's to keep, in its own ledger, and
+# the shipped default stays something a second consumer can actually use. They
+# are also the migration: they are what Arachne drops into ops/task-loop/briefs/
+# to keep its prose.
+#
+# Both are reached through arachne.conf's TASKPUMP_BRIEF_TEMPLATE /
+# TASKPUMP_RESUME_TEMPLATE pins. The resume note used to be reached instead by a
+# probe of this directory, which issue #37 deleted as one consumer's layout baked
+# into a generic tool; the pin replaced it, and these goldens are what proves the
+# replacement rendered the same bytes. Delete either pin and the golden moves.
 cp "$GOLDEN/consumer-resume-template.md" "$BRIEFS/_resume-note-template.md"
 
 mk() {  # mk <id> <status> [blockers_csv] [claimed_by]

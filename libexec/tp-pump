@@ -26,8 +26,11 @@
 #     tick once its container has exited, so a multi-day drain's disk footprint
 #     stays bounded — when TASKPUMP_RECLAIM_CMD names how; unconfigured, the
 #     pass is a no-op (TASKPUMP_DISK_RECLAIM=0 disables it entirely).
-#   * Drains: exits only when no open task remains in range AND no live agent
-#     container remains, then pushes the ledger and emits a summary.
+#   * Drains: exits only when THREE things are true of the range at once — no
+#     open task, no in-flight claim, and no live agent container — then pushes
+#     the ledger and emits a summary. The middle question is issue #48's: an
+#     in_progress task is committed, unfinished work, and draining over it is
+#     the false-DRAINED this supervisor exists to refuse.
 #
 # Usage:
 #   tp pump --phases F55..F63 --jobs 4 --usage-ceiling 95 --grain phase
@@ -183,8 +186,11 @@ APL_LIVENESS_RUNNER="$RUNNER"
 # --dry-run and NO_LAUNCH ticks never launch and keep working imageless.
 IMAGE="${TASKPUMP_IMAGE:-}"
 # The default names the shipped claude-docker runner's own entrypoint at the
-# path the image contract bakes it (docs/RUNNERS.md §4.0). Arachne's image
-# layout (/entrypoint-parallel.sh) survives as the examples/arachne.conf pin.
+# path the image contract bakes it (docs/RUNNERS.md §4.0). An image that bakes
+# it elsewhere must set this key itself: examples/arachne.conf dropped its
+# /entrypoint-parallel.sh pin in issue #5, because only the shipped entrypoint
+# runs the pre-flight hook, so pinning a pre-hook entrypoint leaves a
+# configured TASKPUMP_PRE_FLIGHT read by nothing.
 ENTRYPOINT="${TASKPUMP_ENTRYPOINT:-/entrypoint.sh}"
 # Building the agent image once before the drain. Unset ⇒ the default docker
 # build of the repo root; set to the empty string ⇒ skip it entirely, which is
@@ -240,6 +246,13 @@ PHASES=""
 # The supervisor's own default cap. Callers that set nothing at all fall back to
 # pump-lib's TASKPUMP_JOBS_FALLBACK instead; see the note there.
 JOBS="${TASKPUMP_JOBS:-${JOBS:-4}}"
+# Did THIS invocation type --jobs? A conf/env cap is a standing preference the
+# live cap file may legitimately outrank; a flag is an instruction about this one
+# run, and effective_cap() below is where that difference is spent (issue #44).
+# CAP_FILE_STAMPED flips once the startup write has put the flag INTO the cap
+# file, after which the file is the single authority again.
+JOBS_GIVEN=0
+CAP_FILE_STAMPED=0
 CEILING="${TASKPUMP_USAGE_CEILING:-95}"
 GRAIN="phase"
 TICK="${TASKPUMP_TICK:-${POOL_TICK:-30}}"
@@ -330,7 +343,7 @@ while [[ $# -gt 0 ]]; do
     --phase=*)  PHASES="${1#--phase=}"; shift;;
     --jobs|-j)
       [[ "${2:-}" =~ ^[0-9]+$ ]] || die "--jobs needs a non-negative integer"
-      JOBS="$2"; shift 2;;
+      JOBS="$2"; JOBS_GIVEN=1; shift 2;;
     --usage-ceiling)
       [[ "${2:-}" =~ ^[0-9]+$ ]] || die "--usage-ceiling needs an integer"
       CEILING="$2"; shift 2;;
@@ -505,6 +518,28 @@ pump_in_list() {
   return 1
 }
 
+# The concurrency cap actually in force — the ONE number the banner, the plan
+# header, the launch loop and the state file all have to quote (issue #44).
+#
+# The banner used to print $JOBS while every tick read CAP_FILE, so a cap file
+# left behind by an earlier run silently topped the pool up to ITS number:
+# `--jobs 1` over a stale 4 launched four agents under a "cap=1" banner, and the
+# operator only found out by counting containers.
+#
+# An explicit --jobs is an instruction about THIS run, so it outranks that file:
+# the real-run startup stamps the flag into CAP_FILE and sets CAP_FILE_STAMPED,
+# after which the file is authoritative again and a mid-drain
+# `echo 3 >| .taskpump-pool-cap` still retunes a live pump. Until the stamp lands
+# — --dry-run and --list exit before it, and an unwritable cap file never gets it
+# — the flag is what this run will use, so it is what every surface must report.
+effective_cap() {
+  if [[ "$JOBS_GIVEN" -eq 1 && "$CAP_FILE_STAMPED" -eq 0 ]]; then
+    printf '%s\n' "$JOBS"
+    return 0
+  fi
+  JOBS=$JOBS apl_read_cap
+}
+
 # Distinct phases present in the live eligible frontier (have ≥1 launchable task).
 frontier_phases() {
   "$TASK_BIN" ready --phases "$PHASES" --json 2>/dev/null \
@@ -519,6 +554,59 @@ open_count() {
 # Open-task count within a single phase (regardless of blocker state).
 phase_open_count() {
   "$TASK_BIN" ready --phase "$1" --count 2>/dev/null || echo 0
+}
+
+# The claims still in flight across the range, one `<id> <claimed_by>` per line.
+#
+# The count above cannot see these: `ready --count` counts `open` tasks, and a
+# claim is not open. That blind spot is fine for the frontier — a claimed task is
+# not launchable — and wrong for the DRAIN test, because an in_progress task is
+# unfinished work with commits on a branch, not finished work. A claim this run
+# cannot own (taken at the other dispatch grain, or on a branch this naming
+# scheme does not own) is never reclaimed and never resumed either, so nothing
+# later clears it: left invisible, it let the run call the range drained over it
+# (issue #48). Read straight from the ledger rather than derived from the plan,
+# because the drain test runs after the plan is gone.
+inflight_claims() {
+  local -A in_range=()
+  local p id status branch _rest
+  while IFS= read -r p; do [[ -n "$p" ]] && in_range["$p"]=1; done < <(pump_expand_phases "$PHASES")
+  # `|| continue` throughout, never a trailing `[[ … ]] && printf`: an and-list
+  # as the last command of the body makes the loop exit non-zero, and read
+  # through a process substitution that truncation is invisible (tasks_in_range
+  # below carries the incident this rule came from).
+  while read -r id status branch _rest; do
+    [[ "$id" != "ID" ]] || continue
+    [[ "$status" == "in_progress" ]] || continue
+    [[ -n "${in_range[${id%%.*}]:-}" ]] || continue
+    # `-` is the TABLE's placeholder for a null claimant, not a branch. Passing
+    # it through verbatim is how a caller ends up telling the operator a claim is
+    # held by a branch NAMED nothing; hand on the empty field the record actually
+    # carries and let the caller say which field is missing.
+    [[ "$branch" == "-" ]] && branch=""
+    printf '%s %s\n' "$id" "$branch"
+  done < <("$TASK_BIN" list --status in_progress 2>/dev/null)
+}
+
+# How ONE in-flight claim is spelled, in the three places that name one: the
+# derived WAITING tail, the stall state reason, the stall page. Single source
+# because the phase-grain plan's two arms each spelled it themselves, so whether
+# a stranded claim was named at all — and in which words — depended on what else
+# happened to be open in its phase (issues #46/#48). Task grain keeps its own
+# sentence (`claimed by …, no live container`), which says one more true thing:
+# there the claim IS the dispatch unit, so the unit's liveness is its own.
+#
+# An `in_progress` record with an empty `claimed_by` is a claim the ledger never
+# finished writing. The old `${branch:--}` rendered that as "claimed by -", which
+# reads as a branch NAMED nothing rather than as a missing field, so say which
+# field is missing instead.
+claim_phrase() {  # <id> [branch]
+  local id="$1" branch="${2:-}"
+  if [[ -n "$branch" ]]; then
+    printf '%s (claimed by %s)' "$id" "$branch"
+    return 0
+  fi
+  printf '%s (claimed, no branch recorded)' "$id"
 }
 
 # Is a phase's worktree branch currently owned by a LIVE agent? (D3)
@@ -1153,20 +1241,26 @@ phase_dependencies() {
 }
 
 # ── Brief-template resolution ─────────────────────────────────────────────────
-# Three places to look, in order: what the operator configured, the consumer's
-# own template inside its ledger (Arachne's path — so an existing project keeps
-# rendering exactly what it did), and finally the generic one shipped with
-# TaskPump. Previously a missing consumer template was a hard die, which made a
-# fresh project unable to run at all until it wrote one.
+# Two places to look, in order: what the operator configured, and the generic one
+# shipped with TaskPump. Previously a missing template was a hard die, which made
+# a fresh project unable to run at all until it wrote one.
+#
+# Between those two there used to sit a third rung: $OPS_DIR/task-loop/briefs/,
+# probed unasked because that is where Arachne keeps its own prose. Extraction
+# turned it into one consumer's directory layout wired into a generic tool — for
+# every other project the path could not exist, so the rung was dead while the
+# not-found message still advertised it as somewhere the pump had looked (issue
+# #37, deferred from PR #29 to preserve golden byte-identity). It is deleted
+# here, and the reference consumer now says what it wants: examples/arachne.conf
+# pins both TASKPUMP_BRIEF_TEMPLATE and TASKPUMP_RESUME_TEMPLATE at those same
+# ledger paths, which is the migration for anyone else who relied on the probe.
 resolve_brief_template() {
   local explicit="${TASKPUMP_PHASE_BRIEF_TEMPLATE:-${TASKPUMP_BRIEF_TEMPLATE:-}}"
   [[ -n "$explicit" ]] && { printf '%s' "$explicit"; return 0; }
-  local consumer="$OPS_DIR/task-loop/briefs/_phase-drain-template.md"
-  [[ -f "$consumer" ]] && { printf '%s' "$consumer"; return 0; }
   printf '%s' "$TP_ROOT/templates/phase-drain-brief.md"
 }
 
-# The task-grain brief resolves the same three ways. It is a DIFFERENT template,
+# The task-grain brief resolves the same two ways. It is a DIFFERENT template,
 # not a re-parameterized phase brief, and the difference is load-bearing: the
 # phase brief's whole working method is the in-context `next --phase` loop, and
 # an agent running that at task grain would claim its siblings — the very tasks
@@ -1176,8 +1270,6 @@ resolve_brief_template() {
 resolve_task_brief_template() {
   local explicit="${TASKPUMP_TASK_BRIEF_TEMPLATE:-}"
   [[ -n "$explicit" ]] && { printf '%s' "$explicit"; return 0; }
-  local consumer="$OPS_DIR/task-loop/briefs/_task-template.md"
-  [[ -f "$consumer" ]] && { printf '%s' "$consumer"; return 0; }
   printf '%s' "$TP_ROOT/templates/task-brief.md"
 }
 if [[ "$GRAIN" == "task" ]]; then
@@ -1186,15 +1278,13 @@ else
   BRIEF_TEMPLATE="$(resolve_brief_template)"
 fi
 
-# The resume note resolves the same three ways, for the same reason: a consumer
-# whose agents depend on particular wording keeps it in its own ledger, while
-# the shipped default stays tool-agnostic. Symmetry matters here — the two
-# templates are read by the same agent in the same session.
+# The resume note resolves the same two ways, for the same reason: a consumer
+# whose agents depend on particular wording points TASKPUMP_RESUME_TEMPLATE at
+# it, while the shipped default stays tool-agnostic. Symmetry matters here — the
+# two templates are read by the same agent in the same session.
 resolve_resume_template() {
   local explicit="${TASKPUMP_RESUME_TEMPLATE:-}"
   [[ -n "$explicit" ]] && { printf '%s' "$explicit"; return 0; }
-  local consumer="$OPS_DIR/task-loop/briefs/_resume-note-template.md"
-  [[ -f "$consumer" ]] && { printf '%s' "$consumer"; return 0; }
   printf '%s' "$TP_ROOT/templates/resume-note.md"
 }
 RESUME_TEMPLATE="$(resolve_resume_template)"
@@ -1204,13 +1294,13 @@ RESUME_TEMPLATE="$(resolve_resume_template)"
 missing_brief_template_msg() {
   if [[ "$GRAIN" == "task" ]]; then
     printf 'task brief template not found: %s\n' "$BRIEF_TEMPLATE"
-    printf '  looked at: $TASKPUMP_TASK_BRIEF_TEMPLATE, then %s/task-loop/briefs/_task-template.md,\n' "$OPS_DIR"
-    printf '  then the one shipped at %s/templates/task-brief.md\n' "$TP_ROOT"
+    printf '  looked at: $TASKPUMP_TASK_BRIEF_TEMPLATE, then the one shipped at\n'
+    printf '  %s/templates/task-brief.md\n' "$TP_ROOT"
     return 0
   fi
   printf 'phase-drain brief template not found: %s\n' "$BRIEF_TEMPLATE"
-  printf '  looked at: $TASKPUMP_BRIEF_TEMPLATE, then %s/task-loop/briefs/_phase-drain-template.md,\n' "$OPS_DIR"
-  printf '  then the one shipped at %s/templates/phase-drain-brief.md\n' "$TP_ROOT"
+  printf '  looked at: $TASKPUMP_BRIEF_TEMPLATE, then the one shipped at\n'
+  printf '  %s/templates/phase-drain-brief.md\n' "$TP_ROOT"
 }
 
 # ── Brief rendering (D6 / F64.4; deps A3 v1) ───────────────────────────────────
@@ -1738,17 +1828,197 @@ graduate_trunk() {
   fi
 }
 
+# ── Why a phase's open work is not eligible (issue #46) ───────────────────────
+# The plan used to ASSERT this reason: every phase with open tasks and an empty
+# frontier printed "cross-phase blockers pending". The case that surfaced it was
+# a phase gated only on its OWN review task (issue #12) — so the report was loud
+# and correct that nothing could launch, and then sent the operator hunting for
+# an upstream dependency that did not exist. An operator acts on the words, not
+# on the exit code; a wrong stated reason is the same failure as a wrong answer,
+# it just spends the reader's afternoon instead of the tool's.
+#
+# So derive it. Two reads answer every case and both go through the CLI (the
+# ledger's only reader): `list --json` for the whole ledger's status, claimant
+# and blockers, and the eligible frontier asked a SECOND time with review units
+# included. Loaded lazily and once per plan — a range that is launching cleanly
+# never pays for either read.
+declare -A WAITSNAP_STATUS WAITSNAP_CLAIMED WAITSNAP_BLOCKERS WAITSNAP_REVIEW
+declare -a WAITSNAP_IDS
+WAITSNAP_LOADED=0
+load_wait_snapshot() {
+  WAITSNAP_STATUS=(); WAITSNAP_CLAIMED=(); WAITSNAP_BLOCKERS=(); WAITSNAP_REVIEW=()
+  WAITSNAP_IDS=()
+  # The WHOLE ledger, deliberately not the range: a blocker outside --phases is
+  # exactly the cross-phase case this reason exists to name, and reading a
+  # missing record as "not done" would report a long-finished upstream as
+  # pending. Same RS-delimited record shape (and the same reason for it) as
+  # load_task_snapshot: a tab would collapse an empty claimant field and shift
+  # every field after it.
+  local id status claimed blockers
+  while IFS=$'\x1e' read -r id status claimed blockers; do
+    [[ -z "$id" ]] && continue
+    WAITSNAP_STATUS["$id"]="$status"
+    WAITSNAP_CLAIMED["$id"]="$claimed"
+    WAITSNAP_BLOCKERS["$id"]="$blockers"
+    WAITSNAP_IDS+=("$id")
+  done < <("$TASK_BIN" list --json 2>/dev/null \
+           | jq -r '.[] | [.id, .status, (.claimed_by // ""), (.blockers | join(" "))]
+                 | join("\u001e")' 2>/dev/null)
+  # A review unit is hidden from the frontier unless it is asked for, and the
+  # pump never asks — so nothing here dispatches one, and a phase can sit on it
+  # indefinitely. Rather than read `review_role` behind the CLI's back (the
+  # ledger has one reader), ask the frontier the same question twice: an id that
+  # appears only WITH --include-reviews is a review unit. That inference is
+  # sound exactly for a phase absent from the plain frontier — the only kind of
+  # phase a reason is derived for — because an ordinary eligible task would have
+  # put its phase in that frontier.
+  while IFS= read -r id; do
+    [[ -n "$id" ]] && WAITSNAP_REVIEW["$id"]=1
+  done < <("$TASK_BIN" ready --phases "$PHASES" --json --include-reviews 2>/dev/null \
+           | jq -r '.[].id' 2>/dev/null)
+  WAITSNAP_LOADED=1
+}
+
+# phase_wait_reason <phase> <open-count> — the derived tail of a WAITING line.
+#
+# Several clauses can be true at once (a phase can await a verdict AND hold a
+# claim), so they are joined rather than ranked — ranking would drop a fact the
+# operator has to act on anyway. Within one task the order is the ledger's own
+# eligibility order (review unit, then claim, then blockers), so each task
+# contributes exactly the clause `ready` skipped it for, and never two.
+#
+# The whole WAITING tail for a non-launching phase is derived here, at BOTH open
+# counts. compute_plan calls it with oc == 0 only from its in-flight arm, where
+# the claim clause below is the only one that can fire — see that arm.
+phase_wait_reason() {
+  local phase="$1" oc="$2"
+  (( WAITSNAP_LOADED )) || load_wait_snapshot
+  local reviews="" cross="" siblings="" claims="" inflight="" dangling="" unexplained=""
+  local -A seen=()
+  local id blk bstatus pending
+  for id in "${WAITSNAP_IDS[@]:-}"; do
+    [[ -z "$id" ]] && continue
+    [[ "${id%%.*}" == "$phase" ]] || continue
+    # A claim is `in_progress`, not `open`, so the filter below used to drop it
+    # and no clause ever named it. compute_plan named it in the one arm where the
+    # claim is the phase's LAST work; put any other open task in the phase and it
+    # vanished from the plan while --grain task still named it — one ledger, two
+    # answers to "who is holding this phase" (issues #46/#48). Derived here so
+    # both plan arms read it from one place, and so the phase-grain answer stops
+    # depending on a grain switch for whether the claim is mentioned at all.
+    if [[ "${WAITSNAP_STATUS[$id]:-}" == "in_progress" ]]; then
+      [[ -n "${seen[f:$id]:-}" ]] || inflight+="${inflight:+, }$(claim_phrase "$id" "${WAITSNAP_CLAIMED[$id]:-}")"
+      seen[f:$id]=1
+      continue
+    fi
+    [[ "${WAITSNAP_STATUS[$id]:-}" == "open" ]] || continue
+    if [[ -n "${WAITSNAP_REVIEW[$id]:-}" ]]; then
+      [[ -n "${seen[r:$id]:-}" ]] || reviews+="${reviews:+, }$id"
+      seen[r:$id]=1
+      continue
+    fi
+    if [[ -n "${WAITSNAP_CLAIMED[$id]:-}" ]]; then
+      claims+="${claims:+, }$id by ${WAITSNAP_CLAIMED[$id]}"
+      continue
+    fi
+    pending=""
+    for blk in ${WAITSNAP_BLOCKERS[$id]:-}; do
+      [[ -z "$blk" ]] && continue
+      # `+set`, not `:-`: an id the ledger has no file for is a dangling edge,
+      # which is a different (and worse) fact than an unfinished blocker, and
+      # fsck is where it gets repaired.
+      if [[ -z "${WAITSNAP_STATUS[$blk]+set}" ]]; then
+        pending=1
+        [[ -n "${seen[d:$blk]:-}" ]] || dangling+="${dangling:+, }$blk"
+        seen[d:$blk]=1
+        continue
+      fi
+      bstatus="${WAITSNAP_STATUS[$blk]}"
+      # A satisfied blocker is not a reason for anything; only the unfinished
+      # ones set `pending`, and each of them independently — a done blocker
+      # listed after an open one must never clear what the open one recorded.
+      [[ "$bstatus" == "done" ]] && continue
+      pending=1
+      if [[ "${blk%%.*}" != "$phase" ]]; then
+        [[ -n "${seen[x:$blk]:-}" ]] || cross+="${cross:+, }$blk ($bstatus)"
+        seen[x:$blk]=1
+        continue
+      fi
+      # An in-phase blocker that is a review unit is reported as the review it
+      # is, not twice — once under its own clause and again as a sibling. The
+      # review inference is only asked about THIS phase's ids, where it is
+      # sound; a cross-phase id in the include-reviews frontier may simply be an
+      # ordinary eligible task of a phase that is launching.
+      if [[ -n "${WAITSNAP_REVIEW[$blk]:-}" ]]; then
+        [[ -n "${seen[r:$blk]:-}" ]] || reviews+="${reviews:+, }$blk"
+        seen[r:$blk]=1
+        continue
+      fi
+      # An in_progress sibling is deliberately NOT folded into the claim clause
+      # the way a review is: the two say different things about it — this one
+      # blocks the open task, that one names the branch holding it — and the
+      # review fold exists because "awaiting review" and "blocker pending" are
+      # the same fact twice, which these are not.
+      [[ -n "${seen[i:$blk]:-}" ]] || siblings+="${siblings:+, }$blk ($bstatus)"
+      seen[i:$blk]=1
+    done
+    [[ -n "$pending" ]] && continue
+    # Open, unclaimed, no unfinished blocker — and still not in the frontier.
+    # Nothing the pump can see explains it, so say that instead of inventing a
+    # dependency: the ledger and the frontier disagree and a human has to look.
+    unexplained+="${unexplained:+, }$id"
+  done
+
+  local why=""
+  [[ -n "$reviews" ]] && why+="${why:+; }awaiting review: $reviews (the pump never dispatches a review task; record the verdict)"
+  [[ -n "$cross" ]] && why+="${why:+; }cross-phase blockers pending: $cross"
+  [[ -n "$siblings" ]] && why+="${why:+; }in-phase blockers pending: $siblings"
+  [[ -n "$claims" ]] && why+="${why:+; }claimed: $claims"
+  [[ -n "$inflight" ]] && why+="${why:+; }in flight: $inflight"
+  [[ -n "$dangling" ]] && why+="${why:+; }blockers with no task file: $dangling"
+  [[ -n "$unexplained" ]] && why+="${why:+; }open and unblocked but outside the frontier: $unexplained"
+  if [[ "$oc" -gt 0 ]]; then
+    # The count and the walk disagree, which is a real fault (an unreadable file,
+    # a ledger read that failed, a ledger that moved under the tick) and not a
+    # dependency. Say which two answers conflict, so the next question is obvious.
+    [[ -z "$why" ]] && why="the ledger lists no open task in this phase — the count and the listing disagree"
+    printf '%s open, none eligible — %s' "$oc" "$why"
+    return 0
+  fi
+  # oc == 0: the in-flight arm. "none eligible" would be vacuous here — there is
+  # nothing open to be eligible — so the head states the count as it is, and the
+  # claim clause carries the rest. Same fault report as above when the tick's two
+  # ledger reads disagree, naming the pair that conflicts.
+  [[ -z "$why" ]] && why="the tick listed an in-flight claim in this phase and the ledger snapshot shows none — the two reads disagree"
+  printf 'no open tasks — %s' "$why"
+}
+
 # ── Planning pass: classify every phase in range ───────────────────────────────
 # Sets arrays LAUNCH/RUNNING/WAITING/DONEP. Returns the plan via globals.
 declare -a PLAN_LAUNCH PLAN_RUNNING PLAN_WAITING PLAN_DONE PLAN_RESUME
 declare -A PLAN_WAIT_REASON
 compute_plan() {
   PLAN_LAUNCH=(); PLAN_RUNNING=(); PLAN_WAITING=(); PLAN_DONE=(); PLAN_RESUME=(); PLAN_WAIT_REASON=()
+  # The reason snapshot answers for ONE tick's ledger; re-read it on demand.
+  WAITSNAP_LOADED=0
   if [[ "$GRAIN" == "task" ]]; then compute_plan_task; return 0; fi
   detect_stalled_orphans
   local -A in_frontier=()
   local p
   while IFS= read -r p; do [[ -n "$p" ]] && in_frontier["$p"]=1; done < <(frontier_phases)
+  # Which phases hold an in-flight claim, read once for the whole range. `ready`
+  # cannot see a claim (it is not `open`), so without this a phase whose last
+  # remaining task is claimed has oc == 0 and reads as finished — the plan half
+  # of issue #48. Keeping it out of the per-phase loop keeps this to one ledger
+  # walk per tick. Presence only: this decides WHICH arm the phase takes, and
+  # phase_wait_reason writes the sentence from the snapshot it already holds, so
+  # the claim is spelled the same however the phase got there.
+  local -A inflight_of=()
+  local id
+  while read -r id _; do
+    [[ -n "$id" ]] || continue
+    inflight_of["${id%%.*}"]=1
+  done < <(inflight_claims)
   while IFS= read -r p; do
     [[ -z "$p" ]] && continue
     local oc; oc="$(phase_open_count "$p")"
@@ -1773,13 +2043,42 @@ compute_plan() {
       # finished over committed, unfinished work.
       PLAN_RESUME+=("$p")
     elif [[ "$oc" -gt 0 ]]; then
-      # Has open tasks but none eligible — gated on incomplete cross-phase deps,
-      # unless a live container is already draining it.
+      # Has open tasks but none eligible, unless a live container is already
+      # draining it. WHY none are eligible is derived from the ledger, never
+      # assumed: a cross-phase dependency is only one of the answers (issue #46).
       if phase_live "$p"; then
         PLAN_RUNNING+=("$p")
       else
         PLAN_WAITING+=("$p")
-        PLAN_WAIT_REASON["$p"]="$oc open, none eligible — cross-phase blockers pending"
+        # Primed HERE, in the main shell: phase_wait_reason is read through a
+        # `$( )`, and a snapshot loaded inside that subshell dies with it — every
+        # waiting phase would re-read the whole ledger. Same trap
+        # load_task_snapshot documents, one caller further out.
+        (( WAITSNAP_LOADED )) || load_wait_snapshot
+        PLAN_WAIT_REASON["$p"]="$(phase_wait_reason "$p" "$oc")"
+      fi
+    elif [[ -n "${inflight_of[$p]:-}" ]]; then
+      # No open tasks left, but a claim here is still in flight and this run can
+      # neither reclaim nor resume it (a grain switch, a foreign branch, or
+      # --no-resume-stalled). DONE would say the phase finished; the drain test
+      # refuses that answer now (issue #48), so the plan must not print it either
+      # — the same lie in a different channel. A live container on the branch is
+      # not stranded at all, so it is asked first, exactly as the oc > 0 arm does.
+      #
+      # The reason is DERIVED, not written here: this arm used to hold its own
+      # sentence for a claim, which is how the phase ended up described one way
+      # when it was the phase's last work and not at all when anything else was
+      # open beside it. One derivation, so both arms say the same thing about the
+      # same claim. It costs the snapshot load in a range that is otherwise all
+      # DONE — a stranded phase is already an anomaly the operator is being sent
+      # to read, and lazy loading still spares a range that launches cleanly.
+      if phase_live "$p"; then
+        PLAN_RUNNING+=("$p")
+      else
+        PLAN_WAITING+=("$p")
+        # Primed in the main shell for the reason the oc > 0 arm documents.
+        (( WAITSNAP_LOADED )) || load_wait_snapshot
+        PLAN_WAIT_REASON["$p"]="$(phase_wait_reason "$p" "$oc")"
       fi
     else
       PLAN_DONE+=("$p")
@@ -1929,7 +2228,7 @@ compute_plan_task() {
 print_plan() {
   compute_plan
   local gate_line; if feed_gate; then gate_line="GATE: feed-ok"; else gate_line="GATE: PAUSED — $GATE_REASON"; fi
-  echo "$PROG_NAME plan — phases $PHASES, grain $GRAIN, cap $(JOBS=$JOBS apl_read_cap), ceiling $CEILING%"
+  echo "$PROG_NAME plan — phases $PHASES, grain $GRAIN, cap $(effective_cap), ceiling $CEILING%"
   echo "$gate_line"
   # What a feeding gate had to say — a Claude gate skipping on a host with no
   # Claude credentials, say. Indented under the gate line because it explains
@@ -1949,7 +2248,11 @@ print_plan() {
   for p in "${PLAN_RUNNING[@]:-}"; do [[ -n "$p" ]] && printf "  RUNNING  %-${w}s -> %s (live container)\n" "$p" "$(unit_branch "$p")"; done
   for p in "${PLAN_RESUME[@]:-}";  do [[ -n "$p" ]] && printf "  RESUME   %-${w}s -> %s (stalled on %s, %s; container dead, work committed)\n" \
       "$p" "$(unit_branch "$p")" "${STALL_TASK[$p]}" "${STALL_STATUS[$p]}"; done
-  for p in "${PLAN_WAITING[@]:-}"; do [[ -n "$p" ]] && printf "  WAITING  %-${w}s (%s)\n" "$p" "${PLAN_WAIT_REASON[$p]:-cross-phase blockers pending}"; done
+  # The last-resort reason names the gap itself rather than guessing at a
+  # dependency (issue #46). Every classification above records one, so reaching
+  # this default means a WAITING entry was filed with none — a pump bug, and the
+  # line has to read like one instead of like a diagnosis.
+  for p in "${PLAN_WAITING[@]:-}"; do [[ -n "$p" ]] && printf "  WAITING  %-${w}s (%s)\n" "$p" "${PLAN_WAIT_REASON[$p]:-no reason recorded — that is a pump bug, please report it}"; done
   for p in "${PLAN_DONE[@]:-}";    do [[ -n "$p" ]] && printf "  DONE     %-${w}s (%s)\n" "$p" "$done_note"; done
   echo "frontier: ${#PLAN_LAUNCH[@]} launchable, ${#PLAN_RUNNING[@]} running, ${#PLAN_RESUME[@]} resumable, ${#PLAN_WAITING[@]} waiting | open tasks in range: $(open_count)"
 }
@@ -2041,10 +2344,89 @@ run_pre_tick_hooks() {
   return 0
 }
 
+# ── Ledger-repo sync (issue #41) ───────────────────────────────────────────────
+# Every tick refreshes the ledger checkout so a task file another machine pushed
+# is planned this tick, and the drain / stall-exit paths push it back. A consumer
+# with no SEPARATE ledger repo — the bring-your-own-repo shape, where OPS_DIR is
+# a missing ops/ or a purely local checkout — has nothing to sync, and the old
+# unconditional `|| warn` reported that absence as a failure every TICK seconds
+# for the life of the run. Harmless per line, corrosive in aggregate: it teaches
+# an operator to skim past pump stderr, which is the channel every loud failure
+# in this file arrives on (found in the G4.4 walkthrough rehearsal, PR #39).
+#
+# So classify the shape ONCE, at startup, and say it once there. Only a sync
+# that can never do anything is skipped; a real sync that really fails still
+# warns every tick, now carrying the reason the old one-liner discarded.
+# "OPS_DIR is the workspace" is deliberately NOT a skip condition even though
+# the issue offers it: a ledger living inside a remote-backed code repo has a
+# real pull to make, and skipping that would drop real ledger updates — the
+# remoteless case below already covers every workspace-as-ledger shape that
+# could have produced the noise.
+OPS_SYNC=1               # 1 = there is a ledger repo to pull/push
+OPS_SYNC_SKIP_REASON=""  # why not, for the one startup line
+
+classify_ops_sync() {
+  OPS_SYNC=1; OPS_SYNC_SKIP_REASON=""
+  if ! git -C "$OPS_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    OPS_SYNC=0; OPS_SYNC_SKIP_REASON="$OPS_DIR is not a git checkout"
+    return 0
+  fi
+  if [[ -z "$(git -C "$OPS_DIR" remote 2>/dev/null)" ]]; then
+    OPS_SYNC=0; OPS_SYNC_SKIP_REASON="$OPS_DIR has no git remote"
+    return 0
+  fi
+  return 0
+}
+
+# Which line of a failed git run is the REASON — deliberately NOT the first one.
+# git's combined output opens with the FETCH banner ("From <url>", then the
+# ref-update line), which describes the step that SUCCEEDED, and pads the middle
+# with `hint:` advice. Quoting line 1 therefore named the wrong thing in the
+# routine failing shape: a ledger branch DIVERGED from its remote — routine
+# because tp-task commits task files locally on every tick while another machine
+# pushes the same branch — warned "— From <url>" on the first tick and a
+# dangling "hint: Diverging branches can't be fast-forwarded, you need to
+# either:" on every tick after, while git's own "fatal: Not possible to
+# fast-forward, aborting." was never shown at all. Pointing an operator at the
+# remote URL for a divergence is precisely the confident-wrong-reason this
+# warning exists to prevent, so: quote git's diagnosis when it made one, else
+# the first line that is neither banner nor advice (a branch with no upstream
+# states its cause as bare prose and then offers four lines of remedy, so the
+# LAST line is the remedy, not the cause). Nothing quotable degrades to the bare
+# warning rather than to a guess.
+git_failure_reason() {  # git_failure_reason <combined git output>
+  local why
+  why=$(grep -m1 -E '^(fatal|error):' <<<"$1") \
+    || why=$(grep -m1 -Ev '^([[:space:]]|From |remote:|hint:|$)' <<<"$1") \
+    || why=""
+  printf '%s' "$why"
+}
+
+# Refresh the ledger before planning. Never fatal — a stale ledger still plans —
+# but a configured remote that fails is an operator-visible fact, so name it.
+ops_pull() {
+  [[ "$OPS_SYNC" -eq 1 ]] || return 0
+  local out rc=0 why
+  out=$(git -C "$OPS_DIR" pull --ff-only 2>&1) || rc=$?
+  (( rc == 0 )) && return 0
+  why=$(git_failure_reason "$out")
+  warn "ops pull --ff-only failed (continuing)${why:+ — $why}"
+  return 0
+}
+
+# Push the ledger back. Same skip, same reason: with no ledger repo, "final ops
+# push failed" is a failure report for a push that was never attempted — and it
+# lands on the drain line, the one line of a run every operator reads.
+ops_push() {  # ops_push <warning>
+  [[ "$OPS_SYNC" -eq 1 ]] || return 0
+  git -C "$OPS_DIR" push >/dev/null 2>&1 || warn "$1"
+  return 0
+}
+
 # ── One tick: scrub, plan, reclaim, gate, top up the pool to cap ───────────────
 do_tick() {
   LIVENESS_DEGRADED_TICK=0   # the degraded-liveness warning is once per tick
-  git -C "$OPS_DIR" pull --ff-only >/dev/null 2>&1 || warn "ops pull --ff-only failed (continuing)"
+  ops_pull
   # Capture rather than discard: a scrub that finds invisible task files (exit
   # 3) has the one detail worth acting on — the paths. Dropping them left the
   # operator a generic "scrub failed" every tick for days with nothing to go on,
@@ -2079,7 +2461,7 @@ do_tick() {
   fi
 
   local cap have launched=0 p
-  cap="$(JOBS=$JOBS apl_read_cap)"
+  cap="$(effective_cap)"
   have="$(apl_count_live_agents)"
   for p in "${PLAN_LAUNCH[@]:-}"; do
     [[ -z "$p" ]] && continue
@@ -2119,18 +2501,72 @@ do_tick() {
 # hand the range to a human instead of spinning. Exits non-zero so the systemd
 # unit reports `failed` rather than sitting green while making no progress.
 stall_exit() {
-  local attention
+  local attention inflight reason
   attention=$("$TASK_BIN" list 2>/dev/null \
     | awk '$2=="blocked"||$2=="stuck"||$2=="needs-review"{n++} END{print n+0}')
-  write_state stalled "no live agents, nothing launchable, nothing resumable"
-  git -C "$OPS_DIR" push >/dev/null 2>&1 || warn "ops push on stall exit failed"
-  pump_notify "$PHASES STALLED after $STALL_TICKS idle ticks — $(open_count) open task(s) remain but none can launch, and no orphaned claim is resumable. $attention task(s) need human review (blocked/stuck/needs-review)."
+  # The claims by name, not a tally of them. `inflight_claims` yields `<id>
+  # <branch>` pairs and this counted the lines, discarding both halves — so the
+  # operator woken at 3am was handed a number and sent back to the ledger for the
+  # two fields the pump had already read. Finishing or releasing a claim is a
+  # per-claim act; the page has to name what to act on.
+  local -a named=()
+  local cid cbranch
+  inflight=0
+  while read -r cid cbranch; do
+    [[ -n "$cid" ]] || continue
+    inflight=$((inflight + 1))
+    # Bounded, and not by taste: this string goes out through a desktop/mobile
+    # notifier that truncates, and a range with more than a handful of stranded
+    # claims is one systemic fault (a grain switch, a dead supervisor) that the
+    # count already describes — the named few identify it, and `list --status
+    # in_progress` holds the rest. An unbounded page is its own failure: a
+    # notification nobody can read explains nothing.
+    if (( ${#named[@]} < 5 )); then
+      named+=("$(claim_phrase "$cid" "$cbranch")")
+    fi
+  done < <(inflight_claims)
+  local claim_list="" phrase
+  for phrase in "${named[@]:-}"; do
+    [[ -n "$phrase" ]] || continue
+    claim_list+="${claim_list:+, }$phrase"
+  done
+  (( inflight > ${#named[@]} )) && claim_list+=", and $((inflight - ${#named[@]})) more"
+  reason="no live agents, nothing launchable, nothing resumable"
+  # A stall the drain test's new middle question produced (issue #48) shows the
+  # operator `open_tasks: 0` next to `status: stalled`, which on its own reads as
+  # "finished, but paged anyway". Name the claims, or the state file explains the
+  # page with the one number that argues against it.
+  (( inflight > 0 )) && reason+="; $inflight in-flight claim(s) nobody is driving: $claim_list"
+  write_state stalled "$reason"
+  # ops_push, not a raw git push: with no ledger repo to push to there is nothing
+  # to fail, and "ops push on stall exit failed" on the one line an operator reads
+  # during a page is a failure report for a push nobody attempted (issue #41).
+  ops_push "ops push on stall exit failed"
+  # Same list in both channels, bounded the same way: the state file and the page
+  # are read minutes apart by the same person, and two different accounts of one
+  # stall is the reason to distrust both.
+  pump_notify "$PHASES STALLED after $STALL_TICKS idle ticks — $(open_count) open task(s) and $inflight in-flight claim(s) remain, none can launch, and no orphaned claim is resumable.${claim_list:+ In flight: $claim_list.} $attention task(s) need human review (blocked/stuck/needs-review)."
   exit 3
 }
 
 # ── Drain check ────────────────────────────────────────────────────────────────
+# Three questions, and the middle one is issue #48's. "No open tasks and no live
+# agents" reads as finished, but a claim is neither: an in_progress task with no
+# container behind it is committed, unfinished work on a branch nobody is
+# driving. While other open work sat beside it the run still reached the
+# deadlock exit; alone in the range it drove open_count to 0 and the pump
+# announced DRAINED over it — the F79 false-DRAINED through the claim-ownership
+# door instead of the ledger-resolution one. Refusing to drain hands the range
+# to the deadlock detector instead, which is the outcome the docs already
+# promise for a stranded claim.
+#
+# Asked BEFORE the liveness count on purpose: liveness is the fail-open half of
+# this conjunction (a degraded enumeration reports every agent dead), so the
+# ledger's own answer must not depend on it.
 is_drained() {
-  [[ "$(open_count)" -eq 0 && "$(apl_count_live_agents)" -eq 0 ]]
+  [[ "$(open_count)" -eq 0 ]] || return 1
+  [[ -z "$(inflight_claims)" ]] || return 1
+  [[ "$(apl_count_live_agents)" -eq 0 ]]
 }
 
 # ── Restart-safe state (E2) ────────────────────────────────────────────────────
@@ -2154,8 +2590,11 @@ write_state() {  # $1=status(running|paused|drained|stalled|stopped) $2=reason
   local status="${1:-running}" reason="${2:-}"
   PUMP_LAST_STATUS="$status"
   PUMP_LAST_REASON="$reason"
+  # `jobs` is the cap in force, not the flag: the monitor renders this file, and
+  # a run whose cap file says 4 must not present the operator's --jobs 1 there
+  # either (issue #44 — same lie, second channel).
   jq -n \
-    --arg phases "$PHASES" --argjson jobs "$JOBS" --argjson ceiling "$CEILING" \
+    --arg phases "$PHASES" --argjson jobs "$(effective_cap)" --argjson ceiling "$CEILING" \
     --arg grain "$GRAIN" --arg started "$PUMP_STARTED_AT" \
     --arg last_tick "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --argjson live "$(apl_count_live_agents)" --argjson open "$(open_count)" \
@@ -2169,16 +2608,114 @@ write_state() {  # $1=status(running|paused|drained|stalled|stopped) $2=reason
 }
 
 # ── Notify (E5) ────────────────────────────────────────────────────────────────
-# Pluggable: ARACHNE_NOTIFY_CMD reads the message on stdin; defaults to
-# `notify-send` (desktop) when present, else a no-op (just the log line).
+# Pluggable: TASKPUMP_NOTIFY_CMD (legacy spelling ARACHNE_NOTIFY_CMD, bridged by
+# lib/config.sh) reads the message on STDIN; unset falls back to `notify-send`
+# (desktop) when present, else the log line alone.
+#
+# The two channels take the message differently on purpose — the configured
+# command reads stdin, the notify-send fallback gets argv — and that asymmetry
+# is what a plausible pin walks into: `notify-send -u low` wants a summary
+# argument and never reads stdin, so it errors on every notice. Discarding that
+# status made a whole drain's worth of notifications vanish while the pump
+# looked like it had sent them, so a configured command that fails is reported.
+# Every message is logged above this either way; the warning is what says the
+# delivery the operator asked for did not happen. The fallback stays quiet: it
+# is best-effort by definition (a headless host has no bus), nobody configured
+# it, and the log line is still the record.
+#
+# What is reported is the command's OWN exit status, which is why the message
+# arrives on a here-string and not through `printf | cmd`. Under the pipefail
+# this script runs with, a pipeline's status is the writer's too, and a
+# notifier that exits 0 without reading — `true`, the documented silencer, or
+# any argv-style desktop notifier — leaves printf writing to a closed pipe: the
+# SIGPIPE surfaces as 141 and the pump reports a drop for a notification that
+# was delivered. Claiming a failure that did not happen is the same lie as
+# swallowing one that did. Silence therefore means "the notifier did not
+# complain", which is all any exit status can tell us.
+#
+# And the warning reports only what a non-zero exit establishes: the program,
+# its status, that nothing was delivered. It used to append "TASKPUMP_NOTIFY_CMD
+# takes the message on stdin, not as an argument" to EVERY failure — one cause
+# asserted for every possible one, and wrong in exactly the deployment this tool
+# ships for. `xargs -0 notify-send …`, the desktop recipe docs/CONFIG.md §3.2
+# hands an operator, honours the stdin contract perfectly and still fails on a
+# host with no session bus (123, "Failed to execute child process dbus-launch",
+# where this was reproduced) — which is every headless run under the `loginctl
+# enable-linger` the unit file documents. The pump was sending that operator to
+# fix the one thing they had already got right. So the notifier's own first
+# speaking line of stderr is quoted instead, LABELLED as the first line rather
+# than offered as the cause: the notifier is the only party here that knows why,
+# but which of its lines carries the reason is its business, not something this
+# pump can rank without a grammar to rank it by. The stdin contract is named
+# only when the notifier says nothing at all, and named as something to check.
 pump_notify() {
-  local msg="$1"
+  local msg="$1" rc=0 errfile="" detail="" wrote=0 line
   log "$msg"
   if [[ -n "${TASKPUMP_NOTIFY_CMD:-}" ]]; then
-    printf '%s\n' "$msg" | ${TASKPUMP_NOTIFY_CMD} >/dev/null 2>&1 || true
-  elif command -v notify-send >/dev/null 2>&1; then
+    # A notify command is a command line, and every warning below names its
+    # first word only: a webhook notifier carries its token in the arguments
+    # (`curl -d @- https://hooks…/SECRET`), and under --detach this stderr is
+    # persisted for the life of the run — the unit's journal, or $PUMP_LOG on
+    # the fallback.
+    # shellcheck disable=SC2086
+    set -- ${TASKPUMP_NOTIFY_CMD}
+    # Asked BEFORE the run, because afterwards it is not answerable. A missing
+    # program makes the SHELL write "…tp-pump: line N: foo: command not found"
+    # to the capture below, and quoting that as the notifier's own output would
+    # attribute the pump's words to a program that never ran — and print this
+    # script's path and line number at an operator as if the notifier had said
+    # it. 127 cannot be tested for instead: a notifier that runs is free to exit
+    # 127 itself, and these two want opposite advice.
+    if ! command -v "$1" >/dev/null 2>&1; then
+      warn "notify command not found: $1 — notification not delivered; TASKPUMP_NOTIFY_CMD names a program that is not on the pump's PATH"
+      return 0
+    fi
+    # A file, not a pipe: a notifier that leaves a background child holding the
+    # inherited fd would hang a command substitution forever, and a notification
+    # is best-effort — it does not get to stop the pump. Same reason the mktemp
+    # failure degrades to /dev/null instead of dying.
+    errfile="$(mktemp 2>/dev/null)" || errfile=""
+    ${TASKPUMP_NOTIFY_CMD} >/dev/null 2>"${errfile:-/dev/null}" <<<"$msg" || rc=$?
+    if [[ "$rc" -ne 0 && -s "$errfile" ]]; then
+      wrote=1
+      # The first line that still says something once control characters are
+      # out — not simply the first line. `-s` proves the notifier wrote, and a
+      # notifier whose first line is blank or a lone escape sequence (a progress
+      # spinner, a colour reset) used to leave $detail empty and take the branch
+      # that told the operator it "wrote nothing to stderr", a flat falsehood
+      # about a notifier that had written a complete diagnosis on line 2.
+      # Bounded at one line and 200 CHARACTERS: under --detach this is persisted
+      # for the life of the run, and how much an operator's notifier writes
+      # there is not something the pump can assume.
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line//[[:cntrl:]]/}"
+        [[ -z "${line//[[:space:]]/}" ]] && continue
+        detail="$line"
+        break
+      done <"$errfile"
+      [[ "${#detail}" -gt 200 ]] && detail="${detail:0:200}…"
+    fi
+    [[ -n "$errfile" ]] && rm -f "$errfile"
+    [[ "$rc" -eq 0 ]] && return 0
+    # Three distinct facts, never conflated. What is quoted is the notifier's
+    # first speaking line, said to be exactly that: the pump does not rank a
+    # notifier's output the way git_failure_reason ranks git's, because that
+    # ranking is built on git's grammar (`fatal:`, `hint:`, the fetch banner)
+    # and an arbitrary notifier has none to read. Reporting an observation is
+    # honest without a grammar; calling it the cause would not be.
+    if [[ -n "$detail" ]]; then
+      warn "notify command failed (exit $rc): $1 — notification not delivered; its first stderr line: $detail"
+    elif [[ "$wrote" -eq 1 ]]; then
+      warn "notify command failed (exit $rc): $1 — notification not delivered; it wrote to stderr, but no line of it survives quoting (blank or control characters only)"
+    else
+      warn "notify command failed (exit $rc): $1 — notification not delivered, and wrote nothing to stderr; check that it reads the message on stdin and that whatever it notifies is reachable from where the pump runs"
+    fi
+    return 0
+  fi
+  if command -v notify-send >/dev/null 2>&1; then
     notify-send "$PROG_NAME" "$msg" >/dev/null 2>&1 || true
   fi
+  return 0
 }
 
 # ── Detach (E3) ────────────────────────────────────────────────────────────────
@@ -2337,9 +2874,6 @@ if [[ -z "${GITHUB_TOKEN:-}" ]] && command -v gh >/dev/null 2>&1; then
 fi
 [[ -f "$BRIEF_TEMPLATE" ]] || die "$(missing_brief_template_msg)"
 
-# Seed the live cap file for discoverability / retuning.
-[[ -f "$CAP_FILE" ]] || echo "$JOBS" >| "$CAP_FILE" 2>/dev/null || true
-
 # Skip the (~9 GB) image build when we will not launch containers — keeps the
 # NO_LAUNCH tick (tests / live read-only validation) side-effect-free.
 if [[ "${TASKPUMP_PUMP_NO_LAUNCH:-0}" -ne 1 ]]; then
@@ -2373,6 +2907,41 @@ if [[ "${TASKPUMP_PUMP_NO_LAUNCH:-0}" -ne 1 ]]; then
   ensure_trunk
 fi
 
+# Decide once whether this pump has a ledger repo to sync at all (issue #41),
+# and disclose the answer HERE — as one startup line — instead of as a pull
+# failure every tick forever. Outside the NO_LAUNCH guard on purpose: a
+# read-only tick refreshes the ledger like any other. It reads git state and
+# never aborts, so it sits ABOVE the cap-file write below, which must stay the
+# last thing this startup does before the banner reports it.
+classify_ops_sync
+[[ "$OPS_SYNC" -eq 1 ]] \
+  || log "ledger: no separate ledger repo to sync ($OPS_SYNC_SKIP_REASON); skipping the per-tick pull and the closing push"
+
+# Seed the live cap file for discoverability / retuning — and, when the operator
+# typed --jobs, OVERWRITE it: the flag sets the live cap for this run (issue
+# #44). Every tick reads this file, so a number an earlier run left here used to
+# outrank the flag silently. Without the flag the file is left exactly as found;
+# it is the mid-drain retune knob and outranking a standing TASKPUMP_JOBS is its
+# whole job.
+#
+# Placed HERE — below every startup abort, above the banner that reports what
+# this write left — for the reason the exit traps give below: a pump that never
+# ticked must not clobber a file a previous run, an operator or the disk
+# watchdog set. Written before the prerequisites, an imageless `--jobs 12` died
+# printing no banner and nothing about a cap, and left 12 behind to govern the
+# next unflagged run — issue #44's own bug shape, re-created by its fix. It also
+# precedes the watchdog start below, so the two never race for this file.
+if [[ "$JOBS_GIVEN" -eq 1 || ! -f "$CAP_FILE" ]]; then
+  if { echo "$JOBS" >| "$CAP_FILE"; } 2>/dev/null; then
+    CAP_FILE_STAMPED=1
+  elif [[ "$JOBS_GIVEN" -eq 1 ]]; then
+    # Unwritable cap file: keep honoring the flag (effective_cap feeds banner,
+    # plan, tick and state alike) and say what that costs, rather than quietly
+    # ticking against a file the operator just tried to override.
+    warn "could not write $CAP_FILE — this run holds at --jobs $JOBS; retuning through that file is off"
+  fi
+fi
+
 # Belt-and-suspenders disk discipline (A4): auto-start the disk watchdog like
 # run-parallel.sh does, so disk pressure also drops the live pool cap (cap-file
 # path) on top of the feed gate. --auto-exit retires it once no agents remain.
@@ -2384,7 +2953,16 @@ if [[ "$MODE" == "run" && "$DISK_GATE" -eq 1 && "${TASKPUMP_PUMP_NO_LAUNCH:-0}" 
   log "disk watchdog started (cap-file path; log: $DISK_WATCHDOG_LOG)"
 fi
 
-log "Pump: phases=$PHASES grain=$GRAIN cap=$JOBS (live via $CAP_FILE) ceiling=${CEILING}% tick=${TICK}s"
+# The cap here is the one the ticks will use, and the parenthetical names who set
+# it: printing the flag while the ticks read the file is issue #44 exactly. The
+# stamp above is what hands authority back to the file, so a flag whose stamp
+# never landed must not advertise it — that clause would promise a retune knob
+# the warn one line up just said is off, in the change whose whole subject is
+# where a cap came from.
+CAP_NOTE="live via $CAP_FILE"
+[[ "$JOBS_GIVEN" -eq 1 ]] && CAP_NOTE="--jobs, then live via $CAP_FILE"
+[[ "$JOBS_GIVEN" -eq 1 && "$CAP_FILE_STAMPED" -eq 0 ]] && CAP_NOTE="--jobs (cap file unwritable; no live retuning)"
+log "Pump: phases=$PHASES grain=$GRAIN cap=$(effective_cap) ($CAP_NOTE) ceiling=${CEILING}% tick=${TICK}s"
 log "Singular supervisor; Ctrl-C stops feeding but leaves running agents. Monitor: $MONITOR_BIN"
 
 # ── Exit honesty (issue #22) ───────────────────────────────────────────────────
@@ -2441,7 +3019,7 @@ fi
 while true; do
   do_tick
   if is_drained; then
-    log "range $PHASES drained: no open tasks and no live agents remain."
+    log "range $PHASES drained: no open tasks, no in-flight claims, and no live agents remain."
     break
   fi
   if (( STALL_TICKS >= STALL_EXIT_TICKS )); then
@@ -2459,7 +3037,7 @@ done
 # Graduate the integration trunk as one auto/trunk → main PR (A3, no-op when
 # --integration-trunk is off), then push canonical ops/.
 graduate_trunk
-git -C "$OPS_DIR" push >/dev/null 2>&1 || warn "final ops push failed"
+ops_push "final ops push failed"
 write_state drained ""
 # Tally non-done terminal states that need a human (blocked / stuck / needs-review).
 attention=$("$TASK_BIN" list 2>/dev/null \

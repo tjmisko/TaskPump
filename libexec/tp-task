@@ -51,7 +51,12 @@ tp_load_config
 # the claim into the *primary's* ledger — the worktree's own ledger never learns
 # about it, and the primary's silently drifts. Preferring $PWD's worktree makes
 # task state follow the workspace the work is happening in, which is what every
-# caller means.
+# caller means WHEN THEY HAVE NOT SAID OTHERWISE. A TASKPUMP_WORKSPACE_ROOT pin
+# is saying otherwise — it outranks the probes below, so in a pinned shell a
+# claim made from inside a worktree lands in the PINNED workspace's ledger, not
+# the worktree's. That is the point of a pin and it is what tp-pump has always
+# done; it is also the one way this paragraph's guarantee can be given up, so
+# an operator exporting the pin should know they are giving it up (issue #45).
 #
 # TASKPUMP_LEDGER_PROBE is the ledger's path relative to a candidate workspace
 # root. It answers "does this worktree carry a ledger of its own?" and, when no
@@ -79,6 +84,53 @@ _tp_conf_root="$TP_WS_CONF_ROOT"
 _tp_cwd_root="$TP_WS_CWD_ROOT"
 _tp_repo_root="$TP_WS_ROOT"
 _tp_resolved_via="$TP_WS_VIA"
+# TASKPUMP_WORKSPACE_ROOT pins the workspace outright, for the runs where $PWD
+# proves nothing: a container, a CI step, an operator standing in $HOME. The
+# pump has always honored it; this CLI did not, so one shell carrying one pin
+# gave two answers — `tp pump --dry-run` planned the pinned consumer's frontier
+# while `tp task ready --count` answered 0 `via install-root`, the install's own
+# ledger (issue #45). Nothing was corrupted (the guard below refuses the
+# fallback for mutating verbs, and a pump-launched agent is handed the pinned
+# derivation), but 0 is what a human reads as "drained" — a confident wrong
+# answer at the exact moment the operator is checking the two tools against
+# each other. The pin outranks the conf/cwd walk for the same reason it does in
+# the pump: it is the caller naming the workspace, over any probe. An explicit
+# tasks dir still wins — naming the ledger outright is more specific than naming
+# the workspace it usually sits in — and it wins OUTRIGHT: see the narrowing
+# below, which keeps the pin from moving anything once it has lost the ledger.
+if [[ -n "${TASKPUMP_WORKSPACE_ROOT:-}" ]]; then
+  if ! _tp_pinned_root="$(CDPATH='' cd -- "$TASKPUMP_WORKSPACE_ROOT" 2>/dev/null && pwd)"; then
+    # `die` is defined below this block, and a pin naming nothing must not fall
+    # through to the install root the way an unset pin does: a typo would then
+    # silently read the ledger the pin was set to steer away from. Checked even
+    # when an explicit tasks dir outranks the pin, exactly as tp-pump:85-90
+    # checks it: a pin naming nothing is a misconfiguration whether or not it
+    # is the rung that decides. It costs `resolve` and `--help` their answer in
+    # that one case (the check runs before argv is parsed) — acceptable only
+    # because this refusal names the key and the value that caused it, so it is
+    # its own diagnostic rather than a dead end pointing at a dead tool.
+    printf '%s: TASKPUMP_WORKSPACE_ROOT names a missing directory: %s\n' \
+      "${TASKPUMP_PROG_NAME:-tp-task}" "$TASKPUMP_WORKSPACE_ROOT" >&2
+    exit 1
+  fi
+  # The pin moves the workspace only when it is the rung that DECIDES it.
+  # $_tp_repo_root feeds TASKPUMP_CODE_REPO (below) as well as the tasks dir,
+  # so moving it under an explicit tasks dir would redirect the heartbeat's
+  # productivity meter while `via` still read `env` — a silent second effect on
+  # a rung that lost. That is the pump-launched agent's exact environment:
+  # tp-pump exports the pinned TASKPUMP_TASKS_DIR (tp-pump:154-156), the local
+  # runner cds into the agent's worktree carrying the operator's pin whole
+  # (runners/local/runner.sh), and code_repo pointed at the primary sees none
+  # of the agent's commits — productive=0 every cycle, then `stuck` at
+  # TASKPUMP_FAILURE_LIMIT on a task whose agent is committing normally, with
+  # nothing in the diagnostic naming the pin. Narrowed here rather than at the
+  # CODE_REPO default so the two derivations cannot drift apart again.
+  if [[ "$_tp_tasks_dir_explicit" -eq 0 ]]; then
+    _tp_repo_root="$_tp_pinned_root"
+    _tp_resolved_via="workspace-pin"
+  fi
+  unset _tp_pinned_root
+fi
 # When the tasks dir was handed to us outright, the workspace rung did not
 # decide it — the via diagnostic must name the rung that did, or it misleads
 # in exactly the misconfiguration case it exists for.
@@ -359,22 +411,93 @@ git_commit_state() {
 # closing the claim race and preventing index.lock contention. Held for the
 # lifetime of the process via FD 9 (auto-released on exit). Degrades to a no-op
 # where flock is unavailable (e.g. a stock macOS host).
+#
+# The FILE is removed when the process that took it exits (issue #33): a
+# consumer's first contact with the ledger CLI used to end with an unexplained
+# `?? .taskpump-task.lock` in their tree, and every `git status` after it.
+# Removal is safe only under both halves of a protocol, because a lockfile
+# unlinked carelessly stops being a lock: unlink ONLY while still holding the
+# flock, and ONLY when the path still names the inode this process locked
+# (_tp_lock_is_at_path). Then no holder's file can be unlinked out from under
+# it, and a waiter that inherits a lock on a file which has since left the tree
+# finds out the moment it wakes and re-acquires the file that is really there.
+# Drop either half and two agents hold flocks on two different inodes while
+# both believe they are alone — the claim race this lock exists to close.
+_tp_state_lockfile=""
+
+# True when <path> is the very file fd 9 has open, by device+inode. `-ef` is
+# bash's own same-file test (no stat(1) flavor to get wrong), and
+# /proc/self/fd/9 is how an open file names itself; for a file that has been
+# unlinked the link no longer resolves, so the answer is a truthful "no".
+_tp_lock_is_at_path() {
+  [[ "$1" -ef /proc/self/fd/9 ]]
+}
+
+# Removal is a trap, not a call at the bottom of main(): `create` takes the
+# lock before its exists-check and ends at die() on a duplicate, `fsck --fix`
+# ends at a deliberate exit 3, and neither ever reaches the end of dispatch.
+# A verb killed by a signal still leaves the file; the next verb to take the
+# lock removes it, so the litter is bounded at one file rather than one per run.
+_tp_release_state_lock() {
+  [[ -n "$_tp_state_lockfile" ]] || return 0
+  if _tp_lock_is_at_path "$_tp_state_lockfile"; then
+    rm -f -- "$_tp_state_lockfile" 2>/dev/null || dbg "could not remove $_tp_state_lockfile"
+  fi
+  _tp_state_lockfile=""
+  return 0
+}
+
 acquire_state_lock() {
   [[ "$TASKPUMP_TASK_NOCOMMIT" == "1" ]] && return 0
   command -v flock >/dev/null 2>&1 || { dbg "flock unavailable; no state lock"; return 0; }
-  local root lockfile
+  local root lockfile budget deadline wait_s
   root=$(git -C "$TASKPUMP_TASKS_DIR" rev-parse --show-toplevel 2>/dev/null || echo "")
   lockfile="${root:-/tmp}/$TASKPUMP_LOCK_NAME"
-  # Open fd 9 to the lockfile for the lifetime of the process. The `2>/dev/null`
-  # MUST be scoped to a brace group: `exec 9>… 2>/dev/null` with no command would
-  # apply 2>/dev/null to the *current shell permanently*, silently swallowing all
-  # subsequent stderr (every warning + `die` reason). The brace group restores
-  # fd 2 after the open while leaving fd 9 (set by exec) in place.
-  { exec 9>"$lockfile"; } 2>/dev/null || { dbg "cannot open lockfile $lockfile"; return 0; }
-  if ! flock -w "$TASKPUMP_LOCK_WAIT" 9; then
-    die "could not acquire state lock ($lockfile) within ${TASKPUMP_LOCK_WAIT}s"
-  fi
-  dbg "acquired state lock $lockfile"
+  # ONE budget for the whole acquisition, not one per attempt. Under a real
+  # drain every departing agent removes this file, and each departure wakes the
+  # next waiter onto an inode that has already left the tree — with twelve
+  # agents the unlucky one re-queues once per departure ahead of it, so a fixed
+  # retry count fails them outright (seven of ten, measured). Retrying is
+  # still *waiting for the same lock*, and TASKPUMP_LOCK_WAIT is the wait the
+  # operator was promised, so the retries spend that budget and the timeout
+  # keeps its one diagnostic. The first attempt passes the pin through verbatim
+  # — a fractional or otherwise non-integer pin is flock's to interpret, and is
+  # simply worth no retry budget here.
+  budget=${TASKPUMP_LOCK_WAIT%%.*}
+  [[ "$budget" =~ ^[0-9]+$ ]] || budget=0
+  deadline=$(( SECONDS + budget ))
+  wait_s=$TASKPUMP_LOCK_WAIT
+  while :; do
+    # Open fd 9 to the lockfile for the lifetime of the process. The `2>/dev/null`
+    # MUST be scoped to a brace group: `exec 9>… 2>/dev/null` with no command would
+    # apply 2>/dev/null to the *current shell permanently*, silently swallowing all
+    # subsequent stderr (every warning + `die` reason). The brace group restores
+    # fd 2 after the open while leaving fd 9 (set by exec) in place.
+    { exec 9>"$lockfile"; } 2>/dev/null || { dbg "cannot open lockfile $lockfile"; return 0; }
+    if ! flock -w "$wait_s" 9; then
+      die "could not acquire state lock ($lockfile) within ${TASKPUMP_LOCK_WAIT}s"
+    fi
+    # Where an open file cannot be named there is no way to prove the identity
+    # removal depends on, so hold the lock and keep the file — the pre-#33
+    # behavior, litter included. A cleanup that cannot prove what it is
+    # deleting is worse than the mess it tidies.
+    if [[ ! -d /proc/self/fd ]]; then
+      dbg "acquired state lock $lockfile (kept: cannot name an open file here)"
+      return 0
+    fi
+    if _tp_lock_is_at_path "$lockfile"; then
+      _tp_state_lockfile=$lockfile
+      trap _tp_release_state_lock EXIT
+      dbg "acquired state lock $lockfile"
+      return 0
+    fi
+    # We were waiting on a file the holder ahead of us unlinked as it left. The
+    # flock we now hold is on an inode nothing else will ever open, so it
+    # excludes nobody: take the file that is actually at the path instead.
+    wait_s=$(( deadline - SECONDS ))
+    (( wait_s > 0 )) || die "could not acquire state lock ($lockfile) within ${TASKPUMP_LOCK_WAIT}s"
+    dbg "state lockfile $lockfile was replaced while we waited; re-acquiring (${wait_s}s left)"
+  done
 }
 
 # ── Subcommands ───────────────────────────────────────────────────────────────
@@ -2094,19 +2217,77 @@ cmd_scrub() {
 # classifies the ways a file can fail to even reach the schema checks:
 #   0 mapping parsed    1 no opening ---     2 no closing ---
 #   3 not valid YAML    4 parses, but is not a mapping
+#   5 CRLF, delimiters included         6 CRLF keys between bare delimiters
 # The delimiter checks are load-bearing, not pedantry: yq's front-matter mode
 # happily "parses" a file with no frontmatter at all (the whole body reads as a
 # YAML scalar) and treats everything after an unclosed `---` as frontmatter, so
 # without them a README.md in the tasks dir would type-check instead of being
 # named for what it is.
+#
+# 5 and 6 still PRINT the mapping: the block parsed, and the code says only
+# that the endings are CRLF (and which reader that breaks), so the caller can
+# withhold --fix while auditing the file like any other. CRLF gets codes of its
+# own because it is none of the others — the delimiters ARE `---` and yq parses
+# them, so the delimiter comparisons strip a trailing CR first; a CR-terminated
+# file used to fall out as "no YAML frontmatter", which sent the importer
+# hunting for a delimiter that was right there (issue #34). Three things about
+# these two codes are load-bearing:
+#   - they are decided LAST, below the yq parse and the mapping check, because
+#     their messages assert the block is readable. A CRLF file yq cannot parse
+#     (the unquoted-colon import, or a README carrying no mapping) is invisible
+#     to next/ready — the same verdict `scrub` prints as UNPARSEABLE/NO-ID —
+#     and telling its owner the frontier reads it would be one verb of this CLI
+#     contradicting another about the same file, in the direction that hides
+#     the failure class that matters most.
+#   - the CR is looked for across the WHOLE frontmatter block, not on line 1.
+#     The hazard they guard is that --fix rewrites that block through fm_set,
+#     which writes LF over every key line and leaves the delimiters' own
+#     endings as it found them (measured); a file whose opening delimiter is LF
+#     and whose keys are CR-terminated is exactly as unsafe to stamp, and
+#     reading line 1 alone classified it as nothing at all — so --fix converted
+#     its endings and then reported the ledger clean.
+#   - they do not stop the audit. The first cut of this returned early on a
+#     CRLF file, so the file got the CRLF line and NO other check; an operator
+#     who did what the line said and converted the endings met a second,
+#     different report — id mismatches, schema violations, dangling blockers —
+#     that had been there all along and were suppressed. Advice whose result is
+#     a fresh diagnosis is worse than no advice.
+# The 5/6 split is the SECOND reader. lib/dag-layout.awk — the DAG renderer's
+# parser, and the monitor's GRAPH tab through it — matches its delimiters as
+# /^---[ \t]*$/ and never strips a CR off a value, so one repair answers two
+# different damages: a CR on a delimiter leaves the task out of the graph
+# altogether, while a CR on the keys alone draws it from values that still
+# carry theirs — an id read that way ("T1\r") matches no other task's blocker,
+# so the node lands detached. Both are measured; each file is told which it is.
+# A CR past the closing delimiter is the body's business: fm_set never writes
+# there, nothing gets mixed, and there is nothing to report.
 fsck_read_frontmatter() {
-  local file=$1 first="" fm_json
+  local file=$1 first="" fm_json endings
   IFS= read -r first < "$file" || true
-  [[ "$first" == "---" ]] || return 1
-  awk 'NR > 1 && $0 == "---" { found = 1; exit } END { exit (found ? 0 : 1) }' "$file" || return 2
+  [[ "${first%$'\r'}" == "---" ]] || return 1
+  # One walk of the block answers all of it: is the block closed (exit status),
+  # and where its carriage returns sit (stdout) — on a delimiter, or only on
+  # the keys, which is the distinction the second reader makes.
+  endings=$(awk '
+    { line = $0; cr = sub(/\r$/, "", line) }
+    NR == 1 { if (cr) delim = 1; next }
+    line == "---" {
+      if (cr) delim = 1
+      found = 1
+      print (delim ? "delim" : (keys ? "keys" : "lf"))
+      exit
+    }
+    cr { keys = 1 }
+    END { exit (found ? 0 : 1) }
+  ' "$file") || return 2
   fm_json=$(yq --front-matter=extract -o=json -I=0 '.' "$file" 2>/dev/null) || return 3
   [[ "$(jq -r 'type' <<<"$fm_json")" == "object" ]] || return 4
   printf '%s' "$fm_json"
+  case $endings in
+    delim) return 5;;
+    keys)  return 6;;
+  esac
+  return 0
 }
 
 # The frontmatter schema of LEDGER-CONTRACT §3 as one jq program, so the check
@@ -2196,12 +2377,33 @@ fsck_check_file() {
     2) FSCK_VIOLATIONS+=("$file: frontmatter has no closing \"---\" delimiter"); return 0;;
     3) FSCK_VIOLATIONS+=("$file: frontmatter is not valid YAML between the --- delimiters"); return 0;;
     4) FSCK_VIOLATIONS+=("$file: frontmatter is not a YAML mapping of machine keys"); return 0;;
+    # 5 and 6 alone do not return: the block parsed, $fm_json is already in
+    # hand, and every check below applies to a CRLF file exactly as it does to
+    # an LF one. Returning here is what made the repair advice a trap — see
+    # fsck_read_frontmatter. Only --fix's stamping is withheld, in
+    # fsck_apply_fixes.
+    5) FSCK_VIOLATIONS+=("$file: CRLF line endings in the frontmatter, delimiters included — yq reads the block, so list/next/ready/scrub see this task, but lib/dag-layout.awk (the DAG renderer, and the monitor's GRAPH tab through it) matches a bare \"---\" and so never sees this block open and close: the task is absent from the DAG, every edge into it dropped. --fix will not stamp it either, because fm_set writes LF and stamping one key would convert the whole block's endings with it; convert it to LF and re-run");;
+    6) FSCK_VIOLATIONS+=("$file: CRLF line endings on the frontmatter keys (the \"---\" delimiters are bare) — yq reads the block, so list/next/ready/scrub see this task, but lib/dag-layout.awk (the DAG renderer, and the monitor's GRAPH tab through it) reads its values off those lines with the CR still attached, so the DAG's copy of this task is one no other reader has: an id read that way matches no blocker, and the node lands detached. --fix will not stamp it either, because fm_set writes LF and stamping one key would convert the whole block's endings with it; convert it to LF and re-run");;
   esac
 
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     FSCK_VIOLATIONS+=("$file: $line")
   done < <(jq -r --arg mode check "$FSCK_SCHEMA_JQ" <<<"$fm_json")
+
+  # Duplicate machine keys. yq's tree keeps BOTH entries, and every reader —
+  # the jq above, and fm_get in every verb — takes the last: a `status: open`
+  # above a `status: done` (the merge-conflict artifact) is a file whose human
+  # reader and whose tools disagree about what it says, and nothing named the
+  # disagreement. Counted from yq's key list rather than $fm_json because jq
+  # collapses duplicates the moment it parses the object. --fix never resolves
+  # one: which value the author meant is exactly the guess it refuses to make.
+  local dup
+  while IFS= read -r dup; do
+    [[ -z "$dup" ]] && continue
+    FSCK_VIOLATIONS+=("$file: duplicate key '$dup' (every reader takes the last value; the one a human reads first is silently dead)")
+  done < <(yq --front-matter=extract -o=json -I=0 'keys' "$file" 2>/dev/null \
+             | jq -r 'group_by(.) | map(select(length > 1) | .[0])[]')
 
   # Identity: the tools resolve a task to a path by name and read the id back
   # out of the frontmatter, so a file whose name and id disagree is reachable
@@ -2218,6 +2420,16 @@ fsck_check_file() {
   # name, so the stem is the node other tasks actually reach.
   blockers=$(jq -r 'if (.blockers | type) == "array" then .blockers[] | select(type == "string") else empty end' <<<"$fm_json")
   [[ -n "$blockers" ]] && FSCK_ADJ[$stem]=$blockers
+
+  # An empty blocker entry names nothing. The dangling check below skips it and
+  # so does the eligibility predicate (§6), so the edge is inert in every
+  # reader — consistent, but it still reads as a dependency in the file, and a
+  # blocker that is a dependency on paper and nowhere else is precisely the
+  # disagreement fsck exists to name.
+  local empty_blockers
+  empty_blockers=$(jq -r 'if (.blockers | type) == "array" then ([.blockers[] | select(. == "")] | length) else 0 end' <<<"$fm_json")
+  [[ "$empty_blockers" -gt 0 ]] \
+    && FSCK_VIOLATIONS+=("$file: blockers contains an empty entry (\"\") — it names no task, and every reader skips it: a dependency on paper and nowhere else")
 
   # Review-chain facts for the whole-ledger pass: `verdict` resolves the
   # implementation through review_of by name, so a dangling one is a chain
@@ -2382,6 +2594,14 @@ fsck_default_expr() {
 # identity is in question, and writing to it would launder a broken file into a
 # half-plausible one. Present-but-wrong values are never rewritten; the report
 # pass that follows still names them. One ledger commit covers the repair.
+#
+# A file whose frontmatter is CRLF (codes 5 and 6) is skipped by the same
+# `parse_rc != 0` gate, deliberately: fm_set writes LF, so stamping one key
+# would convert the whole block's endings with it — bytes nobody asked it to
+# touch. This is the ONLY thing a CRLF file is spared; the report pass audits
+# it in full, so converting the endings and re-running turns up nothing the
+# first run had not already named, and that second pass stamps it like any
+# other import.
 fsck_apply_fixes() {
   local file stem id fm_json parse_rc key
   local stamped_keys=0 stamped_files=0
@@ -2824,8 +3044,10 @@ usage() {
   printf 'usage: %s <command> [args]\n\n' "$TASKPUMP_PROG_NAME"
   cat <<'EOF'
 Commands:
-  next [--branch <b>] [--phase <FN>] Emit next ready task as JSON (incl. goal).
-                                     --phase scopes to one epic (e.g. F51).
+  next [--branch <b>] [--phase <TN>] Emit next ready task as JSON (incl. goal).
+                                     --phase scopes to one phase (e.g. T51; a
+                                       bare 51 or a full id T51.2 also resolve
+                                       to that phase).
                                      Review tasks are skipped unless
                                        --include-reviews: an in-context agent
                                        loop must never claim the review of its
@@ -2908,15 +3130,18 @@ Commands:
   verdict <review-id> [--branch <b>] --approve [--findings -|"..."]
           | --request-changes --findings -|"..."
                                      Render a review's outcome through existing
-                                       state-machine doors. --approve completes
-                                       the review task (findings to its body);
-                                       a panel reviewer's approve is its report.
+                                       state-machine doors. EITHER verdict
+                                       requires the reviewed task to be done —
+                                       a review is of completed work, and one
+                                       rendered over a moving target reviews
+                                       nothing. --approve completes the review
+                                       task (findings to its body); a panel
+                                       reviewer's approve is its report.
                                      A claimed review needs --branch matching
                                        claimed_by; an unclaimed one rules with a
                                        warning (nothing records who ruled).
                                        --request-changes (gate task only,
-                                       findings required, requires the reviewed
-                                       task to be done) appends the findings to
+                                       findings required) appends the findings to
                                        the IMPLEMENTATION task's body, reopens
                                        it (completion markers shed, prior
                                        commits preserved in the note), re-arms
@@ -2949,21 +3174,28 @@ Commands:
                                        docs/LEDGER-CONTRACT.md — the import
                                        path for a pre-existing markdown task
                                        DAG. Checks: frontmatter parses between
-                                       --- delimiters, id matches the filename
-                                       and TASKPUMP_ID_PATTERN, status is in
+                                       --- delimiters, its line endings are
+                                       LF, id matches the filename and
+                                       TASKPUMP_ID_PATTERN, status is in
                                        the vocabulary, machine keys have
-                                       contract-legal types, every blocker
-                                       resolves, no self-blocks, no blocker
+                                       contract-legal types, no key appears
+                                       twice, every blocker resolves and none
+                                       is empty, no self-blocks, no blocker
                                        cycles, review_of resolves (never to
                                        the task itself), review_role is
-                                       reviewer|adjudicator. One line per
-                                       violation
-                                       (<file>: <what>); exit 3 when any
-                                       exist, 0 clean, 1 = fsck itself failed.
+                                       reviewer|adjudicator. A file whose
+                                       block parses gets every check, CRLF
+                                       endings included. One line per
+                                       violation (<file>: <what>); exit 3
+                                       when any exist, 0 clean, 1 = fsck
+                                       itself failed.
                                        --fix stamps MISSING machine keys with
                                        their documented defaults as one ledger
                                        commit; a present-but-wrong value is
-                                       reported, never rewritten.
+                                       never rewritten, a duplicate key is
+                                       never resolved, and a file whose
+                                       frontmatter is CRLF is not written at
+                                       all.
   resolve [--tasks-dir|--code-repo|--all]
                                      Print which workspace's ledger this
                                        invocation resolves to. Use it when a
@@ -2973,6 +3205,9 @@ Config (env or taskpump.conf; the legacy ARACHNE_* spelling of each still works)
   Locations
     TASKPUMP_LEDGER_PROBE   ledger path relative to a workspace root, and the
                               default tasks dir  (default: tasks)
+    TASKPUMP_WORKSPACE_ROOT the workspace to resolve the ledger inside, for a
+                              run whose $PWD proves nothing. The pump reads the
+                              same pin, so both tools answer alike.
     TASKPUMP_TASKS_DIR      tasks dir            (default: <root>/<probe>)
     TASKPUMP_TASK_OUT       next-task JSON path  (default: <parent>/.next-task)
     TASKPUMP_CODE_REPO      code repo root — what heartbeat measures commits in
@@ -2997,7 +3232,8 @@ Config (env or taskpump.conf; the legacy ARACHNE_* spelling of each still works)
     TASKPUMP_CLAIM_STALE_HOURS   heartbeat staleness threshold     (default: 24)
     TASKPUMP_LOCK_WAIT      seconds to wait for the state lock    (default: 120)
     TASKPUMP_LOCK_NAME      the state lockfile's name, created in the ledger's
-                              git root         (default: .taskpump-task.lock)
+                              git root and removed when the verb that took it
+                              exits             (default: .taskpump-task.lock)
   Misc
     TASKPUMP_TASK_NOCOMMIT=1  skip commits and the state lock (fixture mode)
     TASKPUMP_TASK_DEBUG=1     print debug traces
@@ -3009,17 +3245,24 @@ plus TASKPUMP_PHASE_SIGIL derive the phase from it. Phase grouping (--phase),
 range expansion (--phases T55..T63) and ordering are all built on that split, so
 the dot is part of the contract even though the sigil and the pattern are yours.
 
-The workspace is the directory of a DISCOVERED taskpump.conf when the ledger
-probe resolves there, else $PWD's git worktree when that worktree carries a
-ledger of its own (TASKPUMP_LEDGER_PROBE resolves there), otherwise the
-directory above this script. Since each worktree carries both its own copy of
-this CLI and its own ledger, preferring the caller's workspace keeps a claim
-made inside a worktree out of the primary checkout's ledger. A vendored
-TaskPump checkout inside a consumer never captures resolution: its own conf is
-skipped by discovery, and from inside a vendored submodule the workspace is the
-consumer's (docs/CONFIG.md, "Vendored TaskPump checkouts"). Relative paths in a
-conf anchor to the conf's workspace, never to $PWD. The config above still
-overrides; `resolve` prints what a given invocation picked.
+The workspace is TASKPUMP_WORKSPACE_ROOT when that pin is set, else the
+directory of a DISCOVERED taskpump.conf when the ledger probe resolves there,
+else $PWD's git worktree when that worktree carries a ledger of its own
+(TASKPUMP_LEDGER_PROBE resolves there), otherwise the directory above this
+script. The pin outranks both probes because it is the caller naming the
+workspace, and tp-pump honors it identically — one pinned shell, one answer.
+WITH NO PIN SET, each worktree carries both its own copy of this CLI and its
+own ledger, so preferring the caller's workspace keeps a claim made inside a
+worktree out of the primary checkout's ledger; export the pin and you trade
+that away deliberately, since the pinned workspace is then the one every verb
+answers for. Naming TASKPUMP_TASKS_DIR outright is more specific still and
+wins over both — and it wins outright, leaving TASKPUMP_CODE_REPO on the
+caller's own worktree so the heartbeat keeps measuring where the work lands.
+A vendored TaskPump checkout inside a consumer never captures resolution: its
+own conf is skipped by discovery, and from inside a vendored submodule the
+workspace is the consumer's (docs/CONFIG.md, "Vendored TaskPump checkouts").
+Relative paths in a conf anchor to the conf's workspace, never to $PWD. The
+config above still overrides; `resolve` prints what a given invocation picked.
 EOF
 }
 
@@ -3041,7 +3284,11 @@ EOF
 # fallback AND the install root is outside the caller's worktree. Read-only
 # commands keep working, deliberately — `resolve` is the diagnostic this error
 # points at, and an error that disables the tool you need to diagnose it is a
-# worse error.
+# worse error. One refusal does precede even `resolve`: a TASKPUMP_WORKSPACE_ROOT
+# naming a missing directory, checked at load time above. It is the exception
+# that proves the rule rather than a hole in it — that message names the key and
+# the value that caused it, so it IS the diagnostic and there is nothing left
+# for `resolve` to add.
 tp_require_resolved_ledger() {
   [[ "$_tp_tasks_dir_explicit" -eq 1 ]] && return 0
   [[ "$_tp_resolved_via" != "install-root" ]] && return 0

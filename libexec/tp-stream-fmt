@@ -1,16 +1,23 @@
 #!/bin/bash
-# stream-fmt.sh -- format stream-json output from claude -p into readable text
+# tp-stream-fmt -- format stream-json output from claude -p into readable text
+#
+# A filter, and nothing else: it reads stdin to EOF and takes no arguments at
+# all, so `tp stream-fmt --help` reads stdin too and blocks on a terminal.
 #
 # Usage:
-#   tail -f .taskpump-agent.log | ./scripts/stream-fmt.sh
-#   docker logs -f arachne-agent | ./scripts/stream-fmt.sh
+#   tail -f .taskpump-agent.log | tp stream-fmt
+#   docker logs -f tp-agent-feat-t1 | tp stream-fmt
 #
 # Color key:
 #   Blue    = assistant text
 #   Yellow  = tool calls
-#   Green   = tool results (truncated)
-#   Red     = errors
+#   Green   = the final result block
+#   Red     = a Bash tool result mentioning error/failed/panicked, and any
+#             non-JSON line mentioning BLOCKED/ERROR/error
+#   Dim     = a Bash tool result mentioning test result/Finished/warning
 #   Cyan    = ralph iteration markers
+#
+# Every other tool_result is dropped, not printed.
 
 # ── TaskPump config core ──────────────────────────────────────────────────────
 _tp_self_root="$(CDPATH='' cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"

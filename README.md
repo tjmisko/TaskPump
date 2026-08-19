@@ -166,10 +166,10 @@ took it, and the two grains derive different branches (`feat/t3` vs `feat/t3.4`)
 Restarting a range at the other grain leaves any in-flight claim stranded, since
 neither the reclaim nor the resume pass will touch a branch this run's naming
 scheme does not own. The plan says so every tick — `WAITING T3.4 (claimed by
-feat/t3, no live container)` — and if other open work remains the run reaches its
-deadlock exit (3). But if that claim is the *last* thing in the range, `ready
---count` sees no `open` task and the run reports the range **drained**. Finish or
-`tp task release` an in-flight claim before changing grain.
+feat/t3, no live container)` — and the run reaches its deadlock exit (3), whether
+or not other open work remains beside it: a range is never reported **drained**
+while a claim is still in flight. Finish or `tp task release` an in-flight claim
+before changing grain.
 
 ### 6. Watch
 
@@ -241,9 +241,25 @@ cat >> .gitignore <<'EOF'
 .taskpump-usage-reset
 .taskpump-fsguard.notified
 .taskpump-disk-watchdog.log
+.taskpump-monitor-notes/
 EOF
 git add taskpump.conf .gitignore && git commit -m "chore: adopt TaskPump"
 ```
+
+That last line is the one people leave out, and it is the one that bites: the
+monitor's scratchpad (`n` in the TUI) writes a note file into a directory at the
+repository root, which is neither ignored by default nor in the contamination
+guard's allowlist. Take one note during a drain and the guard reports
+
+```
+FS-GUARD: primary checkout dirty outside allowlist:
+?? .taskpump-monitor-notes/
+```
+
+on every tick for the rest of the run, and pushes a desktop notification the
+first time. Note the line break: the header and the offending paths are separate
+lines (`lib/pump-lib.sh:590`), so grep for `dirty outside allowlist` rather than
+for a whole sentence naming the path.
 
 Then run `tp task resolve --all`. It prints which ledger every invocation from
 here will touch and how it decided — it is the diagnostic every error message
@@ -346,9 +362,12 @@ tp-pump: refusing to run against the TaskPump installation itself.
 
 `TASKPUMP_WORKSPACE_ROOT=/path/to/project` is that pin, for the layouts where
 `$PWD` proves nothing; a pin naming a missing directory is a loud error, never a
-fallback. It pins the **pump's** workspace only — ledger verbs still answer from
-where you stand, so run `tp task …` from inside the project (or name
-`TASKPUMP_TASKS_DIR` alongside it).
+fallback. Ledger verbs read the same pin, so `tp task ready --count` in that
+shell counts the pinned project's frontier instead of answering `0` from the
+install's own ledger — one pin, one workspace, `tp pump` and `tp task` alike.
+It outranks `$PWD`, so in a pinned shell a claim made from inside a worktree
+lands in the pinned workspace's ledger; that is the trade a pin buys. Naming
+`TASKPUMP_TASKS_DIR` outright still wins over it, in both.
 
 ### 6. One supervised tick
 
@@ -388,10 +407,12 @@ tp pump --phases T1..T2 --dry-run   # LAUNCH T1, and why feeding is permitted
 tp pump --phases T1..T2 --once
 ```
 
-The tick prints the launch — agent name, lead task, and the log path under
-`.worktrees/feat/t1/` — and one warning worth decoding: `ops pull --ff-only
-failed (continuing)` is the pump trying to refresh a separate ledger checkout you
-have not configured, and is noise here. Now look at what exists:
+The run opens with one startup line worth decoding — `ledger: no separate ledger
+repo to sync (... is not a git checkout); skipping the per-tick pull and the
+closing push` is the pump noticing you keep the ledger in this repository rather
+than in a separate checkout, so it has nothing to refresh; it says that once and
+then stays quiet — and then prints the launch: agent name, lead task, and the log
+path under `.worktrees/feat/t1/`. Now look at what exists:
 
 ```bash
 tp pump --phases T1..T2 --dry-run                  # T1 is RUNNING now, not LAUNCH
@@ -420,11 +441,17 @@ the agent's own log and the pump log are your view into it — and a stub does n
 claim its task, so the ledger keeps T1 `○ ready` while the pump counts the phase
 RUNNING. A real agent claims as its first act.
 
-One knob is worth knowing before it surprises you: `--jobs` seeds
-`.taskpump-pool-cap` and every tick then *reads* it, which is what lets
-`echo 1 >| .taskpump-pool-cap` retune a live pump. The file outlives the run that
-wrote it, so a number left by an earlier run wins over the `--jobs` you just
-passed; delete it or overwrite it when the cap looks wrong.
+One knob is worth knowing: `--jobs` *writes* `.taskpump-pool-cap` at startup and
+every tick then reads it, which is what lets `echo 1 >| .taskpump-pool-cap`
+retune a live pump mid-drain. The file outlives the run that wrote it, so an
+explicit `--jobs` overwrites whatever an earlier run left there — the flag is an
+instruction about this run, and a run that aborts at startup, before it ticks
+once, leaves the file alone. Without the flag the file wins, deliberately, and
+the startup banner prints the cap actually in force plus where it came from:
+
+```
+[09:23:16] Pump: phases=T1..T2 grain=phase cap=1 (--jobs, then live via /repo/.taskpump-pool-cap) ceiling=95% tick=30s
+```
 
 Ctrl-C stops feeding and leaves running agents alive — and stamps the state file
 on the way out, so the next reader is not misled:
@@ -455,6 +482,49 @@ set `TASKPUMP_BUILD_GATE` to the check you would not merge without, and read
 [docs/PUMP-MECHANISMS.md](docs/PUMP-MECHANISMS.md) before leaving a drain
 unattended.
 
+### 8. The rest of the toolkit
+
+`tp task` and `tp pump` are the two halves of the idea. Everything else under
+`tp` exists because a multi-day unattended run produces situations a supervisor
+should not try to resolve by itself, and each of those tools is one of those
+situations, packaged. You will not need any of them on day one. Knowing which
+one exists is what saves the afternoon on day four.
+
+**Looking at a run.** `tp monitor` is the live view (quickstart §6);
+`tp dag-render` prints the same dependency graph as a layered ASCII diagram, for
+a terminal, a paste, or a machine with no TUI. `tp usage` reads the plan-usage
+meter directly — it is the gate's own probe, so it answers "why did feeding
+stop" without starting a pump. `tp stream-fmt` is a filter, not a command: pipe
+an agent's JSON log through it and read what the agent actually did.
+
+**Getting a wedged box moving again.** An agent container can hang silently on a
+tool call that never returns — a build lock held by a corpse, a disk that filled
+up — and a hung agent is worse than a dead one, because its task stays claimed
+and nothing else may pick it up. `tp cleanup` is the packaged recovery for that:
+it identifies agents whose log has gone quiet past a threshold, commits their
+work-in-progress so nothing is lost, stops them, and releases the claims. It
+also reclaims build output and prunes the container runtime, which is the other
+way a long run wedges a machine. Start with its read-only mode; it will tell you
+what it would do without doing any of it.
+
+**Doing that on a schedule.** `tp agent-watchdog` runs the stuck sweep on an
+interval, and `tp disk-watchdog` watches free space and drops the pool cap
+before the disk fills. You are probably already running the second one without
+knowing it — the pump starts one for you
+([docs/PUMP-MECHANISMS.md §3](docs/PUMP-MECHANISMS.md#3-budget-gated-launching-that-never-kills-in-flight-work)
+explains what that means for your build directories, and is worth reading before
+an unattended drain).
+
+Every flag, mode and exit code for all of them is in
+[docs/CLI-TOOLS.md](docs/CLI-TOOLS.md) — including the ones whose behaviour is
+narrower than their name suggests, which is most of the reason that document
+exists. Each of them also answers `--help` with its own header, which is the
+copy that ships with the binary and therefore the copy that cannot go stale —
+each of them except `tp stream-fmt`, which parses no arguments at all. Being a
+filter is the whole of it: `tp stream-fmt --help` echoes `--help` back as
+another line of input, and typed at a terminal with nothing piped in it just
+waits.
+
 ---
 
 ## Layout
@@ -465,7 +535,9 @@ unattended.
 | `libexec/` | the tools themselves (`tp-task`, `tp-pump`, `tp-monitor`, …) |
 | `lib/` | sourced shared code: the config core, pump helpers, the DAG layout engine |
 | `gates/` | feed gates the pump consults before launching |
+| `hooks/` | the pre-tick housekeeping seam, plus TaskPump's own container pre-flight |
 | `runners/` | agent launchers; `claude-docker/` is the sandboxed container runner |
+| `templates/` | the briefs an agent is handed — phase drain, task, resume note |
 | `systemd/` | unit templates for running a pump across days |
 | `examples/` | annotated configurations: minimal, and a real consumer |
 | `tests/` | the shell suites; `tests/run-all.sh` runs every one |
@@ -478,16 +550,25 @@ unattended.
 | Document | What it answers |
 |---|---|
 | [docs/LEDGER-CONTRACT.md](docs/LEDGER-CONTRACT.md) | The versioned compatibility surface: file format, frontmatter schema, status vocabulary, state machine, eligibility, id grammar, exit codes. Read this before writing anything that reads a ledger. |
-| [docs/PUMP-MECHANISMS.md](docs/PUMP-MECHANISMS.md) | The five supervisor mechanisms and the incident behind each. Read this before re-implementing or trusting one. |
+| [docs/PUMP-MECHANISMS.md](docs/PUMP-MECHANISMS.md) | The six supervisor mechanisms and the incident behind each. Read this before re-implementing or trusting one. |
+| [docs/CLI-TASK.md](docs/CLI-TASK.md) | Every verb, flag and exit code of `tp task` — the ledger CLI, including the traps where a verb does less than its name suggests. |
+| [docs/CLI-PUMP.md](docs/CLI-PUMP.md) | The `tp pump` surface: flags, exit codes, the state file, and everything it hands a runner. |
+| [docs/CLI-TOOLS.md](docs/CLI-TOOLS.md) | The rest of the CLI — the `tp` dispatcher, `init`, `monitor`, `cleanup`, `dag-render`, both watchdogs, `stream-fmt` and `usage`. |
 | [docs/CONFIG.md](docs/CONFIG.md) | How configuration is discovered, which source wins, and what every key group is for. |
-| [docs/GATES.md](docs/GATES.md) | The gate plugin contract, the shipped gates, and how to write one. |
+| [docs/GATES.md](docs/GATES.md) | The gate plugin contract, the shipped gates, the pre-tick hook seam, and how to write one of each. |
 | [docs/RUNNERS.md](docs/RUNNERS.md) | The runner contract, and what the hardened reference runner guarantees. |
+
+The two contracts and the reference answer different questions. Ask
+LEDGER-CONTRACT or PUMP-MECHANISMS *why* something behaves as it does and what
+you may depend on; ask the three CLI references what to type.
 
 ---
 
 ## Extending it
 
-TaskPump has two plugin seams, both of which are just executables.
+TaskPump has three plugin seams, all of which are just executables named by a
+configuration key, and all of which replace a default chain rather than add to
+one.
 
 A **gate** decides whether starting new work right now is a bad idea. It exits 10
 to pause launching and prints one line saying why; 0 feeds; anything else fails
@@ -495,13 +576,23 @@ open with a warning. A gate never kills a running agent, and never fails a task.
 See [docs/GATES.md](docs/GATES.md).
 
 A **runner** starts an agent. `runner.sh launch` reads its inputs from the
-environment, prints a handle, and detaches; `runner.sh stop` stops one. Adapting
-TaskPump to a different agent, or to no container at all, means writing about
-fifteen lines. See [docs/RUNNERS.md](docs/RUNNERS.md).
+environment, prints a handle, and detaches; `runner.sh stop` stops one;
+`runner.sh list` answers which of its agents are alive, which is where the
+supervisor's never-double-launch property comes from; `runner.sh contract`
+reports the contract version. Adapting TaskPump to a different agent, or to no
+container at all, means writing about twenty lines. See
+[docs/RUNNERS.md](docs/RUNNERS.md).
 
-Between them sits the **pre-flight hook**, where everything project-shaped goes:
-toolchain setup, dependency bootstrapping, smoke tests. That hook is the reason
-the runner can stay generic.
+A **pre-tick hook** is housekeeping the supervisor runs before it plans
+anything — it takes the repo root, says anything worth saying on stdout, and can
+never abort a tick. The two shipped hooks keep the worktrees visible to git and
+report contamination in the primary checkout. See
+[docs/GATES.md §5](docs/GATES.md#5-the-third-seam--pre-tick-hooks).
+
+Beside those sits the **pre-flight hook**, which belongs to the runner rather
+than to the pump: it runs inside the container, and it is where everything
+project-shaped goes — toolchain setup, dependency bootstrapping, smoke tests,
+the egress allowlist. That hook is the reason the runner can stay generic.
 
 ---
 

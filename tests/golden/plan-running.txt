@@ -4,5 +4,5 @@ arachne-pump plan — phases F55..F57, grain phase, cap 4, ceiling 95%
 GATE: feed-ok
   LAUNCH   F56    -> feat/f56
   RUNNING  F55    -> feat/f55 (live container)
-  WAITING  F57    (1 open, none eligible — cross-phase blockers pending)
+  WAITING  F57    (1 open, none eligible — cross-phase blockers pending: F55.1 (open))
 frontier: 1 launchable, 1 running, 0 resumable, 1 waiting | open tasks in range: 4
