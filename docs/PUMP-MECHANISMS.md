@@ -425,12 +425,43 @@ meant to stop it.
 
 ### Deadlock exit
 
-The other half of the fix: when nothing is live, launchable, *or* resumable for
-N consecutive ticks, the pump **notifies and exits 3** rather than idling green.
-`systemd`'s `Restart=on-failure` catches it; a drained pump exits 0 and is
-deliberately not restarted.
+The other half of the fix: when a tick ends with **nothing live and nothing
+started**, N consecutive times, the pump **notifies and exits 3** rather than
+idling green. `systemd`'s `Restart=on-failure` catches it; a drained pump exits 0
+and is deliberately not restarted.
 
 N is greater than one so a container dying mid-tick cannot trip it.
+
+**The counter reads the outcome of the tick, not the plan**, and that distinction
+is the whole mechanism. It first asked whether anything was *launchable* —
+whether `PLAN_LAUNCH` and `PLAN_RESUME` were empty — which is a question about
+intent rather than about progress, and it answers "not deadlocked" in exactly the
+two cases where the supervisor is most stuck:
+
+- **a pool cap of 0.** Every candidate is refused by the cap, the plan stays
+  full, and the counter reset every tick. The run wrote `status: running`
+  indefinitely over work it would never start.
+- **a launch that fails every time.** `launch_unit` returns 1 with a warning on
+  three paths — a worktree a global `core.excludesFile` still ignores, a
+  worktree that conflicts with the integration trunk, and a runner that will not
+  start — and none of them removes the unit from the plan. The pump warned once
+  per tick, forever, and stayed green. The gitignored-worktree arm is not
+  hypothetical: that exact condition is what made the 2026-08-13 canary launch
+  nothing.
+
+Both are the same failure the detector exists to catch, arriving through a door
+it was not watching. Asking "did this tick start anything?" catches all three
+doors with one question, because a tick that started nothing and has nothing
+running made no progress by definition — while a tick that launched something,
+or that has a live agent, is progress whatever the plan says.
+
+The page has to name which one it was. `stall_exit` records the cause of the
+idle ticks and quotes it: `the pool cap is 0, so 4 launchable unit(s) were never
+started`, or `every launch attempt failed — 4 unit(s) planned, none started;
+last: <the last refusal>`, or plain `nothing launchable, nothing resumable` when
+the frontier really was empty. The three demand different repairs, and
+"nothing launchable" said over a plan that was full sends the operator to look
+for missing tasks that are all right there.
 
 A range with **zero open tasks** can reach this exit too, and must: the drain
 test asks about in-flight claims as well as open tasks, so a claim nobody is

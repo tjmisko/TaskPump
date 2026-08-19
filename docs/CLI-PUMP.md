@@ -83,29 +83,32 @@ never complains at all.
 
 Prefer the space form for both.
 
-#### 1.2 `--jobs 0` is legal, and it idles green forever
+#### 1.2 `--jobs 0` is legal, and it stalls out rather than pausing
 
 The validation is `^[0-9]+$`, so zero passes. The launch loop breaks when
 `live >= cap`, and `0 >= 0` on the first candidate, so nothing is ever started.
 The *plan* is unaffected — the cap is applied in the tick, not in `compute_plan`
 — so `--jobs 0 --list` still prints `LAUNCH` lines under a `cap 0` header.
 
-The deadlock detector does not catch this, and the reason is worth stating
-because it is the one failure mode the detector exists to prevent. It counts an
-idle tick only when nothing is live **and** nothing was planned:
-`have == 0 && PLAN_LAUNCH empty && PLAN_RESUME empty`. At cap 0 the plan is
-*full* of launchable work that the cap refuses to start, so the counter is reset
-every tick and `STALL_EXIT_TICKS` is never reached. Verified: a real run with
-`--jobs 0` over three open tasks ticked for as long as it was left alone with
-`status: running`, and only stopped when it was signalled.
+A cap of 0 is therefore not a pause: it is a run that cannot make progress, and
+the deadlock detector treats it as one. Three consecutive ticks that end with
+nothing live and nothing started reach `stall_exit` — exit 3, `status: stalled`,
+and a page whose reason names the cause: `the pool cap is 0, so N launchable
+unit(s) were never started`. Use it to make a run stop loudly, not to hold one
+open; to hold a pool open at minimum feed, set the cap file to `1`, which is
+also the knob that retunes a live run.
 
-That is the 563-tick idle of
+It did not always do that, and the old shape is worth remembering because it is
+the one failure this detector exists to prevent. The counter used to read the
+*plan* rather than the outcome — `have == 0 && PLAN_LAUNCH empty && PLAN_RESUME
+empty` — and at cap 0 the plan is *full* of launchable work the cap refuses to
+start, so the counter reset every tick, `STALL_EXIT_TICKS` was never reached, and
+the run wrote `status: running` for as long as it was left alone. That was the
+563-tick idle of
 [PUMP-MECHANISMS.md §4](PUMP-MECHANISMS.md#the-563-tick-idle) in a different
-costume — a supervisor reporting health while making no progress. Filed as a code
-bug. Until it is fixed, `--jobs 0` is not a way to pause a run; stop the run, or
-lower the cap through the cap file to `1`. (The disk watchdog's own attempt to
-write `0` there is inert for a different reason —
-[CLI-TOOLS.md](CLI-TOOLS.md#two-reasons-the-cap-file-path-may-do-nothing).)
+costume: a supervisor reporting health while making no progress. (The disk
+watchdog's own attempt to write `0` into the cap file is inert for a separate
+reason — [CLI-TOOLS.md](CLI-TOOLS.md#two-reasons-the-cap-file-path-may-do-nothing).)
 
 #### 1.3 Mode precedence is last-wins
 
@@ -399,7 +402,7 @@ $ tp pump --phases T1..T2 --integration-trunk --grain task --list
   DONE     T1.1      (complete)
 
 $ tp pump --phases T1..T2 --integration-trunk        # TASKPUMP_PUMP_STALL_EXIT_TICKS=1
-[…] T1..T2 STALLED after 1 idle ticks — 1 open task(s) … none can launch […]
+[…] T1..T2 STALLED after 1 idle ticks — 1 open task(s) … : nothing launchable, nothing resumable […]
 $ echo $?
 3
 ```
@@ -732,6 +735,15 @@ prose puts them:
    is throttled.
 10. Update the deadlock counter, write `running`.
 
+The counter in step 10 reads the **outcome** of steps 9, not the plan from step
+6: a tick that ends with no live agent and nothing started is an idle tick,
+whatever the cause — an empty frontier, a pool cap of 0, or N launches that all
+failed. It records why, and `stall_exit` quotes that back (`the pool cap is 0,
+so N launchable unit(s) were never started`; `every launch attempt failed — N
+unit(s) planned, none started; last: <the last refusal>`), because "nothing
+launchable" said over a plan that was full is a page pointing at the wrong thing.
+Anything that starts, and any live agent, resets it to zero.
+
 Then, outside the tick: `is_drained` (three questions — no open task, no
 in-flight claim, no live agent) breaks the loop; otherwise `STALL_TICKS >=
 STALL_EXIT_TICKS` calls `stall_exit`; otherwise sleep. The sleep is backgrounded
@@ -751,7 +763,7 @@ delivers it. Nothing else notifies.
 | `<unit> STALLED on <id> — <verdict>, no progress across N auto-resumes. Marked needs-review; …` | the resume budget is spent |
 | `auto/trunk: quarantined <unit> (<reason>); <lead> left done — reconcile the merge by hand` | a failed trunk merge whose lead task is already `done` |
 | `auto/trunk: quarantined <unit> (<reason>); <lead> flagged needs-review` | a failed trunk merge whose lead task is not |
-| `<phases> STALLED after N idle ticks — … In flight: <claims>. M task(s) need human review …` | immediately before exit 3 |
+| `<phases> STALLED after N idle ticks — … : <why the ticks were idle>. In flight: <claims>. M task(s) need human review …` | immediately before exit 3 |
 | `<phases> drained: 0 open should remain (N open), M task(s) need human review …` | immediately before exit 0 |
 
 `TASKPUMP_NOTIFY_CMD` receives the message **on stdin**, not as an argument.

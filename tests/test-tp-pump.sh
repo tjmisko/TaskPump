@@ -1044,7 +1044,10 @@ out=$(PATH="$BIN:$PATH" TASKPUMP_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 \
       timeout 60 "$PUMP" --no-health-gate --phases F97 --tick 1 --resume-max 1 2>&1) || rc=$?
 [[ "$rc" -eq 3 ]] && pass "deadlocked pump exits 3 (systemd sees failed, not green)" || fail "exit=$rc, want 3:\n$out"
 have "$out" 'STALLED after [0-9]+ idle ticks' && pass "stall exit pages with a reason" || fail "no stall page:\n$out"
-have "$out" 'none can launch' && pass "stall page explains why nothing ran" || fail "stall page lacks the cause:\n$out"
+# The page quotes the cause the counter recorded. Here the frontier really is
+# empty, so it is the plain one; a cap of 0 or a failing launcher say something
+# else, and telling those apart is the whole point (Test 37).
+have "$out" 'nothing launchable, nothing resumable' && pass "stall page explains why nothing ran" || fail "stall page lacks the cause:\n$out"
 
 # ── Test 20: --detach hands the terminal to the monitor ───────────────────────
 # The detach itself is stubbed: systemd-run records its argv to a marker instead
@@ -2343,6 +2346,97 @@ grep -qF "$capped36" <<<"$reason" \
 have "$page" 'F98\.6|F98\.7' \
   && fail "the page named past its own bound: $page" \
   || pass "should not name a claim past the bound it announces"
+
+echo "--- Test 37: a tick that STARTED nothing is idle, whatever the plan said ---"
+# The deadlock counter used to ask whether anything was launchABLE — whether
+# PLAN_LAUNCH and PLAN_RESUME were empty — which is a question about intent, not
+# about progress. It therefore answered "not deadlocked" in the two cases where
+# the supervisor is most stuck: a pool cap of 0 refuses every candidate while
+# the plan stays full, and a launch that fails every tick leaves its unit in the
+# plan too. Both reset the counter every tick, so STALL_EXIT_TICKS was never
+# reached and the run wrote status=running forever — the 563-tick idle again,
+# through two doors the detector was not watching.
+STATE37="$TMP/pump37.state"
+LOG37="$TMP/pump37.log"
+reason37() { jq -r '.paused_reason // empty' "$STATE37" 2>/dev/null; }
+loop37() {  # a REAL loop over F99; extra env/flags from the caller
+  TASKPUMP_NOTIFY_CMD=true TASKPUMP_STAGGER=0 GITHUB_TOKEN=stub \
+  TASKPUMP_PUMP_STALL_EXIT_TICKS="${TASKPUMP_PUMP_STALL_EXIT_TICKS:-2}" \
+  TASKPUMP_GATES="$GBIN/feed-ok" \
+  TASKPUMP_PRE_TICK_HOOKS=' ' TASKPUMP_HOOK_MARK_FILE="$TMP/37.mark" \
+  ARACHNE_PUMP_OPS_DIR="$TMP/noops" ARACHNE_PUMP_STATE_FILE="$STATE37" \
+  ARACHNE_POOL_CAP_FILE="$TMP/cap37" ARACHNE_PUMP_LOG="$LOG37" \
+  ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" STUB_LIVE="" \
+  timeout "${T37:-60}" "$PUMP" --no-health-gate --phases F99 --tick 1 "$@"
+}
+
+# 37a: the pool cap the operator typed. `--jobs 0` passes `^[0-9]+$`, the launch
+# loop breaks on `0 >= 0` before starting anything, and the plan stays full.
+rm -f "$TASKS"/*.md; mk F99.0 open
+rm -f "$STATE37" "$TMP/cap37"
+rc=0; out=$(ARACHNE_PUMP_NO_LAUNCH=1 loop37 --jobs 0 2>&1) || rc=$?
+[[ "$rc" -eq 3 ]] && pass "should exit 3 when a pool cap of 0 refuses every launchable unit" \
+  || fail "exit=$rc, want 3 — --jobs 0 idled instead of stalling:\n$out"
+[[ "$(jq -r '.status' "$STATE37" 2>/dev/null)" == "stalled" ]] \
+  && pass "should stamp status=stalled at cap 0, never running" \
+  || fail "state after the cap-0 run: $(cat "$STATE37" 2>/dev/null)"
+have "$(reason37)" 'pool cap is 0' \
+  && pass "should name the cap in the stall reason when the cap refused the work" \
+  || fail "the stall reason does not name the cap: $(reason37)"
+have "$(reason37)" 'nothing launchable' \
+  && fail "the page said 'nothing launchable' over a plan that was full: $(reason37)" \
+  || pass "should not report 'nothing launchable' about work the cap refused"
+
+# 37b: the default configuration, no unusual flag — a launch that fails every
+# tick. launch_unit returns 1 with only a warning on three paths (gitignored
+# worktree, trunk conflict, runner failure) and none of them removes the unit
+# from the plan, so the pump warned once per tick, forever, and stayed green.
+REPO37="$TMP/repo37"; mkdir -p "$REPO37"
+git -C "$REPO37" init -q -b main 2>/dev/null
+git -C "$REPO37" config user.email fixture@example.invalid
+git -C "$REPO37" config user.name fixture
+printf 'seed\n' >| "$REPO37/README.md"
+git -C "$REPO37" add -A; git -C "$REPO37" commit -qm seed
+rm -f "$STATE37" "$TMP/cap37"
+rc=0
+out=$(TASKPUMP_WORKSPACE_ROOT="$REPO37" ARACHNE_PUMP_WORKTREES_DIR="$REPO37/.worktrees" \
+      TASKPUMP_AGENT_HOME="$WDHOME" TASKPUMP_IMAGE=stub-image TASKPUMP_IMAGE_BUILD= \
+      TASKPUMP_RUNNER="$BIN/norunner" TASKPUMP_DISK_GATE=0 \
+      loop37 2>&1) || rc=$?
+[[ "$rc" -eq 3 ]] && pass "should exit 3 when every launch attempt fails, tick after tick" \
+  || fail "exit=$rc, want 3 — a failing launcher never tripped the detector:\n$out"
+[[ "$(jq -r '.status' "$STATE37" 2>/dev/null)" == "stalled" ]] \
+  && pass "should stamp status=stalled when nothing can be started, never running" \
+  || fail "state after the failing-launch run: $(cat "$STATE37" 2>/dev/null)"
+have "$(reason37)" 'every launch attempt failed' \
+  && pass "should say the launches failed rather than that nothing was launchable" \
+  || fail "the stall reason misdescribes the fault: $(reason37)"
+have "$(reason37)" 'last: ' \
+  && pass "should carry the last launch refusal into the stall reason" \
+  || fail "the stall reason names no launch failure: $(reason37)"
+have "$out" 'STALLED after [0-9]+ idle ticks' \
+  && pass "should page about the stall a failing launcher produced" \
+  || fail "no stall page from the failing-launch run:\n$out"
+
+# 37c: the false-positive guard. A tick that DID start something is progress,
+# so the counter must reset — otherwise this change trades a silent idle for a
+# spurious page, which is the same class of wrong answer.
+rm -f "$TASKS"/*.md; mk F99.0 open
+rm -f "$STATE37" "$TMP/cap37"
+rc=0; out=$(T37=8 TASKPUMP_PUMP_STALL_EXIT_TICKS=1 ARACHNE_PUMP_NO_LAUNCH=1 loop37 2>&1) || rc=$?
+[[ "$rc" -eq 124 ]] && pass "should keep ticking while every tick launches something" \
+  || fail "exit=$rc, want 124 — a launching pump paged as stalled:\n$out"
+
+# 37d: and an empty frontier still reads as one. The plain reason is the right
+# one exactly when the plan really was empty.
+rm -f "$TASKS"/*.md; mk F99.0 open F99.1; mk F99.1 open F99.0
+rm -f "$STATE37" "$TMP/cap37"
+rc=0; out=$(ARACHNE_PUMP_NO_LAUNCH=1 loop37 2>&1) || rc=$?
+[[ "$rc" -eq 3 ]] && pass "should still exit 3 when the frontier is genuinely empty" \
+  || fail "exit=$rc, want 3 on a mutually-blocked range:\n$out"
+have "$(reason37)" 'nothing launchable, nothing resumable' \
+  && pass "should still say 'nothing launchable' when nothing was launchable" \
+  || fail "the empty-frontier reason changed: $(reason37)"
 
 echo
 echo "=============================================="

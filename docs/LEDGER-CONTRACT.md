@@ -764,6 +764,17 @@ reader does not have to infer the outcome from a process's exit code —
 means deadlock unambiguously; `0` means "this invocation finished", and the file
 says what it finished doing.
 
+**`tp pump` exit 3 is wider than the row's parenthetical, on purpose.** Row
+`3 | tp pump` glosses the deadlock as "nothing live, launchable, or resumable
+for N consecutive ticks". The pump asks the question one step later: nothing
+live and **nothing started**, for N consecutive ticks. The narrower predicate
+was the literal implementation once, and it answered "not deadlocked" in the two
+cases where the supervisor is most stuck — a pool cap of 0, and launches that
+fail every tick — because in both the plan stays full of work that never starts.
+The code and its meaning are unchanged (`3` is deadlock: page a human, restart
+under `Restart=on-failure`); only the set of conditions that reach it is
+complete now. The reason string in the state file names which one it was.
+
 ---
 
 ## 11. Minimal conformance
