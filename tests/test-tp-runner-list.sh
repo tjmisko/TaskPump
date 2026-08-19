@@ -27,8 +27,8 @@
 # Run: ./tests/test-tp-runner-list.sh   (offline)
 set -uo pipefail
 
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
-TP_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
+TP_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd)
 RUNNER="$TP_ROOT/runners/claude-docker/runner.sh"
 PUMP_LIB="$TP_ROOT/lib/pump-lib.sh"
 
@@ -81,7 +81,7 @@ run_list() {
     unset TP_AGENT_PREFIX TASKPUMP_AGENT_PREFIX ARACHNE_AGENT_PREFIX STUB_NAMES
     unset TP_CONTAINER_NAME ARACHNE_CONTAINER_NAME TP_WORKSPACE TP_IMAGE
     local kv
-    for kv in "$@"; do export "$kv"; done
+    for kv in "$@"; do export "${kv?}"; done
     DOCKER="$docker" bash "$RUNNER" list 2>"$WORK/err"
   )
 }
@@ -178,6 +178,75 @@ via_lib=$(
 [[ "$via_runner" == "$via_lib" && -n "$via_lib" ]] \
   && pass "runner list agrees with apl_live_agent_names name for name" \
   || fail "the two enumerations have drifted:\n runner: '$via_runner'\n lib:    '$via_lib'"
+
+echo "--- one runtime for every verb, resolved one way ---"
+
+# `list` reached the runtime through lib/pump-lib.sh's apl_docker
+# (TASKPUMP_DOCKER → DOCKER → docker) while `stop` and `launch` read only the
+# bare DOCKER seam. On a host configured with TASKPUMP_DOCKER alone that is ONE
+# runner answering about podman's fleet and tearing down containers on docker's
+# — the drift this suite exists to catch, one level below the name mapping.
+CALLS="$WORK/runtime-calls.log"
+cat >| "$WORK/docker-logging" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$CALLS"
+if [[ "\$1" == "ps" ]]; then
+  [[ -n "\${STUB_NAMES:-}" ]] && printf '%s\n' "\$STUB_NAMES"
+fi
+exit 0
+EOF
+chmod +x "$WORK/docker-logging"
+
+: >| "$CALLS"
+out=$(env -u DOCKER -u TP_DOCKER TASKPUMP_DOCKER="$WORK/docker-logging" \
+      STUB_NAMES=tp-agent-feat-a bash "$RUNNER" list 2>"$WORK/err"); rc=$?
+[[ $rc -eq 0 && "$out" == "tp-agent-feat-a" ]] \
+  && pass "list enumerates through TASKPUMP_DOCKER" \
+  || fail "list did not reach the TASKPUMP_DOCKER runtime (rc=$rc): '$out'"
+
+: >| "$CALLS"
+env -u DOCKER -u TP_DOCKER TASKPUMP_DOCKER="$WORK/docker-logging" \
+    TP_CONTAINER_NAME=tp-agent-feat-a bash "$RUNNER" stop >/dev/null 2>&1; rc=$?
+[[ $rc -eq 0 ]] && grep -q '^stop tp-agent-feat-a$' "$CALLS" \
+  && pass "stop reaches the same runtime TASKPUMP_DOCKER named for list" \
+  || fail "stop bypassed TASKPUMP_DOCKER (rc=$rc); calls: $(tr '\n' ';' <"$CALLS")"
+
+# ...and only from the keys the CALLER passes. TP_DOCKER is the launch
+# environment's spelling (docs/RUNNERS.md §1.1) and the pump writes it into a
+# `launch`, but apl__runner_list — the call that asks for the fleet — passes
+# TASKPUMP_DOCKER and DOCKER only. A runner that reads TP_DOCKER therefore
+# resolves `list` from a variable its caller never set: a TP_DOCKER left in the
+# supervisor's environment wins on the enumeration and loses on the launch, so
+# the pump starts containers on one runtime and asks another which ones are
+# alive. Every agent is invisible, and an invisible agent is one the pump
+# launches a second copy of on a branch that already has one.
+cat >| "$WORK/docker-decoy" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == "ps" ]]; then printf 'tp-agent-DECOY-RUNTIME\n'; fi
+exit 0
+EOF
+chmod +x "$WORK/docker-decoy"
+
+out=$(env -u DOCKER TP_DOCKER="$WORK/docker-decoy" TASKPUMP_DOCKER="$WORK/docker-ok" \
+      STUB_NAMES=tp-agent-feat-a bash "$RUNNER" list 2>"$WORK/err"); rc=$?
+[[ $rc -eq 0 && "$out" == "tp-agent-feat-a" ]] \
+  && pass "an ambient TP_DOCKER does not divert list off the configured runtime" \
+  || fail "TP_DOCKER overrode the runtime list must enumerate (rc=$rc): '$out'"
+
+# The same thing through the real caller rather than a hand-built environment:
+# apl__runner_list is what libexec/tp-pump's liveness path invokes, and the
+# decoy is visible to it only if the runner reads a key it does not pass.
+via_pump=$(
+  # shellcheck disable=SC1090
+  . "$PUMP_LIB"
+  export TP_DOCKER="$WORK/docker-decoy" TASKPUMP_DOCKER="$WORK/docker-ok" \
+         STUB_NAMES=tp-agent-feat-a
+  unset DOCKER
+  apl__runner_list "$RUNNER" 2>"$WORK/err"
+)
+[[ "$via_pump" == "tp-agent-feat-a" ]] \
+  && pass "the pump's own fleet call enumerates the runtime the pump resolved" \
+  || fail "apl__runner_list reached a runtime the pump never chose: '$via_pump'"
 
 echo "--- the verb is advertised, and the contract version says so ---"
 

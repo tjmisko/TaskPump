@@ -307,19 +307,22 @@ the directory, `TASKPUMP_MONITOR_NOTES_DIR` relocates it, and
 `TASKPUMP_MONITOR_NOTES_FILE` overrides the resolved path outright. Add the
 directory to `.gitignore`.
 
-#### It talks to `docker` by name
+#### Which container runtime it talks to
 
-Every other tool in the tree reaches the container runtime through
-`apl_docker`, which resolves `TASKPUMP_DOCKER`, then `DOCKER`, then `docker`.
-The monitor does not: its disk gauge, its session sweep and its GRAPH-tab
-liveness read all invoke a literal `docker`. On a host running `podman` — with
-`TASKPUMP_DOCKER=podman` configured and honoured by the pump, the runner and
-`tp cleanup` — the monitor's SESSIONS tab reports `(no tp-agent containers
-running or recently exited)` for a fleet that is running perfectly well, and the
-GRAPH tab draws every claimed task as `⧗ claimed, idle` rather than
-`▶ in progress`.
-Filed as a code bug. There is no workaround inside the monitor; a `docker` shim
-on `PATH` is the only lever.
+The same one everything else does. The monitor reaches the runtime through
+`apl_docker` (`lib/pump-lib.sh`), which resolves `TASKPUMP_DOCKER`, then
+`DOCKER`, then `docker`, and it resolves it **once at startup** — the disk
+gauge's runtime breakdown, the session sweep and the GRAPH tab's liveness signal
+all speak to that one binary.
+
+It did not always. Those three call sites used to spell `docker`
+literally, so on a host running `podman` — with `TASKPUMP_DOCKER=podman`
+configured and honoured by the pump, the runner and `tp cleanup` — the SESSIONS
+tab reported `(no tp-agent containers running or recently exited)` for a fleet
+that was running perfectly well, the GRAPH tab drew every claimed task as
+`⧗ claimed, idle` rather than `▶ in progress`, and the disk gauge lost its
+`docker img … · cont …` line. A supervisor's dashboard lying about the fleet it
+is supervising, with no in-tool workaround.
 
 #### Where it reads, and what it caches
 
@@ -335,6 +338,54 @@ therefore tens of milliseconds and the first frame is instant; cold caches show
 `…` placeholders that fill in within a couple of seconds. The three TTLs are the
 docker session table (2s), the eligible-frontier scan (8s — it is a ~3s scan, far
 too slow to run every paint) and the disk sizing (60s).
+
+#### Nothing it displays can repaint it
+
+Every string on this dashboard was written by somebody else: a task's title and
+goal come out of the ledger, a branch out of a claim, a feed line out of an
+agent's log — which routinely quotes repository content back. A terminal
+executes what it is handed, so raw CSI in any of those repaints a `blocked` row
+green, `ESC[2K\r` erases the line being read and writes another, `ESC[1A` walks
+back over the row above, and an OSC sets the window title. The panel an operator
+uses to decide whether a drain is healthy is precisely the thing worth forging.
+
+So every value that reaches a row from a source the operator does not write —
+the ledger, the container runtime, an agent's log, the pump state file, the
+filesystem — goes through `lib/tty-safe.sh`'s `tp_display_safe`: TAB folded to a
+space, every other C0 byte and DEL dropped, and C1 dropped in both encodings it
+can arrive in (`0xC2` followed by `0x80`–`0x9F`, and a bare `0x80`–`0x9F` byte
+standing outside any UTF-8 sequence). Well-formed UTF-8 is left byte-for-byte
+alone, so the words survive. What is *not* stripped is a `0x80`–`0x9F` byte that
+is part of a legal character — `→` is `0xE2 0x86 0x92` — which a terminal
+decoding UTF-8 does not read as a control and a terminal in 8-bit mode does; see
+`lib/tty-safe.sh`'s header for why no strip can keep UTF-8 and also emit no C1
+byte.
+
+It is applied where the value is **composed**, not where it is printed: the
+session records are sanitised in the background worker before they reach the TSV
+cache, because the paint path later truncates those rows to the terminal width
+and truncating a half-sanitised row is how you cut a control sequence in two.
+The GRAPH tab's node index gets the same treatment on load, the pump summary
+line and the disk breakdown likewise. The monitor's own palette is composed
+*around* sanitised values and is unaffected.
+
+Three things are deliberately **not** covered, and all three are worth knowing:
+
+- **The GRAPH tab's canvas.** It is drawn by `tp dag-render`, and the monitor
+  prints that output as it arrives. Whatever the renderer does with a task id or
+  title is the renderer's business; the monitor sanitises the detail bar above
+  the canvas, not the canvas itself.
+- **The notes panel.** Those lines are the operator's own, typed at the `n`
+  prompt or edited into the notes file by hand, and by default they live in the
+  primary checkout — which the container runner mounts **read-only**, so an
+  agent has no path to them. They are printed as written.
+- **The task id in the GRAPH index.** It is the key every lookup and the `o`
+  open are done by, and a rewritten key names nothing, so it is kept raw and
+  sanitised at its one print site (the detail bar) instead. The SESSIONS cache
+  is the other way round: there the id is a *field* of a TSV record, so it is
+  sanitised with the rest of the row and `o` on that tab opens by the sanitised
+  value — a task whose id carried control bytes would not open from there.
+  `tp task create` refuses to make such an id (`TASKPUMP_ID_PATTERN`).
 
 ---
 
@@ -592,6 +643,28 @@ Tool *results* are the exception: only `Bash` results are shown at all, and only
 when they mention `error`/`failed`/`panicked` (red, last 15 lines) or `test
 result`/`Finished`/`warning` (dim, last 3 lines). Everything else is dropped, so
 a quiet run prints nothing between the tool calls.
+
+**Nothing in the stream can steer your terminal.** Every field this prints was
+written by somebody else — an agent's narration, a tool call's arguments, and,
+worst, the stdout of a command the agent ran over whatever the repository
+contains. So each is passed through `lib/tty-safe.sh`'s `tp_display_safe`, which
+folds TAB to a space and drops every other C0 byte, DEL, and C1 in both
+encodings — `0xC2` followed by `0x80`–`0x9F`, and a bare `0x80`–`0x9F` byte
+standing outside any UTF-8 sequence. The words survive and well-formed UTF-8 is
+untouched, which is also the limit of it: a `0x80`–`0x9F` byte inside a legal
+multi-byte character is kept, and on a terminal running in 8-bit mode that byte
+is a control (`lib/tty-safe.sh`'s header says why no strip can have it both
+ways). The colours above are the only escapes the tool emits, and they wrap the
+sanitised text rather than coming out of it.
+
+This is not hypothetical hardening. The printer used `echo -e`, which *expands*
+backslash escapes — so a literal `\e[2J` sitting in a test fixture, harmless in
+the JSON and harmless to `jq`, became a real screen-clear on the way to the
+operator's terminal. Add an OSC and it rewrites the window title; add `ESC[<n>A`
+and it walks back over the failure lines already on screen and overwrites them
+with `0 errors, all tests passed`. The command an operator is told to watch a
+multi-day drain with was the one place a hostile repository could write directly
+onto their screen. `tests/test-tp-stream-fmt.sh` holds both halves of it.
 
 ---
 

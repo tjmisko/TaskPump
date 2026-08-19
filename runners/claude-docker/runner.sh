@@ -61,15 +61,26 @@
 #   TP_ENV_PASSTHROUGH  —                   extra variable names to forward when
 #                                           set (see DEFAULT_PASSTHROUGH)
 #   GITHUB_TOKEN        —                   forwarded for ops fetch + gh
-#   DOCKER              —                   container binary override (test seam)
+#   —                   TASKPUMP_DOCKER / DOCKER
+#                                           container binary override (test seam),
+#                                           resolved once for every verb — launch,
+#                                           stop, list — from apl_docker's two
+#                                           keys and no others. The pump also
+#                                           passes TP_DOCKER at launch, and this
+#                                           runner ignores it on purpose: see the
+#                                           resolution below.
 #
-# `list` reads none of the above. Its only input is the name prefix the fleet
-# shares, which is configuration rather than a property of any one launch:
+# `list` reads no per-launch input. Its inputs are configuration the whole fleet
+# shares rather than properties of any one launch — the name prefix, and the same
+# container runtime `launch` and `stop` use:
 #
 #   TP_AGENT_PREFIX     TASKPUMP_AGENT_PREFIX / ARACHNE_AGENT_PREFIX
 #                                           container-name prefix to enumerate
 #                                           (default tp-agent-, via
 #                                           lib/pump-lib.sh's one accessor)
+#   —                   TASKPUMP_DOCKER / DOCKER
+#                                           the runtime, the same value the other
+#                                           two verbs resolved (see below)
 #
 # ── Liveness, and why `list` is shaped the way it is ─────────────────────────
 #
@@ -117,7 +128,22 @@ PUMP_LIB="${TP_LIB_DIR:-$RUNNER_DIR/../../lib}/pump-lib.sh"
 die()  { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
 warn() { printf '%s: %s\n' "$PROG" "$*" >&2; }
 
-DOCKER="${DOCKER:-docker}"
+# The container runtime, resolved ONCE for every verb, in the SAME order and
+# from the SAME keys lib/pump-lib.sh's apl_docker uses. `launch` and `stop` read
+# only the bare `DOCKER` seam before, while `list` reached the runtime through
+# apl_docker — so a host configured with TASKPUMP_DOCKER alone had one runner
+# answering about podman's fleet and starting containers on docker's.
+#
+# TP_DOCKER is deliberately NOT a rung here, even though it is the launch
+# environment's own spelling for this input (docs/RUNNERS.md §1.1). The pump
+# passes it at launch (`TP_DOCKER="$DOCKER" DOCKER="$DOCKER"`), but the call that
+# asks this runner for the fleet — apl__runner_list — passes TASKPUMP_DOCKER and
+# DOCKER only. A rung this runner reads and that caller does not set is a rung an
+# AMBIENT TP_DOCKER wins on: the supervisor would launch on the binary it
+# resolved and enumerate on the one it never chose, which is the invisible-agent
+# split that makes the pump start a second agent on a branch that already has
+# one. Resolve exactly what the caller passes, and the two cannot disagree.
+DOCKER="${TASKPUMP_DOCKER:-${DOCKER:-docker}}"
 
 # Variables forwarded into the container when — and only when — they are set in
 # the runner's own environment. Keeping this list opt-in keeps the launch line
@@ -354,7 +380,13 @@ do_list() {
 
   local errs; errs="$(mktemp)"
   local names rc=0
-  names="$(TASKPUMP_AGENT_PREFIX="$prefix" apl_live_agent_names_strict 2>"$errs")" || rc=$?
+  # The resolved binary is handed over rather than left to a second lookup. It
+  # is the same value apl_docker would derive — the resolution above reads its
+  # two keys in its order, and that is the point: this line pins the equality
+  # instead of assuming it, so a future rung added on either side shows up here
+  # rather than as one runner launching on docker and enumerating on podman.
+  names="$(TASKPUMP_AGENT_PREFIX="$prefix" TASKPUMP_DOCKER="$DOCKER" \
+           apl_live_agent_names_strict 2>"$errs")" || rc=$?
 
   if [[ $rc -ne 0 ]]; then
     # One line, per the contract: the runtime's first line of complaint is the
