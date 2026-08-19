@@ -181,11 +181,20 @@ STATE="$TMP/pump.state"
 NOTIFY="$TMP/notify.txt"; : >| "$NOTIFY"
 # Hermetic tick: no worktrees/containers (NO_LAUNCH), ops/git ops point at a
 # non-repo (fail-open), state/cap/log/template/usage all redirected.
+#
+# TASKPUMP_STATE_DIR is the one that is easy to forget and expensive to omit
+# (B16). This helper never cds and pins no workspace, so the pump's cwd rung
+# resolves REPO_ROOT to the TaskPump CHECKOUT the suite is running from — and
+# every state file whose name is not individually redirected below then
+# defaults to $REPO_ROOT/<name>. That is how a suite run came to delete and
+# rewrite the operator's live .taskpump-fsguard.notified on 2026-08-19. One
+# key moves all of them; keep it, even as individual names are pinned.
 pump_tick() {  # $1=phases ; extra env via caller
   # Suppress real desktop notifications by default (the fs-guard now runs in
   # do_tick and would notify-send against this dirty worktree); a caller can
   # still override TASKPUMP_NOTIFY_CMD to capture, as the drain test does.
   TASKPUMP_NOTIFY_CMD="${TASKPUMP_NOTIFY_CMD:-true}" \
+  TASKPUMP_STATE_DIR="${TASKPUMP_STATE_DIR:-$TMP}" \
   ARACHNE_PUMP_NO_LAUNCH=1 \
   ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
   ARACHNE_PUMP_STATE_FILE="$STATE" \

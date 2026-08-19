@@ -8,7 +8,8 @@
 #   SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 #   . "$SCRIPT_DIR/suite-prologue.sh"
 #
-# It closes the two ways the caller's world can silently reconfigure a fixture:
+# It closes the ways the caller's world can silently reconfigure a fixture —
+# and the one way a fixture can silently reconfigure the caller's world:
 #
 # Conf files. The tools discover taskpump.conf by walking up from $PWD, so the
 # conf of whatever repo the suites happen to run from (TaskPump's own dogfood
@@ -31,6 +32,20 @@
 # needs one of these variables sets it explicitly AFTER sourcing this; none
 # may inherit one. test-env-hermeticity.sh pins this seam.
 #
+# Run state (B16). The leak runs the other way: tp-pump resolves its dotfiles
+# to $TASKPUMP_STATE_DIR, which defaults to the workspace root — and a suite
+# that runs a real tick without pinning a workspace resolves that, through the
+# cwd rung, to the TaskPump checkout the suites are running FROM. The pre-tick
+# hook mark file is the one that actually moves: run_pre_tick_hooks WRITES it
+# when the hooks have something to say and `rm -f`s it when they go quiet, so
+# on 2026-08-19 a suite run deleted and then rewrote the operator's live
+# .taskpump-fsguard.notified in the primary checkout. Every state file is
+# gitignored, so run-all.sh's status diff could not see it; the manifest guard
+# there is the other half of this fix. Redirecting the mark file out of the
+# tree is the default a new suite inherits without having to know any of this —
+# a suite that pins its own TASKPUMP_STATE_DIR or mark file still outranks it,
+# and a suite that pins neither can no longer reach the repo root.
+#
 # Exported names only: a suite's own unexported helpers (TP_ROOT,
 # TP_ENV_UNSET, ...) are not environment, and are defined after this runs in
 # any case.
@@ -46,6 +61,12 @@ unset _tp_scrub_var
 #     drive code paths that would otherwise fire a real desktop notification
 #     per tick. A test that captures notifications overrides
 #     TASKPUMP_NOTIFY_CMD per invocation.
+#   * the pre-tick hook mark file points outside any repository (above). Per
+#     process, so two suites running side by side do not share a fingerprint;
+#     the pump creates it only when a tick's hooks produce output and removes
+#     it again when they go quiet, so this leaves nothing behind in the common
+#     case. test-env-hermeticity.sh pins that it is never a repo-root path.
 export TASKPUMP_NO_CONF=1
 export TASKPUMP_NOTIFY_CMD=true
 export ARACHNE_NOTIFY_CMD=true
+export TASKPUMP_HOOK_MARK_FILE="${TMPDIR:-/tmp}/taskpump-suite-hookmark.$$"

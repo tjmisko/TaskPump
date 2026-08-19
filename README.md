@@ -607,6 +607,15 @@ The suites are hermetic: no container runtime, no network, no real agent, and no
 checkout of any particular project. They build their fixtures in temporary
 directories and stub anything external.
 
+Hermeticity runs in both directions, and two guards hold it. `tests/suite-prologue.sh`
+closes the ways the caller's world can reconfigure a fixture — ambient
+`taskpump.conf` discovery off, the inherited `TASKPUMP_*` / `TP_*` / `ARACHNE_*`
+environment scrubbed, notifications stubbed — and the one way a fixture can
+reconfigure the caller's world: the pump's hook mark file is redirected out of
+any repository, because a suite that runs a real tick without pinning a
+workspace resolves the state dir to the checkout the suites are running *from*.
+Every suite sources it, and `run-all.sh` sources it too.
+
 ---
 
 ## Provenance

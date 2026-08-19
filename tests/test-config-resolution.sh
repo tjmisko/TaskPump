@@ -320,9 +320,17 @@ WTS="$TMP/wts"
 mkdir -p "$WTS/feat/t5/ops/planning"
 printf 'status\n' >| "$WTS/feat/t5/ops/planning/STATUS.md"
 
+# TASKPUMP_STATE_DIR is load-bearing (B16). This tick cds to $TMP, but it also
+# names TASKPUMP_TASKS_DIR — which exempts it from the pump's install-root
+# refusal — so REPO_ROOT resolves to the TaskPump INSTALL root, i.e. the
+# checkout the suite is running from. TASKPUMP_PRE_TICK_HOOKS=' ' means the
+# hooks produce no output, and run_pre_tick_hooks' quiet branch `rm -f`s the
+# mark file: this suite DELETED the operator's live
+# .taskpump-fsguard.notified until the state dir was pinned into $TMP.
 probe_tick() {  # extra env assignments come first, as "K=V" words
   ( cd "$TMP" && env "${TP_ENV_UNSET[@]}" "$@" \
       PATH="$BIN:$PATH" \
+      TASKPUMP_STATE_DIR="$TMP" \
       TASKPUMP_TASK_NOCOMMIT=1 \
       TASKPUMP_TASKS_DIR="$PTASKS" \
       TASKPUMP_TASK="$TASK" \

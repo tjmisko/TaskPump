@@ -131,10 +131,10 @@ leftover=$(env TASKPUMP_TASKS_DIR="$PUMP_TASKS" TP_TASKS_DIR="$PUMP_TASKS" \
              ARACHNE_ZZ_FUTURE_KEY=poison TASKPUMPX_BYSTANDER=keep \
              bash -c '. "$1"; compgen -e TASKPUMP_; compgen -e TP_; compgen -e ARACHNE_; true' \
              _ "$PROLOGUE" | LC_ALL=C sort)
-expected=$'ARACHNE_NOTIFY_CMD\nTASKPUMP_NOTIFY_CMD\nTASKPUMP_NO_CONF'
+expected=$'ARACHNE_NOTIFY_CMD\nTASKPUMP_HOOK_MARK_FILE\nTASKPUMP_NOTIFY_CMD\nTASKPUMP_NO_CONF'
 [[ "$leftover" == "$expected" ]] \
   && pass "the scrub leaves exactly the hermetic baseline, invented keys included" \
-  || fail "post-scrub namespace was '$(tr '\n' ' ' <<<"$leftover")', expected exactly the baseline three"
+  || fail "post-scrub namespace was '$(tr '\n' ' ' <<<"$leftover")', expected exactly the baseline four"
 
 got=$(env TASKPUMPX_BYSTANDER=keep \
         bash -c '. "$1"; printf "%s" "${TASKPUMPX_BYSTANDER:-gone}"' _ "$PROLOGUE")
@@ -187,6 +187,59 @@ out=$(env TASKPUMP_TASKS_DIR="$PUMP_TASKS" TP_TASKS_DIR="$PUMP_TASKS" \
 grep -q 'All 1 suite(s) passed' <<<"$out" \
   && pass "the nested run reports the suite green" \
   || fail "nested run-all summary did not report 1 passing suite"
+
+# ── 6. Run state: a fixture must not write the caller's checkout (B16) ───────
+echo
+echo "--- run state: the pump's hook mark file is redirected out of any repo ---"
+
+# The leak the other four sections do not cover runs the OTHER way. tp-pump
+# resolves its dotfiles to $TASKPUMP_STATE_DIR, defaulting to the workspace
+# root — and a suite helper that runs a real tick without cding or pinning a
+# workspace resolves that, through the cwd rung, to the TaskPump checkout the
+# suites are running FROM. run_pre_tick_hooks WRITES the mark file when the
+# hooks have something to say and `rm -f`s it when they go quiet, so on
+# 2026-08-19 a suite run deleted and rewrote the operator's live
+# .taskpump-fsguard.notified. Every one of those files is gitignored, so
+# run-all.sh's status probe reported the run green; its state manifest is the
+# other half of the fix.
+PUMP="$TP_ROOT/libexec/tp-pump"
+
+mark=$(bash -c '. "$1"; printf "%s" "${TASKPUMP_HOOK_MARK_FILE:-<unset>}"' _ "$PROLOGUE")
+[[ "$mark" == /* && "$mark" != "$TP_ROOT"/* ]] \
+  && pass "the prologue points the hook mark file at an absolute path outside the checkout" \
+  || fail "the hook mark file default is '$mark' — unset, relative, or inside $TP_ROOT"
+
+# Behaviourally, against a directory shaped exactly like the checkout that got
+# hurt: a git repo with a tasks/ probe dir is all the cwd rung needs to answer
+# "this is the workspace". Nothing is pinned here on purpose — the tick
+# inherits only what the prologue set, which is the situation a new suite
+# helper that forgets to pin anything creates.
+WS="$TMP/ws"; mkdir -p "$WS/tasks" "$TMP/noops"
+git -C "$WS" init -q
+mk "$WS/tasks" T1
+cat >| "$TMP/hook-noisy" <<'EOF'
+#!/usr/bin/env bash
+printf 'a persistent condition worth notifying about once\n'
+EOF
+chmod +x "$TMP/hook-noisy"
+( cd "$WS" && TASKPUMP_PRE_TICK_HOOKS="$TMP/hook-noisy" \
+    TASKPUMP_PUMP_NO_LAUNCH=1 TASKPUMP_PUMP_OPS_DIR="$TMP/noops" \
+    "$PUMP" --no-health-gate --no-usage-gate --no-disk-gate --once --phases T1 \
+  ) >/dev/null 2>&1
+# The tick has to have really happened, or the two assertions below are vacuous
+# — and its OTHER dotfiles must still land in the workspace, because relocating
+# the mark file is a test-harness redirect, not a change to where a pump keeps
+# its state.
+[[ -f "$WS/.taskpump-pump.state" ]] \
+  && pass "the tick ran a real tick against the workspace the cwd rung resolved" \
+  || fail "no state file in $WS — the tick never got far enough to prove anything"
+[[ ! -e "$WS/.taskpump-fsguard.notified" ]] \
+  && pass "and left no mark file there, though its hooks had plenty to say" \
+  || fail "the tick wrote $WS/.taskpump-fsguard.notified — the default reached a repo again"
+[[ -n "${TASKPUMP_HOOK_MARK_FILE:-}" && -f "${TASKPUMP_HOOK_MARK_FILE:-}" ]] \
+  && pass "the fingerprint went to the redirect instead, so the dedup still works" \
+  || fail "no mark file at the redirect '${TASKPUMP_HOOK_MARK_FILE:-<unset>}' — did the tick reach the hooks?"
+rm -f "${TASKPUMP_HOOK_MARK_FILE:-}"
 
 echo
 echo "=============================================="
