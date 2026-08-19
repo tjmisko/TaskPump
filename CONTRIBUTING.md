@@ -2,7 +2,7 @@
 
 TaskPump starts coding agents against a repository and supervises them for days
 with nobody watching. The cost of a change that merely *looks* right is not a red
-build — it is an unattended run that spends seven hours telling an operator
+build — it is an unattended run that spends the night telling an operator
 something untrue. Every rule below was bought with an incident of that shape, and
 each one is stated with the incident rather than as a bare policy, so you can tell
 which parts are load-bearing.
@@ -50,8 +50,8 @@ So the review question for a change here is not only "does it work". It is:
 > **After this lands, is every sentence it emits true?**
 
 Every sentence: diagnostics, warnings, plan lines, `--help` text, log lines, code
-comments, the docs it touches, and its own `CHANGELOG.md` entry. In practice that
-decomposes into four habits.
+comments, the docs it touches, and the `CHANGELOG.md` entry it writes for itself
+(§4.2). In practice that decomposes into four habits.
 
 **A diagnostic asserts only what its evidence establishes.** If a probe failed,
 say the probe failed; do not name the most likely cause as *the* cause. The
@@ -59,16 +59,22 @@ shipped notifier warning is the worked example: it quotes the first line the
 notifier itself wrote to stderr, and names the stdin contract as something to
 check *only when the notifier wrote nothing at all*.
 
-**A message that names a cause names a reachable one.** A reason string that the
-repository cannot act on is worse than no reason string — `tp pump --grain phase`
-with `--integration-trunk` currently holds a phase forever behind a blocker
-branch that never existed and then exits 3 stating a cause nobody can satisfy
-(#74, #75).
+**A message that names a cause names a reachable one.** A reason string the
+repository cannot act on is worse than no reason string. `tp pump --grain phase`
+with `--integration-trunk` holds a phase `WAITING` on *"deps done but not yet
+integrated into $INTEGRATION_TRUNK"* (`libexec/tp-pump:2033`) when the blocker's
+branch never existed — a condition no tick can satisfy — and then, after
+`STALL_EXIT_TICKS` idle ticks, exits 3 with a *different* account: "no live
+agents, nothing launchable, nothing resumable" (`stall_exit`,
+`libexec/tp-pump:2534-2551`), which never mentions the missing branch. Two
+reasons, neither actionable, and they disagree with each other. #74 is the
+message; #75 is the behaviour behind it.
 
 **A comment is a claim.** `libexec/tp-pump:1398` says "The shipped templates call
-this `{{BUILD_GATE}}`"; `rg -n 'BUILD_GATE' templates/` hits only prose in
-`templates/README.md`, which says the value is *deliberately not* called that
-(#57). A comment that is wrong sends the next reader to delete a live alias.
+this `{{BUILD_GATE}}`"; `rg -n 'BUILD_GATE' templates/` hits only
+`templates/README.md`, which states the opposite in as many words — "No shipped
+template uses `{{BUILD_GATE}}`" (#57). A comment that is wrong sends the next
+reader to delete a live alias.
 
 **Documentation claims are checked, not remembered.** Six sites in this tree said
 a defect "is filed as a bug" while the tracker had zero open issues; that is #52,
@@ -99,10 +105,12 @@ introduced**.
 Fix the finding rather than silencing it. Where a warning is genuinely wrong
 about intent, a `# shellcheck disable=SCxxxx` carries its reason on the same
 line — `lib/config.sh:180` (`# path is discovered at runtime by design`),
-`libexec/tp-pump:182` (`# read by apl_live_agents (lib/pump-lib.sh)`). Twelve
-disables exist in the whole tree, eight of them annotated that way; the bare ones
-either sit above a deliberate word split (`set -- $spec`) or repeat a disable
-whose reason is stated one line earlier.
+`libexec/tp-pump:182` (`# read by apl_live_agents (lib/pump-lib.sh)`).
+`rg -n 'shellcheck disable' bin/ libexec/ lib/ gates/ runners/ hooks/` returns
+twelve lines, seven of them annotated that way; the five bare ones sit above a
+deliberate word split (`set -- $spec`, `set -- ${TASKPUMP_NOTIFY_CMD}`) or repeat
+a disable whose reason is stated one line earlier (`libexec/tp-monitor:1256`
+under `:1254`).
 
 ### 2.2 Test hermeticity, in two halves
 
@@ -138,7 +146,7 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 . "$SCRIPT_DIR/suite-prologue.sh"
 ```
 
-This is enforced, not merely conventional: `tests/test-env-hermeticity.sh:154-167`
+This is enforced, not merely conventional: `tests/test-env-hermeticity.sh:155-167`
 greps every `tests/test-*.sh` and `run-all.sh` for a **source line** naming the
 prologue (a mention in a comment does not count) and fails if one is missing. Set
 anything your fixture needs *after* sourcing it; nothing may be inherited.
@@ -171,21 +179,40 @@ $ TASKPUMP_HOOK_MARK_FILE=/tmp/pin-probe bash -c \
 after prologue: [<unset>]
 ```
 
-The containment is **where you run from**: run the full suite in a throwaway copy
-of the checkout, never in a checkout a pump is driving. Measured — one of the
-three leaking suites, run through the copy's own `run-all.sh`:
+The containment is **the working directory you run from**, and only that. The
+three leaking suites never `cd`, so the workspace comes off the cwd rung of
+`tp_resolve_workspace` (`lib/config.sh:231-233`) — which reads `$PWD`'s git
+worktree, not where the tooling lives. Copying the checkout and invoking the
+copy's scripts is therefore **not enough**: from the primary, the copy's own CLI
+still resolves onto the primary.
 
 ```
-$ mkdir -p /tmp/tp-copy && cp -a ~/Projects/TaskPump/. /tmp/tp-copy/
-$ /tmp/tp-copy/tests/run-all.sh pump-task-grain
-...
-test-pump-task-grain       ok             Tests: 107  Passed: 107  Failed: 0
-All 1 suite(s) passed.
-$ ls /tmp/tp-copy/.taskpump-fsguard.notified
-/tmp/tp-copy/.taskpump-fsguard.notified          # the copy absorbed the write
-$ ls ~/Projects/TaskPump/.taskpump-fsguard.notified
-ls: cannot access ...: No such file or directory  # the primary did not
+$ copy=$(mktemp -d) && cp -a ~/Projects/TaskPump/. "$copy/"
+
+$ cd ~/Projects/TaskPump && "$copy/bin/tp" task resolve --tasks-dir
+/home/tjmisko/Projects/TaskPump/tasks            # the copy's CLI, the primary's ledger
+
+$ cd "$copy" && "$copy/bin/tp" task resolve --tasks-dir
+<copy>/tasks                                   # only the cd moved it
 ```
+
+So: `cd` into the copy first, then run the suite there. Never run the full suite
+in a checkout a pump is driving.
+
+```bash
+copy=$(mktemp -d)
+cp -a ~/Projects/TaskPump/. "$copy/"
+cd "$copy"            # ← the load-bearing line; without it, nothing is contained
+./tests/run-all.sh
+```
+
+Measured that way with one of the three leaking suites — `./tests/run-all.sh
+pump-task-grain` from inside the copy — the suite passed (`Tests: 107  Passed:
+107  Failed: 0`, `All 1 suite(s) passed.`) and the file it rewrote was
+`$copy/.taskpump-fsguard.notified`, carrying the suite's own `FS-GUARD: primary
+checkout dirty outside allowlist:` text. Run `tp task resolve --tasks-dir` from
+where you are standing before you trust any of this: it prints, without writing
+anything, which ledger the next invocation will pick.
 
 ### 2.3 A fix lands with the assertion that would have caught it
 
@@ -225,12 +252,15 @@ parsing frontmatter, because a direct read is a second implementation of the
 schema that no MAJOR bump will ever notify.
 
 Say plainly which half is missing: **nothing enforces this today.** The ledger is
-mounted read-write in every runner, and `libexec/tp-task:356` stages the *whole*
-tasks directory (`git add -A -- "$TASKPUMP_TASKS_DIR"`), so a hand edit is swept
-into the next ordinary verb's commit under the CLI's own committer identity, and
-`tp task fsck` exits 0 because it is a schema check, not a provenance check
-(#85). Treat one-writer as a review obligation you enforce by reading the diff,
-not as a property the tool guarantees.
+mounted read-write in every runner (`runners/claude-docker/runner.sh:261`,
+`:267` — no `:ro`), and `libexec/tp-task:356` stages the *whole* tasks directory
+(`git add -A -- "$TASKPUMP_TASKS_DIR"`), so a hand edit is swept into the next
+ordinary verb's commit under the CLI's own committer identity. `tp task fsck`
+does not catch it: it is a schema check, not a provenance check (#85). Measured
+on a copy of this repository's own ledger — flip one task's `status: done` back
+to `open` with `sed`, and `tp task fsck` still exits 0 and prints nothing. Treat
+one-writer as a review obligation you enforce by reading the diff, not as a
+property the tool guarantees.
 
 Resolution is from `$PWD`, never from where the tools are installed
 ([§8.1](docs/LEDGER-CONTRACT.md#81-where-a-ledger-lives--resolution)) — a scar
@@ -255,7 +285,7 @@ exactly where the tools do not implement the frozen table, and which is
 authoritative for a consumer writing code today. Editing §10 to describe what the
 code happens to do is the offence in §1 with a contract attached to it.
 
-Today's divergences, both open and both milestoned `v0.3.0`:
+The divergences on 2026-08-19, both open and both milestoned `v0.3.0`:
 
 - **#71** — `tp task` and `tp pump` never exit 2. §10 reserves 2 for "bad CLI
   arguments, any tool"; both tools route every usage error through a `die()` that
@@ -281,20 +311,23 @@ item and needs a migration note.
 
 ### 3.1 What must be installed
 
-README's Quickstart list — `bash` 4+, `git`, mikefarah `yq` v4, `jq`, and GNU
-`awk` — is accurate, and it is not exhaustive. What each one is for, and what its
-absence actually looks like:
+README's Quickstart lists `bash` 4+, `git`, mikefarah `yq` v4, `jq`, and GNU
+`awk`. That list is right, and it is not exhaustive. What each one is for, and
+what its absence actually looks like. Rows that say **Measured** were checked by
+running against a two-task fixture ledger with exactly one tool removed from a
+purpose-built `PATH`; the rest cite the guard in the source:
 
 | Tool | Used for | Missing it looks like |
 |---|---|---|
-| `bash` 4+ | namerefs and associative arrays throughout | `tp monitor` and `tp dag-render` check `BASH_VERSINFO` up front and exit 1 naming your version (`libexec/tp-monitor:111`, `libexec/tp-dag-render:59`); nothing else checks |
-| `git` | ledger commits, phase branches, agent worktrees | a tasks directory that is not a git repository is **not** an error — the mutation happens on disk and the commit is skipped (contract §9) |
-| `yq` (mikefarah, v4 — **not** the Python `yq`) | every frontmatter read and write, via `--front-matter=extract\|process` | **an empty ledger at rc 0.** `tp task ready` prints an empty frontier and exits 0, `tp task list` prints rows of blanks, `tp task next` prints `null`, and `tp task fsck` accuses every task file of invalid YAML — i.e. blames the ledger for the tool's own missing parser. There is no `command -v yq` anywhere in the tree (#104). CI pins `YQ_VERSION: v4.44.3`; v4 is the API the tools are written against |
-| `jq` | every JSON surface, the state file, the plan | probed — `lib/pump-lib.sh:506` dies naming it |
-| `gawk` | the DAG layout engine (`lib/dag-layout.awk` uses `and()`/`or()`, gawk extensions; mawk silently renders every edge junction wrong) | probed — `libexec/tp-dag-render:137-139` exits 1 naming it, and `TASKPUMP_AWK` points at a differently-named gawk |
-| `flock` | the ledger's cross-agent state lock | degrades to a no-op rather than failing (contract §8) — correct for a single writer, and silently wrong for concurrent ones |
-| GNU coreutils (`df`, `stat`, `date`, `du`) | the disk watchdog, the usage meter, worktree sizing | **undeclared, and destructive when absent.** A non-GNU `df` makes `tp disk-watchdog` read 0 GB free on its first check, write a pool cap of 0 that pauses every future launch, and run its panic reclaim — `docker builder prune -af` — on a host with terabytes free (#102) |
-| `setsid` (util-linux) | `tp pump --detach`'s fallback, and `runners/local` | `--detach` prints a pid and a `stop: kill <pid>` line and exits 0 with **nothing running**; the local runner reports it as "the agent did not start within 5s", pointing you at your agent command (#104) |
+| `bash` 4+ | namerefs and associative arrays throughout | `tp monitor` and `tp dag-render` check `BASH_VERSINFO` up front and exit 1 naming your version (`libexec/tp-monitor:111`, `libexec/tp-dag-render:59`). Those are the only two `BASH_VERSINFO` sites in `bin/ libexec/ lib/ gates/ runners/ hooks/`; nothing else checks |
+| `git` | ledger commits, phase branches, agent worktrees | **not an error, and not mentioned.** `libexec/tp-task:352-356` skips the commit when the tasks directory has no git root — including when `git` is absent entirely. Measured with `git` off `PATH`: `tp task claim T1.1 --branch feat/probe` printed `claimed T1.1 for feat/probe (turn_budget=50)` and mutated the frontmatter, with no commit and no warning (contract §9) |
+| `yq` (mikefarah, v4 — **not** the Python `yq`) | every frontmatter read and write, via `--front-matter=extract\|process` | **an empty or blank ledger, reported as an ordinary one.** Measured with `yq` off `PATH`: `tp task ready` prints the header and no rows at rc 0; `tp task list` prints rows of blanks at rc 0; `tp task next` prints `null` at rc 1 — which is also what a genuinely empty frontier does; `tp task fsck` reports every file as `frontmatter is not valid YAML between the --- delimiters`, blaming the ledger for the tool's own missing parser. There is no `command -v yq` anywhere in the tree (#104). CI pins `YQ_VERSION: v4.44.3` (`.github/workflows/ci.yml:18`); v4 is the API the tools are written against |
+| `jq` | `tp task next`'s JSON hand-off, the pump's eligibility read, both Claude gates | **nothing guards it, and the pump calls a launchable phase `WAITING`.** Measured: `tp pump --phases T1 --list` with `jq` present printed `LAUNCH T1 -> feat/t1`; with `jq` off `PATH` it printed `WAITING T1 (1 open, none eligible — the ledger lists no open task in this phase — the count and the listing disagree)` and `frontier: 0 launchable`, at rc 0. `tp task next` dies with bash's own `…/libexec/tp-task: line 623: jq: command not found` at rc 127, a code the frozen §10 table does not define. The only two `command -v jq` sites are `lib/pump-lib.sh:506`, inside `apl_host_credentials_problem()` — documented at `:484-485` as "Always exits 0: this classifies, it does not decide" — and `gates/claude-usage:102`, which returns into a cache fallback. Neither guards the frontier |
+| `gawk` | the DAG layout engine (`lib/dag-layout.awk` uses `and()`/`or()`, gawk extensions) | probed twice, and named both times: `libexec/tp-dag-render:136-137` exits 1 if the binary is missing, `:138-139` exits 1 if it is not GNU awk. Measured: `TASKPUMP_AWK=mawk tp dag-render` → `ERROR: mawk not found — tp dag-render needs GNU awk (gawk); set TASKPUMP_AWK to override`. This is the row to copy when you add a dependency |
+| `flock` | the ledger's cross-agent state lock | degrades to a no-op rather than failing — `libexec/tp-task:452` is `command -v flock … \|\| { dbg "flock unavailable; no state lock"; return 0; }` (contract §8). Correct for a single writer, and silently wrong for concurrent ones |
+| GNU coreutils (`df`, `stat`, `date`, `du`) | the disk watchdog, the usage meter, worktree sizing | **undeclared, and destructive when absent.** The probe is `df --output=avail -BG` with its stderr discarded (`libexec/tp-disk-watchdog:110-114`), so a non-GNU `df` yields an empty reading that the state machine treats as 0 GB free: `set_cap 0` pauses every future launch and `docker_panic` (`:184` → `libexec/tp-cleanup:365-366`) runs `docker builder prune -af` and `docker system prune -f` on a host that may have terabytes free (#102) |
+| `setsid` (util-linux) | `tp pump --detach`'s fallback, and `runners/local` | `--detach` backgrounds itself at `libexec/tp-pump:2783`, never checks that the child survived, prints a pid and a `stop: kill <pid>` line (`:2786-2787`) and exits 0 with **nothing running**; the local runner (`runners/local/runner.sh:413`) fails its five-second poll instead, with `the agent did not start within 5s` (`:428`), pointing you at your agent command (#104) |
+| `curl` | only the Claude usage gate's refresh | not a hard requirement: `gates/claude-usage:102` falls back to a stale-but-valid cache, and with no usable cache `build_decision` reports `severity: unknown` and the gate feeds (`:186-188`). Measured with `curl` off `PATH`: `tp pump --list` printed `GATE: feed-ok` and planned normally |
 
 Running agents additionally needs a container runtime, unless you are on
 `runners/local`.
@@ -308,8 +341,9 @@ Running agents additionally needs a container runtime, unless you are on
 UPDATE_GOLDEN=1 ./tests/test-golden-plan.sh   # re-record the frozen surfaces
 ```
 
-There are 25 suites. The filter is a plain substring match against each suite's
-**full path**, so `task` selects six (`test-pump-task-grain`, `test-tp-task`,
+`ls tests/test-*.sh | wc -l` answers 25 as of 2026-08-19. The filter is a plain
+substring match against each suite's **full path**, so `task` selects six
+(`test-pump-task-grain`, `test-tp-task`,
 `test-tp-task-fsck`, `test-tp-task-generic`, `test-tp-task-lock`,
 `test-tp-task-review`) and a filter that happens to match the directory selects
 everything. `run-all.sh` keeps going after a failure so one broken suite does not
@@ -330,8 +364,13 @@ and `^FAIL` lines), and it exits non-zero on any failure. Observed, standalone:
 ```
 $ ./tests/test-env-hermeticity.sh
 ...
+--- coverage: every suite and run-all source the shared prologue ---
 PASS: every tests/test-*.sh sources the shared prologue
 PASS: run-all.sh sources the shared prologue (the central guard)
+
+--- end to end: run-all launches a legacy-spelled suite clean under poison ---
+PASS: run-all under pump-poisoned env exits 0 for a legacy-spelled suite
+PASS: the nested run reports the suite green
 
 ==============================================
 Tests: 11  Passed: 11  Failed: 0
@@ -372,23 +411,55 @@ the next runner-image bump.
 
 ## 4. Branches, commits, and releases
 
-### 4.1 Branches
+### 4.1 Branches, and how to propose a change
 
-Do not commit to `main`. Cut a feature branch or a worktree. The shapes in use:
-`feat/<slug>` — or `feat/<task-id>-<slug>` when the work is a ledger task, as in
-`feat/g4.5-suite-env` — plus `fix/<slug>`, `docs/<topic>`, `chore/<topic>` for an
-integration branch that collects several, and `release/vX.Y.Z`. Several branches
-merge into one `chore/` integration branch and that lands as a unit
-(`Merge branch 'docs/truth-repairs' into chore/followup-integration`); single
-changes land through a PR (`Merge pull request #51 from
-tjmisko/release/v0.2.0`).
+**The first action: branch, then open a draft PR against `main`.** Do not commit
+to `main`; cut a feature branch or a worktree, push it, and
+`gh pr create -d --base main`. Every pull request this repository has ever had —
+nineteen, as of 2026-08-19 — targets `main`
+(`gh pr list --state all --json baseRefName`). An *agent* driven by the pump is
+the exception and is told so by its brief: under `--integration-trunk` it opens
+against the trunk it was cut from, which `AGENTS.md` covers. A human contributor
+targets `main`.
+
+Branch shapes in use, from `git branch -a`:
+
+- `fix/issue-<n>-<slug>` when you are fixing a filed issue. This is the common
+  case and the shape to reach for: all eleven fixes in the v0.2.1 sweep used it
+  (`fix/issue-33-task-lock-litter` … `fix/issue-48-stranded-claim-false-drain`).
+- `fix/<slug>` when there is no issue number yet.
+- `feat/<slug>`, or `feat/<task-id>-<slug>` when the work is a ledger task, as in
+  `feat/g4.5-suite-env`.
+- `docs/<topic>`, `chore/<topic>` for an integration branch that collects
+  several, and `release/vX.Y.Z`.
+
+Single changes land through their own PR (`Merge pull request #51 from
+tjmisko/release/v0.2.0`). A sweep does not: several branches merge into one
+`chore/` integration branch and that lands as a unit (`Merge branch
+'docs/truth-repairs' into chore/followup-integration`) — which is why the eleven
+`fix/issue-*` branches above have no PRs of their own.
+
+**If you cannot set labels or milestones** — an outside contributor cannot —
+write the release class you believe applies, and the reason, in the PR
+description: *"PATCH: makes the code match its own documented behaviour"*, using
+the tests in §4.3. A maintainer applies the `release:` label and the milestone.
+Label and milestone agreed on every open issue when §4.3 was measured, so a
+silent guess is worse than saying which class you meant and why.
 
 ### 4.2 Commits
 
-Conventional commits, with an optional scope. Measured over the last 100 commits
-on `main`: `fix` 32, `docs` 16, `feat` 6, `test` 5, `chore` 3, `refactor` 1, plus
-merges. Scopes name the tool or surface — `fix(pump):`, `fix(fsck):`,
-`docs(config):`, `fix(runner-local):`, `chore(release):`.
+Conventional commits, with an optional scope. Over the last 100 commits on `main`
+as of 2026-08-19: `fix` 32, `docs` 16, `feat` 6, `test` 5, `chore` 3,
+`refactor` 1, plus 34 merges and three ledger commits (`complete G4.4`) that
+`tp task` writes for itself and that are not conventional. Recount with:
+
+```bash
+git log -100 --format='%s' main \
+  | sed -E 's/^(Merge).*/merge/; s/^([a-z]+)(\([^)]*\))?:.*/\1/' | sort | uniq -c | sort -rn
+```
+
+Scopes name the tool or surface — `fix(pump):`, `fix(fsck):`, `docs(config):`,
+`fix(runner-local):`, `chore(release):`.
 
 One commit, one logical change. The subject states **what is now true**, not what
 was edited:
@@ -402,15 +473,33 @@ fix(fsck): decide CRLF last, and from the whole frontmatter block
 The body is where the reasoning goes: what an operator saw, why the obvious
 repair was wrong, and what was measured. No emoji.
 
+**Your change writes its own `CHANGELOG.md` entry, under an `## Unreleased`
+heading.** That is the practice, and it is the reason §4.4's release commit
+touches only two files: it dates the `Unreleased` heading with the version and
+folds the sweep's entries in beside it, rather than authoring them. `5715c6e`'s
+own body says so — "the CHANGELOG's `Unreleased` heading gets its date and the
+entries written across this sweep are folded in beside it" — and the ledger tasks
+say the same from the other side (`tasks/G2.3.md:33`, `tasks/G3.1.md:62`). Note
+that `CHANGELOG.md` carries no `## Unreleased` heading right now
+(`rg -n '^## ' CHANGELOG.md` shows `0.2.1`, `0.2.0`, `0.1.0`), because v0.2.1 has
+just been cut — the first change after a release creates it. Write the entry in
+the house style described in §4.4 step 3.
+
 ### 4.3 Which release a change belongs to
 
 The rule lives in
 [docs/LEDGER-CONTRACT.md §1](docs/LEDGER-CONTRACT.md#1-versioning). The tracker
 encodes how it is applied, in three labels that map one-to-one onto three
-milestones — verified across all 73 open issues, every one of which carries a
-`release:` label matching its milestone:
+milestones. On 2026-08-19 there were 73 open issues (#52–#124), and every one
+carried a `release:` label matching its milestone — no exceptions. The counts
+below are of that date; recount them with:
 
-| Label | Milestone (open) | Its own words |
+```bash
+gh issue list --state open --limit 200 --json number,milestone,labels \
+  | jq -r 'group_by(.milestone.title // "none") | map({ms: .[0].milestone.title, n: length})'
+```
+
+| Label | Milestone (open, 2026-08-19) | The label's own description |
 |---|---|---|
 | `release:v0.2.2` | `v0.2.2` (36) | PATCH-safe: ships in v0.2.2 |
 | `release:v0.3.0` | `v0.3.0` (37) | Behaviour change: needs a MINOR |
@@ -443,12 +532,17 @@ ask before you pick a milestone.
 
 ### 4.4 Cutting a release
 
-What is actually done, from the three tags that exist (`v0.1.0`, `v0.2.0`,
-`v0.2.1`):
+Three releases have been cut — `v0.1.0`, `v0.2.0`, `v0.2.1`. (`git tag -l` prints
+a fourth tag, `archive/f15-canvas-interaction-2026-04-15`, which is not a version
+tag.) What those three actually did:
 
 1. On the integration or `release/` branch, one commit `chore(release): vX.Y.Z`
    that touches `VERSION` and `CHANGELOG.md` and nothing else. `5715c6e` is the
-   template: `2 files changed, 161 insertions(+), 10 deletions(-)`.
+   template: `2 files changed, 161 insertions(+), 10 deletions(-)`. The
+   `CHANGELOG.md` half dates the existing `## Unreleased` heading and folds the
+   sweep's entries in beside it; it does not author entries the changes should
+   already have written (§4.2). `0fbf96f` says the same of v0.1.0: "the
+   CHANGELOG's Unreleased heading gets the date".
 2. That commit's body names the semver class **and justifies it against the
    contract**, field by field — v0.2.1's says: "No frontmatter field, status
    vocabulary entry, state transition, eligibility predicate, id grammar rule or
@@ -471,11 +565,12 @@ tag is the marker.
 
 ## 5. TaskPump drains its own ledger
 
-`tasks/` is TaskPump's own task DAG, driven by TaskPump. It holds 34 task files
-under the `G` grammar this repository configures for itself
-(`TASKPUMP_ID_PATTERN='^G[0-9]+(\.[0-9]+)?$'`, `taskpump.conf`), and today all 34
-are `status: done` — `tp task ready --count` answers `0`. The current backlog is
-the 73 open issues on the tracker (#52–#124), not the ledger.
+`tasks/` is TaskPump's own task DAG, driven by TaskPump, under the `G` grammar
+this repository configures for itself (`TASKPUMP_ID_PATTERN='^G[0-9]+(\.[0-9]+)?$'`,
+`taskpump.conf:41`). On 2026-08-19 it held 34 task files, all of them
+`status: done`, and `tp task ready --count` answered `0`; the backlog that day
+was the 73 open issues on the tracker (#52–#124), not the ledger. Check both
+before you assume: `ls tasks/*.md | wc -l` and `tp task ready --count`.
 
 The same conf sets `TASKPUMP_BUILD_GATE='./tests/run-all.sh'`: the suite *is* the
 dogfood pump's answer to "is the tree broken?". That is also why the hermeticity
