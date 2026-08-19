@@ -138,9 +138,10 @@ printf '0\n' >| "$CAP_FILE"
 # ...but a 0 is a HELD PAUSE, and it is only as good as the process holding it.
 # A watchdog killed mid-PANIC leaves its 0 behind; the pump does not overwrite an
 # existing cap file unless --jobs was passed, so without an expiry that 0 caps
-# the NEXT unattended run at zero, forever, with `status: running` and no page.
-# A live watchdog re-stamps the file every poll, so an unrefreshed 0 has no
-# holder. (One such file, containing 0, was found in the primary checkout.)
+# the NEXT unattended run at zero — launching nothing while nothing is wrong with
+# the disk. A live watchdog re-stamps the file every poll, so a 0 nothing has
+# refreshed is not being held. (One such file, containing 0, was found in the
+# primary checkout.)
 printf '0\n' >| "$CAP_FILE"; touch -d '2 hours ago' "$CAP_FILE"
 got="$(JOBS=4 apl_read_cap 2>"$TMP/cap-warn")"
 [[ "$got" == "4" ]] \
@@ -159,6 +160,15 @@ got="$(JOBS=4 apl_read_cap 2>"$TMP/cap-warn2")"
 [[ "$got" == "4" && ! -s "$TMP/cap-warn2" ]] \
   && pass "and the second read is silent, not a per-tick warning" \
   || fail "the healed file warned again: '$(cat "$TMP/cap-warn2")'"
+
+# A window that is not a number must not be swallowed: the message says the
+# configured value was ignored, and which number it used instead.
+printf '0\n' >| "$CAP_FILE"; touch -d '2 hours ago' "$CAP_FILE"
+got="$(JOBS=4 TASKPUMP_POOL_CAP_STALE_SEC=abc apl_read_cap 2>"$TMP/cap-warn3")"
+warn="$(cat "$TMP/cap-warn3")"
+[[ "$got" == "4" && "$warn" == *"is not a number and was ignored"* && "$warn" == *"window: 900s"* ]] \
+  && pass "a non-numeric staleness window is named, not silently defaulted" \
+  || fail "the bad window was swallowed: got '$got', warning '$warn'"
 
 # A fresh 0 — the live watchdog's heartbeat — is still obeyed.
 printf '0\n' >| "$CAP_FILE"

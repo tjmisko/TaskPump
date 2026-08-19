@@ -174,11 +174,11 @@ apl_file_age_sec() {
 # NEXT unattended run at zero, forever, silently: the pump does not overwrite an
 # existing cap file unless --jobs was passed, so the number outlives the process
 # whose state it described. A watchdog that is still alive re-stamps the file
-# every poll; a 0 older than TASKPUMP_POOL_CAP_STALE_SEC therefore has no holder,
-# and is expired here — named on stderr, and rewritten with the cap actually in
-# force so the file stops lying and the warning is said once rather than every
-# tick. A POSITIVE cap never expires: `echo 3 > .taskpump-pool-cap` is a standing
-# operator preference, not a pause, and nothing has to keep proving it.
+# every poll, so a 0 older than TASKPUMP_POOL_CAP_STALE_SEC is not being held by
+# anything, and is expired here — named on stderr, and rewritten with the cap
+# actually in force so the file stops lying and the warning is said once rather
+# than every tick. A POSITIVE cap never expires: `echo 3 > .taskpump-pool-cap` is
+# a standing operator preference, not a pause, and nothing has to keep proving it.
 apl_read_cap() {
   local c="${JOBS:-$TASKPUMP_JOBS_FALLBACK}"
   [[ -n "${CAP_FILE:-}" && -f "$CAP_FILE" ]] || { echo "$c"; return 0; }
@@ -186,34 +186,40 @@ apl_read_cap() {
   [[ "$v" =~ ^[0-9]+$ ]] || { echo "$c"; return 0; }
   if [[ "$v" != "0" ]]; then echo "$v"; return 0; fi
 
-  local window="${TASKPUMP_POOL_CAP_STALE_SEC:-900}" age
+  local window="${TASKPUMP_POOL_CAP_STALE_SEC:-900}" window_note="" age
+  # A window that is not a number falls back to the default — and SAYS it did,
+  # in the same breath as the number it used, because a silently-ignored config
+  # value is the defect this whole file keeps closing.
+  if ! [[ "$window" =~ ^[0-9]+$ ]]; then
+    window_note="; the configured value $(printf '%q' "$window") is not a number and was ignored"
+    window=900
+  fi
   # No expiry configured, or an mtime we cannot read: honour the pause. Refusing
   # to pause because a stat failed would be the same class of error in reverse.
-  [[ "$window" =~ ^[0-9]+$ ]] || window=900
   if (( window == 0 )) || ! age="$(apl_file_age_sec "$CAP_FILE")"; then
     echo 0; return 0
   fi
   if (( age <= window )); then echo 0; return 0; fi
 
-  apl_expire_cap_pause "$age" "$window" "$c" >&2
+  apl_expire_cap_pause "$age" "$window" "$c" "$window_note" >&2
   echo "$c"
 }
 
-# apl_expire_cap_pause <age-sec> <window-sec> <cap-in-force> — say, on stdout,
-# that the cap file's 0 has outlived its holder, and clear it back to the cap
-# actually in force. Split out of apl_read_cap so the reader stays one screen
-# and so the message and the repair cannot drift apart: whichever branch the
-# rewrite takes is the branch the sentence describes.
+# apl_expire_cap_pause <age-sec> <window-sec> <cap-in-force> [window-note] — say,
+# on stdout, that the cap file's 0 is no longer being held by anything, and clear
+# it back to the cap actually in force. Split out of apl_read_cap so the reader
+# stays one screen and so the message and the repair cannot drift apart:
+# whichever branch the rewrite takes is the branch the sentence describes.
 apl_expire_cap_pause() {
-  local age="$1" window="$2" c="$3" repair
+  local age="$1" window="$2" c="$3" window_note="${4:-}" repair
   if printf '%s\n' "$c" >| "$CAP_FILE" 2>/dev/null; then
     repair="cleared it to $c"
   else
     repair="could NOT rewrite it (permissions?), so this warning repeats until the file is removed"
   fi
-  printf 'WARNING: pool cap file %s has held 0 for %ss with nothing refreshing it (TASKPUMP_POOL_CAP_STALE_SEC=%s).\n' \
-    "$CAP_FILE" "$age" "$window"
-  printf '         A live tp-disk-watchdog re-stamps its pause every poll, so this 0 outlived the process that wrote it — using cap %s and %s.\n' \
+  printf 'WARNING: pool cap file %s has held 0 for %ss with nothing refreshing it (TASKPUMP_POOL_CAP_STALE_SEC window: %ss%s).\n' \
+    "$CAP_FILE" "$age" "$window" "$window_note"
+  printf '         A live tp-disk-watchdog re-stamps its pause every poll, so nothing is holding this one any more — using cap %s and %s.\n' \
     "$c" "$repair"
 }
 
