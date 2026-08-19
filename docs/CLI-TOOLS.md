@@ -386,8 +386,9 @@ The id that claim carries is validated before it is used, and the two things tha
 can be wrong with it are reported differently:
 
 **Unsafe refuses.** The §7.1 shape — "an id is a filename", so no path separator,
-no whitespace, nothing outside `[A-Za-z0-9._-]`, no leading `-` — is what makes an
-id safe to pass as a path component and as one argv word. A task file can reach
+no whitespace, nothing outside `A-Za-z0-9._-`, no leading `-` (every CLI would
+read it as a flag), and not empty, `.` or `..` — is what makes an id safe to pass
+as a path component and as one argv word. A task file can reach
 the ledger without passing `tp task create`'s check (written by hand, by an agent
 with a filesystem, by a merged pull request), so an id that fails this is named on
 stderr and the claim is left for a human rather than handed to another command:
@@ -444,9 +445,7 @@ and names the key:
 
 ```
 $ tp cleanup --targets --dry-run
-[…] nothing to reclaim: no workspace under …/.worktrees/*/* has a target/
-    (set TASKPUMP_RECLAIM_DIR to the directory your build writes, or empty to
-     run TASKPUMP_RECLAIM_CMD in every idle workspace)
+[…] nothing to reclaim: no workspace under …/.worktrees/*/* has a target/ (set TASKPUMP_RECLAIM_DIR to the directory your build writes, or empty to run TASKPUMP_RECLAIM_CMD in every idle workspace)
 ```
 
 Note what the empty value costs on the **primary** arm. `--include-primary` is
@@ -710,8 +709,9 @@ A file with no digits in it at all is still garbage and still falls back to
 **…and a `0` is only as good as the process holding it.** The pump does not
 overwrite an existing cap file unless `--jobs` was passed, so without a liveness
 rule a `0` left behind by a killed watchdog caps the *next* unattended run at
-zero — launching nothing, reporting `status: running`, paging nobody. Three
-mechanisms keep that from happening, and they are worth knowing together:
+zero: it launches nothing while nothing is wrong with the disk, and whether the
+supervisor then idles or gives up, the cap it is obeying is wrong either way.
+Three mechanisms keep that from happening, and they are worth knowing together:
 
 1. **The pause is re-stamped while it is held.** Every poll in `PAUSED`/`PANIC`
    touches the cap file. No log line — nothing has changed — but the mtime is the
