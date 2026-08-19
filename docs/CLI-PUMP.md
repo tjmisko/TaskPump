@@ -145,7 +145,7 @@ on the status.
 |---|---|
 | **0** | A drained range — *and* five other things (§2.1). |
 | **1** | Every fatal error, including every bad argument (§2.2). |
-| **3** | Deadlock: nothing live, launchable or resumable for `STALL_EXIT_TICKS` consecutive ticks. |
+| **3** | Deadlock: `STALL_EXIT_TICKS` consecutive ticks ended with nothing live and nothing started. An empty frontier is only one of the causes — a cap of 0, a gate that refuses every launch, and a launch that fails every tick all reach it with work still on the plan. §1.2 and §12 enumerate them. |
 | **2** | Never (§2.2). |
 
 #### 2.1 Exit 0 does not mean drained
