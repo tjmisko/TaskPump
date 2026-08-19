@@ -729,8 +729,8 @@ Three mechanisms keep that from happening, and they are worth knowing together:
    in force:
 
    ```
-   WARNING: pool cap file …/.taskpump-pool-cap has held 0 for 7200s with nothing refreshing it (TASKPUMP_POOL_CAP_STALE_SEC=900).
-            A live tp-disk-watchdog re-stamps its pause every poll, so this 0 outlived the process that wrote it — using cap 4 and cleared it to 4.
+   WARNING: pool cap file …/.taskpump-pool-cap has held 0 for 7200s with nothing refreshing it (TASKPUMP_POOL_CAP_STALE_SEC window: 900s).
+            A live tp-disk-watchdog re-stamps its pause every poll, so nothing is holding this one any more — using cap 4 and cleared it to 4.
    ```
 
    Set `TASKPUMP_POOL_CAP_STALE_SEC=0` to disable the expiry — for a pause
