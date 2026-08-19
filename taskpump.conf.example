@@ -140,7 +140,7 @@
 # TASKPUMP_POOL_CAP_STALE_SEC=  # how long a cap file holding 0 stays believable without
 #                           #   being refreshed (default: 900). A 0 is a HELD pause: the
 #                           #   disk watchdog re-stamps it every poll and hands it back
-#                           #   on exit, so one this old outlived whatever wrote it and
+#                           #   on exit, so one this old is not being held any more, and
 #                           #   is ignored (loudly) and cleared. 0 = never expire. A
 #                           #   POSITIVE cap never expires either way.
 # TASKPUMP_TICK=            # seconds between supervisor ticks (default: 30)
