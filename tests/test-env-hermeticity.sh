@@ -241,6 +241,42 @@ chmod +x "$TMP/hook-noisy"
   || fail "no mark file at the redirect '${TASKPUMP_HOOK_MARK_FILE:-<unset>}' — did the tick reach the hooks?"
 rm -f "${TASKPUMP_HOOK_MARK_FILE:-}"
 
+# ── 7. And the gate that would have caught it ────────────────────────────────
+echo
+echo "--- run-all's state manifest sees what the status probe cannot ---"
+
+# run-all.sh resolves the repo it guards from its own location, so a copy of it
+# in a throwaway repo guards THAT repo — which is how this can be driven for
+# real without dirtying anything. The canary suite stands in for a helper that
+# runs an unpinned tick: it drops one run-state file into the repo it is
+# running from, and .gitignore hides that file from `git status` exactly as
+# TaskPump's own .gitignore hides it in the real checkout.
+GATE="$TMP/gate"; mkdir -p "$GATE/tests"
+git -C "$GATE" init -q
+printf '.taskpump-*\n' >| "$GATE/.gitignore"
+cp "$SCRIPT_DIR/run-all.sh" "$SCRIPT_DIR/suite-prologue.sh" "$GATE/tests/"
+cat >| "$GATE/tests/test-canary.sh" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
+# shellcheck source=tests/suite-prologue.sh
+. "$SCRIPT_DIR/suite-prologue.sh"
+printf 'litter\n' >| "$SCRIPT_DIR/../.taskpump-pump.state"
+echo "Tests: 1  Passed: 1  Failed: 0"
+EOF
+chmod +x "$GATE/tests/test-canary.sh"
+
+gate_out=$(bash "$GATE/tests/run-all.sh" canary 2>&1); gate_rc=$?
+[[ $gate_rc -ne 0 ]] \
+  && pass "a suite that drops a gitignored run-state file fails the run" \
+  || fail "run-all exited 0 with a state file planted; tail: $(tail -4 <<<"$gate_out" | tr '\n' ' ')"
+grep -qF 'created: .taskpump-pump.state' <<<"$gate_out" \
+  && pass "and the failure names the file rather than printing a diff" \
+  || fail "the gate did not name .taskpump-pump.state: $(tr '\n' ' ' <<<"$gate_out")"
+grep -qF "changed this repo's git status" <<<"$gate_out" \
+  && fail "the status probe saw the canary — the fixture is not actually gitignored" \
+  || pass "the status probe stayed blind to it, which is why the manifest exists"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"

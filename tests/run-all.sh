@@ -30,11 +30,74 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 
 filter="${1:-}"
 
+REPO_ROOT="$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd)"
+
+# ── Hermeticity gate, both halves (issue #20, B16) ────────────────────────────
+#
 # Suites must not litter the repo they run from (issue #20: a git stub's
 # fallthrough answer to --git-common-dir once manufactured <sha>/info/exclude
 # trees in the repo root on every run). Snapshot the tree's status up front;
 # any delta after the suites ran is itself a failure.
-REPO_STATUS_BEFORE="$(git -C "$SCRIPT_DIR/.." status --porcelain 2>/dev/null)"
+#
+# The status diff alone is BLIND to the damage that actually happened, though.
+# Every file a TaskPump run drops is listed in .gitignore — that is deliberate,
+# TaskPump is itself a repo a pump can be pointed at — so `git status
+# --porcelain` cannot see one appear, vanish, or change. On 2026-08-19 a suite
+# run deleted and rewrote the operator's live .taskpump-fsguard.notified in the
+# primary checkout and this script still printed "All 25 suite(s) passed".
+#
+# So a second probe runs alongside: a MANIFEST of the run-state files, by
+# content. Manifest rather than `git status --ignored` for two reasons.
+# `--ignored` reports PATHS, and the observed damage was a content rewrite of a
+# file that existed before and after — a diff of zero. And `--ignored` reports
+# every ignored path in the tree, so a developer's own .claude/, editor state,
+# or build output would fail a run they had nothing to do with. The manifest is
+# scoped to the names TaskPump itself writes (the same set .gitignore lists,
+# matched as globs so a state file added later is covered without editing this
+# line), and it hashes them, so a clobber is as visible as a create.
+#
+# .git/info/exclude rides along because NO status probe of any width can see
+# it: apl_ensure_worktrees_visible appends the worktree negation there, and a
+# suite driving that path against the real checkout edits the operator's git
+# config with no working-tree trace at all.
+state_manifest() {
+  local exclude
+  exclude="$(git -C "$REPO_ROOT" rev-parse --git-common-dir 2>/dev/null)"
+  [[ -n "$exclude" && "$exclude" != /* ]] && exclude="$REPO_ROOT/$exclude"
+  (
+    cd "$REPO_ROOT" || return 0
+    local f
+    for f in .taskpump-* .arachne-* .auto-trunk* "${exclude:+$exclude/info/exclude}"; do
+      [[ -e "$f" ]] || continue
+      if [[ -d "$f" ]]; then
+        printf '%s\t<directory>\n' "$f"
+      else
+        printf '%s\t%s\n' "$f" "$(cksum <"$f" 2>/dev/null)"
+      fi
+    done | LC_ALL=C sort
+  )
+}
+
+# Name what moved, one file per line, instead of handing back an opaque diff.
+# The two snapshots are TAGGED into one stream rather than handed to awk as two
+# files: the usual NR==FNR idiom mis-files the whole second file as "before"
+# when the first one is EMPTY, and empty is exactly what the before-snapshot of
+# a clean checkout looks like — the one case this gate exists for. awk does the
+# tagging because `sed 's/^/B\t/'` writes a literal t outside GNU sed.
+state_manifest_delta() {  # $1=before file  $2=after file
+  { awk '{ print "B\t" $0 }' "$1"; awk '{ print "A\t" $0 }' "$2"; } | awk -F'\t' '
+    $1 == "B" { before[$2] = $3; next }
+    { after[$2] = $3
+      if (!($2 in before))          printf "  created: %s\n", $2
+      else if ($3 != before[$2])    printf "  changed: %s\n", $2 }
+    END { for (p in before) if (!(p in after)) printf "  deleted: %s\n", p }
+  ' | LC_ALL=C sort
+}
+
+REPO_STATUS_BEFORE="$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null)"
+STATE_SNAPSHOT_DIR="$(mktemp -d)"
+trap 'rm -rf "$STATE_SNAPSHOT_DIR"' EXIT
+state_manifest >"$STATE_SNAPSHOT_DIR/before"
 
 suites=()
 while IFS= read -r f; do
@@ -76,13 +139,26 @@ for suite in "${suites[@]}"; do
   fi
 done
 
-REPO_STATUS_AFTER="$(git -C "$SCRIPT_DIR/.." status --porcelain 2>/dev/null)"
+REPO_STATUS_AFTER="$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null)"
 if [[ "$REPO_STATUS_AFTER" != "$REPO_STATUS_BEFORE" ]]; then
   printf '\nFAIL: the suites changed this repo'\''s git status (hermeticity, issue #20):\n' >&2
   diff <(printf '%s\n' "$REPO_STATUS_BEFORE") <(printf '%s\n' "$REPO_STATUS_AFTER") >&2
   names+=("(repo hermeticity)")
   results+=("FAILED (littered)")
   counts+=("the run added or removed working-tree entries")
+  failed=$((failed + 1))
+fi
+
+state_manifest >"$STATE_SNAPSHOT_DIR/after"
+STATE_DELTA="$(state_manifest_delta "$STATE_SNAPSHOT_DIR/before" "$STATE_SNAPSHOT_DIR/after")"
+if [[ -n "$STATE_DELTA" ]]; then
+  printf '\nFAIL: the suites wrote this repo'\''s own run state (hermeticity, B16).\n' >&2
+  printf 'These files are gitignored, so the status check above cannot see them:\n' >&2
+  printf '%s\n' "$STATE_DELTA" >&2
+  printf 'A suite that runs a real tick must pin TASKPUMP_STATE_DIR (or the individual\nfile) into its own temp dir; tests/suite-prologue.sh carries the default.\n' >&2
+  names+=("(repo run state)")
+  results+=("FAILED (littered)")
+  counts+=("$(printf '%s\n' "$STATE_DELTA" | grep -c .) state file(s) created/changed/deleted")
   failed=$((failed + 1))
 fi
 

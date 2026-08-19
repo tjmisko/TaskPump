@@ -616,6 +616,16 @@ any repository, because a suite that runs a real tick without pinning a
 workspace resolves the state dir to the checkout the suites are running *from*.
 Every suite sources it, and `run-all.sh` sources it too.
 
+`run-all.sh` then checks that claim rather than trusting it. It snapshots the
+tree twice around the run: `git status --porcelain`, for tracked and untracked
+litter, and a content manifest of the run-state files — `.taskpump-*`,
+`.arachne-*`, `.auto-trunk*`, and `.git/info/exclude`. The manifest exists
+because the status probe is blind to exactly the files that got hurt: every one
+of those names is in `.gitignore` (TaskPump is itself a repo a pump can be
+pointed at), so a suite deleting and rewriting the operator's live
+`.taskpump-fsguard.notified` left `git status` empty and the run green. Either
+delta now fails the run and names the files that moved.
+
 ---
 
 ## Provenance
