@@ -628,3 +628,9 @@ a rule, so the next person can tell which parts are load-bearing.
 Arachne remains the reference consumer — its real configuration is
 `examples/arachne.conf` — and the generalization is ongoing. See
 [CHANGELOG.md](CHANGELOG.md) for what has moved and what is still Arachne-shaped.
+
+---
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE). Copyright 2026 Tristan Misko.
