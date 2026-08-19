@@ -63,7 +63,7 @@ legacy name the pump writes beside it, where it writes one at all:
 | `TP_TASKS_DIR` | **none** | The ledger's tasks directory. |
 | `TP_MEMORY_MAX` | `AGENT_MEMORY_MAX` | Memory ceiling for a runner that can impose one (default `3g`). |
 | `TP_MEMORY_SWAP` | `AGENT_MEMORY_SWAP` | Memory-plus-swap ceiling (default `5g`). |
-| `TP_DOCKER` | `DOCKER` | The container runtime binary. The shipped container runner also honours the shared `TASKPUMP_DOCKER` between the two, and resolves the three into one value every verb uses (§1.3). |
+| `TP_DOCKER` | `DOCKER` | The container runtime binary. The pump writes both spellings with the same value. The shipped container runner reads only `TASKPUMP_DOCKER` then `DOCKER` — the two keys `apl_docker` reads and the two the fleet call passes (§1.3) — so `TP_DOCKER` alone does not move it. |
 | — | `GITHUB_TOKEN` | Forwarded from the pump's own environment, empty when it has none. The one input with no canonical spelling. |
 
 #### The legacy twins are not what they look like
@@ -155,18 +155,29 @@ in hand, so it may read only what `stop` already reads from configuration — fo
 the shipped runners, the agent-name prefix (`TP_AGENT_PREFIX`, or the shared
 `TASKPUMP_AGENT_PREFIX`), the workspace whose fleet is being asked about
 (`TP_REPO_ROOT`, or `TASKPUMP_REPO_ROOT`), and the container runtime
-(`TP_DOCKER`, `TASKPUMP_DOCKER`, or `DOCKER`). All of them name a *fleet*, not an
-agent; a runner that demands launch-shaped input is uncallable at exactly the
-moment it is needed.
+(`TASKPUMP_DOCKER`, or `DOCKER`). All of them name a *fleet*, not an agent; a
+runner that demands launch-shaped input is uncallable at exactly the moment it
+is needed.
 
-**One runtime per runner, not one per verb.** `list` reaches the container
-runtime through `lib/pump-lib.sh`'s `apl_docker` while `launch` and `stop` hold
-the binary themselves, so a runner that resolves it twice can answer about one
-fleet and start containers on another — the claude-docker runner read only the
-bare `DOCKER` for `launch`/`stop` while `list` already honoured
-`TASKPUMP_DOCKER`, which on a `TASKPUMP_DOCKER=podman` host is exactly that
-split. It now resolves once, at the top of the file, and hands that value to the
-shared enumeration.
+**One runtime per runner, and only from the keys the caller passes.** `launch`
+and `stop` hold the binary themselves while the fleet call — `apl__runner_list`
+in `lib/pump-lib.sh` — hands `list` `TASKPUMP_DOCKER` and `DOCKER`, both set to
+`apl_docker`'s answer. A runner that resolves the runtime twice, or from a key
+that call does not set, can answer about one fleet and start containers on
+another: the claude-docker runner read only the bare `DOCKER` for
+`launch`/`stop` while `list` already went through `apl_docker`, which on a
+`TASKPUMP_DOCKER=podman` host is exactly that split. It now resolves once, at
+the top of the file, from `TASKPUMP_DOCKER` then `DOCKER` — `apl_docker`'s keys
+in `apl_docker`'s order — and hands that value to the shared enumeration.
+
+That is also why it does **not** read `TP_DOCKER`, although the pump writes that
+spelling into a `launch` (§1.1). `apl__runner_list` does not set it, so a
+`TP_DOCKER` left in the supervisor's own environment would reach `list` and
+nothing else: the pump would start containers on the runtime it resolved and
+enumerate on the one it never chose, and an agent invisible to the fleet call is
+an agent the pump launches a second copy of. A runner honouring `TP_DOCKER` for
+`launch` must therefore be reachable by that key for `list` too, which means
+changing what `apl__runner_list` passes — not what the runner reads.
 
 **And it is called more than once a tick.** Every pass that needs to know
 whether something is alive asks at the moment it asks — the orphan reclaim, the

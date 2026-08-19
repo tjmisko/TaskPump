@@ -27,8 +27,8 @@
 # Run: ./tests/test-tp-runner-list.sh   (offline)
 set -uo pipefail
 
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
-TP_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
+TP_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd)
 RUNNER="$TP_ROOT/runners/claude-docker/runner.sh"
 PUMP_LIB="$TP_ROOT/lib/pump-lib.sh"
 
@@ -81,7 +81,7 @@ run_list() {
     unset TP_AGENT_PREFIX TASKPUMP_AGENT_PREFIX ARACHNE_AGENT_PREFIX STUB_NAMES
     unset TP_CONTAINER_NAME ARACHNE_CONTAINER_NAME TP_WORKSPACE TP_IMAGE
     local kv
-    for kv in "$@"; do export "$kv"; done
+    for kv in "$@"; do export "${kv?}"; done
     DOCKER="$docker" bash "$RUNNER" list 2>"$WORK/err"
   )
 }
@@ -211,14 +211,42 @@ env -u DOCKER -u TP_DOCKER TASKPUMP_DOCKER="$WORK/docker-logging" \
   && pass "stop reaches the same runtime TASKPUMP_DOCKER named for list" \
   || fail "stop bypassed TASKPUMP_DOCKER (rc=$rc); calls: $(tr '\n' ';' <"$CALLS")"
 
-# TP_DOCKER is the launch environment's own spelling (docs/RUNNERS.md §1.1), so
-# it has to reach the fleet verb too, not just the per-container ones.
-: >| "$CALLS"
-out=$(env -u DOCKER -u TASKPUMP_DOCKER TP_DOCKER="$WORK/docker-logging" \
+# ...and only from the keys the CALLER passes. TP_DOCKER is the launch
+# environment's spelling (docs/RUNNERS.md §1.1) and the pump writes it into a
+# `launch`, but apl__runner_list — the call that asks for the fleet — passes
+# TASKPUMP_DOCKER and DOCKER only. A runner that reads TP_DOCKER therefore
+# resolves `list` from a variable its caller never set: a TP_DOCKER left in the
+# supervisor's environment wins on the enumeration and loses on the launch, so
+# the pump starts containers on one runtime and asks another which ones are
+# alive. Every agent is invisible, and an invisible agent is one the pump
+# launches a second copy of on a branch that already has one.
+cat >| "$WORK/docker-decoy" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == "ps" ]]; then printf 'tp-agent-DECOY-RUNTIME\n'; fi
+exit 0
+EOF
+chmod +x "$WORK/docker-decoy"
+
+out=$(env -u DOCKER TP_DOCKER="$WORK/docker-decoy" TASKPUMP_DOCKER="$WORK/docker-ok" \
       STUB_NAMES=tp-agent-feat-a bash "$RUNNER" list 2>"$WORK/err"); rc=$?
 [[ $rc -eq 0 && "$out" == "tp-agent-feat-a" ]] \
-  && pass "TP_DOCKER, the contract's own spelling, reaches list as well" \
-  || fail "list ignored TP_DOCKER (rc=$rc): '$out'"
+  && pass "an ambient TP_DOCKER does not divert list off the configured runtime" \
+  || fail "TP_DOCKER overrode the runtime list must enumerate (rc=$rc): '$out'"
+
+# The same thing through the real caller rather than a hand-built environment:
+# apl__runner_list is what libexec/tp-pump's liveness path invokes, and the
+# decoy is visible to it only if the runner reads a key it does not pass.
+via_pump=$(
+  # shellcheck disable=SC1090
+  . "$PUMP_LIB"
+  export TP_DOCKER="$WORK/docker-decoy" TASKPUMP_DOCKER="$WORK/docker-ok" \
+         STUB_NAMES=tp-agent-feat-a
+  unset DOCKER
+  apl__runner_list "$RUNNER" 2>"$WORK/err"
+)
+[[ "$via_pump" == "tp-agent-feat-a" ]] \
+  && pass "the pump's own fleet call enumerates the runtime the pump resolved" \
+  || fail "apl__runner_list reached a runtime the pump never chose: '$via_pump'"
 
 echo "--- the verb is advertised, and the contract version says so ---"
 
