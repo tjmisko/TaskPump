@@ -471,7 +471,12 @@ REPO="$E2E/repo"
 # running the installed pump here would create `feat/f80` and a worktree in
 # TaskPump's own repo — a suite that mutates the checkout it is testing. The copy
 # costs a second and makes this hermetic.
-cp -R "$TP_ROOT"/{lib,libexec,gates,runners,templates} "$REPO"/ 2>/dev/null
+# hooks/ is part of the install, not an optional extra: the pump's default
+# pre-tick chain is <install>/hooks/gitignore-repair then <install>/hooks/fs-guard,
+# and an entry it cannot run now refuses the run at startup rather than being
+# skipped with a warning. A fixture install missing them is not a shape a
+# consumer should be able to reach quietly, so the fixture is a complete one.
+cp -R "$TP_ROOT"/{lib,libexec,gates,hooks,runners,templates} "$REPO"/ 2>/dev/null
 PUMP="$REPO/libexec/tp-pump"
 
 git -C "$REPO" init -q -b main 2>/dev/null || git -C "$REPO" init -q

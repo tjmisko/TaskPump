@@ -35,9 +35,9 @@ actually accepts — which is not uniform, and the irregularity has teeth (§1.1
 | `--resume-max N` | space or `=` | No-progress resume attempts before a stalled task is escalated. The bare form validates `^[1-9][0-9]*$`; **the `=` form does not** (§1.1). |
 | `--no-resume-stalled` | no value | Disables stalled-orphan detection entirely. |
 | `--no-health-gate` | no value | Drops `net-health` from the default chain and exports `TASKPUMP_HEALTH_GATE=0`. |
-| `--no-usage-gate` | no value | Drops `claude-usage --gate` from the default chain and exports `TASKPUMP_USAGE_GATE=0`. |
-| `--no-disk-gate` | no value | Drops `disk-low` from the default chain **and** suppresses the auto-started disk watchdog (§9). |
-| `--dry-run` | no value | Print the gate chain and the plan; launch nothing; exit 0. |
+| `--no-usage-gate` | no value | Drops `claude-usage --gate` from the default chain and exports `TASKPUMP_USAGE_GATE=0`. `TASKPUMP_USAGE_GATE=0` in the environment or a conf does the same thing standingly; the flag wins when both are given. |
+| `--no-disk-gate` | no value | Drops `disk-low` from the default chain **and** suppresses the auto-started disk watchdog (§9). `TASKPUMP_DISK_GATE=0` does the same thing standingly, watchdog included — it is the same switch. |
+| `--dry-run` | no value | Print the gate chain and the plan; launch nothing; exit 0 — or exit 1 on any of the misconfigurations §6 lists, the gate and hook chains included, because the mode you confirm a chain in has to be able to say no. |
 | `--list` | no value | Print the plan only; exit 0. |
 | `--once` | no value | Run one real tick, stamp `stopped`, exit 0. |
 | `--render-brief <unit>` | space or `=` | Debug: render the brief for one unit to stdout, exit 0. |
@@ -83,29 +83,32 @@ never complains at all.
 
 Prefer the space form for both.
 
-#### 1.2 `--jobs 0` is legal, and it idles green forever
+#### 1.2 `--jobs 0` is legal, and it stalls out rather than pausing
 
 The validation is `^[0-9]+$`, so zero passes. The launch loop breaks when
 `live >= cap`, and `0 >= 0` on the first candidate, so nothing is ever started.
 The *plan* is unaffected — the cap is applied in the tick, not in `compute_plan`
 — so `--jobs 0 --list` still prints `LAUNCH` lines under a `cap 0` header.
 
-The deadlock detector does not catch this, and the reason is worth stating
-because it is the one failure mode the detector exists to prevent. It counts an
-idle tick only when nothing is live **and** nothing was planned:
-`have == 0 && PLAN_LAUNCH empty && PLAN_RESUME empty`. At cap 0 the plan is
-*full* of launchable work that the cap refuses to start, so the counter is reset
-every tick and `STALL_EXIT_TICKS` is never reached. Verified: a real run with
-`--jobs 0` over three open tasks ticked for as long as it was left alone with
-`status: running`, and only stopped when it was signalled.
+A cap of 0 is therefore not a pause: it is a run that cannot make progress, and
+the deadlock detector treats it as one. Three consecutive ticks that end with
+nothing live and nothing started reach `stall_exit` — exit 3, `status: stalled`,
+and a page whose reason names the cause: `the pool cap is 0, so N launchable
+unit(s) were never started`. Use it to make a run stop loudly, not to hold one
+open; to hold a pool open at minimum feed, set the cap file to `1`, which is
+also the knob that retunes a live run.
 
-That is the 563-tick idle of
+It did not always do that, and the old shape is worth remembering because it is
+the one failure this detector exists to prevent. The counter used to read the
+*plan* rather than the outcome — `have == 0 && PLAN_LAUNCH empty && PLAN_RESUME
+empty` — and at cap 0 the plan is *full* of launchable work the cap refuses to
+start, so the counter reset every tick, `STALL_EXIT_TICKS` was never reached, and
+the run wrote `status: running` for as long as it was left alone. That was the
+563-tick idle of
 [PUMP-MECHANISMS.md §4](PUMP-MECHANISMS.md#the-563-tick-idle) in a different
-costume — a supervisor reporting health while making no progress. Filed as a code
-bug. Until it is fixed, `--jobs 0` is not a way to pause a run; stop the run, or
-lower the cap through the cap file to `1`. (The disk watchdog's own attempt to
-write `0` there is inert for a different reason —
-[CLI-TOOLS.md](CLI-TOOLS.md#two-reasons-the-cap-file-path-may-do-nothing).)
+costume: a supervisor reporting health while making no progress. (The disk
+watchdog's own attempt to write `0` into the cap file is inert for a separate
+reason — [CLI-TOOLS.md](CLI-TOOLS.md#two-reasons-the-cap-file-path-may-do-nothing).)
 
 #### 1.3 Mode precedence is last-wins
 
@@ -142,7 +145,7 @@ on the status.
 |---|---|
 | **0** | A drained range — *and* five other things (§2.1). |
 | **1** | Every fatal error, including every bad argument (§2.2). |
-| **3** | Deadlock: nothing live, launchable or resumable for `STALL_EXIT_TICKS` consecutive ticks. |
+| **3** | Deadlock: `STALL_EXIT_TICKS` consecutive ticks ended with nothing live and nothing started. An empty frontier is only one of the causes — a cap of 0, a gate that refuses every launch, and a launch that fails every tick all reach it with work still on the plan. §1.2 and §12 enumerate them. |
 | **2** | Never (§2.2). |
 
 #### 2.1 Exit 0 does not mean drained
@@ -203,7 +206,7 @@ The pump is also a consumer of the protocol, and these are the ones it reads:
 | any gate | `10` | Pause launching. The gate's combined output becomes the pause reason (first `10` short-circuits the chain). |
 | any gate | `0` with output | **Fed, but collected as a note.** Surfaced only by `print_plan`, indented under the `GATE:` line — never in the tick log, because a persistent condition would print every tick for days. |
 | any gate | anything else | Fail open: warn, feed anyway. |
-| a non-executable gate | — | Skipped with a warning. |
+| a gate that is no longer executable | — | Skipped with a warning, **mid-drain only** — an entry that was already unrunnable at startup refused the run (§6), so this is a gate deleted or un-`chmod`'d while the drain was in flight. The warning on stderr is the whole disclosure: a real run prints no `GATE:` line to hang a note under. |
 | `tp task resume-attempt` | `10` | The no-progress budget is spent: escalate to `needs-review` and notify once. |
 | `tp task scrub` | `3` | Re-emit each `UNPARSEABLE`/`NO-ID` line as `ledger integrity: …`. Any other non-zero scrub status is a flat `scrub failed (continuing)`. |
 | the liveness source | `75` | Degraded enumeration. One warning per tick, and the two **absence-driven** passes (orphan reclaim, stall detection) are skipped for that tick. |
@@ -399,7 +402,7 @@ $ tp pump --phases T1..T2 --integration-trunk --grain task --list
   DONE     T1.1      (complete)
 
 $ tp pump --phases T1..T2 --integration-trunk        # TASKPUMP_PUMP_STALL_EXIT_TICKS=1
-[…] T1..T2 STALLED after 1 idle ticks — 1 open task(s) … none can launch […]
+[…] T1..T2 STALLED after 1 idle ticks — 1 open task(s) … : nothing launchable, nothing resumable […]
 $ echo $?
 3
 ```
@@ -428,6 +431,9 @@ All of these are exit 1, and all of them fire before any launch:
 | `bad phase range '<x>'` | The spec is expanded and validated **in the main shell**, up front. Every later consumer reads the expander through a process substitution, where `die` would kill only the subshell — a malformed range would be reported and then ignored, leaving the pump to idle green against an empty phase list. |
 | a branch-prefix whose slug cannot round-trip | The agent name is the branch with `/` → `-`, and liveness is read back out of those names. Checked once at tick zero, because the prefix is a property of the configuration, not of any one launch. |
 | a unit-name collision at `--grain task` | `validate_unit_names` runs before **every** mode, `--dry-run` included: a plan showing two tasks launching onto one agent name is a wrong plan, and finding that out at launch time is too late. |
+| `gate entry is not an executable file: <x>` | Every entry of the gate chain in force is checked before any mode, `--dry-run` included: each line's first word must be a regular file with the execute bit (a directory passes `-x` and is refused too). An entry that cannot run used to be skipped with one warning and then reported as `GATE: feed-ok` for the rest of the run — a gate the operator configured, believes in, and does not have ([GATES.md §1.0](GATES.md#10-how-taskpump_gates-is-spelled-and-how-it-fails)). The refusal names the key that produced the entry, which is not always the chain: the default chain's usage entry comes from `TASKPUMP_USAGE`. |
+| `pre-tick hook entry is not an executable file: <x>` | The same check on `TASKPUMP_PRE_TICK_HOOKS`, where the same typo silently disables `fs-guard`. |
+| `TASKPUMP_<X>_GATE must be 0 or 1 (got '<v>')` | The three gate enable switches are numeric keys — every gate in the tree tests them arithmetically — so `false`, `no` and `off` are refused by name rather than read. Checked against the environment, so passing the matching `--no-*-gate` flag does not hide an unreadable key. |
 | no `~/.claude`, no `TASKPUMP_IMAGE`, no executable runner | Launch prerequisites. Skipped entirely under `TASKPUMP_PUMP_NO_LAUNCH=1` and never checked by `--dry-run`/`--list`, so a read-only plan works on a host with none of them. |
 | a missing brief template | Checked for the render modes and for real runs. |
 
@@ -443,30 +449,44 @@ All of these are exit 1, and all of them fire before any launch:
 are in unless their flag drops them. A configured `TASKPUMP_GATES` **replaces the
 whole chain** and is used verbatim — including, note, that a `net-health` entry in
 a custom chain still needs `TASKPUMP_HEALTH_GATE=1` to actually probe.
-`--dry-run` prints the chain as basenames in consultation order:
+`--dry-run` prints the chain as basenames in consultation order, and a real run
+logs the identical line at startup from the same function — the mode you confirm
+a chain in and the mode that spends money must not describe the chain
+differently:
 
 ```
 gates: claude-token-fresh -> claude-usage -> disk-low
 ```
 
 Basenames only — a custom entry's arguments do not show, so `claude-usage --gate`
-and `claude-usage --gate --ceiling 50` print identically.
+and `claude-usage --gate --ceiling 50` print identically. Every entry on that
+line resolved to an executable *file*, because a chain containing one that did
+not would have refused the run before printing anything (§6). One name per
+**line** of the chain, though, and only each line's first word is checked — two
+gates written on one line are one entry, and the line shows the first of them
+([GATES.md §1.0](GATES.md#10-how-taskpump_gates-is-spelled-and-how-it-fails)).
 
 **What every gate sees.** The pump exports a fixed set before running the chain,
 not "its configuration" wholesale: `TASKPUMP_HEALTH_GATE`, `TASKPUMP_USAGE_GATE`,
 `TASKPUMP_DISK_GATE`, `TASKPUMP_HEALTH_WINDOW`, `TASKPUMP_USAGE_CEILING`,
 `TASKPUMP_USAGE_RESET_FILE`, `TASKPUMP_CREDENTIALS` and
 `TASKPUMP_DISK_WATCHDOG`, plus the legacy `HEALTH_GATE`, `HEALTH_WINDOW` and
-`ARACHNE_USAGE_RESET_FILE`. `TASKPUMP_CREDENTIALS` is derived from the agent home
-**only when unset** — an operator's explicit value is never clobbered by a
-derivation of itself. Everything else a gate wants, it discovers for itself the
-way any tool does.
+`ARACHNE_USAGE_RESET_FILE`. The three `*_GATE` switches carry the value in force
+for this run — the operator's key with the matching `--no-*-gate` flag applied —
+so a gate kept in a custom chain reads back what was actually asked for.
+`TASKPUMP_CREDENTIALS` is derived from the agent home **only when unset** — an
+operator's explicit value is never clobbered by a derivation of itself.
+Everything else a gate wants, it discovers for itself the way any tool does.
 
 **Pre-tick hooks** have no document of their own; this is their contract. The
 default chain is `hooks/gitignore-repair` then `hooks/fs-guard`;
 `TASKPUMP_PRE_TICK_HOOKS` replaces it. Each entry is a command line. For each:
 
-- a non-executable entry is skipped with a warning;
+- an entry whose first word is not an executable file **refuses the run** at
+  startup, before any mode (§6) — the same rule the gate chain is held to, and
+  for the same reason: a hook that is skipped is indistinguishable from a hook
+  that ran and found nothing. A hook that stops being executable *mid*-drain is
+  skipped with one warning per tick instead, as a gate is;
 - the workspace root is **appended** to whatever words the entry itself carries,
   and `TP_REPO_ROOT` is exported alongside. A bare `hooks/fs-guard` therefore
   reads the root as `$1`; an entry written `myhook --strict` reads it as `$2`;
@@ -548,7 +568,8 @@ Two of them are worth knowing before you start an unattended run:
   `TASKPUMP_PUMP_NO_LAUNCH` unset, it launches
   `nohup tp-disk-watchdog --auto-exit` in the background, logging to
   `TASKPUMP_DISK_WATCHDOG_LOG`, and says so: `disk watchdog started (cap-file
-  path; log: …)`. `--no-disk-gate` suppresses it along with the gate. The
+  path; log: …)`. Turning the disk gate off suppresses it along with the gate —
+  `--no-disk-gate` or `TASKPUMP_DISK_GATE=0`, the same switch either way. The
   watchdog retires itself once no agents remain. Note the caveat in
   [CLI-TOOLS.md](CLI-TOOLS.md#tp-disk-watchdog) about which cap file it actually
   writes.
@@ -720,6 +741,24 @@ prose puts them:
    is throttled.
 10. Update the deadlock counter, write `running`.
 
+The counter in step 10 reads the **outcome** of steps 9, not the plan from step
+6: a tick that ends with no live agent and nothing started is an idle tick,
+whatever the cause — an empty frontier, a pool cap of 0, N launches that all
+failed, or N units refused before any launch was attempted. It records which,
+and `stall_exit` quotes that back:
+
+- `nothing launchable, nothing resumable`
+- `the pool cap is 0, so N launchable unit(s) were never started`
+- `every launch attempt failed — N unit(s) planned, none started; last: <the
+  last refusal>` — at least one launch was attempted, and all of them failed
+- `N unit(s) planned, none started; last: <the last refusal>` — nothing started
+  and no launch was attempted, which is what a resume the budget retired looks
+  like: it escalates to `needs-review` and pages without reaching the launcher
+
+"Nothing launchable" said over a plan that was full is a page pointing at the
+wrong thing, and so is "every launch attempt failed" over a tick that attempted
+none. Anything that starts, and any live agent, resets the counter to zero.
+
 Then, outside the tick: `is_drained` (three questions — no open task, no
 in-flight claim, no live agent) breaks the loop; otherwise `STALL_TICKS >=
 STALL_EXIT_TICKS` calls `stall_exit`; otherwise sleep. The sleep is backgrounded
@@ -739,7 +778,7 @@ delivers it. Nothing else notifies.
 | `<unit> STALLED on <id> — <verdict>, no progress across N auto-resumes. Marked needs-review; …` | the resume budget is spent |
 | `auto/trunk: quarantined <unit> (<reason>); <lead> left done — reconcile the merge by hand` | a failed trunk merge whose lead task is already `done` |
 | `auto/trunk: quarantined <unit> (<reason>); <lead> flagged needs-review` | a failed trunk merge whose lead task is not |
-| `<phases> STALLED after N idle ticks — … In flight: <claims>. M task(s) need human review …` | immediately before exit 3 |
+| `<phases> STALLED after N idle ticks — … : <why the ticks were idle>. In flight: <claims>. M task(s) need human review …` | immediately before exit 3 |
 | `<phases> drained: 0 open should remain (N open), M task(s) need human review …` | immediately before exit 0 |
 
 `TASKPUMP_NOTIFY_CMD` receives the message **on stdin**, not as an argument.
