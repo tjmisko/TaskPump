@@ -93,6 +93,9 @@
 #                     TASKPUMP_AGENT_LOG_FILTER    jq program pulling feed lines
 #                     TASKPUMP_AGENT_LOG_SCAN      log lines scanned per session
 # Binaries            TASKPUMP_DAG_BIN  TASKPUMP_USAGE  TASKPUMP_TASK
+#                     TASKPUMP_DOCKER   container runtime (then DOCKER, then
+#                                       `docker`) — the shared apl_docker order,
+#                                       so a podman host is watched, not guessed
 # Id grammar          TASKPUMP_PHASE_SIGIL  TASKPUMP_PHASE_SEPARATOR
 # Presentation        TASKPUMP_MONITOR_TITLE       title-line text
 #                     TASKPUMP_MONITOR_USAGE_WINDOWS  `label=datefmt` gauge list
@@ -118,6 +121,16 @@ _tp_self_root="$(CDPATH='' cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")"
 # shellcheck source=../lib/config.sh
 . "$_tp_self_root/lib/config.sh"
 tp_load_config
+# shellcheck source=../lib/pump-lib.sh
+. "$TP_LIB_DIR/pump-lib.sh"
+
+# The container runtime, resolved through the SAME accessor the pump, cleanup and
+# both runners use — TASKPUMP_DOCKER, then DOCKER, then `docker`. The monitor
+# used to spell `docker` literally in three places, so on a podman host the
+# SESSIONS tab reported an empty fleet and the GRAPH tab drew every claimed task
+# as idle while the pump it was watching ran perfectly well. Resolved once here
+# rather than per call: nothing may re-derive it, and the paint path is hot.
+RUNTIME_BIN="$(apl_docker)"
 
 # REPO_ROOT is the checkout whose worktrees hold the agent workspaces — i.e. the
 # PRIMARY checkout. Which repo that is, is a property of the CALLER's directory
@@ -164,7 +177,7 @@ PHASE_SEP="${TASKPUMP_PHASE_SEPARATOR:-.}"
 # TASKPUMP_AGENT_PREFIX is the shared spelling (the pump names containers with
 # it, dash included); the monitor works with the dashless form internally, so
 # strip a trailing dash from whichever spelling arrives.
-AGENT_PREFIX="${TASKPUMP_AGENT_PREFIX:-${TASKPUMP_AGENT_CONTAINER_PREFIX:-tp-agent-}}"
+AGENT_PREFIX="${TASKPUMP_AGENT_PREFIX:-${TASKPUMP_AGENT_CONTAINER_PREFIX:-$(apl_agent_prefix)}}"
 AGENT_PREFIX="${AGENT_PREFIX%-}"
 AGENT_LOG_NAME="${TASKPUMP_AGENT_LOG_NAME:-.taskpump-agent.log}"
 AGENT_LOG_SCAN="${TASKPUMP_AGENT_LOG_SCAN:-200}"
@@ -786,8 +799,8 @@ disk_compute() {
     local main_b
     main_b="$(du -sb --exclude="$MAIN_ROOT/$WORKTREES_DIR" "$MAIN_ROOT" 2>/dev/null | awk '{print $1}')"
     printf 'MAIN\t%s\n' "${main_b:-0}"
-    if command -v docker >/dev/null 2>&1; then
-        docker system df --format '{{.Type}}\t{{.Size}}\t{{.Reclaimable}}' 2>/dev/null \
+    if command -v "$RUNTIME_BIN" >/dev/null 2>&1; then
+        "$RUNTIME_BIN" system df --format '{{.Type}}\t{{.Size}}\t{{.Reclaimable}}' 2>/dev/null \
             | while IFS=$'\t' read -r dt ds dr; do
                   [[ -n "$dt" ]] && printf 'DKR\t%s\t%s\t%s\n' "$dt" "$ds" "$dr"
               done
@@ -980,7 +993,7 @@ sessions_compute() {
         case "$tstat" in
             blocked|stuck|needs-review) flagged+=$'F\t'"$task"$'\t'"$name"$'\t'"$tstat"$'\n' ;;
         esac
-    done < <(docker ps -a --filter "name=$AGENT_PREFIX" --format '{{.Names}}|{{.State}}|{{.Status}}' 2>/dev/null)
+    done < <("$RUNTIME_BIN" ps -a --filter "name=$AGENT_PREFIX" --format '{{.Names}}|{{.State}}|{{.Status}}' 2>/dev/null)
     [[ "$found" -eq 0 ]] && printf 'N\t1\n'
     printf '%s' "$flagged"
     return 0
@@ -1301,7 +1314,7 @@ graph_live_branches() {
         [[ -z "$cname" ]] && continue
         b="$(slug_branch "${cname#"$AGENT_PREFIX"-}")"
         [[ -n "$b" ]] && out+="$b,"
-    done < <(docker ps --filter "name=$AGENT_PREFIX" --format '{{.Names}}' 2>/dev/null)
+    done < <("$RUNTIME_BIN" ps --filter "name=$AGENT_PREFIX" --format '{{.Names}}' 2>/dev/null)
     printf '%s' "${out%,}"
 }
 

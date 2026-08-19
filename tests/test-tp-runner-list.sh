@@ -179,6 +179,47 @@ via_lib=$(
   && pass "runner list agrees with apl_live_agent_names name for name" \
   || fail "the two enumerations have drifted:\n runner: '$via_runner'\n lib:    '$via_lib'"
 
+echo "--- one runtime for every verb, resolved one way ---"
+
+# `list` reached the runtime through lib/pump-lib.sh's apl_docker
+# (TASKPUMP_DOCKER → DOCKER → docker) while `stop` and `launch` read only the
+# bare DOCKER seam. On a host configured with TASKPUMP_DOCKER alone that is ONE
+# runner answering about podman's fleet and tearing down containers on docker's
+# — the drift this suite exists to catch, one level below the name mapping.
+CALLS="$WORK/runtime-calls.log"
+cat >| "$WORK/docker-logging" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$CALLS"
+if [[ "\$1" == "ps" ]]; then
+  [[ -n "\${STUB_NAMES:-}" ]] && printf '%s\n' "\$STUB_NAMES"
+fi
+exit 0
+EOF
+chmod +x "$WORK/docker-logging"
+
+: >| "$CALLS"
+out=$(env -u DOCKER -u TP_DOCKER TASKPUMP_DOCKER="$WORK/docker-logging" \
+      STUB_NAMES=tp-agent-feat-a bash "$RUNNER" list 2>"$WORK/err"); rc=$?
+[[ $rc -eq 0 && "$out" == "tp-agent-feat-a" ]] \
+  && pass "list enumerates through TASKPUMP_DOCKER" \
+  || fail "list did not reach the TASKPUMP_DOCKER runtime (rc=$rc): '$out'"
+
+: >| "$CALLS"
+env -u DOCKER -u TP_DOCKER TASKPUMP_DOCKER="$WORK/docker-logging" \
+    TP_CONTAINER_NAME=tp-agent-feat-a bash "$RUNNER" stop >/dev/null 2>&1; rc=$?
+[[ $rc -eq 0 ]] && grep -q '^stop tp-agent-feat-a$' "$CALLS" \
+  && pass "stop reaches the same runtime TASKPUMP_DOCKER named for list" \
+  || fail "stop bypassed TASKPUMP_DOCKER (rc=$rc); calls: $(tr '\n' ';' <"$CALLS")"
+
+# TP_DOCKER is the launch environment's own spelling (docs/RUNNERS.md §1.1), so
+# it has to reach the fleet verb too, not just the per-container ones.
+: >| "$CALLS"
+out=$(env -u DOCKER -u TASKPUMP_DOCKER TP_DOCKER="$WORK/docker-logging" \
+      STUB_NAMES=tp-agent-feat-a bash "$RUNNER" list 2>"$WORK/err"); rc=$?
+[[ $rc -eq 0 && "$out" == "tp-agent-feat-a" ]] \
+  && pass "TP_DOCKER, the contract's own spelling, reaches list as well" \
+  || fail "list ignored TP_DOCKER (rc=$rc): '$out'"
+
 echo "--- the verb is advertised, and the contract version says so ---"
 
 out=$(bash "$RUNNER" --help 2>&1)

@@ -63,7 +63,7 @@ legacy name the pump writes beside it, where it writes one at all:
 | `TP_TASKS_DIR` | **none** | The ledger's tasks directory. |
 | `TP_MEMORY_MAX` | `AGENT_MEMORY_MAX` | Memory ceiling for a runner that can impose one (default `3g`). |
 | `TP_MEMORY_SWAP` | `AGENT_MEMORY_SWAP` | Memory-plus-swap ceiling (default `5g`). |
-| `TP_DOCKER` | `DOCKER` | The container runtime binary. |
+| `TP_DOCKER` | `DOCKER` | The container runtime binary. The shipped container runner also honours the shared `TASKPUMP_DOCKER` between the two, and resolves the three into one value every verb uses (§1.3). |
 | — | `GITHUB_TOKEN` | Forwarded from the pump's own environment, empty when it has none. The one input with no canonical spelling. |
 
 #### The legacy twins are not what they look like
@@ -155,9 +155,18 @@ in hand, so it may read only what `stop` already reads from configuration — fo
 the shipped runners, the agent-name prefix (`TP_AGENT_PREFIX`, or the shared
 `TASKPUMP_AGENT_PREFIX`), the workspace whose fleet is being asked about
 (`TP_REPO_ROOT`, or `TASKPUMP_REPO_ROOT`), and the container runtime
-(`TASKPUMP_DOCKER`, or `DOCKER`). All of them name a *fleet*, not an agent; a
-runner that demands launch-shaped input is uncallable at exactly the moment it
-is needed.
+(`TP_DOCKER`, `TASKPUMP_DOCKER`, or `DOCKER`). All of them name a *fleet*, not an
+agent; a runner that demands launch-shaped input is uncallable at exactly the
+moment it is needed.
+
+**One runtime per runner, not one per verb.** `list` reaches the container
+runtime through `lib/pump-lib.sh`'s `apl_docker` while `launch` and `stop` hold
+the binary themselves, so a runner that resolves it twice can answer about one
+fleet and start containers on another — the claude-docker runner read only the
+bare `DOCKER` for `launch`/`stop` while `list` already honoured
+`TASKPUMP_DOCKER`, which on a `TASKPUMP_DOCKER=podman` host is exactly that
+split. It now resolves once, at the top of the file, and hands that value to the
+shared enumeration.
 
 **And it is called more than once a tick.** Every pass that needs to know
 whether something is alive asks at the moment it asks — the orphan reclaim, the

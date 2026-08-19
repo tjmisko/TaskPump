@@ -1495,6 +1495,70 @@ grep -q 'pump\[F80\]: stopped — received SIGTERM' <<<"$tout" \
 grep -q 'STALE' <<<"$tout" && fail "terminal state mislabeled STALE:\n$tout" \
     || pass "no STALE label on a terminal state"
 
+# ── Test 38: the container runtime is resolved, never spelled `docker` (B11) ──
+# Every other tool reaches the runtime through lib/pump-lib.sh's apl_docker
+# (TASKPUMP_DOCKER → DOCKER → docker). The monitor used to call `docker` by name
+# in three places, so on a podman host — TASKPUMP_DOCKER=podman, honoured by the
+# pump, the runner and tp cleanup — the SESSIONS tab reported an empty fleet, the
+# GRAPH tab drew every claimed task as idle, and the disk gauge lost its runtime
+# breakdown, all for a fleet that was running fine.
+#
+# The stub is reachable ONLY through TASKPUMP_DOCKER: `docker` on PATH is the
+# suite's no-containers stub, so each assertion below fails against the literal
+# spelling and passes against the resolver.
+echo "--- Test 38: TASKPUMP_DOCKER is the runtime (B11) ---"
+cat >| "$BIN/podman" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == system && "${2:-}" == df ]]; then
+  printf 'Images\t42.5GB\t1GB (2%%)\n'
+  exit 0
+fi
+for a in "$@"; do
+  case "$a" in
+    '{{.Names}}|{{.State}}|{{.Status}}') echo 'arachne-agent-feat-f97|running|Up 3 minutes'; exit 0 ;;
+    '{{.Names}}') echo 'arachne-agent-feat-f97'; exit 0 ;;
+  esac
+done
+exit 0
+EOF
+chmod +x "$BIN/podman"
+RTC="$TMP/runtime-sess.tsv"
+rtmon() { TASKPUMP_DOCKER="$BIN/podman" TASKPUMP_MONITOR_REPO_ROOT="$SFR" \
+          TASKPUMP_TASKS_DIR="$CTD" TASKPUMP_PUMP_STATE_FILE="$CPS" \
+          TASKPUMP_MONITOR_SESS_CACHE="$RTC" TASKPUMP_MONITOR_COLS=140 \
+          "$CLI" "$@" 2>/dev/null | strip_ansi; }
+rtmon >/dev/null; sleep 2; rt=$(rtmon)
+grep -qE 'feat-f97 .*F97\.3:in_progress' <<<"$rt" \
+    && pass "TASKPUMP_DOCKER supplies the SESSIONS sweep (podman host sees its fleet)" \
+    || fail "session sweep ignored TASKPUMP_DOCKER:\n$rt"
+grep -q 'containers running or recently exited' <<<"$rt" \
+    && fail "the fleet reported empty while TASKPUMP_DOCKER named a live agent:\n$rt" \
+    || pass "no empty-fleet copy when the resolved runtime has agents"
+# GRAPH liveness reads the same runtime: a claimed task whose branch has a live
+# container is ▶ in progress, not ⧗ claimed, idle.
+rtg=$(TASKPUMP_DOCKER="$BIN/podman" TASKPUMP_MONITOR_REPO_ROOT="$SFR" \
+      TASKPUMP_TASKS_DIR="$CTD" TASKPUMP_PUMP_STATE_FILE="$CPS" \
+      TASKPUMP_MONITOR_COLS=140 "$CLI" --tab graph --cursor F97.3 2>/dev/null | strip_ansi)
+grep -q 'in progress' <<<"$rtg" \
+    && pass "TASKPUMP_DOCKER supplies the GRAPH tab's liveness signal" \
+    || fail "graph liveness ignored TASKPUMP_DOCKER:\n$rtg"
+grep -q 'claimed, idle' <<<"$rtg" \
+    && fail "a live claim drew as idle while TASKPUMP_DOCKER named its container:\n$rtg" \
+    || pass "a live claim is not drawn idle under a resolved runtime"
+# The disk gauge's runtime breakdown comes from the same binary. This is the one
+# assertion that has to let the background sizing worker really run, so the main
+# root is a git repo: disk_compute's last step is `git worktree list`, and under
+# `set -o pipefail` a non-repo aborts the worker before the cache is written.
+RTM="$TMP/runtime-main"; mkdir -p "$RTM"; git -C "$RTM" init -q 2>/dev/null
+RDC="$TMP/runtime-disk.tsv"; rm -f "$RDC"
+rtdisk() { TASKPUMP_DOCKER="$BIN/podman" TASKPUMP_MONITOR_DISK=1 \
+           TASKPUMP_MONITOR_DISK_CACHE="$RDC" TASKPUMP_MONITOR_MAIN_ROOT="$RTM" \
+           DF_AVAIL_KB=52428800 "$CLI" 2>/dev/null | strip_ansi; }
+rtdisk >/dev/null; sleep 2; rtd=$(rtdisk)
+grep -q 'docker img 42.5G' <<<"$rtd" \
+    && pass "the disk gauge's runtime breakdown comes from TASKPUMP_DOCKER" \
+    || fail "disk breakdown ignored TASKPUMP_DOCKER:\n$rtd"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"

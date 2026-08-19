@@ -61,15 +61,22 @@
 #   TP_ENV_PASSTHROUGH  —                   extra variable names to forward when
 #                                           set (see DEFAULT_PASSTHROUGH)
 #   GITHUB_TOKEN        —                   forwarded for ops fetch + gh
-#   DOCKER              —                   container binary override (test seam)
+#   TP_DOCKER           DOCKER              container binary override (test seam);
+#                                           TASKPUMP_DOCKER is honoured too, and
+#                                           every verb — launch, stop, list —
+#                                           resolves it once, the same way
 #
-# `list` reads none of the above. Its only input is the name prefix the fleet
-# shares, which is configuration rather than a property of any one launch:
+# `list` reads no per-launch input. Its inputs are configuration the whole fleet
+# shares rather than properties of any one launch — the name prefix, and the same
+# container runtime `launch` and `stop` use:
 #
 #   TP_AGENT_PREFIX     TASKPUMP_AGENT_PREFIX / ARACHNE_AGENT_PREFIX
 #                                           container-name prefix to enumerate
 #                                           (default tp-agent-, via
 #                                           lib/pump-lib.sh's one accessor)
+#   TP_DOCKER           TASKPUMP_DOCKER / DOCKER
+#                                           the runtime, resolved once for all
+#                                           three verbs (see below)
 #
 # ── Liveness, and why `list` is shaped the way it is ─────────────────────────
 #
@@ -117,7 +124,14 @@ PUMP_LIB="${TP_LIB_DIR:-$RUNNER_DIR/../../lib}/pump-lib.sh"
 die()  { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
 warn() { printf '%s: %s\n' "$PROG" "$*" >&2; }
 
-DOCKER="${DOCKER:-docker}"
+# The container runtime, resolved ONCE for every verb. `launch` and `stop` read
+# only the bare `DOCKER` seam before, while `list` reached the runtime through
+# lib/pump-lib.sh's apl_docker — so a host configured with TASKPUMP_DOCKER alone
+# had one runner answering about podman's fleet and starting containers on
+# docker's. The order is the contract's own TP_ spelling (docs/RUNNERS.md §1.1),
+# then apl_docker's TASKPUMP_DOCKER → DOCKER; do_list hands this same value back
+# to apl_docker so all three verbs speak to one binary.
+DOCKER="${TP_DOCKER:-${TASKPUMP_DOCKER:-${DOCKER:-docker}}}"
 
 # Variables forwarded into the container when — and only when — they are set in
 # the runner's own environment. Keeping this list opt-in keeps the launch line
@@ -354,7 +368,11 @@ do_list() {
 
   local errs; errs="$(mktemp)"
   local names rc=0
-  names="$(TASKPUMP_AGENT_PREFIX="$prefix" apl_live_agent_names_strict 2>"$errs")" || rc=$?
+  # TASKPUMP_DOCKER is handed over rather than left to apl_docker's own lookup:
+  # the runtime this runner launches and stops with is the runtime it must
+  # enumerate, and re-deriving it here is how the two drifted apart.
+  names="$(TASKPUMP_AGENT_PREFIX="$prefix" TASKPUMP_DOCKER="$DOCKER" \
+           apl_live_agent_names_strict 2>"$errs")" || rc=$?
 
   if [[ $rc -ne 0 ]]; then
     # One line, per the contract: the runtime's first line of complaint is the

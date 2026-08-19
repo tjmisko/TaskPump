@@ -307,19 +307,22 @@ the directory, `TASKPUMP_MONITOR_NOTES_DIR` relocates it, and
 `TASKPUMP_MONITOR_NOTES_FILE` overrides the resolved path outright. Add the
 directory to `.gitignore`.
 
-#### It talks to `docker` by name
+#### Which container runtime it talks to
 
-Every other tool in the tree reaches the container runtime through
-`apl_docker`, which resolves `TASKPUMP_DOCKER`, then `DOCKER`, then `docker`.
-The monitor does not: its disk gauge, its session sweep and its GRAPH-tab
-liveness read all invoke a literal `docker`. On a host running `podman` — with
-`TASKPUMP_DOCKER=podman` configured and honoured by the pump, the runner and
-`tp cleanup` — the monitor's SESSIONS tab reports `(no tp-agent containers
-running or recently exited)` for a fleet that is running perfectly well, and the
-GRAPH tab draws every claimed task as `⧗ claimed, idle` rather than
-`▶ in progress`.
-Filed as a code bug. There is no workaround inside the monitor; a `docker` shim
-on `PATH` is the only lever.
+The same one everything else does. The monitor reaches the runtime through
+`apl_docker` (`lib/pump-lib.sh`), which resolves `TASKPUMP_DOCKER`, then
+`DOCKER`, then `docker`, and it resolves it **once at startup** — the disk
+gauge's runtime breakdown, the session sweep and the GRAPH tab's liveness signal
+all speak to that one binary.
+
+It did not always. Those three call sites used to spell `docker`
+literally, so on a host running `podman` — with `TASKPUMP_DOCKER=podman`
+configured and honoured by the pump, the runner and `tp cleanup` — the SESSIONS
+tab reported `(no tp-agent containers running or recently exited)` for a fleet
+that was running perfectly well, the GRAPH tab drew every claimed task as
+`⧗ claimed, idle` rather than `▶ in progress`, and the disk gauge lost its
+`docker img … · cont …` line. A supervisor's dashboard lying about the fleet it
+is supervising, with no in-tool workaround.
 
 #### Where it reads, and what it caches
 
