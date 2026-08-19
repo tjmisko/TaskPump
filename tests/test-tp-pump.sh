@@ -1428,7 +1428,7 @@ real_run() {  # a REAL run (no NO_LAUNCH) over the drained phase F97; env from t
   TASKPUMP_GATES="${TASKPUMP_GATES:-$GBIN/feed-ok}" \
   TASKPUMP_PRE_TICK_HOOKS=' ' TASKPUMP_HOOK_MARK_FILE="$TMP/wd.mark" \
   TASKPUMP_DISK_WATCHDOG="$BIN/wd-stub" TASKPUMP_DISK_WATCHDOG_LOG="$TMP/wd.log" \
-  TASKPUMP_AGENT_HOME="$WDHOME" TASKPUMP_IMAGE=stub-image TASKPUMP_IMAGE_BUILD= \
+  TASKPUMP_AGENT_HOME="$WDHOME" TASKPUMP_IMAGE=stub-image TASKPUMP_IMAGE_BUILD='' \
   TASKPUMP_RUNNER="$BIN/norunner" \
   ARACHNE_PUMP_OPS_DIR="$TMP/noops" ARACHNE_PUMP_STATE_FILE="$TMP/wd.state" \
   ARACHNE_POOL_CAP_FILE="$TMP/wd.cap" ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
@@ -1447,6 +1447,46 @@ have "$out" 'disk watchdog started' \
   || pass "should suppress the disk watchdog when --no-disk-gate is passed"
 rm -f "$TASKS/F97.0.md"
 
+echo "--- Test 24e: the gate enable switches are 0 or 1, and nothing else ---"
+# 24c made the pump READ TASKPUMP_USAGE_GATE and TASKPUMP_DISK_GATE instead of
+# pinning them to literals — which put an operator's string into
+# `[[ "$USAGE_GATE" -eq 1 ]]` under `set -u` for the first time. `false`, `no`
+# and `off` are all things an operator writes, and none of them is a number:
+# inside default_gates' command substitution the arithmetic error kills only the
+# subshell, truncating the chain mid-list and leaving a run that prints
+# `GATE: feed-ok` over gates nobody turned off; at the watchdog spawn it kills
+# the run with a raw bash trace and no diagnostic. The vocabulary every gate in
+# the tree already reads these keys with is 0/1 (gates/disk-low,
+# gates/claude-usage, lib/pump-lib.sh all test them arithmetically), so the pump
+# accepts exactly that and refuses the rest by name.
+bad_switch() {  # bad_switch <KEY> <value>
+  local rc=0 out
+  out=$( export "$1=$2"; pump F56 2>&1 ) || rc=$?
+  [[ "$rc" -eq 1 ]] && pass "should refuse to start when $1=$2" \
+    || fail "$1=$2 did not refuse (rc=$rc):\n$out"
+  have "$out" "$1 must be 0 or 1 \\(got '$2'\\)" \
+    && pass "should name the key and the value for $1=$2" \
+    || fail "the refusal for $1=$2 names neither key nor value:\n$out"
+  have "$out" 'unbound variable' \
+    && fail "$1=$2 was reported by bash, not by the pump:\n$out" \
+    || pass "should diagnose $1=$2 itself rather than dying in arithmetic"
+  have "$out" 'GATE: feed-ok' \
+    && fail "$1=$2 truncated the chain and fed anyway:\n$out" \
+    || pass "should never reach feed-ok with $1=$2 unread"
+}
+bad_switch TASKPUMP_USAGE_GATE false
+bad_switch TASKPUMP_DISK_GATE off
+# The key is refused even under the flag that would force it to 0 anyway: the
+# flag is about this run, and a conf the pump cannot read is still unreadable
+# tomorrow, when nobody passes the flag. (`pump` always passes --no-health-gate.)
+bad_switch TASKPUMP_HEALTH_GATE yes
+# An empty value is the "left blank in the conf" spelling and still means "use
+# the default", exactly as an unset key does.
+out=$(TASKPUMP_USAGE_GATE='' TASKPUMP_DISK_GATE='' pump F56 2>&1)
+have "$out" '^gates: claude-token-fresh -> arachne-usage -> disk-low$' \
+  && pass "should treat an empty switch as unset, not as a value it cannot read" \
+  || fail "an empty switch changed the chain:\n$out"
+
 echo "--- Test 24d: a gate or hook entry that cannot run refuses the run ---"
 # TASKPUMP_GATES and TASKPUMP_PRE_TICK_HOOKS are newline-separated command lines
 # whose first word must be an executable PATH. Every other shape used to cost
@@ -1458,7 +1498,7 @@ echo "--- Test 24d: a gate or hook entry that cannot run refuses the run ---"
 rc=0; out=$(gate_plan 'claude-usage' 2>&1) || rc=$?
 [[ "$rc" -eq 1 ]] && pass "should refuse to start when a gate entry is a bare name" \
   || fail "a bare gate name did not refuse (rc=$rc):\n$out"
-have "$out" 'gate entry is not an executable path: claude-usage' \
+have "$out" 'gate entry is not an executable file: claude-usage' \
   && pass "should name the offending gate entry in the refusal" \
   || fail "the refusal does not name the entry:\n$out"
 have "$out" 'FIRST WORD is the path to an' \
@@ -1482,12 +1522,47 @@ rc=0; out=$(gate_plan 'gates/no-such-gate' 2>&1) || rc=$?
 [[ "$rc" -eq 1 ]] && pass "should refuse a relative gate path that does not resolve from here" \
   || fail "an unresolvable relative gate path did not refuse (rc=$rc):\n$out"
 
+# A DIRECTORY is the shape `[[ -x ]]` alone gets wrong: every searchable
+# directory passes it, so pointing either chain at gates/ or hooks/ — the two
+# most plausible near-misses of all — validated, and then reproduced the exact
+# symptom this check exists to stop: a plausible `gates:` line, `GATE: feed-ok`,
+# and one rc=126 warning on stderr. The entry has to be a regular file.
+rc=0; out=$(gate_plan "$GBIN" 2>&1) || rc=$?
+[[ "$rc" -eq 1 ]] && pass "should refuse a gate entry that is a directory" \
+  || fail "a directory passed as a gate (rc=$rc):\n$out"
+have "$out" 'GATE: feed-ok' \
+  && fail "a directory as the whole gate chain still reported feed-ok:\n$out" \
+  || pass "should never report feed-ok for a chain that is a directory"
+rc=0; out=$(TASKPUMP_PRE_TICK_HOOKS="$TMP" pump F56 2>&1) || rc=$?
+[[ "$rc" -eq 1 ]] && pass "should refuse a pre-tick hook entry that is a directory" \
+  || fail "a directory passed as a hook (rc=$rc):\n$out"
+
+# And the refusal has to blame the key that produced the entry. The default
+# chain is assembled from more than one key: `<usage bin> --gate` comes from
+# TASKPUMP_USAGE, so a typo there is not a chain-syntax mistake and the operator
+# must not be sent to check the syntax of a variable they never set.
+rc=0; out=$(TASKPUMP_USAGE=/nonexistent-usage-bin pump F56 2>&1) || rc=$?
+[[ "$rc" -eq 1 ]] && pass "should refuse when TASKPUMP_USAGE names nothing runnable" \
+  || fail "an unrunnable TASKPUMP_USAGE did not refuse (rc=$rc):\n$out"
+have "$out" '\(from TASKPUMP_USAGE\)' \
+  && pass "should blame the key the unrunnable entry came from" \
+  || fail "the refusal does not name TASKPUMP_USAGE:\n$out"
+have "$out" 'from TASKPUMP_GATES|from the default gate chain' \
+  && fail "the refusal blamed the chain for an entry TASKPUMP_USAGE set:\n$out" \
+  || pass "should not blame the chain for a key the chain did not set"
+have "$out" 'FIRST WORD' \
+  && fail "a TASKPUMP_USAGE typo was answered with chain-syntax rules:\n$out" \
+  || pass "should not lecture about chain syntax when the chain is not the mistake"
+have "$out" 'TASKPUMP_USAGE_GATE=0' \
+  && pass "should say how to drop the usage gate instead" \
+  || fail "the refusal offers no way out:\n$out"
+
 # The same rule, the same refusal, on the hook chain — where the typo disables
 # fs-guard, the contamination guard, rather than a meter.
 rc=0; out=$(TASKPUMP_PRE_TICK_HOOKS='fs-guard' pump F56 2>&1) || rc=$?
 [[ "$rc" -eq 1 ]] && pass "should refuse to start when a pre-tick hook entry is a bare name" \
   || fail "a bare hook name did not refuse (rc=$rc):\n$out"
-have "$out" 'pre-tick hook entry is not an executable path: fs-guard' \
+have "$out" 'pre-tick hook entry is not an executable file: fs-guard' \
   && pass "should name the offending hook entry in the refusal" \
   || fail "the hook refusal does not name the entry:\n$out"
 
@@ -1514,6 +1589,38 @@ run24d=$(TASKPUMP_GATES="$chain24d" real_run 2>&1 | sed -n 's/^\[[0-9:]*\] \(gat
   && pass "should name the same chain on a real run as --dry-run printed" \
   || fail "dry-run said '$dry24d'; the real run said '$run24d'"
 rm -f "$TASKS/F97.0.md"
+
+# The one skip startup validation cannot catch: a gate that stops being
+# executable DURING a drain that lasts days. It stays a skip — halting a live
+# run over it would be worse — and the warning on stderr is the whole
+# disclosure. It has to be, and this is the assertion that keeps the docs
+# honest about it: a real tick has no `GATE:` line to hang a note under, because
+# print_plan is plan-mode only, so anything collected for the plan is invisible
+# here. Claiming otherwise would be a sentence about a line the operator never
+# sees.
+cat >| "$GBIN/vanishing" <<'EOF'
+#!/usr/bin/env bash
+chmod -x "$0" 2>/dev/null || true
+exit 0
+EOF
+chmod +x "$GBIN/vanishing"
+# Open work, so the loop reaches a SECOND tick: the gate is consulted (and
+# disables itself) on the first one, and the skip can only be observed after
+# that. A drained range would exit before the condition exists.
+mk F56.0 open
+rc=0
+out=$(TASKPUMP_NOTIFY_CMD=true TASKPUMP_STAGGER=0 TASKPUMP_PUMP_NO_LAUNCH=1 \
+      TASKPUMP_GATES="$GBIN/vanishing" TASKPUMP_PRE_TICK_HOOKS=' ' \
+      ARACHNE_PUMP_OPS_DIR="$TMP/noops" ARACHNE_PUMP_STATE_FILE="$TMP/vanish.state" \
+      ARACHNE_POOL_CAP_FILE="$TMP/vanish.cap" ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+      timeout 6 "$PUMP" --no-health-gate --phases F56 --tick 1 2>&1) || rc=$?
+chmod +x "$GBIN/vanishing"
+have "$out" 'gate not executable, skipping' \
+  && pass "should warn every tick about a gate that stopped being executable mid-drain" \
+  || fail "a gate that vanished mid-drain was skipped silently:\n$out"
+have "$out" 'GATE:' \
+  && fail "a real run printed a GATE: line, which only print_plan renders:\n$out" \
+  || pass "should not pretend a real run has a GATE: line to disclose the skip under"
 
 echo "--- Test 25: pre-tick hooks are a chain too ---"
 HBIN="$TMP/hooks"; mkdir -p "$HBIN"
@@ -2400,7 +2507,7 @@ git -C "$REPO37" add -A; git -C "$REPO37" commit -qm seed
 rm -f "$STATE37" "$TMP/cap37"
 rc=0
 out=$(TASKPUMP_WORKSPACE_ROOT="$REPO37" ARACHNE_PUMP_WORKTREES_DIR="$REPO37/.worktrees" \
-      TASKPUMP_AGENT_HOME="$WDHOME" TASKPUMP_IMAGE=stub-image TASKPUMP_IMAGE_BUILD= \
+      TASKPUMP_AGENT_HOME="$WDHOME" TASKPUMP_IMAGE=stub-image TASKPUMP_IMAGE_BUILD='' \
       TASKPUMP_RUNNER="$BIN/norunner" TASKPUMP_DISK_GATE=0 \
       loop37 2>&1) || rc=$?
 [[ "$rc" -eq 3 ]] && pass "should exit 3 when every launch attempt fails, tick after tick" \

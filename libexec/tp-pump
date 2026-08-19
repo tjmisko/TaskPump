@@ -269,6 +269,9 @@ HEALTH_GATE="${TASKPUMP_HEALTH_GATE:-0}"
 # gate process — a switch that looked set, read back as unset, and went on
 # metering. The --no-*-gate flags force 0 either way, and still win, because they
 # are parsed after this.
+#
+# All three switches are 0/1 and nothing else — see check_gate_switch below,
+# which refuses any other value before the first arithmetic test reads it.
 USAGE_GATE="${TASKPUMP_USAGE_GATE:-1}"
 DISK_GATE="${TASKPUMP_DISK_GATE:-1}"
 BRANCH_PREFIX="${TASKPUMP_PUMP_BRANCH_PREFIX:-${TASKPUMP_BRANCH_PREFIX:-feat/}}"
@@ -398,6 +401,35 @@ usage() { apl_help "$0"; }
 [[ "$MODE" == "help" ]] && { usage; exit 0; }
 
 [[ -n "$PHASES" ]] || die "--phases is required (e.g. --phases F55..F63)"
+
+# ── Gate enable switches: 0 or 1, and nothing else ────────────────────────────
+# Every reader of these keys in the tree tests them arithmetically —
+# `[[ "${TASKPUMP_DISK_GATE:-1}" -eq 1 ]]` in gates/disk-low and lib/pump-lib.sh,
+# `[[ "${TASKPUMP_USAGE_GATE:-1}" -eq 1 ]]` in gates/claude-usage — so the
+# vocabulary is already fixed at 0/1, and `false`, `no` and `off` mean nothing
+# anywhere. Two of the three were out of reach of that arithmetic while the pump
+# pinned them to literals and read no key; TASKPUMP_HEALTH_GATE never was, and
+# has carried the same exposure all along. Now that all three are honoured, an
+# unparsed value is the worst of both outcomes: `[[ "$X" -eq 1 ]]` under `set -u`
+# aborts the shell with a raw bash trace where it runs in the main shell (the
+# disk-watchdog spawn), and inside default_gates' command substitution it kills
+# only the subshell — truncating the chain mid-list and leaving the run to print
+# `GATE: feed-ok` over gates nobody asked to turn off. So the value is parsed
+# once, here, and anything outside the vocabulary is refused by name.
+#
+# Read from the environment rather than from the shell variables, so a
+# --no-*-gate flag on this one run cannot hide a conf key that will be unparsed
+# again tomorrow when the flag is not passed.
+check_gate_switch() {  # check_gate_switch <key> <value>
+  [[ "$2" =~ ^[01]$ ]] && return 0
+  die "$1 must be 0 or 1 (got '$2')
+  1 enables the gate, 0 disables it. There is no word form: every gate in the
+  tree reads these keys as numbers, so 'false', 'no' and 'off' are values the
+  pump and the gate would disagree about. Leave the key unset for the default."
+}
+check_gate_switch TASKPUMP_HEALTH_GATE "${TASKPUMP_HEALTH_GATE:-0}"
+check_gate_switch TASKPUMP_USAGE_GATE  "${TASKPUMP_USAGE_GATE:-1}"
+check_gate_switch TASKPUMP_DISK_GATE   "${TASKPUMP_DISK_GATE:-1}"
 
 # A missing ledger must never read as a drained range: open_count and
 # frontier_phases mask tp-task's refusal into "0 open tasks" with their
@@ -1018,42 +1050,64 @@ detect_stalled_orphans() {
 # silently halt a multi-day drain. Every gate shipped here fails open too.
 #
 # The default chain is token freshness, the usage ceiling, and free disk — with
-# the three --no-*-gate flags dropping their entry. The shipped net-health gate
-# is host-hardware policy and OFF by default; TASKPUMP_HEALTH_GATE=1 opts it in
-# at the head of the chain (a wedged host is the cheapest, most binding check).
-# A configured TASKPUMP_GATES replaces the whole chain and is used verbatim; the
-# flags still export their disable switches, so a gate that honors them keeps
-# working either way — note that means a net-health entry in a custom chain also
-# needs TASKPUMP_HEALTH_GATE=1 to actually probe.
+# each entry dropped by its own switch, which is the TASKPUMP_*_GATE key or the
+# matching --no-*-gate flag, the flag winning where both are given. The shipped
+# net-health gate is host-hardware policy and OFF by default;
+# TASKPUMP_HEALTH_GATE=1 opts it in at the head of the chain (a wedged host is
+# the cheapest, most binding check). A configured TASKPUMP_GATES replaces the
+# whole chain and is used verbatim; export_gate_env still exports the three
+# switches with the values in force, so a gate that honors them keeps working
+# either way — note that means a net-health entry in a custom chain also needs
+# TASKPUMP_HEALTH_GATE=1 to actually probe.
+#
+# The switches are compared as STRINGS, not arithmetically. check_gate_switch
+# has already refused anything but 0 or 1, so the two spellings agree — but this
+# function runs inside a command substitution, where a fatal arithmetic error
+# kills the subshell and silently truncates the chain rather than the run. A
+# comparison that cannot be fatal is the belt for that suspenders.
 default_gates() {
-  [[ "$HEALTH_GATE" -eq 1 ]] && printf '%s\n' "$TP_GATES_DIR/net-health"
+  [[ "$HEALTH_GATE" == 1 ]] && printf '%s\n' "$TP_GATES_DIR/net-health"
   printf '%s\n' "$TP_GATES_DIR/claude-token-fresh"
-  [[ "$USAGE_GATE" -eq 1 ]] && printf '%s\n' "$USAGE_BIN --gate"
-  [[ "$DISK_GATE"  -eq 1 ]] && printf '%s\n' "$TP_GATES_DIR/disk-low"
+  [[ "$USAGE_GATE" == 1 ]] && printf '%s\n' "$USAGE_BIN --gate"
+  [[ "$DISK_GATE"  == 1 ]] && printf '%s\n' "$TP_GATES_DIR/disk-low"
   return 0
 }
 
-# The gate chain in force, and the label to blame for it. Both readers below
-# need the same pair, and `${TASKPUMP_GATES:-…}` falls back on an EMPTY value as
-# well as an unset one — so the test for "the operator configured this" has to
-# be the same -n test, spelled once.
+# The chain in force. `${TASKPUMP_GATES:-…}` falls back on an EMPTY value as well
+# as an unset one — so the test for "the operator configured this" has to be the
+# same -n test, spelled once, and it lives in chain_entry_source below.
 active_gates() { printf '%s' "${TASKPUMP_GATES:-$(default_gates)}"; }
-active_gates_label() {
-  if [[ -n "${TASKPUMP_GATES:-}" ]]; then printf 'TASKPUMP_GATES'
-  else printf 'the default gate chain'; fi
-}
 active_hooks() { printf '%s' "${TASKPUMP_PRE_TICK_HOOKS:-$(default_pre_tick_hooks)}"; }
-active_hooks_label() {
-  if [[ -n "${TASKPUMP_PRE_TICK_HOOKS:-}" ]]; then printf 'TASKPUMP_PRE_TICK_HOOKS'
-  else printf 'the default pre-tick hook chain'; fi
+
+# Which key put this entry in the chain. Not "which chain is in force": the
+# default gate chain is assembled from more than one key, and blaming the whole
+# chain for an entry TASKPUMP_USAGE named is the same class of wrong answer this
+# validation exists to remove — a diagnostic that sends the operator to check
+# the syntax of a variable they never set.
+chain_entry_source() {  # chain_entry_source <gate|hook> <first word of the entry>
+  local kind="$1" first="$2"
+  if [[ "$kind" == gate ]]; then
+    [[ -n "${TASKPUMP_GATES:-}" ]] && { printf 'TASKPUMP_GATES'; return 0; }
+    # default_gates emits `$USAGE_BIN --gate`, so the entry's first word is the
+    # first word of USAGE_BIN — which is TASKPUMP_USAGE's value when that key is
+    # set, and a shipped path when it is not.
+    [[ -n "${TASKPUMP_USAGE:-}" && "$first" == "${USAGE_BIN%% *}" ]] \
+      && { printf 'TASKPUMP_USAGE'; return 0; }
+    printf 'the default gate chain'
+    return 0
+  fi
+  [[ -n "${TASKPUMP_PRE_TICK_HOOKS:-}" ]] && { printf 'TASKPUMP_PRE_TICK_HOOKS'; return 0; }
+  printf 'the default pre-tick hook chain'
 }
 
 # ── Chain validation (gates and pre-tick hooks) ────────────────────────────────
 # Both chains are newline-separated command lines whose first whitespace-
-# delimited word must be an executable path. Every other shape — a bare gate
-# name, a comma-separated list (read as ONE entry), a relative path that does
-# not resolve from $PWD — used to cost one `not executable, skipping` line on
-# stderr and then a full-throated `GATE: feed-ok` for the rest of the run.
+# delimited word must be an executable REGULAR FILE. Every other shape used to
+# cost one line on stderr and then a full-throated `GATE: feed-ok` for the rest
+# of the run: a bare gate name, a comma-separated list (read as ONE entry) and a
+# relative path that does not resolve from $PWD were `not executable, skipping`,
+# while a DIRECTORY passed the old `-x` test outright and failed at exec time as
+# `failed (rc=126); feeding anyway`. Different lines, one outcome.
 #
 # That is strictly worse than configuring no gate at all. An operator who wired
 # a usage ceiling and got a typo believes they are metered for the next three
@@ -1066,26 +1120,65 @@ active_hooks_label() {
 # misconfiguration is refused (docs/CLI-PUMP.md §6) and before any mode —
 # --dry-run included, because that is the mode an operator uses to CONFIRM a
 # chain, and confirming has to be able to say no.
-validate_chain() {  # validate_chain <label> <chain text> <noun> <example>
-  local label="$1" chain="$2" noun="$3" example="$4" spec
+#
+# What the refusal SAYS is per-entry, because the fix is: a chain the operator
+# wrote gets the chain-syntax rules, TASKPUMP_USAGE gets its own key back, and a
+# shipped path gets "your install is incomplete" — none of which is improved by
+# reading either of the other two.
+validate_chain() {  # validate_chain <gate|hook> <chain text>
+  local kind="$1" chain="$2" noun key shipped_dir example spec src advice
+  if [[ "$kind" == gate ]]; then
+    noun="gate"; key="TASKPUMP_GATES"; shipped_dir="$TP_GATES_DIR"
+    example="  TASKPUMP_GATES=\"$TP_GATES_DIR/disk-low
+  $TP_GATES_DIR/claude-usage --gate --ceiling 80\""
+  else
+    noun="pre-tick hook"; key="TASKPUMP_PRE_TICK_HOOKS"; shipped_dir="$TP_ROOT/hooks"
+    example="  TASKPUMP_PRE_TICK_HOOKS=\"$TP_ROOT/hooks/gitignore-repair
+  $TP_ROOT/hooks/fs-guard\""
+  fi
   while IFS= read -r spec; do
     [[ -z "${spec//[[:space:]]/}" ]] && continue
     # A chain entry is a command line; splitting on whitespace is the point.
     # shellcheck disable=SC2086
     set -- $spec
-    [[ -x "$1" ]] && continue
-    die "$noun entry is not an executable path: $1
-  (from $label)
-Each line of the chain is one command line whose FIRST WORD is the path to an
+    # -f as well as -x: `[[ -x dir ]]` is true for any searchable directory, so
+    # pointing the key at gates/ or hooks/ used to pass validation and then
+    # reproduce the exact symptom this check exists to stop — a plausible
+    # `gates:` line, `GATE: feed-ok`, and one rc=126 warning on stderr.
+    [[ -f "$1" && -x "$1" ]] && continue
+    src="$(chain_entry_source "$kind" "$1")"
+    case "$src" in
+      "$key")
+        advice="Each line of $key is one command line whose FIRST WORD is the path to an
 executable; arguments follow it on the same line. A bare name does not work —
 nothing searches \$PATH — and a comma-separated list is read as a single entry,
 not as several:
 
 $example
 
+Only that first word is checked, so several ${noun}s written on ONE line are
+still one command line: the first runs and the rest are handed to it as
+arguments. One per line.
+
 A relative first word is resolved against the directory the pump runs from, so
 the same configuration works from the repository root and fails from any
-subdirectory; an absolute path costs nothing and cannot do that.
+subdirectory; an absolute path costs nothing and cannot do that."
+        ;;
+      TASKPUMP_USAGE)
+        advice="TASKPUMP_USAGE names the binary the usage gate runs, and the default chain
+uses it verbatim — so this is not a chain-syntax error and $key is not
+involved. Point the key at an executable file, or drop the usage gate instead:
+TASKPUMP_USAGE_GATE=0 standingly, or --no-usage-gate for one run."
+        ;;
+      *)
+        advice="This entry is a ${noun} shipped with TaskPump, under $shipped_dir — so the
+chain is not the mistake. The file is missing, is not a regular file, or has
+lost its execute bit: repair the install, or name a chain of your own in $key."
+        ;;
+    esac
+    die "$noun entry is not an executable file: $1
+  (from $src)
+$advice
 
 This is a refusal and not a warning because everywhere else the operator can
 look, a skipped $noun and a $noun that passed look exactly alike."
@@ -1152,14 +1245,15 @@ feed_gate() {
     # A gate entry is a command line; splitting on whitespace is the point.
     # shellcheck disable=SC2086
     set -- $spec
-    if [[ ! -x "$1" ]]; then
+    if [[ ! -f "$1" || ! -x "$1" ]]; then
       # Startup validation already refused every unrunnable entry, so reaching
       # here means the gate was deleted or un-chmod'd DURING the drain — days
-      # long, so it happens. Say it on both channels: the warning goes to a log
-      # nobody is reading at 3am, while the note lands under `GATE:` in the
-      # plan, which is where an operator looks to ask whether they are metered.
+      # long, so it happens. A warning on stderr is the whole disclosure, and
+      # deliberately so: this branch is only ever reached from a tick, and a
+      # tick has no `GATE:` line to hang a note under — print_plan is plan-mode
+      # only. Halting a live drain over it would be worse than the skip, so the
+      # run continues, one warning per tick, for as long as it lasts.
       warn "gate not executable, skipping: $1"
-      GATE_NOTES+="${GATE_NOTES:+$'\n'}$(basename "$1"): SKIPPED — no longer executable, NOT consulted"
       continue
     fi
     rc=0
@@ -2402,9 +2496,10 @@ run_pre_tick_hooks() {
     # A hook entry is a command line; splitting on whitespace is the point.
     # shellcheck disable=SC2086
     set -- $spec
-    if [[ ! -x "$1" ]]; then
+    if [[ ! -f "$1" || ! -x "$1" ]]; then
       # As with a gate: unreachable at startup (validate_chain refused), so this
-      # is a hook that stopped being executable mid-drain.
+      # is a hook that stopped being executable mid-drain, and the warning is
+      # the whole disclosure — there is no plan line to hang a note under here.
       warn "pre-tick hook not executable, skipping: $1"
       continue
     fi
@@ -2935,12 +3030,8 @@ validate_unit_names
 # And refuse a gate or a pre-tick hook that cannot run, for the same reason one
 # step further out: a chain entry that is skipped is, everywhere the operator
 # can see, a chain entry that passed. Before every mode, --dry-run included.
-validate_chain "$(active_gates_label)" "$(active_gates)" gate \
-  "  TASKPUMP_GATES=\"$TP_GATES_DIR/disk-low
-  $TP_GATES_DIR/claude-usage --gate --ceiling 80\""
-validate_chain "$(active_hooks_label)" "$(active_hooks)" "pre-tick hook" \
-  "  TASKPUMP_PRE_TICK_HOOKS=\"$TP_ROOT/hooks/gitignore-repair
-  $TP_ROOT/hooks/fs-guard\""
+validate_chain gate "$(active_gates)"
+validate_chain hook "$(active_hooks)"
 
 case "$MODE" in
   render)
@@ -3075,7 +3166,7 @@ fi
 # run-parallel.sh does, so disk pressure also drops the live pool cap (cap-file
 # path) on top of the feed gate. --auto-exit retires it once no agents remain.
 # Skipped for --once / NO_LAUNCH ticks and when the disk gate is disabled.
-if [[ "$MODE" == "run" && "$DISK_GATE" -eq 1 && "${TASKPUMP_PUMP_NO_LAUNCH:-0}" -ne 1 ]]; then
+if [[ "$MODE" == "run" && "$DISK_GATE" == 1 && "${TASKPUMP_PUMP_NO_LAUNCH:-0}" -ne 1 ]]; then
   nohup "$DISK_WATCHDOG_BIN" --auto-exit \
     >>"$DISK_WATCHDOG_LOG" 2>&1 </dev/null &
   disown "$!" 2>/dev/null || true
