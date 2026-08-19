@@ -140,14 +140,21 @@ apl_network_unhealthy() {
 : "${TASKPUMP_JOBS_FALLBACK:=6}"
 
 # apl_read_cap — the live concurrency cap: CAP_FILE's contents if it holds a
-# positive integer (live-retunable mid-run), else the caller's JOBS, else
+# non-negative integer (live-retunable mid-run), else the caller's JOBS, else
 # TASKPUMP_JOBS_FALLBACK. Lets an operator `echo 3 > .taskpump-pool-cap` without
 # restarting the supervisor.
+#
+# ZERO IS A VALUE, not garbage. It is the one number the disk watchdog ever
+# writes — `set_cap 0` is how PAUSED and PANIC stop new launches — and this
+# reader used to require `>= 1`, so that 0 fell through to the caller's JOBS and
+# the pump kept launching at full cap through the pressure the watchdog had
+# already detected and logged (B8). A cap of 0 means launch nothing; a file that
+# holds no digits at all is still garbage and still falls back.
 apl_read_cap() {
   local c="${JOBS:-$TASKPUMP_JOBS_FALLBACK}"
   if [[ -n "${CAP_FILE:-}" && -f "$CAP_FILE" ]]; then
     local v; v="$(tr -dc '0-9' < "$CAP_FILE" 2>/dev/null || true)"
-    [[ -n "$v" && "$v" -ge 1 ]] && c="$v"
+    [[ "$v" =~ ^[0-9]+$ ]] && c="$v"
   fi
   echo "$c"
 }

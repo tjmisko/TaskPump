@@ -423,7 +423,7 @@ consistent — a sigil the pattern does not accept produces tasks nothing can gr
 | `TASKPUMP_WORKSPACE_ROOT` | `tp pump`, `tp task` | the config anchor (a discovered conf's directory, else the caller's worktree root) | The workspace the pump **drives** — the default image-build context, the repository phase branches and agent worktrees are created in, the state-dir default, every `git` surface of a run. Never derived from where the tools are installed, so a vendored TaskPump's own checkout is never mistaken for the workspace (issue #32). Set it to pin a container/CI run whose `$PWD` proves nothing. Naming a missing directory is a loud error. The install's own assets (`lib/`, `libexec/`, `gates/`, `runners/`, `templates/`, `hooks/`) stay script-relative regardless. Not pump-scoped: `tp task` resolves its ledger through the same pin (§3.1), so the two tools cannot answer differently in one pinned shell. |
 | `TASKPUMP_JOBS` | `tp pump` | `4` | Concurrent pool cap. This is the key the pump reads; `TASKPUMP_PUMP_JOBS` is the systemd unit's name for the same number, which it passes as `--jobs`. A standing preference: the cap file below outranks it, so an unflagged run uses whatever the last retune left there. |
 | `TASKPUMP_JOBS_FALLBACK` | `lib/pump-lib.sh`, `tp disk-watchdog` — **not reachable from `tp pump`** | `6` | The cap `apl_read_cap` falls back to for a caller that passes none. The pump always passes its own `JOBS` (defaulted to 4 above), so this number cannot decide a pump run: with no cap file and no `--jobs`, `TASKPUMP_JOBS_FALLBACK=99 tp pump --dry-run` still plans `cap 4`. Its live consumer is the disk watchdog, which uses it as the cap to restore when it has no other record of one. |
-| `TASKPUMP_POOL_CAP_FILE` | `tp pump`, `tp disk-watchdog` | `<state dir>/.taskpump-pool-cap` | A file holding the live cap, re-read each tick so concurrency can be retuned mid-run. An explicit `--jobs` sets it at startup — the flag is an instruction about this run, and a number a previous run left behind must not outrank it (issue #44). That write happens once the run has cleared its prerequisites, so a startup that aborts (no image, no runner, failed build) leaves the file exactly as it found it. The startup banner prints the cap in force and names which of the two set it. |
+| `TASKPUMP_POOL_CAP_FILE` | `tp pump`, `tp disk-watchdog` | `<state dir>/.taskpump-pool-cap` | A file holding the live cap, re-read each tick so concurrency can be retuned mid-run. Any non-negative integer counts, **`0` included** — that is how the disk watchdog says "launch nothing" — while a file holding no digits at all falls back to `JOBS`. An explicit `--jobs` sets it at startup — the flag is an instruction about this run, and a number a previous run left behind must not outrank it (issue #44). That write happens once the run has cleared its prerequisites, so a startup that aborts (no image, no runner, failed build) leaves the file exactly as it found it. The startup banner prints the cap in force and names which of the two set it. |
 | `TASKPUMP_TICK` | `tp pump` | `30` | Seconds between supervisor ticks. |
 | `TASKPUMP_STAGGER` | `tp pump` | `3` | Seconds between launches within a single tick. |
 | `TASKPUMP_PUMP_TASKS_DIR` | `tp pump` | `TASKPUMP_TASKS_DIR`, else `<workspace>/<ledger probe>` | Tasks directory for the pump alone, independent of the ledger checkout — lets the pump be tested against a flat fixture. It feeds the pump's own dependency scan and the worktree handoff; the frontier itself comes from the ledger CLI, which resolves separately. |
@@ -805,24 +805,24 @@ opt-in `TASKPUMP_MANIFEST`; the disk watchdog reads `TASKPUMP_STATE_DIR` and
 task it should release through the ledger's live claim; the manifest is
 consulted only as a fallback, and only when it is configured.
 
-**Both `_REPO_ROOT` defaults are script-relative, not caller-relative.** Unlike
-`tp task`, `tp pump`, `tp monitor` and `tp dag-render`, which resolve from
-`$PWD`, `tp cleanup` and `tp disk-watchdog` default their repository to the
-parent of the script's own directory — the TaskPump install. Run from a consumer
-repo with no key set, they sweep and measure the install instead of your project
-and report on that, which reads as a clean sweep: from a fixture repo carrying
+**`tp cleanup`'s `_REPO_ROOT` default is script-relative, not caller-relative.**
+Unlike `tp task`, `tp pump`, `tp monitor` and `tp dag-render`, which resolve from
+`$PWD`, `tp cleanup` defaults its repository to the parent of the script's own
+directory — the TaskPump install. Run from a consumer repo with no key set, it
+sweeps and measures the install instead of your project and reports on that,
+which reads as a clean sweep: from a fixture repo carrying
 `.worktrees/feat/x/target`, `tp cleanup --targets --dry-run` said `no worktree
 target dirs to reclaim` until `TASKPUMP_CLEANUP_REPO_ROOT` named the fixture.
 
-The pump does not set either key for the tools it starts. It launches the disk
-watchdog with a bare `nohup`, so the watchdog inherits the pump's environment
-and nothing more: its repo root is the install, and — since its state dir
-defaults to that same repo root — so is its `TASKPUMP_POOL_CAP_FILE`. Whenever
-the install and the workspace are different directories (every layout except
-dogfooding), the cap file the watchdog writes under pressure is not the one the
-pump re-reads each tick. Set `TASKPUMP_STATE_DIR` or `TASKPUMP_POOL_CAP_FILE`
-explicitly for a run that wants the watchdog's cap changes to land, and
-`TASKPUMP_DISK_REPO_ROOT` for one that wants its reclaim to touch your project.
+`tp disk-watchdog` resolves the workspace the way the pump does (a discovered
+conf's directory, else the caller's git worktree, else the install root), so the
+cap file it writes is the one the pump re-reads each tick, and its PANIC sweep
+passes that workspace down to `tp cleanup` as `TASKPUMP_CLEANUP_REPO_ROOT`.
+`TASKPUMP_WORKSPACE_ROOT` pins it explicitly for both; `TASKPUMP_DISK_REPO_ROOT`
+overrides it for the watchdog alone. Until this was fixed the watchdog defaulted
+to the install like cleanup, so on every layout except dogfooding the cap file it
+wrote under pressure was not the one the pump read — and the `0` it wrote there
+would have been discarded anyway (`TASKPUMP_POOL_CAP_FILE`, §3.2).
 
 **`tp cleanup`'s busy-directory list reads both spellings.**
 `TASKPUMP_EXTRA_BUSY_DIRS` is the canonical name and wins; the bare

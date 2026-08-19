@@ -103,9 +103,11 @@ That is the 563-tick idle of
 [PUMP-MECHANISMS.md §4](PUMP-MECHANISMS.md#the-563-tick-idle) in a different
 costume — a supervisor reporting health while making no progress. Filed as a code
 bug. Until it is fixed, `--jobs 0` is not a way to pause a run; stop the run, or
-lower the cap through the cap file to `1`. (The disk watchdog's own attempt to
-write `0` there is inert for a different reason —
-[CLI-TOOLS.md](CLI-TOOLS.md#two-reasons-the-cap-file-path-may-do-nothing).)
+lower the cap through the cap file to `1`. (A `0` written to the cap file — by
+you or by the disk watchdog — *is* honoured now and does hold the launch loop at
+zero; it reaches the same deadlock-counter blind spot this section describes,
+which is why `1` is still the number to write by hand —
+[CLI-TOOLS.md](CLI-TOOLS.md#the-cap-file-path-and-how-it-used-to-fail).)
 
 #### 1.3 Mode precedence is last-wins
 
@@ -549,9 +551,9 @@ Two of them are worth knowing before you start an unattended run:
   `nohup tp-disk-watchdog --auto-exit` in the background, logging to
   `TASKPUMP_DISK_WATCHDOG_LOG`, and says so: `disk watchdog started (cap-file
   path; log: …)`. `--no-disk-gate` suppresses it along with the gate. The
-  watchdog retires itself once no agents remain. Note the caveat in
-  [CLI-TOOLS.md](CLI-TOOLS.md#tp-disk-watchdog) about which cap file it actually
-  writes.
+  watchdog retires itself once no agents remain. It resolves the workspace the
+  way the pump does, so the cap file it writes is the one this run re-reads
+  ([CLI-TOOLS.md](CLI-TOOLS.md#tp-disk-watchdog)).
 
 Files a run touches, all in `TASKPUMP_STATE_DIR` (default: the workspace root)
 unless individually overridden:

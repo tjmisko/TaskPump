@@ -119,13 +119,21 @@ printf '1' >| "$CAP_FILE"
 [[ "$(apl_read_cap)" == "1" ]] && pass "cap file '1' → throttle to 1" \
   || fail "cap file '1' expected 1 got '$(apl_read_cap)'"
 
-# Garbage / non-positive contents fall back to JOBS (never a 0/negative cap).
+# Garbage — a file with no digits in it at all — falls back to JOBS.
 printf 'abc' >| "$CAP_FILE"
 [[ "$(apl_read_cap)" == "6" ]] && pass "garbage cap file → falls back to JOBS (6)" \
   || fail "garbage cap file expected 6 got '$(apl_read_cap)'"
+
+# Zero is a VALUE, not garbage (B8). It is the only number the disk watchdog
+# ever writes — `set_cap 0` is how PAUSED and PANIC stop new launches — and this
+# reader used to require >= 1, so the 0 fell through to JOBS and the pump kept
+# launching at full cap through the disk pressure the watchdog had already
+# detected, logged, and acted on. A cap of 0 means launch nothing.
 printf '0\n' >| "$CAP_FILE"
-[[ "$(apl_read_cap)" == "6" ]] && pass "cap file '0' → rejected, falls back to JOBS (6)" \
-  || fail "cap file '0' expected 6 got '$(apl_read_cap)'"
+[[ "$(apl_read_cap)" == "0" ]] && pass "cap file '0' → cap 0, the watchdog's pause is honoured" \
+  || fail "cap file '0' expected 0 got '$(apl_read_cap)'"
+[[ "$(JOBS=4 apl_read_cap)" == "0" ]] && pass "a written 0 outranks the caller's JOBS" \
+  || fail "cap file '0' with JOBS=4 expected 0 got '$(JOBS=4 apl_read_cap)'"
 
 # ── Live-agent counting: the other rotation input (docker ps, stubbed) ─────────
 echo "--- pool cap: apl_count_live_agents (docker ps stubbed) ---"

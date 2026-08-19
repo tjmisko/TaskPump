@@ -125,6 +125,7 @@ cp "$TP_ROOT/lib/pump-lib.sh" "$TPFIX/lib/pump-lib.sh"
 cat > "$TPFIX/libexec/tp-cleanup" <<'EOF'
 #!/bin/bash
 echo "STUB-CLEANUP-CALLED args: $*"
+echo "STUB-CLEANUP-ROOT: ${TASKPUMP_CLEANUP_REPO_ROOT:-<unset>}"
 EOF
 chmod +x "$TPFIX/libexec/tp-disk-watchdog" "$TPFIX/libexec/tp-cleanup"
 WATCHDOG="$TPFIX/libexec/tp-disk-watchdog"
@@ -135,6 +136,10 @@ assert_has "panic state entered (free=3 < panic=5)" "$out" "HEALTHY → PANIC"
 # Toolchain-neutral wording (G1.7): the watchdog names no build system.
 assert_has "reclaim_targets ran"                    "$out" "reclaiming build target/ dirs (worktrees + primary)"
 assert_has "cleanup invoked with targets+primary+dry-run" "$out" "STUB-CLEANUP-CALLED args: --targets --include-primary --dry-run"
+# The panic sweep must run against the workspace this watchdog guards. cleanup
+# resolves its own root from its install dir, so without this it walks the
+# TaskPump checkout's worktrees and frees nothing (B8's wrong-root family).
+assert_has "the sweep is pointed at the guarded workspace" "$out" "STUB-CLEANUP-ROOT: $FIX"
 assert_has "docker prune still attempted"           "$out" "would run tp-cleanup --docker"
 
 echo "--- Test 5: PANIC_RECLAIM_TARGETS=0 disables the target reclaim ---"
@@ -350,6 +355,34 @@ out="$(cd "$D4" && TASKPUMP_CLEANUP_REPO_ROOT="$D4" STUB_LIVE="" "$CLEANUP" --ta
                          || fail "the directory name was evaluated: $D4/$CANARY exists"
 assert_has "the unsafe workspace is skipped by name" "$out" "worktree directory"
 assert_has "and the well-named one is still reclaimed" "$out" "$D4/.worktrees/feat/ok/target"
+
+echo "--- Test 17: the watchdog drives the WORKSPACE's cap file, not the install's (B8) ---"
+# The cap file is the documented choke point between these two processes: the
+# watchdog writes it, the pump reads it. The watchdog used to default its root
+# to the parent of its own script dir — the INSTALLATION — so from a consumer
+# workspace it wrote a cap file the pump never looks at, logged "pool cap → 0",
+# and the pump kept launching at full cap. It resolves the workspace the same
+# way the pump does now.
+WS="$FIX/ws"; mkdir -p "$WS/tasks"
+git -C "$WS" init -q >/dev/null 2>&1
+rm -f "$TPFIX/.taskpump-pool-cap" "$WS/.taskpump-pool-cap"
+out="$(cd "$WS" && FREE_GB_OVERRIDE=7 PANIC_THRESHOLD_GB=5 PAUSE_THRESHOLD_GB=10 \
+       "$WATCHDOG" --once 2>&1)"
+assert_has "the pause names the workspace's cap file" "$out" "→ 0 ($WS/.taskpump-pool-cap)"
+[[ -f "$WS/.taskpump-pool-cap" ]] \
+  && pass "the cap file lands in the workspace the pump reads" \
+  || fail "no cap file at $WS/.taskpump-pool-cap"
+[[ ! -f "$TPFIX/.taskpump-pool-cap" ]] \
+  && pass "and the installation's own root was not written" \
+  || fail "the watchdog wrote the install's cap file at $TPFIX/.taskpump-pool-cap"
+# ...and what it writes is a 0 the shared reader honours, which is the other
+# half of B8: apl_read_cap used to require >= 1 and threw this 0 away.
+capval="$(cat "$WS/.taskpump-pool-cap")"
+[[ "$capval" == "0" ]] && pass "the paused cap written is 0" || fail "expected 0, got '$capval'"
+got="$(CAP_FILE="$WS/.taskpump-pool-cap" JOBS=4 bash -c '. "$1"; apl_read_cap' _ "$TP_ROOT/lib/pump-lib.sh")"
+[[ "$got" == "0" ]] \
+  && pass "and the shared cap reader answers 0, so nothing launches" \
+  || fail "apl_read_cap discarded the watchdog's 0: got '$got'"
 
 echo
 echo "=============================================="

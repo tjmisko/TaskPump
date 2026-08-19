@@ -419,6 +419,8 @@ in any vendored layout (TaskPump as a submodule or subtree) `tp cleanup
 --targets` sweeps the *vendored TaskPump checkout's* `.worktrees/` and leaves the
 consumer's alone. Set `TASKPUMP_CLEANUP_REPO_ROOT` — or
 `TASKPUMP_WORKTREES_DIR`, which it also honours — to point it at the real one.
+The one caller that no longer needs telling is `tp disk-watchdog`: its PANIC
+sweep passes its own resolved workspace down as `TASKPUMP_CLEANUP_REPO_ROOT`.
 
 Finally: the extra-busy-directory list is read as `TASKPUMP_EXTRA_BUSY_DIRS`,
 with the unprefixed `EXTRA_BUSY_DIRS` still honoured as the legacy spelling and
@@ -585,46 +587,50 @@ prune but never touches build directories. `--gate` answers against the *pause*
 threshold only and **fails open**: a mount it cannot read is `free=unknown —
 failing open (feed OK)`, exit 0.
 
-#### Two reasons the cap-file path may do nothing
+#### The cap-file path, and how it used to fail
 
 The pump auto-starts this watchdog for every real run with the disk gate on
 ([CLI-PUMP.md §9](CLI-PUMP.md#9-side-effects-of-a-real-run)), described there as
-belt-and-suspenders on top of the `disk-low` feed gate. At this revision the
-belt is not attached:
+belt-and-suspenders on top of the `disk-low` feed gate. The belt is attached: the
+watchdog resolves the workspace the same way the pump does, and a `0` in the cap
+file caps at zero.
 
-**The cap file it writes is resolved from the install root.** Like `tp cleanup`,
-this tool's `REPO_ROOT` defaults to the parent of its own script directory rather
-than to the caller's git worktree. Run from a consumer repo with no
-`TASKPUMP_STATE_DIR` set, it names the *installation's* cap file while the pump
-reads the *workspace's*:
+**The cap file is the workspace's.** `REPO_ROOT` here is resolved through the
+same workspace rule the pump, the monitor, `tp task` and `tp dag-render` use — a
+discovered `taskpump.conf`'s directory, else the caller's git worktree, else the
+install root — so both processes name the same file:
 
 ```
-$ cd ~/project && FREE_GB_OVERRIDE=1 tp disk-watchdog --once --dry-run
-[…]   (dry-run) would set pool cap  → 0 via /path/to/taskpump/.taskpump-pool-cap
+$ cd ~/project && FREE_GB_OVERRIDE=1 tp disk-watchdog --once
+[…]   pool cap  → 0 (/home/you/project/.taskpump-pool-cap)
 $ cd ~/project && tp pump --phases T1 --once
-[…] Pump: … cap=4 (live via /home/you/project/.taskpump-pool-cap) …
+[…] Pump: … cap=0 (live via /home/you/project/.taskpump-pool-cap) …
 ```
 
-`TASKPUMP_POOL_CAP_FILE` or `TASKPUMP_STATE_DIR` — set in the `taskpump.conf`
-both processes discover, so they cannot diverge — fixes this.
+`TASKPUMP_WORKSPACE_ROOT` pins it explicitly, exactly as it does for the pump,
+and `TASKPUMP_POOL_CAP_FILE` / `TASKPUMP_STATE_DIR` still override the filename
+outright. It used to default to the parent of its own script directory — the
+*installation* — so from a consumer repo it wrote a cap file the pump never read
+while logging `pool cap → 0` as though it had throttled something.
 
-**And a cap file containing `0` is ignored anyway.** The shared cap reader takes
-the file's value only when it is `>= 1`, so a `0` falls through to the caller's
-own `JOBS`:
+**A cap file containing `0` means launch nothing.** The shared cap reader used to
+take the file's value only when it was `>= 1`, so the only number this watchdog
+ever writes fell through to the caller's own `JOBS`:
 
 ```
 $ echo 0 > .taskpump-pool-cap && tp pump --phases T1 --list | head -1
-tp-pump plan — phases T1, grain phase, cap 4, ceiling 95%
+tp-pump plan — phases T1, grain phase, cap 0, ceiling 95%
 $ echo 2 > .taskpump-pool-cap && tp pump --phases T1 --list | head -1
 tp-pump plan — phases T1, grain phase, cap 2, ceiling 95%
 ```
 
-So `set_cap 0` under `PAUSED` and `PANIC` does not stop the pump launching. The
-`disk-low` feed gate does, and it is the mechanism actually holding the line —
-which is why `--no-disk-gate` turning off both the gate *and* the watchdog is
-less lossy than it looks. Both of these are filed as code bugs; until they are
-fixed, treat the watchdog's reclaim and prune as its useful half and the gate as
-the thing that governs the feed.
+A file with no digits in it at all is still garbage and still falls back to
+`JOBS`. The `disk-low` feed gate remains the other half of the mechanism, so
+`--no-disk-gate` still turns off both the gate and the watchdog together.
+
+Its PANIC sweep also passes its resolved workspace to `tp cleanup` as
+`TASKPUMP_CLEANUP_REPO_ROOT`, so the reclaim runs against the workspace being
+guarded rather than against whatever `tp cleanup` would have resolved for itself.
 
 ---
 
