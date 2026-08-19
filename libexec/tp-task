@@ -2217,19 +2217,77 @@ cmd_scrub() {
 # classifies the ways a file can fail to even reach the schema checks:
 #   0 mapping parsed    1 no opening ---     2 no closing ---
 #   3 not valid YAML    4 parses, but is not a mapping
+#   5 CRLF, delimiters included         6 CRLF keys between bare delimiters
 # The delimiter checks are load-bearing, not pedantry: yq's front-matter mode
 # happily "parses" a file with no frontmatter at all (the whole body reads as a
 # YAML scalar) and treats everything after an unclosed `---` as frontmatter, so
 # without them a README.md in the tasks dir would type-check instead of being
 # named for what it is.
+#
+# 5 and 6 still PRINT the mapping: the block parsed, and the code says only
+# that the endings are CRLF (and which reader that breaks), so the caller can
+# withhold --fix while auditing the file like any other. CRLF gets codes of its
+# own because it is none of the others — the delimiters ARE `---` and yq parses
+# them, so the delimiter comparisons strip a trailing CR first; a CR-terminated
+# file used to fall out as "no YAML frontmatter", which sent the importer
+# hunting for a delimiter that was right there (issue #34). Three things about
+# these two codes are load-bearing:
+#   - they are decided LAST, below the yq parse and the mapping check, because
+#     their messages assert the block is readable. A CRLF file yq cannot parse
+#     (the unquoted-colon import, or a README carrying no mapping) is invisible
+#     to next/ready — the same verdict `scrub` prints as UNPARSEABLE/NO-ID —
+#     and telling its owner the frontier reads it would be one verb of this CLI
+#     contradicting another about the same file, in the direction that hides
+#     the failure class that matters most.
+#   - the CR is looked for across the WHOLE frontmatter block, not on line 1.
+#     The hazard they guard is that --fix rewrites that block through fm_set,
+#     which writes LF over every key line and leaves the delimiters' own
+#     endings as it found them (measured); a file whose opening delimiter is LF
+#     and whose keys are CR-terminated is exactly as unsafe to stamp, and
+#     reading line 1 alone classified it as nothing at all — so --fix converted
+#     its endings and then reported the ledger clean.
+#   - they do not stop the audit. The first cut of this returned early on a
+#     CRLF file, so the file got the CRLF line and NO other check; an operator
+#     who did what the line said and converted the endings met a second,
+#     different report — id mismatches, schema violations, dangling blockers —
+#     that had been there all along and were suppressed. Advice whose result is
+#     a fresh diagnosis is worse than no advice.
+# The 5/6 split is the SECOND reader. lib/dag-layout.awk — the DAG renderer's
+# parser, and the monitor's GRAPH tab through it — matches its delimiters as
+# /^---[ \t]*$/ and never strips a CR off a value, so one repair answers two
+# different damages: a CR on a delimiter leaves the task out of the graph
+# altogether, while a CR on the keys alone draws it from values that still
+# carry theirs — an id read that way ("T1\r") matches no other task's blocker,
+# so the node lands detached. Both are measured; each file is told which it is.
+# A CR past the closing delimiter is the body's business: fm_set never writes
+# there, nothing gets mixed, and there is nothing to report.
 fsck_read_frontmatter() {
-  local file=$1 first="" fm_json
+  local file=$1 first="" fm_json endings
   IFS= read -r first < "$file" || true
-  [[ "$first" == "---" ]] || return 1
-  awk 'NR > 1 && $0 == "---" { found = 1; exit } END { exit (found ? 0 : 1) }' "$file" || return 2
+  [[ "${first%$'\r'}" == "---" ]] || return 1
+  # One walk of the block answers all of it: is the block closed (exit status),
+  # and where its carriage returns sit (stdout) — on a delimiter, or only on
+  # the keys, which is the distinction the second reader makes.
+  endings=$(awk '
+    { line = $0; cr = sub(/\r$/, "", line) }
+    NR == 1 { if (cr) delim = 1; next }
+    line == "---" {
+      if (cr) delim = 1
+      found = 1
+      print (delim ? "delim" : (keys ? "keys" : "lf"))
+      exit
+    }
+    cr { keys = 1 }
+    END { exit (found ? 0 : 1) }
+  ' "$file") || return 2
   fm_json=$(yq --front-matter=extract -o=json -I=0 '.' "$file" 2>/dev/null) || return 3
   [[ "$(jq -r 'type' <<<"$fm_json")" == "object" ]] || return 4
   printf '%s' "$fm_json"
+  case $endings in
+    delim) return 5;;
+    keys)  return 6;;
+  esac
+  return 0
 }
 
 # The frontmatter schema of LEDGER-CONTRACT §3 as one jq program, so the check
@@ -2319,12 +2377,33 @@ fsck_check_file() {
     2) FSCK_VIOLATIONS+=("$file: frontmatter has no closing \"---\" delimiter"); return 0;;
     3) FSCK_VIOLATIONS+=("$file: frontmatter is not valid YAML between the --- delimiters"); return 0;;
     4) FSCK_VIOLATIONS+=("$file: frontmatter is not a YAML mapping of machine keys"); return 0;;
+    # 5 and 6 alone do not return: the block parsed, $fm_json is already in
+    # hand, and every check below applies to a CRLF file exactly as it does to
+    # an LF one. Returning here is what made the repair advice a trap — see
+    # fsck_read_frontmatter. Only --fix's stamping is withheld, in
+    # fsck_apply_fixes.
+    5) FSCK_VIOLATIONS+=("$file: CRLF line endings in the frontmatter, delimiters included — yq reads the block, so list/next/ready/scrub see this task, but lib/dag-layout.awk (the DAG renderer, and the monitor's GRAPH tab through it) matches a bare \"---\" and so never sees this block open and close: the task is absent from the DAG, every edge into it dropped. --fix will not stamp it either, because fm_set writes LF and stamping one key would convert the whole block's endings with it; convert it to LF and re-run");;
+    6) FSCK_VIOLATIONS+=("$file: CRLF line endings on the frontmatter keys (the \"---\" delimiters are bare) — yq reads the block, so list/next/ready/scrub see this task, but lib/dag-layout.awk (the DAG renderer, and the monitor's GRAPH tab through it) reads its values off those lines with the CR still attached, so the DAG's copy of this task is one no other reader has: an id read that way matches no blocker, and the node lands detached. --fix will not stamp it either, because fm_set writes LF and stamping one key would convert the whole block's endings with it; convert it to LF and re-run");;
   esac
 
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     FSCK_VIOLATIONS+=("$file: $line")
   done < <(jq -r --arg mode check "$FSCK_SCHEMA_JQ" <<<"$fm_json")
+
+  # Duplicate machine keys. yq's tree keeps BOTH entries, and every reader —
+  # the jq above, and fm_get in every verb — takes the last: a `status: open`
+  # above a `status: done` (the merge-conflict artifact) is a file whose human
+  # reader and whose tools disagree about what it says, and nothing named the
+  # disagreement. Counted from yq's key list rather than $fm_json because jq
+  # collapses duplicates the moment it parses the object. --fix never resolves
+  # one: which value the author meant is exactly the guess it refuses to make.
+  local dup
+  while IFS= read -r dup; do
+    [[ -z "$dup" ]] && continue
+    FSCK_VIOLATIONS+=("$file: duplicate key '$dup' (every reader takes the last value; the one a human reads first is silently dead)")
+  done < <(yq --front-matter=extract -o=json -I=0 'keys' "$file" 2>/dev/null \
+             | jq -r 'group_by(.) | map(select(length > 1) | .[0])[]')
 
   # Identity: the tools resolve a task to a path by name and read the id back
   # out of the frontmatter, so a file whose name and id disagree is reachable
@@ -2341,6 +2420,16 @@ fsck_check_file() {
   # name, so the stem is the node other tasks actually reach.
   blockers=$(jq -r 'if (.blockers | type) == "array" then .blockers[] | select(type == "string") else empty end' <<<"$fm_json")
   [[ -n "$blockers" ]] && FSCK_ADJ[$stem]=$blockers
+
+  # An empty blocker entry names nothing. The dangling check below skips it and
+  # so does the eligibility predicate (§6), so the edge is inert in every
+  # reader — consistent, but it still reads as a dependency in the file, and a
+  # blocker that is a dependency on paper and nowhere else is precisely the
+  # disagreement fsck exists to name.
+  local empty_blockers
+  empty_blockers=$(jq -r 'if (.blockers | type) == "array" then ([.blockers[] | select(. == "")] | length) else 0 end' <<<"$fm_json")
+  [[ "$empty_blockers" -gt 0 ]] \
+    && FSCK_VIOLATIONS+=("$file: blockers contains an empty entry (\"\") — it names no task, and every reader skips it: a dependency on paper and nowhere else")
 
   # Review-chain facts for the whole-ledger pass: `verdict` resolves the
   # implementation through review_of by name, so a dangling one is a chain
@@ -2505,6 +2594,14 @@ fsck_default_expr() {
 # identity is in question, and writing to it would launder a broken file into a
 # half-plausible one. Present-but-wrong values are never rewritten; the report
 # pass that follows still names them. One ledger commit covers the repair.
+#
+# A file whose frontmatter is CRLF (codes 5 and 6) is skipped by the same
+# `parse_rc != 0` gate, deliberately: fm_set writes LF, so stamping one key
+# would convert the whole block's endings with it — bytes nobody asked it to
+# touch. This is the ONLY thing a CRLF file is spared; the report pass audits
+# it in full, so converting the endings and re-running turns up nothing the
+# first run had not already named, and that second pass stamps it like any
+# other import.
 fsck_apply_fixes() {
   local file stem id fm_json parse_rc key
   local stamped_keys=0 stamped_files=0
@@ -3072,21 +3169,28 @@ Commands:
                                        docs/LEDGER-CONTRACT.md — the import
                                        path for a pre-existing markdown task
                                        DAG. Checks: frontmatter parses between
-                                       --- delimiters, id matches the filename
-                                       and TASKPUMP_ID_PATTERN, status is in
+                                       --- delimiters, its line endings are
+                                       LF, id matches the filename and
+                                       TASKPUMP_ID_PATTERN, status is in
                                        the vocabulary, machine keys have
-                                       contract-legal types, every blocker
-                                       resolves, no self-blocks, no blocker
+                                       contract-legal types, no key appears
+                                       twice, every blocker resolves and none
+                                       is empty, no self-blocks, no blocker
                                        cycles, review_of resolves (never to
                                        the task itself), review_role is
-                                       reviewer|adjudicator. One line per
-                                       violation
-                                       (<file>: <what>); exit 3 when any
-                                       exist, 0 clean, 1 = fsck itself failed.
+                                       reviewer|adjudicator. A file whose
+                                       block parses gets every check, CRLF
+                                       endings included. One line per
+                                       violation (<file>: <what>); exit 3
+                                       when any exist, 0 clean, 1 = fsck
+                                       itself failed.
                                        --fix stamps MISSING machine keys with
                                        their documented defaults as one ledger
                                        commit; a present-but-wrong value is
-                                       reported, never rewritten.
+                                       never rewritten, a duplicate key is
+                                       never resolved, and a file whose
+                                       frontmatter is CRLF is not written at
+                                       all.
   resolve [--tasks-dir|--code-repo|--all]
                                      Print which workspace's ledger this
                                        invocation resolves to. Use it when a
