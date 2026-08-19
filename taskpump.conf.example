@@ -337,19 +337,21 @@
 #                           #   What the container copies is TASKPUMP_AGENT_HOME.
 
 # ── Gate: disk-low (gates/disk-low) ──────────────────────────────────────────
-# TASKPUMP_DISK_GATE=       # 0 disables the low-disk feed gate for a HAND-RUN gate
-#                           #   (default: 1). Under tp-pump it decides nothing: the pump
-#                           #   hardcodes 1 and exports it over your value, so only
-#                           #   --no-disk-gate (or dropping the gate from TASKPUMP_GATES)
-#                           #   takes it out of the chain.
+# TASKPUMP_DISK_GATE=       # 0 disables the low-disk feed gate (default: 1). Under
+#                           #   tp-pump it drops disk-low from the default chain AND
+#                           #   suppresses the background disk watchdog, which is
+#                           #   guarded on the same switch — exactly what
+#                           #   --no-disk-gate does, standingly rather than per run.
 # TASKPUMP_DISK_WATCHDOG=   # path to the watchdog the gate consults
 #                           #   (default: <install>/libexec/tp-disk-watchdog)
 # The floor itself is TASKPUMP_DISK_PAUSE_GB, under the watchdog section below.
 
 # ── Gate: claude-usage (gates/claude-usage) ──────────────────────────────────
-# TASKPUMP_USAGE_GATE=      # 0 disables the usage gate for a HAND-RUN gate (default: 1).
-#                           #   Under tp-pump it decides nothing, exactly as
-#                           #   TASKPUMP_DISK_GATE above: use --no-usage-gate.
+# TASKPUMP_USAGE_GATE=      # 0 disables the usage gate (default: 1). Under tp-pump it
+#                           #   drops claude-usage from the default chain and reaches the
+#                           #   gate as 0, so an entry kept in a custom TASKPUMP_GATES
+#                           #   disables itself too. --no-usage-gate is the same
+#                           #   instruction for one run, and wins over the key.
 # TASKPUMP_USAGE=           # path to the usage-gate binary
 #                           #   (default: <install>/gates/claude-usage)
 # TASKPUMP_USAGE_CEILING=   # utilization percent at which to pause launching (default: 95)

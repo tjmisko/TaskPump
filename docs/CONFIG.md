@@ -340,9 +340,6 @@ meeting one for the first time during an unattended run is a day.
   there while `tp pump`, `tp monitor` and `tp dag-render` honour it. The pump's
   frontier comes from that CLI, so the two halves disagree and the pump reports
   the range drained. Write `TASKPUMP_LEDGER_PROBE`.
-- **`TASKPUMP_USAGE_GATE` and `TASKPUMP_DISK_GATE` are not switches under the
-  pump.** The pump hardcodes both to 1 and exports them over whatever the
-  operator set; only `--no-usage-gate` / `--no-disk-gate` drop those gates.
 - **`TASKPUMP_TASK_EXT` does not change the ledger.** `tp task` hardcodes `.md`.
   The key only tells the *readers* (`tp monitor`, `tp dag-render`, the container
   entrypoint) to look for a different extension, which desynchronises them from
@@ -676,7 +673,7 @@ container the shipped runner starts.
 | Key | Read by | Default | What it configures |
 |---|---|---|---|
 | `TASKPUMP_GATES` | `tp pump` | `gates/claude-token-fresh`, `<usage bin> --gate`, `gates/disk-low` — plus `gates/net-health` at the head when `TASKPUMP_HEALTH_GATE=1` | The ordered gate list. A configured value replaces the chain outright and is used verbatim. |
-| `TASKPUMP_USAGE_GATE` | `gates/claude-usage` | `1` — **and the pump overwrites it** | Whether the usage gate answers. The pump hardcodes `1` and exports it over the operator's value: see below. |
+| `TASKPUMP_USAGE_GATE` | `tp pump`, `gates/claude-usage` | `1` | Whether the usage gate is in the default chain and answers. `0` drops `<usage bin> --gate` from the chain and reaches the gate as `0`, so a `claude-usage` entry kept in a custom `TASKPUMP_GATES` disables itself too. `--no-usage-gate` forces `0` for one run. |
 | `TASKPUMP_USAGE` | `tp pump`, `tp monitor` | `<install>/gates/claude-usage` | The binary that answers the usage question. |
 | `TASKPUMP_USAGE_CEILING` | `tp pump`, `gates/claude-usage` | `95` | The utilization percent at which launching pauses. `--usage-ceiling` overrides for a run. |
 | `TASKPUMP_USAGE_ENDPOINT` | `gates/claude-usage` | `https://api.anthropic.com/api/oauth/usage` | The OAuth usage endpoint. |
@@ -691,20 +688,22 @@ container the shipped runner starts.
 | `TASKPUMP_HEALTH_WINDOW` | `tp pump`, `gates/net-health` | `120` | How many seconds back the gate looks. |
 | `TASKPUMP_HEALTH_PROBE_CMD` | `lib/pump-lib.sh` | empty ⇒ `journalctl -k -b 0 --since '<window> sec ago'` | The command whose output is searched. |
 | `TASKPUMP_HEALTH_SIGNATURES` | `lib/pump-lib.sh` | `Failed to alloc SKB\|Firmware reported general error\|Timeout on response for query command` | The failure signatures it matches. The shipped set is one machine's WiFi firmware; a consumer enabling the gate on other hardware replaces them. |
-| `TASKPUMP_DISK_GATE` | `lib/pump-lib.sh`, `gates/disk-low` | `1` — **and the pump overwrites it** | Whether the low-disk gate answers. Its floor is `TASKPUMP_DISK_PAUSE_GB`, shared with the watchdog (§3.7). |
+| `TASKPUMP_DISK_GATE` | `tp pump`, `lib/pump-lib.sh`, `gates/disk-low` | `1` | Whether the low-disk gate is in the default chain and answers. Its floor is `TASKPUMP_DISK_PAUSE_GB`, shared with the watchdog (§3.7). `0` also suppresses the auto-started disk watchdog, exactly as `--no-disk-gate` does — the spawn is guarded on the same switch. |
 | `TASKPUMP_DISK_WATCHDOG` | `tp pump`, `gates/disk-low`, `lib/pump-lib.sh` | `<install>/libexec/tp-disk-watchdog` | The watchdog binary the gate asks for the free-space answer. |
 
-**Two of these enable-flags do nothing under `tp pump`.** The pump assigns
-`USAGE_GATE=1` and `DISK_GATE=1` as literals — only `--no-usage-gate` and
-`--no-disk-gate` move them — and then exports `TASKPUMP_USAGE_GATE` and
-`TASKPUMP_DISK_GATE` into every gate's environment from those literals, so an
-operator's value is overwritten before any gate reads it.
-`TASKPUMP_USAGE_GATE=0 tp pump --dry-run` still prints
-`gates: claude-token-fresh -> claude-usage -> disk-low`, and so does
-`TASKPUMP_DISK_GATE=0`. Both keys work as documented when the gate script is run
-by hand. Use the flags for a run, or drop the gate from `TASKPUMP_GATES`
-permanently. `TASKPUMP_TOKEN_GATE` and `TASKPUMP_HEALTH_GATE` are not clobbered
-this way and do what they say.
+**All four enable-flags mean the same thing under `tp pump` and standalone.**
+`TASKPUMP_USAGE_GATE` and `TASKPUMP_DISK_GATE` used to be the exceptions: the
+pump assigned `USAGE_GATE=1` / `DISK_GATE=1` as literals, read neither key, and
+then exported `TASKPUMP_USAGE_GATE` and `TASKPUMP_DISK_GATE` into every gate's
+environment *from those literals* — so `TASKPUMP_USAGE_GATE=0 tp pump --dry-run`
+printed `gates: claude-token-fresh -> claude-usage -> disk-low` and the gate
+itself read its own switch back as `1`. Both keys are now read where
+`TASKPUMP_HEALTH_GATE` always was, so `TASKPUMP_USAGE_GATE=0` and
+`--no-usage-gate` are the same instruction with different lifetimes: the key is
+a standing preference, the flag is about one run, and the flag wins when both
+are given. One consequence worth knowing: `TASKPUMP_DISK_GATE=0` now also
+suppresses the auto-started disk watchdog, because that spawn is guarded on the
+same switch ([PUMP-MECHANISMS.md §3](PUMP-MECHANISMS.md#3-budget-gated-launching-that-never-kills-in-flight-work)).
 
 ### 3.5 Monitor — `tp monitor`
 

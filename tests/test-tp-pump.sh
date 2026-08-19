@@ -1355,6 +1355,90 @@ out=$(TASKPUMP_GATES="$GBIN/pause-quota" pump F56)
 have "$out" '^gates: pause-quota$' && pass "a custom TASKPUMP_GATES chain is named verbatim" \
   || fail "custom chain not named:\n$out"
 
+echo "--- Test 24c: the usage and disk gate KEYS mean what the flags mean ---"
+# The pump pinned USAGE_GATE=1 / DISK_GATE=1 as literals and read neither key,
+# and export_gate_env then wrote those literals over the operator's value. So a
+# conf that turned either gate off got a run where the gate was still in the
+# chain, still ran, and still read its OWN switch back as 1 — a switch that
+# looked set from every side and metered anyway. TASKPUMP_HEALTH_GATE (which
+# reads its key) and TASKPUMP_TOKEN_GATE (which the pump never exports) were the
+# counter-examples that made the asymmetry hard to see.
+out=$(TASKPUMP_USAGE_GATE=0 pump F56)
+have "$out" '^gates: claude-token-fresh -> disk-low$' \
+  && pass "should drop the usage gate from the chain when TASKPUMP_USAGE_GATE=0" \
+  || fail "TASKPUMP_USAGE_GATE=0 left the usage gate in the chain:\n$out"
+out=$(TASKPUMP_DISK_GATE=0 pump F56)
+have "$out" '^gates: claude-token-fresh -> arachne-usage$' \
+  && pass "should drop the disk gate from the chain when TASKPUMP_DISK_GATE=0" \
+  || fail "TASKPUMP_DISK_GATE=0 left the disk gate in the chain:\n$out"
+out=$(STUB_GATE_RC=10 TASKPUMP_USAGE_GATE=0 pump F56)
+have "$out" 'GATE: feed-ok' \
+  && pass "should not consult a gate the key turned off when that gate would pause" \
+  || fail "TASKPUMP_USAGE_GATE=0 still paused on the usage gate:\n$out"
+
+# And the value a gate READS back has to be the value the operator set: a gate
+# kept in a custom chain honours these switches itself (gates/claude-usage does),
+# so exporting 1 over a 0 disables the only mechanism that chain has.
+PROBEOUT="$TMP/gate-switches.txt"
+cat >| "$GBIN/probe-switches" <<EOF
+#!/usr/bin/env bash
+printf 'usage=%s disk=%s health=%s\n' \\
+  "\${TASKPUMP_USAGE_GATE:-unset}" "\${TASKPUMP_DISK_GATE:-unset}" "\${TASKPUMP_HEALTH_GATE:-unset}" >| "$PROBEOUT"
+exit 0
+EOF
+chmod +x "$GBIN/probe-switches"
+: >| "$PROBEOUT"
+out=$(TASKPUMP_GATES="$GBIN/probe-switches" TASKPUMP_USAGE_GATE=0 TASKPUMP_DISK_GATE=0 pump F56)
+[[ "$(cat "$PROBEOUT")" == "usage=0 disk=0 health=0" ]] \
+  && pass "should hand a gate the switch values the operator set, not literals" \
+  || fail "the gate process saw: $(cat "$PROBEOUT") (want usage=0 disk=0 health=0)"
+: >| "$PROBEOUT"
+out=$(TASKPUMP_GATES="$GBIN/probe-switches" pump F56)
+[[ "$(cat "$PROBEOUT")" == "usage=1 disk=1 health=0" ]] \
+  && pass "should hand a gate 1 for the two switches that default on" \
+  || fail "the gate process saw: $(cat "$PROBEOUT") (want usage=1 disk=1 health=0)"
+
+# The second-order effect of honouring the key: the disk WATCHDOG spawn is
+# guarded on the same switch, so TASKPUMP_DISK_GATE=0 now suppresses the
+# watchdog exactly as --no-disk-gate always has. Only a real run reaches that
+# branch, so this one is a real run — over an already-drained phase, so it
+# starts, decides about the watchdog, drains and exits.
+mk F97.0 done
+WDHOME="$TMP/wd-home"; mkdir -p "$WDHOME"
+cat >| "$BIN/wd-stub" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+cat >| "$BIN/norunner" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in list) exit 2;; esac
+exit 1
+EOF
+chmod +x "$BIN/wd-stub" "$BIN/norunner"
+real_run() {  # a REAL run (no NO_LAUNCH) over the drained phase F97; env from the caller
+  TASKPUMP_NOTIFY_CMD=true TASKPUMP_STAGGER=0 \
+  TASKPUMP_GATES="${TASKPUMP_GATES:-$GBIN/feed-ok}" \
+  TASKPUMP_PRE_TICK_HOOKS=' ' TASKPUMP_HOOK_MARK_FILE="$TMP/wd.mark" \
+  TASKPUMP_DISK_WATCHDOG="$BIN/wd-stub" TASKPUMP_DISK_WATCHDOG_LOG="$TMP/wd.log" \
+  TASKPUMP_AGENT_HOME="$WDHOME" TASKPUMP_IMAGE=stub-image TASKPUMP_IMAGE_BUILD= \
+  TASKPUMP_RUNNER="$BIN/norunner" \
+  ARACHNE_PUMP_OPS_DIR="$TMP/noops" ARACHNE_PUMP_STATE_FILE="$TMP/wd.state" \
+  ARACHNE_POOL_CAP_FILE="$TMP/wd.cap" ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+  timeout 30 "$PUMP" --no-health-gate --phases F97 --tick 1 "$@"
+}
+out=$(real_run 2>&1)
+have "$out" 'disk watchdog started' && pass "should start the disk watchdog on a real run by default" \
+  || fail "no watchdog on the default real run:\n$out"
+out=$(TASKPUMP_DISK_GATE=0 real_run 2>&1)
+have "$out" 'disk watchdog started' \
+  && fail "TASKPUMP_DISK_GATE=0 still started the disk watchdog:\n$out" \
+  || pass "should suppress the disk watchdog when TASKPUMP_DISK_GATE=0"
+out=$(real_run --no-disk-gate 2>&1)
+have "$out" 'disk watchdog started' \
+  && fail "--no-disk-gate still started the disk watchdog:\n$out" \
+  || pass "should suppress the disk watchdog when --no-disk-gate is passed"
+rm -f "$TASKS/F97.0.md"
+
 echo "--- Test 25: pre-tick hooks are a chain too ---"
 HBIN="$TMP/hooks"; mkdir -p "$HBIN"
 cat >| "$HBIN/quiet" <<'EOF'

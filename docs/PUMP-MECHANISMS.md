@@ -327,10 +327,14 @@ running build is never broken; and it delegates to `tp cleanup --targets`, which
 does nothing at all unless `TASKPUMP_RECLAIM_CMD` is configured — so an
 unconfigured consumer gets the cap drop and the prune and no deletion. Setting
 that key is what arms the rest. `TASKPUMP_PANIC_RECLAIM=0` keeps the prune and
-drops the build-dir reclaim, and the **flag** `--no-disk-gate` suppresses the
-watchdog spawn along with the gate — the flag, and not the `TASKPUMP_DISK_GATE`
-key, which does not reach this decision at all
-([GATES.md §2.1](GATES.md#21-turning-a-default-gate-off-is-not-symmetric)).
+drops the build-dir reclaim, and turning the disk gate off suppresses the
+watchdog spawn along with the gate — **either way of turning it off**, the flag
+`--no-disk-gate` or the key `TASKPUMP_DISK_GATE=0`, because the spawn is guarded
+on the one switch both of them set. (The key used to be inert here: the pump
+pinned that switch to `1` and read no key, so only the flag reached this
+decision. It now does what it says, which means a conf carrying
+`TASKPUMP_DISK_GATE=0` and expecting the watchdog to keep running loses the
+watchdog — see [GATES.md §2.1](GATES.md#21-turning-a-default-gate-off-is-not-symmetric).)
 
 The reclaim pass *inside* the tick (step 7) is the narrower of the two: it
 touches only the workspaces the plan just filed as `DONE`, never the primary,

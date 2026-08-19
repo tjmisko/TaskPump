@@ -33,7 +33,7 @@ so a gate reads the value actually in force rather than the one in the file:
 | Exported | Why a gate cares |
 |---|---|
 | `TASKPUMP_USAGE_CEILING` | `--usage-ceiling 80` reaches the gate as `80`; nothing wrote it to a conf. |
-| `TASKPUMP_HEALTH_GATE`, `TASKPUMP_USAGE_GATE`, `TASKPUMP_DISK_GATE` | The run's own enable switches, so a gate kept in a custom chain can still honour them (§2.1 — note the pump *overwrites* two of these). |
+| `TASKPUMP_HEALTH_GATE`, `TASKPUMP_USAGE_GATE`, `TASKPUMP_DISK_GATE` | The run's own enable switches — the operator's values, with the `--no-*-gate` flags applied — so a gate kept in a custom chain can still honour them (§2.1). |
 | `TASKPUMP_HEALTH_WINDOW`, `TASKPUMP_USAGE_RESET_FILE`, `TASKPUMP_DISK_WATCHDOG` | The shipped gates' plumbing: `net-health`'s journal window, and two paths the pump has already resolved so a gate never has to guess where they are. |
 | `TASKPUMP_CREDENTIALS` | Derived from the agent home **only when unset** — an operator's own value is never clobbered by a derivation of itself. |
 
@@ -174,30 +174,30 @@ by hand still needs `TASKPUMP_HEALTH_GATE=1` to actually probe anything.
 
 ### 2.1 Turning a default gate off is not symmetric
 
-Three different mechanisms hide behind "turn the gate off", and only one of them
-does what the phrase suggests. This is the shape of it today, and it is worth a
-minute because two of the three are traps:
+Every one of these keys now reaches the run, but the four gates still differ in
+what "off" *looks like*, and one of them is worth a minute:
 
-| Gate | Flag | Conf key | What the key actually does |
+| Gate | Flag | Conf key | What the key does |
 |---|---|---|---|
-| `net-health` | `--no-health-gate` | `TASKPUMP_HEALTH_GATE=1` | Works, and is the only way *in*: the gate is off by default and the key is what adds it to the chain. The flag is the way back out, and it wins over the key — `--no-health-gate` drops the gate from the chain even when the key asked for it. |
-| `claude-usage` | `--no-usage-gate` | `TASKPUMP_USAGE_GATE` | **Nothing.** The pump initialises this switch to 1 unconditionally and re-exports it to every gate, overwriting whatever the conf or the environment said. |
-| `disk-low` | `--no-disk-gate` | `TASKPUMP_DISK_GATE` | **Nothing**, for the same reason — and the flag additionally suppresses the background disk watchdog ([PUMP-MECHANISMS.md §3](PUMP-MECHANISMS.md#3-budget-gated-launching-that-never-kills-in-flight-work)). |
+| `net-health` | `--no-health-gate` | `TASKPUMP_HEALTH_GATE=1` | The only way *in*: the gate is off by default and the key is what adds it to the chain. The flag is the way back out, and it wins over the key — `--no-health-gate` drops the gate from the chain even when the key asked for it. |
+| `claude-usage` | `--no-usage-gate` | `TASKPUMP_USAGE_GATE=0` | Drops `<usage bin> --gate` from the default chain, and reaches the gate as `0` — so a `claude-usage` entry kept in a custom `TASKPUMP_GATES` disables itself too. The flag is the same instruction for one run, and wins when both are given. |
+| `disk-low` | `--no-disk-gate` | `TASKPUMP_DISK_GATE=0` | The same, **and** — key or flag alike — it suppresses the background disk watchdog, whose spawn is guarded on the same switch ([PUMP-MECHANISMS.md §3](PUMP-MECHANISMS.md#3-budget-gated-launching-that-never-kills-in-flight-work)). Turning the disk gate off turns off both halves of the disk story. |
 | `claude-token-fresh` | — | `TASKPUMP_TOKEN_GATE=0` | Reaches the gate, which returns "feed" immediately and **silently** (`lib/pump-lib.sh:516` returns before any output). But there is **no `--no-token-gate` flag**, and the gate is emitted into the default chain unconditionally, so it stays on the `gates:` line whether it is doing anything or not. Do not read a `skipped:` line as the sign of a disabled gate — that note means the gate ran and could not find usable credentials. |
 
-Demonstrated, not inferred: a run started with `TASKPUMP_DISK_GATE=0
-TASKPUMP_USAGE_GATE=0 TASKPUMP_TOKEN_GATE=0` in its environment hands a probe
-gate `disk_gate=1 usage_gate=1 token_gate=0`.
+So the asymmetry that remains is only the token gate's: **disabling it leaves it
+on the `gates:` line**, answering "feed" from inside, because the chain is
+assembled without consulting that key. For the other three, the `gates:` line is
+the answer — a gate you turned off is not on it.
 
-So: **to drop the usage or disk gate, pass the flag.** Setting the key looks
-like it worked — no warning, no diagnostic — and the gate goes on metering. And
-do not read a missing gate off the `gates:` line for the token gate: disabling
-it leaves it in the chain, answering "feed" from inside.
-
-This is a divergence between the tools and the keys `docs/CONFIG.md` documents,
-not a design. It is filed as a bug; a patch release may not change which
-switches work, but it can stop the documentation from promising the ones that
-do not.
+Before this release the usage and disk keys were traps: the pump pinned `USAGE_GATE=1`
+and `DISK_GATE=1` as literals, read neither key, and then exported those
+literals to every gate — so a run started with `TASKPUMP_DISK_GATE=0
+TASKPUMP_USAGE_GATE=0 TASKPUMP_TOKEN_GATE=0` handed a probe gate
+`disk_gate=1 usage_gate=1 token_gate=0`, and both gates went on metering with no
+warning and no diagnostic. If you have a conf written against that behaviour —
+one that sets a key *and* passes the flag, or that sets `TASKPUMP_DISK_GATE=0`
+while expecting the watchdog to keep running — this is the release that changes
+what it does.
 
 ### `claude-usage` — plan utilization
 

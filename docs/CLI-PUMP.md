@@ -35,8 +35,8 @@ actually accepts — which is not uniform, and the irregularity has teeth (§1.1
 | `--resume-max N` | space or `=` | No-progress resume attempts before a stalled task is escalated. The bare form validates `^[1-9][0-9]*$`; **the `=` form does not** (§1.1). |
 | `--no-resume-stalled` | no value | Disables stalled-orphan detection entirely. |
 | `--no-health-gate` | no value | Drops `net-health` from the default chain and exports `TASKPUMP_HEALTH_GATE=0`. |
-| `--no-usage-gate` | no value | Drops `claude-usage --gate` from the default chain and exports `TASKPUMP_USAGE_GATE=0`. |
-| `--no-disk-gate` | no value | Drops `disk-low` from the default chain **and** suppresses the auto-started disk watchdog (§9). |
+| `--no-usage-gate` | no value | Drops `claude-usage --gate` from the default chain and exports `TASKPUMP_USAGE_GATE=0`. `TASKPUMP_USAGE_GATE=0` in the environment or a conf does the same thing standingly; the flag wins when both are given. |
+| `--no-disk-gate` | no value | Drops `disk-low` from the default chain **and** suppresses the auto-started disk watchdog (§9). `TASKPUMP_DISK_GATE=0` does the same thing standingly, watchdog included — it is the same switch. |
 | `--dry-run` | no value | Print the gate chain and the plan; launch nothing; exit 0. |
 | `--list` | no value | Print the plan only; exit 0. |
 | `--once` | no value | Run one real tick, stamp `stopped`, exit 0. |
@@ -457,10 +457,12 @@ not "its configuration" wholesale: `TASKPUMP_HEALTH_GATE`, `TASKPUMP_USAGE_GATE`
 `TASKPUMP_DISK_GATE`, `TASKPUMP_HEALTH_WINDOW`, `TASKPUMP_USAGE_CEILING`,
 `TASKPUMP_USAGE_RESET_FILE`, `TASKPUMP_CREDENTIALS` and
 `TASKPUMP_DISK_WATCHDOG`, plus the legacy `HEALTH_GATE`, `HEALTH_WINDOW` and
-`ARACHNE_USAGE_RESET_FILE`. `TASKPUMP_CREDENTIALS` is derived from the agent home
-**only when unset** — an operator's explicit value is never clobbered by a
-derivation of itself. Everything else a gate wants, it discovers for itself the
-way any tool does.
+`ARACHNE_USAGE_RESET_FILE`. The three `*_GATE` switches carry the value in force
+for this run — the operator's key with the matching `--no-*-gate` flag applied —
+so a gate kept in a custom chain reads back what was actually asked for.
+`TASKPUMP_CREDENTIALS` is derived from the agent home **only when unset** — an
+operator's explicit value is never clobbered by a derivation of itself.
+Everything else a gate wants, it discovers for itself the way any tool does.
 
 **Pre-tick hooks** have no document of their own; this is their contract. The
 default chain is `hooks/gitignore-repair` then `hooks/fs-guard`;
@@ -548,7 +550,8 @@ Two of them are worth knowing before you start an unattended run:
   `TASKPUMP_PUMP_NO_LAUNCH` unset, it launches
   `nohup tp-disk-watchdog --auto-exit` in the background, logging to
   `TASKPUMP_DISK_WATCHDOG_LOG`, and says so: `disk watchdog started (cap-file
-  path; log: …)`. `--no-disk-gate` suppresses it along with the gate. The
+  path; log: …)`. Turning the disk gate off suppresses it along with the gate —
+  `--no-disk-gate` or `TASKPUMP_DISK_GATE=0`, the same switch either way. The
   watchdog retires itself once no agents remain. Note the caveat in
   [CLI-TOOLS.md](CLI-TOOLS.md#tp-disk-watchdog) about which cap file it actually
   writes.
