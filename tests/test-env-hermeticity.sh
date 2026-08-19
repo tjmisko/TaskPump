@@ -28,16 +28,28 @@
 #   * the COVERAGE — every tests/test-*.sh and run-all.sh source the shared
 #     prologue, so a future suite that forgets it fails here, loudly;
 #   * the CENTRAL guard, end to end — run-all.sh launches a real
-#     legacy-spelled suite green under the poisoned environment.
+#     legacy-spelled suite green under the poisoned environment;
+#   * the RUN STATE (B16) — the leak in the other direction. A real tick, run
+#     the way a suite helper that pins nothing would run it, must not leave the
+#     pump's hook mark file in the checkout the suites run FROM;
+#   * the GATE that would have caught that — run-all.sh's state manifest,
+#     driven for real against throwaway repos: what it sees, what it names, and
+#     what it refuses to claim about who wrote a file.
 #
 # Two ledgers that answer `ready --count` differently are the tracer:
 # whichever ledger answered is unambiguous from the number alone.
 #
+# Sections 1-5 exercise tp-task only; section 6 runs a real tp-pump tick, so
+# this suite depends on libexec/tp-pump as well.
+#
 # Run: ./tests/test-env-hermeticity.sh   (offline)
 set -uo pipefail
 
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
-TP_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+# CDPATH='' rather than `CDPATH= `: the same env prefix, but shellcheck reads
+# the spelling with the space as a mistyped assignment (SC1007), and this suite
+# has to lint clean for that warning to mean anything here.
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
+TP_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd)
 CLI="$TP_ROOT/libexec/tp-task"
 PROLOGUE="$SCRIPT_DIR/suite-prologue.sh"
 
@@ -131,10 +143,10 @@ leftover=$(env TASKPUMP_TASKS_DIR="$PUMP_TASKS" TP_TASKS_DIR="$PUMP_TASKS" \
              ARACHNE_ZZ_FUTURE_KEY=poison TASKPUMPX_BYSTANDER=keep \
              bash -c '. "$1"; compgen -e TASKPUMP_; compgen -e TP_; compgen -e ARACHNE_; true' \
              _ "$PROLOGUE" | LC_ALL=C sort)
-expected=$'ARACHNE_NOTIFY_CMD\nTASKPUMP_NOTIFY_CMD\nTASKPUMP_NO_CONF'
+expected=$'ARACHNE_NOTIFY_CMD\nTASKPUMP_HOOK_MARK_FILE\nTASKPUMP_NOTIFY_CMD\nTASKPUMP_NO_CONF'
 [[ "$leftover" == "$expected" ]] \
   && pass "the scrub leaves exactly the hermetic baseline, invented keys included" \
-  || fail "post-scrub namespace was '$(tr '\n' ' ' <<<"$leftover")', expected exactly the baseline three"
+  || fail "post-scrub namespace was '$(tr '\n' ' ' <<<"$leftover")', expected exactly the baseline four"
 
 got=$(env TASKPUMPX_BYSTANDER=keep \
         bash -c '. "$1"; printf "%s" "${TASKPUMPX_BYSTANDER:-gone}"' _ "$PROLOGUE")
@@ -187,6 +199,216 @@ out=$(env TASKPUMP_TASKS_DIR="$PUMP_TASKS" TP_TASKS_DIR="$PUMP_TASKS" \
 grep -q 'All 1 suite(s) passed' <<<"$out" \
   && pass "the nested run reports the suite green" \
   || fail "nested run-all summary did not report 1 passing suite"
+
+# ── 6. Run state: a fixture must not write the caller's checkout (B16) ───────
+echo
+echo "--- run state: the pump's hook mark file is redirected out of the checkout ---"
+
+# The leak the other four sections do not cover runs the OTHER way. tp-pump
+# resolves its dotfiles to $TASKPUMP_STATE_DIR, defaulting to the workspace
+# root — and a suite helper that runs a real tick without cding or pinning a
+# workspace resolves that, through the cwd rung, to the TaskPump checkout the
+# suites are running FROM. run_pre_tick_hooks WRITES the mark file when the
+# hooks have something to say and `rm -f`s it when they go quiet, so on
+# 2026-08-19 a suite run deleted and rewrote the operator's live
+# .taskpump-fsguard.notified. .gitignore lists that name, so run-all.sh's status
+# probe reported the run green; its state manifest is the other half of the fix.
+PUMP="$TP_ROOT/libexec/tp-pump"
+
+mark=$(bash -c '. "$1"; printf "%s" "${TASKPUMP_HOOK_MARK_FILE:-<unset>}"' _ "$PROLOGUE")
+[[ "$mark" == /* && "$mark" != "$TP_ROOT"/* ]] \
+  && pass "the prologue points the hook mark file at an absolute path outside the checkout" \
+  || fail "the hook mark file default is '$mark' — unset, relative, or inside $TP_ROOT"
+
+# Behaviourally, against a directory shaped exactly like the checkout that got
+# hurt: a git repo with a tasks/ probe dir is all the cwd rung needs to answer
+# "this is the workspace". Nothing is pinned here on purpose — the tick
+# inherits only what the prologue set, which is the situation a new suite
+# helper that forgets to pin anything creates.
+WS="$TMP/ws"; mkdir -p "$WS/tasks" "$TMP/noops"
+git -C "$WS" init -q
+mk "$WS/tasks" T1
+cat >| "$TMP/hook-noisy" <<'EOF'
+#!/usr/bin/env bash
+printf 'a persistent condition worth notifying about once\n'
+EOF
+chmod +x "$TMP/hook-noisy"
+( cd "$WS" && TASKPUMP_PRE_TICK_HOOKS="$TMP/hook-noisy" \
+    TASKPUMP_PUMP_NO_LAUNCH=1 TASKPUMP_PUMP_OPS_DIR="$TMP/noops" \
+    "$PUMP" --no-health-gate --no-usage-gate --no-disk-gate --once --phases T1 \
+  ) >/dev/null 2>&1
+# The tick has to have really happened, or the two assertions below are vacuous
+# — and its OTHER dotfiles must still land in the workspace, because relocating
+# the mark file is a test-harness redirect, not a change to where a pump keeps
+# its state.
+[[ -f "$WS/.taskpump-pump.state" ]] \
+  && pass "the tick ran a real tick against the workspace the cwd rung resolved" \
+  || fail "no state file in $WS — the tick never got far enough to prove anything"
+[[ ! -e "$WS/.taskpump-fsguard.notified" ]] \
+  && pass "and left no mark file there, though its hooks had plenty to say" \
+  || fail "the tick wrote $WS/.taskpump-fsguard.notified — the default reached a repo again"
+[[ -n "${TASKPUMP_HOOK_MARK_FILE:-}" && -f "${TASKPUMP_HOOK_MARK_FILE:-}" ]] \
+  && pass "the fingerprint went to the redirect instead, so the dedup still works" \
+  || fail "no mark file at the redirect '${TASKPUMP_HOOK_MARK_FILE:-<unset>}' — did the tick reach the hooks?"
+rm -f "${TASKPUMP_HOOK_MARK_FILE:-}"
+
+# ── 7. And the gate that would have caught it ────────────────────────────────
+echo
+echo "--- run-all's state manifest: what it sees, names, and refuses to claim ---"
+
+# run-all.sh resolves the repo it guards from its own location, so a copy of it
+# in a throwaway repo guards THAT repo — which is how this can be driven for
+# real without dirtying anything. Each canary suite stands in for a helper that
+# runs an unpinned tick: it touches one of the paths the manifest guards, in the
+# repo it is running from.
+#
+# gate_repo <dir> <gitignore-body> <suite-name>:<body> ...
+# The body runs with $REPO set to the throwaway repo's root.
+gate_repo() {
+  local dir="$1" ignore="$2"; shift 2
+  rm -rf "$dir"; mkdir -p "$dir/tests"
+  git -C "$dir" init -q
+  printf '%s\n' "$ignore" >| "$dir/.gitignore"
+  cp "$SCRIPT_DIR/run-all.sh" "$SCRIPT_DIR/suite-prologue.sh" "$dir/tests/"
+  local spec
+  for spec in "$@"; do
+    {
+      printf '#!/usr/bin/env bash\nset -uo pipefail\n'
+      printf 'SCRIPT_DIR=$(CDPATH=%s cd -- "$(dirname "$0")" && pwd)\n' "''"
+      printf '. "$SCRIPT_DIR/suite-prologue.sh"\n'
+      printf 'REPO="$SCRIPT_DIR/.."\n'
+      printf '%s\n' "${spec#*:}"
+      printf 'echo "Tests: 1  Passed: 1  Failed: 0"\n'
+    } >| "$dir/tests/test-${spec%%:*}.sh"
+    chmod +x "$dir/tests/test-${spec%%:*}.sh"
+  done
+}
+
+# 7a. The base case: one gitignored run-state file appears.
+GATE="$TMP/gate"
+gate_repo "$GATE" '.taskpump-*' \
+  'canary:printf "litter\n" >| "$REPO/.taskpump-pump.state"'
+gate_out=$(bash "$GATE/tests/run-all.sh" canary 2>&1); gate_rc=$?
+[[ $gate_rc -ne 0 ]] \
+  && pass "a suite that drops a gitignored run-state file fails the run" \
+  || fail "run-all exited 0 with a state file planted; tail: $(tail -4 <<<"$gate_out" | tr '\n' ' ')"
+# The window, not a culprit: two snapshots know WHEN a path changed and cannot
+# know WHO changed it, so "during <suite>" is the whole of the attribution.
+grep -qF 'created during test-canary: .taskpump-pump.state' <<<"$gate_out" \
+  && pass "and names the file and the suite window it changed in, not a diff" \
+  || fail "the gate did not report 'created during test-canary: .taskpump-pump.state': $(tr '\n' ' ' <<<"$gate_out")"
+grep -qF "git status changed while the suites ran" <<<"$gate_out" \
+  && fail "the status probe saw the canary — the fixture is not actually gitignored" \
+  || pass "the status probe stayed blind to it, which is why the manifest exists"
+
+# 7b. A name the manifest globs but .gitignore does NOT list. Both probes fire,
+# so the manifest must not tell the reader the file is hidden from a check that
+# just reported it one line above.
+NOTIG="$TMP/gate-notignored"
+gate_repo "$NOTIG" '.taskpump-pump.state' \
+  'canary:printf "litter\n" >| "$REPO/.taskpump-agent.log"'
+notig_out=$(bash "$NOTIG/tests/run-all.sh" canary 2>&1)
+grep -qF '?? .taskpump-agent.log' <<<"$notig_out" \
+  && pass "the status probe does see a manifest name .gitignore omits" \
+  || fail "the status probe did not report .taskpump-agent.log: $(tr '\n' ' ' <<<"$notig_out")"
+grep -qF 'These files are gitignored' <<<"$notig_out" \
+  && fail "the manifest called a file gitignored that git had just listed as untracked" \
+  || pass "and the manifest does not claim the paths it names are gitignored"
+
+# 7c. .git/info/exclude: in the manifest because no status probe can see it, and
+# a path no TASKPUMP_STATE_DIR pin can move — it is derived from the repo root
+# via --git-common-dir, so the remedy text has to say so rather than prescribing
+# a state-dir pin for it.
+EXCL="$TMP/gate-exclude"
+gate_repo "$EXCL" '.taskpump-*' \
+  'canary:mkdir -p "$REPO/.git/info"; printf "# canary\n" >> "$REPO/.git/info/exclude"'
+excl_out=$(bash "$EXCL/tests/run-all.sh" canary 2>&1)
+grep -qE '(created|changed) during test-canary: .*/\.git/info/exclude' <<<"$excl_out" \
+  && pass "an edit to .git/info/exclude is named, with its window" \
+  || fail "the gate missed .git/info/exclude: $(tr '\n' ' ' <<<"$excl_out")"
+grep -qF 'NO state-dir pin moves it' <<<"$excl_out" \
+  && pass "and the remedy says a state-dir pin cannot move that one" \
+  || fail "the remedy still prescribes a state-dir pin for .git/info/exclude: $(tr '\n' ' ' <<<"$excl_out")"
+
+# 7d. Create in one suite, delete in another: the net before/after view of the
+# whole run is EMPTY, so only per-suite snapshots can see this at all.
+NETZERO="$TMP/gate-netzero"
+gate_repo "$NETZERO" '.taskpump-*' \
+  'canary-a:printf "litter\n" >| "$REPO/.taskpump-pool-cap"' \
+  'canary-b:rm -f "$REPO/.taskpump-pool-cap"'
+nz_out=$(bash "$NETZERO/tests/run-all.sh" canary 2>&1); nz_rc=$?
+[[ $nz_rc -ne 0 ]] \
+  && pass "a file created by one suite and deleted by another still fails the run" \
+  || fail "run-all exited 0 on a create/delete pair that nets to zero; tail: $(tail -4 <<<"$nz_out" | tr '\n' ' ')"
+grep -qF 'created during test-canary-a: .taskpump-pool-cap' <<<"$nz_out" \
+  && grep -qF 'deleted during test-canary-b: .taskpump-pool-cap' <<<"$nz_out" \
+  && pass "and both halves are reported against the suite window each fell in" \
+  || fail "the two windows were not both reported: $(tr '\n' ' ' <<<"$nz_out")"
+
+# 7e. A live pump in the guarded checkout writes these same files at this same
+# root, and the gate cannot tell its writes from a suite's. It must report
+# instead of blaming — and must not call the warned row a pass.
+LIVE="$TMP/gate-live"
+gate_repo "$LIVE" '.taskpump-*' \
+  'canary:printf "litter\n" >| "$REPO/.taskpump-pool-cap"'
+sleep 300 & live_pid=$!
+printf '{\n  "status": "running",\n  "pid": %d,\n  "host": "%s"\n}\n' \
+  "$live_pid" "${HOSTNAME:-$(hostname 2>/dev/null || echo unknown)}" \
+  >| "$LIVE/.taskpump-pump.state"
+live_out=$(bash "$LIVE/tests/run-all.sh" canary 2>&1); live_rc=$?
+kill "$live_pid" 2>/dev/null; wait "$live_pid" 2>/dev/null
+[[ $live_rc -eq 0 ]] \
+  && pass "a run-state change it cannot attribute does not fail the run while a pump is live here" \
+  || fail "run-all exited $live_rc with a live pump recorded; tail: $(tail -6 <<<"$live_out" | tr '\n' ' ')"
+grep -qF 'WARNING: run-state files' <<<"$live_out" \
+  && grep -qF "pid $live_pid" <<<"$live_out" \
+  && pass "it warns instead, naming the live pump it found as the reason" \
+  || fail "no WARNING naming pid $live_pid: $(tr '\n' ' ' <<<"$live_out")"
+grep -qE 'suite\(s\) passed; 1 row\(s\) above report a WARN' <<<"$live_out" \
+  && pass "and the summary does not count the warned row as a passing suite" \
+  || fail "the summary line does not distinguish the WARN row: $(tr '\n' ' ' <<<"$live_out")"
+# A scope guard on the downgrade: a live-pump record from ANOTHER host cannot be
+# verified from here, and must not be allowed to excuse a delta — one stale file
+# left by a machine that no longer exists would otherwise switch this gate off
+# for good. What it guards is new, so the behaviour half of it is not a
+# pre-repair regression (the old gate failed this case by failing everything);
+# only the wording clause is red against that version.
+rm -f "$LIVE/.taskpump-pool-cap"
+sleep 300 & foreign_pid=$!
+printf '{\n  "status": "running",\n  "pid": %d,\n  "host": "not-this-host.invalid"\n}\n' \
+  "$foreign_pid" >| "$LIVE/.taskpump-pump.state"
+foreign_out=$(bash "$LIVE/tests/run-all.sh" canary 2>&1); foreign_rc=$?
+kill "$foreign_pid" 2>/dev/null; wait "$foreign_pid" 2>/dev/null
+[[ $foreign_rc -ne 0 ]] && grep -qF 'FAIL: run-state files' <<<"$foreign_out" \
+  && pass "a live-pump record from another host does not excuse the delta" \
+  || fail "a foreign-host pump record downgraded the failure (rc=$foreign_rc): $(tr '\n' ' ' <<<"$foreign_out")"
+
+# The control, so the downgrade is not just the gate going quiet: same repo,
+# same litter, no live pump recorded.
+rm -f "$LIVE/.taskpump-pump.state" "$LIVE/.taskpump-pool-cap"
+dead_out=$(bash "$LIVE/tests/run-all.sh" canary 2>&1); dead_rc=$?
+[[ $dead_rc -ne 0 ]] \
+  && pass "with no live pump identified, the same litter fails the run" \
+  || fail "run-all exited 0 on the same litter with no live pump: $(tr '\n' ' ' <<<"$dead_out")"
+grep -qF 'FAIL: run-state files' <<<"$dead_out" \
+  && pass "and says FAIL, so the two verdicts are told apart in the text too" \
+  || fail "the failure is not headed 'FAIL: run-state files': $(tr '\n' ' ' <<<"$dead_out")"
+
+# 7f. The redirect the prologue installs moves the mark file out of the repo,
+# but a suite whose last tick still had output leaves it in $TMPDIR. run-all.sh
+# owns that litter for the runs it starts, so a full run cleans up after itself.
+MARKGATE="$TMP/gate-mark"
+gate_repo "$MARKGATE" '.taskpump-*' \
+  'canary:printf "%s\n" "$TASKPUMP_HOOK_MARK_FILE" >| "$REPO/../hookmark-path"; printf "fingerprint\n" >| "$TASKPUMP_HOOK_MARK_FILE"'
+bash "$MARKGATE/tests/run-all.sh" canary >/dev/null 2>&1
+markpath="$(cat "$TMP/hookmark-path" 2>/dev/null)"
+[[ -n "$markpath" && "$markpath" != "$MARKGATE"/* ]] \
+  && pass "a suite under run-all writes its hook fingerprint outside the repo" \
+  || fail "the canary's mark file was '$markpath' — empty, or inside the gate repo"
+[[ ! -e "$markpath" ]] \
+  && pass "and run-all's exit trap removes the fingerprint its own run left behind" \
+  || fail "$markpath survived the run that created it"
+rm -f "$markpath"
 
 echo
 echo "=============================================="

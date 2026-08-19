@@ -153,8 +153,19 @@ have "$out" 'G3\.1' && fail "phase grain leaked task ids into its plan:\n$out" |
 echo "--- 1b. the jobs cap governs total concurrent TASKS ---"
 # A NO_LAUNCH tick reports what it would have started; the cap must bind at the
 # finer grain exactly as it binds at phase grain.
+# TASKPUMP_STATE_DIR, here and on the stall tick in section 7, because these
+# are the two real ticks in this suite that pin no workspace: the pump's cwd
+# rung then resolves REPO_ROOT to the TaskPump CHECKOUT the suite runs from, and
+# any $STATE_DIR-derived name not individually redirected lands in it (B16). The
+# mark file is not one of them — it follows TASKPUMP_HOOK_MARK_FILE from
+# tests/suite-prologue.sh, which outranks $STATE_DIR, and that redirect is what
+# stopped this suite deleting the operator's live .taskpump-fsguard.notified.
+# This pin is the backstop for the rest of the family, kept so a name that stops
+# being pinned by hand cannot reach the checkout. The ticks below that set
+# TASKPUMP_WORKSPACE_ROOT are already anchored in $TMP.
 cap_tick() {  # cap_tick <jobs>
   TASKPUMP_PUMP_NO_LAUNCH=1 \
+  TASKPUMP_STATE_DIR="$TMP" \
   TASKPUMP_PUMP_OPS_DIR="$OPS" \
   TASKPUMP_PUMP_STATE_FILE="$TMP/cap.state" \
   TASKPUMP_POOL_CAP_FILE="$TMP/cap.file" \
@@ -548,7 +559,7 @@ echo "--- 7. nothing live, launchable or resumable still exits 3 ---"
 rm -f "$TASKS"/*.md
 mk G3.1 open G3.9 "libexec/tp-pump"     # blocked on a task that does not exist
 rc=0
-out=$(TASKPUMP_PUMP_NO_LAUNCH=1 TASKPUMP_PUMP_OPS_DIR="$OPS" \
+out=$(TASKPUMP_PUMP_NO_LAUNCH=1 TASKPUMP_PUMP_OPS_DIR="$OPS" TASKPUMP_STATE_DIR="$TMP" \
       TASKPUMP_PUMP_STATE_FILE="$TMP/stall.state" TASKPUMP_POOL_CAP_FILE="$TMP/stall.cap" \
       TASKPUMP_PUMP_LOG="$TMP/stall.log" STUB_LIVE="" \
       timeout 60 "$PUMP" --no-health-gate --no-usage-gate --phases G3 --grain task \

@@ -607,6 +607,38 @@ The suites are hermetic: no container runtime, no network, no real agent, and no
 checkout of any particular project. They build their fixtures in temporary
 directories and stub anything external.
 
+Hermeticity runs in both directions, and two guards hold it. `tests/suite-prologue.sh`
+closes the ways the caller's world can reconfigure a fixture — ambient
+`taskpump.conf` discovery off, the inherited `TASKPUMP_*` / `TP_*` / `ARACHNE_*`
+environment scrubbed, notifications stubbed — and the way a fixture was
+reconfiguring the caller's world: the pump's hook mark file is redirected out of
+any repository, because a suite that runs a real tick without pinning a
+workspace resolves the state dir to the checkout the suites are running *from*.
+Every suite sources it, and `run-all.sh` sources it too.
+
+`run-all.sh` then checks that claim rather than trusting it. It snapshots the
+tree around the run: `git status --porcelain`, for tracked and untracked litter,
+and a content manifest of the run-state names TaskPump writes — `.taskpump-*`,
+`.arachne-*`, `.auto-trunk*`, and `.git/info/exclude`. The manifest exists
+because the status probe is blind to most of what got hurt: `.gitignore` lists
+the run-state names (TaskPump is itself a repo a pump can be pointed at) and
+nothing under `.git/` is in the working tree at all, so a suite deleting and
+rewriting the operator's live `.taskpump-fsguard.notified` left `git status`
+empty and the run green.
+
+The manifest is re-taken after every suite, so each change is reported as
+*during `<suite>`* — the window it happened in. That is as far as two snapshots
+reach: **the gate never claims to know which process wrote a file.** Which
+matters here, because a pump pointed at this checkout writes those same files at
+that same root, and this repo's own dogfood `taskpump.conf` runs
+`./tests/run-all.sh` as its build gate. So when `run-all.sh` finds a live pump
+recorded in this checkout's `.taskpump-pump.state`, it prints the changes as a
+`WARN` row and does **not** fail the run — it cannot tell that pump's writes from
+a suite's, and will not blame the suites for them. With no live pump identified,
+the suites are the only writer the run knows of and the delta fails the run. Run
+the suites with no pump against this checkout when you want a verdict rather
+than a report.
+
 ---
 
 ## Provenance

@@ -672,6 +672,44 @@ set -e
 grep -qF "J1.md: id 'J1' does not match TASKPUMP_ID_PATTERN" <<<"$out" \
   && pass "and the pattern line names the id" || fail "pattern violation not named: '$out'"
 
+# ── the shipped fixtures are themselves conformant ───────────────────────────
+echo
+echo "--- every shipped fixture ledger passes its own fsck ---"
+# docs/LEDGER-CONTRACT.md §11.1 calls fsck "the executable form of this
+# contract", and tests/fixtures/generic-project is the reference ledger — the
+# tree README's "Try it without a project" section runs against, the one CI's
+# generic-consumer smoke drives, and the shape a consumer copies for their own
+# project. It shipped exiting 3: T1's completed_by_commits
+# held an all-digit sha, which YAML types as a NUMBER, so the §3 type check saw
+# an int where it requires a list of sha strings — and `--fix` could not repair
+# it, because a present-but-wrong value is never rewritten. The sha now carries
+# hex letters, which is the shape that cannot be mistyped whether or not the
+# author remembers to quote it.
+#
+# Every fixture, discovered rather than named, so the next one added is covered
+# without editing this. Each runs against a COPY under its OWN conf (the
+# consumer's `cd project && tp task fsck`, which is how the defect was found),
+# never against the committed tree.
+fixtures_checked=0
+while IFS= read -r fixture; do
+  fx_name="$(basename "$fixture")"
+  [[ -d "$fixture/tasks" ]] || continue
+  fixtures_checked=$((fixtures_checked + 1))
+  fx_work="$TMPDIR_TEST/shipped/$fx_name"
+  mkdir -p "$TMPDIR_TEST/shipped"
+  cp -r "$fixture" "$fx_work"
+  set +e
+  out=$(cd "$fx_work" && TASKPUMP_NO_CONF=0 "$CLI" fsck 2>&1)
+  rc=$?
+  set -e
+  [[ $rc -eq 0 && -z "$out" ]] \
+    && pass "the shipped $fx_name ledger is contract-clean out of the box" \
+    || fail "the shipped $fx_name ledger fails fsck (rc=$rc): $out"
+done < <(find "$TP_ROOT/tests/fixtures" -mindepth 1 -maxdepth 1 -type d | sort)
+[[ $fixtures_checked -gt 0 ]] \
+  && pass "the fixture sweep found $fixtures_checked ledger(s) to check" \
+  || fail "no shipped fixture ledger was found — did tests/fixtures/ move?"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"
