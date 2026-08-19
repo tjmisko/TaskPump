@@ -349,18 +349,43 @@ green, `ESC[2K\r` erases the line being read and writes another, `ESC[1A` walks
 back over the row above, and an OSC sets the window title. The panel an operator
 uses to decide whether a drain is healthy is precisely the thing worth forging.
 
-So every externally-sourced value goes through `lib/tty-safe.sh`'s
-`tp_display_safe` — TAB folded to a space, every other C0 byte, DEL and the C1
-range dropped — and it is applied where the value is **composed**, not where it
-is printed: the session records are sanitised in the background worker before
-they reach the TSV cache, because the paint path later truncates those rows to
-the terminal width and truncating a half-sanitised row is how you cut a control
-sequence in two. The GRAPH tab's node index gets the same treatment on load.
-Task **ids** are deliberately left as they are — they are the key every lookup
-and the `o` open are done by, and a rewritten key names nothing — so they are
-sanitised at their one print site instead. The monitor's own palette is composed
-*around* sanitised values and is unaffected. `--json`-shaped output and cache
-keys keep their original bytes for the same reason.
+So every value that reaches a row from a source the operator does not write —
+the ledger, the container runtime, an agent's log, the pump state file, the
+filesystem — goes through `lib/tty-safe.sh`'s `tp_display_safe`: TAB folded to a
+space, every other C0 byte and DEL dropped, and C1 dropped in both encodings it
+can arrive in (`0xC2` followed by `0x80`–`0x9F`, and a bare `0x80`–`0x9F` byte
+standing outside any UTF-8 sequence). Well-formed UTF-8 is left byte-for-byte
+alone, so the words survive. What is *not* stripped is a `0x80`–`0x9F` byte that
+is part of a legal character — `→` is `0xE2 0x86 0x92` — which a terminal
+decoding UTF-8 does not read as a control and a terminal in 8-bit mode does; see
+`lib/tty-safe.sh`'s header for why no strip can keep UTF-8 and also emit no C1
+byte.
+
+It is applied where the value is **composed**, not where it is printed: the
+session records are sanitised in the background worker before they reach the TSV
+cache, because the paint path later truncates those rows to the terminal width
+and truncating a half-sanitised row is how you cut a control sequence in two.
+The GRAPH tab's node index gets the same treatment on load, the pump summary
+line and the disk breakdown likewise. The monitor's own palette is composed
+*around* sanitised values and is unaffected.
+
+Three things are deliberately **not** covered, and all three are worth knowing:
+
+- **The GRAPH tab's canvas.** It is drawn by `tp dag-render`, and the monitor
+  prints that output as it arrives. Whatever the renderer does with a task id or
+  title is the renderer's business; the monitor sanitises the detail bar above
+  the canvas, not the canvas itself.
+- **The notes panel.** Those lines are the operator's own, typed at the `n`
+  prompt or edited into the notes file by hand, and by default they live in the
+  primary checkout — which the container runner mounts **read-only**, so an
+  agent has no path to them. They are printed as written.
+- **The task id in the GRAPH index.** It is the key every lookup and the `o`
+  open are done by, and a rewritten key names nothing, so it is kept raw and
+  sanitised at its one print site (the detail bar) instead. The SESSIONS cache
+  is the other way round: there the id is a *field* of a TSV record, so it is
+  sanitised with the rest of the row and `o` on that tab opens by the sanitised
+  value — a task whose id carried control bytes would not open from there.
+  `tp task create` refuses to make such an id (`TASKPUMP_ID_PATTERN`).
 
 ---
 
@@ -529,10 +554,14 @@ a quiet run prints nothing between the tool calls.
 written by somebody else — an agent's narration, a tool call's arguments, and,
 worst, the stdout of a command the agent ran over whatever the repository
 contains. So each is passed through `lib/tty-safe.sh`'s `tp_display_safe`, which
-folds TAB to a space and drops every other C0 byte, DEL and the C1 range; the
-words survive, the control sequences do not. The colours above are the only
-escapes the tool emits, and they wrap the sanitised text rather than coming out
-of it.
+folds TAB to a space and drops every other C0 byte, DEL, and C1 in both
+encodings — `0xC2` followed by `0x80`–`0x9F`, and a bare `0x80`–`0x9F` byte
+standing outside any UTF-8 sequence. The words survive and well-formed UTF-8 is
+untouched, which is also the limit of it: a `0x80`–`0x9F` byte inside a legal
+multi-byte character is kept, and on a terminal running in 8-bit mode that byte
+is a control (`lib/tty-safe.sh`'s header says why no strip can have it both
+ways). The colours above are the only escapes the tool emits, and they wrap the
+sanitised text rather than coming out of it.
 
 This is not hypothetical hardening. The printer used `echo -e`, which *expands*
 backslash escapes — so a literal `\e[2J` sitting in a test fixture, harmless in

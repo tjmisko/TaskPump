@@ -27,8 +27,8 @@
 # Run: ./tests/test-tp-stream-fmt.sh   (offline)
 set -uo pipefail
 
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
-TP_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
+TP_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd)
 CLI="$TP_ROOT/libexec/tp-stream-fmt"
 
 # Hermeticity: the shared prologue ignores any taskpump.conf in the repo this
@@ -47,11 +47,26 @@ fail() { printf 'FAIL: %s\n' "$*" >&2; FAIL=$((FAIL + 1)); }
 [[ -x "$CLI" ]] || { echo "FAIL: tp-stream-fmt not found at $CLI" >&2; exit 1; }
 
 ESC=$'\033'
-# The tool's own colours are the seven constants at the top of the file, all of
-# the shape ESC [ 0 … m. Strip that shape; an ESC left over is one the tool
-# would never have emitted.
-strip_palette() { sed -r 's/\x1b\[0[0-9;]*m//g'; }
+# The tool's own colours, read out of the tool's own source rather than matched
+# by shape. Stripping the SHAPE (ESC [ 0 … m) would also swallow an injected
+# `ESC[0;5m` blink or `ESC[0;30;40m` black-on-black — payloads that hide a row as
+# effectively as conceal — and the count assertion below would then be counting
+# an attacker's escapes as the palette's. These are the literal strings the
+# printer can emit; anything else left in the output is not ours.
+mapfile -t PALETTE < <(sed -n "s/^[A-Z_][A-Z_]*=\\\$'\\\\033\\[\\([0-9;]*\\)m'.*/\\1/p" "$CLI" | sort -u)
+[[ ${#PALETTE[@]} -ge 6 ]] \
+  && pass "the palette was read from the tool's own constants (${#PALETTE[@]} of them)" \
+  || fail "could not read the palette out of $CLI; the strip below would be meaningless"
+strip_palette() {
+  local prog='' p
+  for p in "${PALETTE[@]}"; do prog+="s/\\x1b\\[${p}m//g;"; done
+  sed -e "$prog"
+}
 esc_count() { tr -cd "$ESC" | wc -c | tr -d ' '; }
+# Raw 8-bit C1 (0x80-0x9F). On a terminal in 8-bit mode 0x9B *is* CSI, and this
+# tool emits nothing outside ASCII plus the palette, so any of these bytes in the
+# output came from the stream.
+c1_count() { LC_ALL=C tr -cd '\200-\237' | wc -c | tr -d ' '; }
 
 # ── The fixture ──────────────────────────────────────────────────────────────
 # One record per print path, each carrying BOTH payload shapes: a literal
@@ -68,6 +83,17 @@ STREAM="$WORK/stream.jsonl"
   printf '%s\n' '{"type":"tool_result","tool":"Bash","output":"error: real failure here\nline two \u001b[1A\u001b[2K  0 errors, all tests passed"}'
   printf '%s\n' '{"type":"result","result":"done \u001b[5mBLINK","cost_usd":0.5,"num_turns":3}'
   printf '%s\n' 'plain ERROR passthrough \e[2Kforged'
+  # The same attack in its 8-bit form. C1 has two encodings and only one of them
+  # is an ESC: the byte 0x9B *is* CSI on a terminal in 8-bit mode, 0x9D is OSC,
+  # 0x9C is ST. A strip that drops ESC and the UTF-8 spelling (0xC2 0x9B) but not
+  # the bare byte leaves exactly the encoding that is dangerous in the one
+  # situation the strip exists for. Written on a passthrough line because a JSON
+  # document may not carry a bare 0x9B.
+  printf 'plain ERROR raw8 \233[1;32mGREEN \233[2K \235PWNED8BIT\234 done\n'
+  # And the same character in its UTF-8 spelling: the two bytes 0xC2 0x9B, sat
+  # directly in the JSON string. That is the encoding a terminal decoding UTF-8
+  # really does execute as CSI, so it is the half that must never survive.
+  printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"utf8c1 [1;32mGREEN2"}]}}'
 } >| "$STREAM"
 
 # The fixture itself is proof of half the attack: on disk it holds no raw ESC
@@ -96,10 +122,28 @@ for payload in "${ESC}]0;PWNEDTITLE" "${ESC}[1A" "${ESC}[2K" "${ESC}[2J" "${ESC}
   fi
 done
 
+# The 8-bit half. ESC is not the only way to say CSI: the single byte 0x9B is
+# CSI, 0x9D is OSC and 0x9C is ST on a terminal in 8-bit mode, and a strip built
+# out of [[:cntrl:]] plus the UTF-8 form covers neither. The tool prints nothing
+# outside ASCII and its own palette, so one of these bytes in the output can only
+# have come from the stream.
+c1=$(printf '%s' "$out" | c1_count)
+[[ "$c1" == "0" ]] \
+  && pass "no raw 8-bit C1 byte from the stream reaches the terminal" \
+  || fail "$c1 raw C1 bytes (0x80-0x9F) reached the terminal:\n$(printf '%s' "$out" | cat -v)"
+
+for payload in $'\233[1;32m' $'\233[2K' $'\235PWNED8BIT' $'\302\233[1;32m'; do
+  if printf '%s' "$out" | grep -qaF "$payload"; then
+    fail "an 8-bit payload survived: $(printf '%s' "$payload" | cat -v)"
+  else
+    pass "no $(printf '%s' "$payload" | cat -v) in the output"
+  fi
+done
+
 echo "--- sanitising neuters the bytes, it does not swallow the content ---"
 
 for word in 'narration' 'FLEET GREEN' 'hidden.txt' 'PWNEDTITLE' 'real failure here' \
-            '0 errors, all tests passed' 'BLINK' 'forged'; do
+            '0 errors, all tests passed' 'BLINK' 'forged' 'GREEN2' 'PWNED8BIT'; do
   grep -qaF "$word" <<<"$out" \
     && pass "the visible text survives: $word" \
     || fail "sanitising ate content: '$word' is missing from:\n$out"
