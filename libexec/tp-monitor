@@ -738,7 +738,10 @@ pump_summary_line() {
     # The state file is written by the supervisor, but paused_reason splices in
     # text the supervisor was handed — a gate's complaint, a claimant's branch —
     # so the whole summary line is display-sanitised like every other row.
-    mon_safe phases status reason pump_host last_tick
+    # open_ct is in the list for the same reason: the legitimate writer emits a
+    # number (jq --argjson), but in the ledger==primary shape the state file sits
+    # in a root the runner mounts read-write, so an agent can write it.
+    mon_safe phases status reason pump_host last_tick open_ct
 
     # Reader skepticism (issue #22): the state file is a HINT, not an oracle. A
     # dead pump cannot retract its last `running` write — the G3 drain left one

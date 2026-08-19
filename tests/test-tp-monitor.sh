@@ -1708,6 +1708,32 @@ printf '%s' "$esess" | grep -aq $'\033\[0;38;5;245m' \
     || fail "sanitising ate the palette:\n$(printf '%s' "$esess" | /usr/bin/cat -v)"
 printf '#!/usr/bin/env bash\nexit 0\n' >| "$BIN/docker"; chmod +x "$BIN/docker"
 
+
+# ── Test 39b: the pump summary row is a rendered row like any other ───────────
+#
+# The summary row reads the pump state file, and the numbers in it are what an
+# operator glances at to decide whether a drain is progressing. tp-pump writes
+# open_tasks with `jq --argjson`, so the legitimate writer can only emit a
+# number — but in the ledger==primary shape the runner mounts the root holding
+# that file read-write, so an agent can write the field. A row that prints it
+# raw lets an agent paint its own status line.
+echo "--- Test 39b: the pump summary row sanitises the state file ---"
+PS39="$TMP/39b-pump.state"
+# , not a raw ESC: a raw control byte is invalid inside a JSON string, and
+# a state file jq cannot parse renders as no pump at all rather than as a
+# forged row.
+printf '%s' "{\"phases\":\"F98\",\"last_tick\":\"2026-08-05T09:00:00Z\",\"open_tasks\":\"7\\u001b[2K\\u001b[1;32mALL-GREEN\",\"status\":\"running\",\"paused_reason\":\"\",\"pid\":$$,\"host\":\"$(hostname)\"}" >| "$PS39"
+s39=$(TASKPUMP_MONITOR_REPO_ROOT="$EFR" TASKPUMP_TASKS_DIR="$ETD" \
+      TASKPUMP_PUMP_STATE_FILE="$PS39" TASKPUMP_MONITOR_SESS_CACHE="$TMP/39b.tsv" \
+      TASKPUMP_MONITOR_COLS=140 "$CLI" --glance 2>/dev/null)
+
+grep -aq 'ALL-GREEN' <<<"$s39" \
+    && pass "the summary row renders the state file's open_tasks field" \
+    || fail "the row never reached the payload, so this asserts nothing:\n$s39"
+[[ "$(printf '%s' "$s39" | strip_palette | esc_count)" == "0" ]] \
+    && pass "no escape from the pump state file reaches the summary row" \
+    || fail "an injected escape survived into the summary row:\n$(printf '%s' "$s39" | /usr/bin/cat -v)"
+
 echo
 echo "=============================================="
 echo "Tests: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"
