@@ -320,13 +320,21 @@ WTS="$TMP/wts"
 mkdir -p "$WTS/feat/t5/ops/planning"
 printf 'status\n' >| "$WTS/feat/t5/ops/planning/STATUS.md"
 
-# TASKPUMP_STATE_DIR is load-bearing (B16). This tick cds to $TMP, but it also
-# names TASKPUMP_TASKS_DIR — which exempts it from the pump's install-root
-# refusal — so REPO_ROOT resolves to the TaskPump INSTALL root, i.e. the
-# checkout the suite is running from. TASKPUMP_PRE_TICK_HOOKS=' ' means the
-# hooks produce no output, and run_pre_tick_hooks' quiet branch `rm -f`s the
-# mark file: this suite DELETED the operator's live
-# .taskpump-fsguard.notified until the state dir was pinned into $TMP.
+# TASKPUMP_STATE_DIR pins the whole state-dir family into $TMP (B16). It is
+# worth having here because this tick cds to $TMP but also names
+# TASKPUMP_TASKS_DIR — which exempts it from the pump's install-root refusal —
+# so REPO_ROOT resolves to the TaskPump INSTALL root, i.e. the checkout the
+# suite runs from, and any $STATE_DIR-derived name not pinned individually below
+# would land there. It is a backstop, not the fix: measured, removing it today
+# leaves nothing at the checkout root, because the names that matter here are
+# already pinned by hand.
+#
+# It does NOT cover the file this suite actually damaged. With
+# TASKPUMP_PRE_TICK_HOOKS=' ' the hooks produce no output and
+# run_pre_tick_hooks' quiet branch `rm -f`s the mark file — that is how this
+# suite deleted the operator's live .taskpump-fsguard.notified. The mark file
+# follows TASKPUMP_HOOK_MARK_FILE, which tests/suite-prologue.sh sets and which
+# outranks $STATE_DIR; that redirect, not this pin, is what stopped it.
 probe_tick() {  # extra env assignments come first, as "K=V" words
   ( cd "$TMP" && env "${TP_ENV_UNSET[@]}" "$@" \
       PATH="$BIN:$PATH" \

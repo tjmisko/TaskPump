@@ -9,7 +9,7 @@
 #   . "$SCRIPT_DIR/suite-prologue.sh"
 #
 # It closes the ways the caller's world can silently reconfigure a fixture —
-# and the one way a fixture can silently reconfigure the caller's world:
+# and the way a fixture was silently reconfiguring the caller's world:
 #
 # Conf files. The tools discover taskpump.conf by walking up from $PWD, so the
 # conf of whatever repo the suites happen to run from (TaskPump's own dogfood
@@ -39,12 +39,19 @@
 # hook mark file is the one that actually moves: run_pre_tick_hooks WRITES it
 # when the hooks have something to say and `rm -f`s it when they go quiet, so
 # on 2026-08-19 a suite run deleted and then rewrote the operator's live
-# .taskpump-fsguard.notified in the primary checkout. Every state file is
-# gitignored, so run-all.sh's status diff could not see it; the manifest guard
-# there is the other half of this fix. Redirecting the mark file out of the
-# tree is the default a new suite inherits without having to know any of this —
-# a suite that pins its own TASKPUMP_STATE_DIR or mark file still outranks it,
-# and a suite that pins neither can no longer reach the repo root.
+# .taskpump-fsguard.notified in the primary checkout. .gitignore lists that
+# name, so run-all.sh's status diff could not see it; the state manifest there
+# is the other half of this fix.
+#
+# Redirecting the mark file out of the tree is the default a new suite inherits
+# without having to know any of this. Note the precedence, because it is the
+# reverse of the obvious guess: tp-pump resolves HOOK_MARK_FILE as
+# TASKPUMP_HOOK_MARK_FILE, then TASKPUMP_FSGUARD_MARK_FILE, then
+# $STATE_DIR/.taskpump-fsguard.notified — so the export below OUTRANKS a suite's
+# own TASKPUMP_STATE_DIR, and pinning the state dir does not move the mark file
+# while this default stands. A suite that wants the mark file somewhere of its
+# own sets one of the two mark-file keys after sourcing this; a suite that pins
+# only the state dir moves the rest of the family and leaves this alone.
 #
 # Exported names only: a suite's own unexported helpers (TP_ROOT,
 # TP_ENV_UNSET, ...) are not environment, and are defined after this runs in
@@ -62,10 +69,15 @@ unset _tp_scrub_var
 #     per tick. A test that captures notifications overrides
 #     TASKPUMP_NOTIFY_CMD per invocation.
 #   * the pre-tick hook mark file points outside any repository (above). Per
-#     process, so two suites running side by side do not share a fingerprint;
-#     the pump creates it only when a tick's hooks produce output and removes
-#     it again when they go quiet, so this leaves nothing behind in the common
-#     case. test-env-hermeticity.sh pins that it is never a repo-root path.
+#     process, so two suites running side by side do not share a fingerprint.
+#     The pump creates it only when a tick's hooks produce output and `rm -f`s
+#     it when they go quiet, but a suite whose last tick still had something to
+#     say leaves the file behind: run-all.sh removes the ones its own run left
+#     (newer than its run stamp, no live process behind the pid) in its EXIT
+#     trap, so a full run cleans up after itself. A suite run standalone can
+#     still leave a one-line fingerprint in $TMPDIR. test-env-hermeticity.sh
+#     pins that this default is absolute and outside the checkout, and that a
+#     full run does not leave its own behind.
 export TASKPUMP_NO_CONF=1
 export TASKPUMP_NOTIFY_CMD=true
 export ARACHNE_NOTIFY_CMD=true

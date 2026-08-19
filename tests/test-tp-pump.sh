@@ -182,13 +182,18 @@ NOTIFY="$TMP/notify.txt"; : >| "$NOTIFY"
 # Hermetic tick: no worktrees/containers (NO_LAUNCH), ops/git ops point at a
 # non-repo (fail-open), state/cap/log/template/usage all redirected.
 #
-# TASKPUMP_STATE_DIR is the one that is easy to forget and expensive to omit
-# (B16). This helper never cds and pins no workspace, so the pump's cwd rung
-# resolves REPO_ROOT to the TaskPump CHECKOUT the suite is running from — and
-# every state file whose name is not individually redirected below then
-# defaults to $REPO_ROOT/<name>. That is how a suite run came to delete and
-# rewrite the operator's live .taskpump-fsguard.notified on 2026-08-19. One
-# key moves all of them; keep it, even as individual names are pinned.
+# TASKPUMP_STATE_DIR is the backstop pin (B16). This helper never cds and pins
+# no workspace, so the pump's cwd rung resolves REPO_ROOT to the TaskPump
+# CHECKOUT the suite is running from — and any $STATE_DIR-derived name not
+# individually redirected below then defaults to $REPO_ROOT/<name>. One key
+# moves that whole family (.taskpump-pump.state, -pool-cap, -pump.log,
+# -usage-reset, -disk-watchdog.log, .auto-trunk.lock, .auto-trunk-quarantine);
+# keep it, so a name that stops being pinned by hand cannot reach the checkout.
+#
+# It is NOT what fixed the 2026-08-19 damage. The file a suite run deleted and
+# rewrote there was the operator's live .taskpump-fsguard.notified, and the mark
+# file follows TASKPUMP_HOOK_MARK_FILE, which tests/suite-prologue.sh sets and
+# which outranks $STATE_DIR.
 pump_tick() {  # $1=phases ; extra env via caller
   # Suppress real desktop notifications by default (the fs-guard now runs in
   # do_tick and would notify-send against this dirty worktree); a caller can

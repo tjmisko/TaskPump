@@ -155,10 +155,14 @@ echo "--- 1b. the jobs cap governs total concurrent TASKS ---"
 # finer grain exactly as it binds at phase grain.
 # TASKPUMP_STATE_DIR, here and on the stall tick in section 7, because these
 # are the two real ticks in this suite that pin no workspace: the pump's cwd
-# rung then resolves REPO_ROOT to the TaskPump CHECKOUT the suite runs from,
-# and every state file not individually redirected lands in it (B16 — this
-# suite deleted the operator's live .taskpump-fsguard.notified). The ticks
-# below that set TASKPUMP_WORKSPACE_ROOT are already anchored in $TMP.
+# rung then resolves REPO_ROOT to the TaskPump CHECKOUT the suite runs from, and
+# any $STATE_DIR-derived name not individually redirected lands in it (B16). The
+# mark file is not one of them — it follows TASKPUMP_HOOK_MARK_FILE from
+# tests/suite-prologue.sh, which outranks $STATE_DIR, and that redirect is what
+# stopped this suite deleting the operator's live .taskpump-fsguard.notified.
+# This pin is the backstop for the rest of the family, kept so a name that stops
+# being pinned by hand cannot reach the checkout. The ticks below that set
+# TASKPUMP_WORKSPACE_ROOT are already anchored in $TMP.
 cap_tick() {  # cap_tick <jobs>
   TASKPUMP_PUMP_NO_LAUNCH=1 \
   TASKPUMP_STATE_DIR="$TMP" \
