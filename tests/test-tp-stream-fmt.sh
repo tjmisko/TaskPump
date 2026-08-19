@@ -11,7 +11,7 @@
 # the most ordinary thing in its brief (run the verification command), and the
 # bytes are on the supervisor's terminal.
 #
-# Two halves of the same hole, and this suite pins both:
+# Three shapes of the same hole, and this suite pins all three:
 #
 #   1. `echo -e` EXPANDS backslash escapes, so the attacker never even needed a
 #      raw ESC byte: a literal `\e[2J` in a fixture survives jq as two harmless
@@ -19,10 +19,16 @@
 #   2. A raw ESC that does arrive (JSON carries it as a \u001b escape, which jq
 #      decodes) was printed verbatim: OSC to rewrite the window title, CUU/EL
 #      to walk back over and overwrite the failure lines above.
+#   3. ESC is not the only spelling of it. C1 has an 8-bit form in which the
+#      single byte 0x9B *is* CSI and 0x9D is OSC, and a UTF-8 form (0xC2 0x9B)
+#      that a terminal decoding UTF-8 executes as CSI. A strip built out of ESC
+#      and [[:cntrl:]] catches neither.
 #
 # The assertion is not "no ESC in the output" — the tool colours its own text.
-# It is that the ONLY escapes present are the palette's own, and that sanitising
-# does not swallow the words: a neutered line still reads.
+# It is that the ONLY escapes present are the palette's own — matched against the
+# tool's actual colour constants, not against their shape, so a payload wearing
+# the shape is not counted as ours — that no raw C1 byte is present at all, and
+# that sanitising does not swallow the words: a neutered line still reads.
 #
 # Run: ./tests/test-tp-stream-fmt.sh   (offline)
 set -uo pipefail
