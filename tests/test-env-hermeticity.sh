@@ -259,7 +259,8 @@ echo "--- run-all's state manifest: what it sees, names, and refuses to claim --
 # run-all.sh resolves the repo it guards from its own location, so a copy of it
 # in a throwaway repo guards THAT repo — which is how this can be driven for
 # real without dirtying anything. Each canary suite stands in for a helper that
-# runs an unpinned tick: it touches run state in the repo it is running from.
+# runs an unpinned tick: it touches one of the paths the manifest guards, in the
+# repo it is running from.
 #
 # gate_repo <dir> <gitignore-body> <suite-name>:<body> ...
 # The body runs with $REPO set to the throwaway repo's root.
@@ -315,9 +316,9 @@ grep -qF 'These files are gitignored' <<<"$notig_out" \
   || pass "and the manifest does not claim the paths it names are gitignored"
 
 # 7c. .git/info/exclude: in the manifest because no status probe can see it, and
-# the one path in it that a TASKPUMP_STATE_DIR pin cannot move — the exclude is
-# derived from the repo root via --git-common-dir, so the remedy text has to say
-# so rather than prescribing a state-dir pin for it.
+# a path no TASKPUMP_STATE_DIR pin can move — it is derived from the repo root
+# via --git-common-dir, so the remedy text has to say so rather than prescribing
+# a state-dir pin for it.
 EXCL="$TMP/gate-exclude"
 gate_repo "$EXCL" '.taskpump-*' \
   'canary:mkdir -p "$REPO/.git/info"; printf "# canary\n" >> "$REPO/.git/info/exclude"'
@@ -366,11 +367,12 @@ grep -qF 'WARNING: run-state files' <<<"$live_out" \
 grep -qE 'suite\(s\) passed; 1 row\(s\) above report a WARN' <<<"$live_out" \
   && pass "and the summary does not count the warned row as a passing suite" \
   || fail "the summary line does not distinguish the WARN row: $(tr '\n' ' ' <<<"$live_out")"
-# A scope guard on the downgrade rather than a pre-repair regression (the old
-# gate failed this case too, by failing everything): a live-pump record from
-# ANOTHER host cannot be verified from here, and must not be allowed to excuse a
-# delta — one stale file left by a machine that no longer exists would otherwise
-# switch this gate off for good.
+# A scope guard on the downgrade: a live-pump record from ANOTHER host cannot be
+# verified from here, and must not be allowed to excuse a delta — one stale file
+# left by a machine that no longer exists would otherwise switch this gate off
+# for good. What it guards is new, so the behaviour half of it is not a
+# pre-repair regression (the old gate failed this case by failing everything);
+# only the wording clause is red against that version.
 rm -f "$LIVE/.taskpump-pool-cap"
 sleep 300 & foreign_pid=$!
 printf '{\n  "status": "running",\n  "pid": %d,\n  "host": "not-this-host.invalid"\n}\n' \
