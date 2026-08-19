@@ -39,14 +39,13 @@
 #   TASKPUMP_WORKTREES_DIR        base dir holding the agent worktrees
 #   TASKPUMP_AGENT_LOG_NAME       the agent log inside each worktree
 #   TASKPUMP_RECLAIM_PRIMARY      1 = same as --include-primary
-#   EXTRA_BUSY_DIRS               newline-separated workspace roots --targets
-#                                 must also skip (the disk guard passes
-#                                 compiler-busy workspaces here; a listed
+#   TASKPUMP_EXTRA_BUSY_DIRS      newline-separated workspace roots --targets
+#                                 must also skip, so a workspace that is
+#                                 mid-compile keeps its build output (a listed
 #                                 primary root skips the primary even under
-#                                 --include-primary). Read UNPREFIXED only —
-#                                 there is no TASKPUMP_ spelling of this one,
-#                                 and setting TASKPUMP_EXTRA_BUSY_DIRS skips
-#                                 nothing.
+#                                 --include-primary). The bare EXTRA_BUSY_DIRS
+#                                 spelling is the legacy one and still works;
+#                                 the prefixed name wins when both are set.
 # HELP-END
 set -uo pipefail
 
@@ -99,6 +98,15 @@ INCLUDE_PRIMARY="${TASKPUMP_RECLAIM_PRIMARY:-${RECLAIM_PRIMARY:-0}}"
 # rescue tool guessing at another toolchain's build dirs is worse than one that
 # says it is unconfigured (G1.7; examples/arachne.conf pins 'cargo clean').
 RECLAIM_CMD="${TASKPUMP_RECLAIM_CMD:-}"
+# Workspaces to leave alone even though no agent container is on them — a human
+# mid-compile, or the disk guard's own busy list. Canonical spelling first,
+# legacy second, the same precedence every other key here uses; the key name
+# that answered is kept so the skip line says which one to edit. The prefixed
+# name used to be inert, so the documented spelling protected nothing and the
+# sweep deleted exactly the build output it was set to save (B5).
+BUSY_EXTRA_KEY="EXTRA_BUSY_DIRS"
+[[ -n "${TASKPUMP_EXTRA_BUSY_DIRS:-}" ]] && BUSY_EXTRA_KEY="TASKPUMP_EXTRA_BUSY_DIRS"
+BUSY_EXTRA="${TASKPUMP_EXTRA_BUSY_DIRS:-${EXTRA_BUSY_DIRS:-}}"
 
 usage() { apl_help "$0"; }
 
@@ -379,8 +387,8 @@ do_targets() {
             skipped=$((skipped + 1))
             continue
         fi
-        if [[ -n "${EXTRA_BUSY_DIRS:-}" ]] && printf '%s\n' "$EXTRA_BUSY_DIRS" | grep -Fxq "$wt"; then
-            log "  skip: $wt/target — busy (EXTRA_BUSY_DIRS)"
+        if [[ -n "$BUSY_EXTRA" ]] && printf '%s\n' "$BUSY_EXTRA" | grep -Fxq "$wt"; then
+            log "  skip: $wt/target — busy ($BUSY_EXTRA_KEY)"
             skipped=$((skipped + 1))
             continue
         fi
@@ -395,8 +403,8 @@ do_targets() {
     # a human may be building there. The watchdog passes --include-primary under
     # PANIC to buy the most space.
     if [[ -d "$REPO_ROOT/target" ]]; then
-        if [[ -n "${EXTRA_BUSY_DIRS:-}" ]] && printf '%s\n' "$EXTRA_BUSY_DIRS" | grep -Fxq "$REPO_ROOT"; then
-            log "  skip: $REPO_ROOT/target — busy (EXTRA_BUSY_DIRS)"
+        if [[ -n "$BUSY_EXTRA" ]] && printf '%s\n' "$BUSY_EXTRA" | grep -Fxq "$REPO_ROOT"; then
+            log "  skip: $REPO_ROOT/target — busy ($BUSY_EXTRA_KEY)"
         elif [[ "$INCLUDE_PRIMARY" -eq 1 ]]; then
             reclaim_target "$REPO_ROOT" "primary"
         else

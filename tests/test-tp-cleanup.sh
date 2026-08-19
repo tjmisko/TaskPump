@@ -149,13 +149,31 @@ out="$(ARACHNE_DISK_REPO_ROOT="$FIX" FREE_GB_OVERRIDE=7 PANIC_THRESHOLD_GB=5 PAU
 assert_has "paused state entered (5 < 7 < 10)"      "$out" "HEALTHY → PAUSED"
 assert_no  "no target reclaim while merely paused"  "$out" "STUB-CLEANUP-CALLED"
 
-echo "--- Test 7: EXTRA_BUSY_DIRS skips listed worktrees and the primary ---"
+echo "--- Test 7: the busy-workspace skip, in BOTH spellings (B5) ---"
+# The documented spelling is TASKPUMP_EXTRA_BUSY_DIRS, and it used to be read by
+# nobody: the tool tested the bare EXTRA_BUSY_DIRS only, so the key an operator
+# set to protect a mid-compile workspace reclaimed exactly that workspace. Both
+# spellings are honoured now, canonical first — and the skip line names the key
+# that answered, so "which one did it read" is never a guess again.
 out="$(ARACHNE_CLEANUP_REPO_ROOT="$FIX" STUB_LIVE="" EXTRA_BUSY_DIRS="$FIX/.worktrees/feat/a" "$CLEANUP" --targets --dry-run 2>&1)"
-assert_has "feat/a skipped via EXTRA_BUSY_DIRS"  "$out" "skip: $FIX/.worktrees/feat/a/target — busy (EXTRA_BUSY_DIRS)"
+assert_has "feat/a skipped via the legacy EXTRA_BUSY_DIRS" "$out" "skip: $FIX/.worktrees/feat/a/target — busy (EXTRA_BUSY_DIRS)"
 assert_has "feat/b still reclaimed"              "$out" "worktree: $FIX/.worktrees/feat/b/target"
+out="$(ARACHNE_CLEANUP_REPO_ROOT="$FIX" STUB_LIVE="" TASKPUMP_EXTRA_BUSY_DIRS="$FIX/.worktrees/feat/a" "$CLEANUP" --targets --dry-run 2>&1)"
+assert_has "feat/a skipped via the canonical TASKPUMP_EXTRA_BUSY_DIRS" "$out" "skip: $FIX/.worktrees/feat/a/target — busy (TASKPUMP_EXTRA_BUSY_DIRS)"
+assert_no  "the protected workspace is not reclaimed"  "$out" "worktree: $FIX/.worktrees/feat/a/target"
+assert_has "feat/b is still reclaimed alongside it"    "$out" "worktree: $FIX/.worktrees/feat/b/target"
+# The canonical spelling wins when both are set — the precedence every other key
+# in this tool uses.
+out="$(ARACHNE_CLEANUP_REPO_ROOT="$FIX" STUB_LIVE="" \
+       TASKPUMP_EXTRA_BUSY_DIRS="$FIX/.worktrees/feat/a" EXTRA_BUSY_DIRS="$FIX/.worktrees/feat/b" \
+       "$CLEANUP" --targets --dry-run 2>&1)"
+assert_has "the canonical spelling outranks the legacy one" "$out" "skip: $FIX/.worktrees/feat/a/target — busy (TASKPUMP_EXTRA_BUSY_DIRS)"
 out="$(ARACHNE_CLEANUP_REPO_ROOT="$FIX" STUB_LIVE="" EXTRA_BUSY_DIRS="$FIX" "$CLEANUP" --targets --include-primary --dry-run 2>&1)"
 assert_has "busy primary skipped despite --include-primary" "$out" "skip: $FIX/target — busy (EXTRA_BUSY_DIRS)"
 assert_no  "busy primary not reclaimed"          "$out" "primary: $FIX/target"
+out="$(ARACHNE_CLEANUP_REPO_ROOT="$FIX" STUB_LIVE="" TASKPUMP_EXTRA_BUSY_DIRS="$FIX" "$CLEANUP" --targets --include-primary --dry-run 2>&1)"
+assert_has "the canonical spelling protects the primary too" "$out" "skip: $FIX/target — busy (TASKPUMP_EXTRA_BUSY_DIRS)"
+assert_no  "the canonically-protected primary is not reclaimed" "$out" "primary: $FIX/target"
 
 echo "--- Test 8: --stuck maps container→task from the LEDGER claim, no manifest (#7) ---"
 # tp-cleanup used to default TASKPUMP_MANIFEST to Arachne's

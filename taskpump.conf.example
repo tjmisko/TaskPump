@@ -516,14 +516,13 @@
 #                           #   caller's repo — unset, a sweep run from your project
 #                           #   measures TaskPump's own checkout and reports success.
 # TASKPUMP_RECLAIM_PRIMARY= # 1 = same as --include-primary (default: 0)
-# EXTRA_BUSY_DIRS=          # newline-separated workspace roots --targets must also
-#                           #   skip. A listed primary root is skipped even under
+# TASKPUMP_EXTRA_BUSY_DIRS= # newline-separated workspace roots --targets must also
+#                           #   skip, so a workspace that is mid-compile keeps its build
+#                           #   output. A listed primary root is skipped even under
 #                           #   --include-primary. (default: empty)
-#                           #   NOTE THE MISSING PREFIX: tp-cleanup reads the bare name,
-#                           #   and nothing maps TASKPUMP_EXTRA_BUSY_DIRS onto it, so the
-#                           #   prefixed spelling silently reclaims the workspace you
-#                           #   meant to protect. The bare name works from this file
-#                           #   (it is sourced with allexport) and from the environment.
+#                           #   The bare EXTRA_BUSY_DIRS is the legacy spelling and still
+#                           #   works; this one wins when both are set, and the skip line
+#                           #   names whichever answered.
 # TASKPUMP_STOP_GRACE_SEC=  # container stop grace period, seconds (default: 30)
 
 # ── Agent watchdog (tp agent-watchdog) ───────────────────────────────────────

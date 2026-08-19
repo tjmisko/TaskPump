@@ -347,11 +347,6 @@ meeting one for the first time during an unattended run is a day.
   The key only tells the *readers* (`tp monitor`, `tp dag-render`, the container
   entrypoint) to look for a different extension, which desynchronises them from
   the writer.
-- **`TASKPUMP_EXTRA_BUSY_DIRS` has no reader; `EXTRA_BUSY_DIRS` does.** The
-  prefixed spelling is the one four places in this tree have documented, and
-  `tp cleanup` reads the bare one. Since the key exists to keep a reclaim sweep
-  off a workspace that is mid-compile, the prefixed spelling deletes exactly the
-  build output it was set to protect.
 
 ### 3.1 Ledger — `tp task` (core)
 
@@ -802,6 +797,7 @@ consumers.
 | `TASKPUMP_ORIGINAL_CAP` | `tp disk-watchdog` | the cap file's contents at start, else `TASKPUMP_JOBS_FALLBACK` | The cap to restore once free space recovers. Nothing in this tree writes it — it is there for a caller that starts the watchdog when the cap has already been lowered, and so has to be told what "restored" means. |
 
 Cleanup also reads `TASKPUMP_WORKTREES_DIR` (as a path), `TASKPUMP_RECLAIM_CMD`,
+`TASKPUMP_EXTRA_BUSY_DIRS`,
 `TASKPUMP_AGENT_LOG_NAME`, `TASKPUMP_AGENT_PREFIX` (through
 `lib/pump-lib.sh`'s one accessor), `TASKPUMP_DAG_BIN` and the
 opt-in `TASKPUMP_MANIFEST`; the disk watchdog reads `TASKPUMP_STATE_DIR` and
@@ -828,17 +824,16 @@ pump re-reads each tick. Set `TASKPUMP_STATE_DIR` or `TASKPUMP_POOL_CAP_FILE`
 explicitly for a run that wants the watchdog's cap changes to land, and
 `TASKPUMP_DISK_REPO_ROOT` for one that wants its reclaim to touch your project.
 
-**`tp cleanup`'s busy-directory list is spelled without the prefix.** The tool's
-own `--help`, this document and `taskpump.conf.example` have all named it
-`TASKPUMP_EXTRA_BUSY_DIRS`; the code reads the bare `EXTRA_BUSY_DIRS` and there
-is no assignment between the two. With `TASKPUMP_EXTRA_BUSY_DIRS=<worktree>`,
-`tp cleanup --targets --dry-run` planned `rm -rf <worktree>/target`; with
-`EXTRA_BUSY_DIRS=<worktree>` it printed
-`skip: <worktree>/target — busy (EXTRA_BUSY_DIRS)`. The bare name is what works,
-including from a `taskpump.conf` (the file is sourced with `allexport`, so a
-bare `KEY=value` is exported like any other). `ARACHNE_EXTRA_BUSY_DIRS` is inert
-too — the legacy bridge only rewrites `ARACHNE_*` to `TASKPUMP_*`, and neither
-spelling is the one being read.
+**`tp cleanup`'s busy-directory list reads both spellings.**
+`TASKPUMP_EXTRA_BUSY_DIRS` is the canonical name and wins; the bare
+`EXTRA_BUSY_DIRS` is the legacy one and still works, including from a
+`taskpump.conf` (the file is sourced with `allexport`, so a bare `KEY=value` is
+exported like any other). `ARACHNE_EXTRA_BUSY_DIRS` reaches the canonical name
+through the legacy bridge like every other key. The skip line names the spelling
+that answered — `skip: <worktree>/target — busy (TASKPUMP_EXTRA_BUSY_DIRS)` — so
+which one the sweep read is never a guess. The prefixed spelling used to have no
+reader at all, which meant the documented way to protect a mid-compile workspace
+reclaimed exactly that workspace.
 
 ### 3.8 The systemd unit
 

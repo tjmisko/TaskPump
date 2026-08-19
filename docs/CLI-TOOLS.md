@@ -420,9 +420,14 @@ in any vendored layout (TaskPump as a submodule or subtree) `tp cleanup
 consumer's alone. Set `TASKPUMP_CLEANUP_REPO_ROOT` — or
 `TASKPUMP_WORKTREES_DIR`, which it also honours — to point it at the real one.
 
-Finally: the extra-busy-directory list is read as the **unprefixed**
-`EXTRA_BUSY_DIRS`. There is no `TASKPUMP_` spelling of it in the code, so
-`TASKPUMP_EXTRA_BUSY_DIRS` skips nothing.
+Finally: the extra-busy-directory list is read as `TASKPUMP_EXTRA_BUSY_DIRS`,
+with the unprefixed `EXTRA_BUSY_DIRS` still honoured as the legacy spelling and
+the prefixed one winning when both are set. The skip line names the spelling
+that answered:
+
+```
+  skip: …/.worktrees/feat/a/target — busy (TASKPUMP_EXTRA_BUSY_DIRS)
+```
 
 ---
 
