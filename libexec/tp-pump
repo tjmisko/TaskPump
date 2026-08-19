@@ -2532,19 +2532,53 @@ write_state() {  # $1=status(running|paused|drained|stalled|stopped) $2=reason
 # was delivered. Claiming a failure that did not happen is the same lie as
 # swallowing one that did. Silence therefore means "the notifier did not
 # complain", which is all any exit status can tell us.
+#
+# And the warning reports only what a non-zero exit establishes: the program,
+# its status, that nothing was delivered. It used to append "TASKPUMP_NOTIFY_CMD
+# takes the message on stdin, not as an argument" to EVERY failure — one cause
+# asserted for every possible one, and wrong in exactly the deployment this tool
+# ships for. `xargs -0 notify-send …`, the desktop recipe docs/CONFIG.md §3.2
+# hands an operator, honours the stdin contract perfectly and still fails on a
+# host with no session bus (123, "Failed to execute child process dbus-launch",
+# where this was reproduced) — which is every headless run under the `loginctl
+# enable-linger` the unit file documents. The pump was sending that operator to
+# fix the one thing they had already got right. So the notifier's own first line
+# of stderr is quoted instead: it is the only party in this exchange that knows
+# why. The stdin contract is named only when the notifier says nothing at all,
+# and named as something to check rather than as the diagnosis.
 pump_notify() {
-  local msg="$1" rc=0
+  local msg="$1" rc=0 errfile="" detail=""
   log "$msg"
   if [[ -n "${TASKPUMP_NOTIFY_CMD:-}" ]]; then
-    ${TASKPUMP_NOTIFY_CMD} >/dev/null 2>&1 <<<"$msg" || rc=$?
+    # A file, not a pipe: a notifier that leaves a background child holding the
+    # inherited fd would hang a command substitution forever, and a notification
+    # is best-effort — it does not get to stop the pump. Same reason the mktemp
+    # failure degrades to /dev/null instead of dying.
+    errfile="$(mktemp 2>/dev/null)" || errfile=""
+    ${TASKPUMP_NOTIFY_CMD} >/dev/null 2>"${errfile:-/dev/null}" <<<"$msg" || rc=$?
+    if [[ "$rc" -ne 0 && -s "$errfile" ]]; then
+      # Bounded to one line, control characters out, 200 bytes: under --detach
+      # this stderr is persisted for the life of the run, and how much an
+      # operator's notifier writes there is not something the pump can assume.
+      IFS= read -r detail <"$errfile" || true
+      detail="${detail//[[:cntrl:]]/}"
+      [[ "${#detail}" -gt 200 ]] && detail="${detail:0:200}…"
+    fi
+    [[ -n "$errfile" ]] && rm -f "$errfile"
     [[ "$rc" -eq 0 ]] && return 0
     # A notify command is a command line, and the warning names its first word
     # only: a webhook notifier carries its token in the arguments (`curl -d @-
     # https://hooks…/SECRET`), and under --detach this stderr is persisted for
     # the life of the run — the unit's journal, or $PUMP_LOG on the fallback.
+    # Quoting the notifier's OWN output does not reopen that: what it chooses to
+    # print is its own, and the value's arguments are still never echoed.
     # shellcheck disable=SC2086
     set -- ${TASKPUMP_NOTIFY_CMD}
-    warn "notify command failed (exit $rc): $1 — notification not delivered; TASKPUMP_NOTIFY_CMD takes the message on stdin, not as an argument"
+    if [[ -n "$detail" ]]; then
+      warn "notify command failed (exit $rc): $1 — notification not delivered; it wrote: $detail"
+    else
+      warn "notify command failed (exit $rc): $1 — notification not delivered, and wrote nothing to stderr; check that it reads the message on stdin and that whatever it notifies is reachable from where the pump runs"
+    fi
     return 0
   fi
   if command -v notify-send >/dev/null 2>&1; then

@@ -64,7 +64,18 @@ all of them exited cleanly while telling an operator something untrue.
   warning that reports a notifier which drops its message names the **program**
   and its exit status rather than the whole `TASKPUMP_NOTIFY_CMD` value, which for
   a webhook notifier copied a credential into a stderr stream `--detach`
-  persists. (#35)
+  persists.
+
+  That warning states only what a non-zero exit establishes. Its first spelling
+  appended "TASKPUMP_NOTIFY_CMD takes the message on stdin, not as an argument"
+  to every failure — one cause asserted for all of them, and the wrong one on a
+  headless host, where a wrapper that honours the stdin contract exactly still
+  fails for want of a session bus (measured: exit 123, `Failed to execute child
+  process "dbus-launch"`) and the operator was being sent to fix the part they
+  had right. It now quotes the first line the notifier itself wrote to
+  stderr (bounded, control characters stripped, the value's arguments still never
+  echoed), and names the stdin contract as something to check only when the
+  notifier wrote nothing at all. (#35)
 
 - **A failed ops pull quotes git's diagnosis, not git's progress banner.** The
   warning quoted the first non-blank line of `git pull --ff-only`, which for the
