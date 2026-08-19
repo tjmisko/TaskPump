@@ -597,9 +597,13 @@ That rule is checked on the way **in** as well as on the way out. `create` and
 `fsck` validate the id a human types, but a task file can also arrive without
 passing either — written by hand, by an agent with a filesystem, or by a merged
 pull request — so a consumer that reads an id back off disk and hands it to
-another command re-checks it there. `tp cleanup`'s stuck-agent rescue does:
-an id outside the shape (or outside `TASKPUMP_ID_PATTERN`, where the project
-configures one) is named on stderr and left unreleased rather than passed on.
+another command re-checks it there. `tp cleanup`'s stuck-agent rescue does: an id
+outside **this shape** is named on stderr and left unreleased rather than passed
+on. `TASKPUMP_ID_PATTERN` is a separate question there — it is a naming
+convention, not a safety property, so an id that is filename-safe but off-grammar
+is reported and still released; refusing to free a wedged agent over a
+convention would strand the claim, and `tp task fsck --fix` filters on the same
+pattern and will not repair the file either.
 Ids from `tp task`'s own read paths — `next`, `ready --json`, `list --json` —
 are **not** yet re-checked; treat what they emit as ledger content, not as a
 word you may splice into a command.

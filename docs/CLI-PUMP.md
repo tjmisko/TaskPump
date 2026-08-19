@@ -106,7 +106,10 @@ bug. Until it is fixed, `--jobs 0` is not a way to pause a run; stop the run, or
 lower the cap through the cap file to `1`. (A `0` written to the cap file — by
 you or by the disk watchdog — *is* honoured now and does hold the launch loop at
 zero; it reaches the same deadlock-counter blind spot this section describes,
-which is why `1` is still the number to write by hand —
+which is why `1` is still the number to write by hand. A `0` is also a *held*
+pause: the watchdog re-stamps it every poll and hands it back when it exits, and
+one that nothing has refreshed for `TASKPUMP_POOL_CAP_STALE_SEC` is expired and
+cleared, so a hand-written `0` is not a pause that lasts either —
 [CLI-TOOLS.md](CLI-TOOLS.md#the-cap-file-path-and-how-it-used-to-fail).)
 
 #### 1.3 Mode precedence is last-wins

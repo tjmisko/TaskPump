@@ -135,6 +135,50 @@ printf '0\n' >| "$CAP_FILE"
 [[ "$(JOBS=4 apl_read_cap)" == "0" ]] && pass "a written 0 outranks the caller's JOBS" \
   || fail "cap file '0' with JOBS=4 expected 0 got '$(JOBS=4 apl_read_cap)'"
 
+# ...but a 0 is a HELD PAUSE, and it is only as good as the process holding it.
+# A watchdog killed mid-PANIC leaves its 0 behind; the pump does not overwrite an
+# existing cap file unless --jobs was passed, so without an expiry that 0 caps
+# the NEXT unattended run at zero, forever, with `status: running` and no page.
+# A live watchdog re-stamps the file every poll, so an unrefreshed 0 has no
+# holder. (One such file, containing 0, was found in the primary checkout.)
+printf '0\n' >| "$CAP_FILE"; touch -d '2 hours ago' "$CAP_FILE"
+got="$(JOBS=4 apl_read_cap 2>"$TMP/cap-warn")"
+[[ "$got" == "4" ]] \
+  && pass "a 0 nothing has refreshed is expired, not obeyed" \
+  || fail "a stale cap-file 0 was still honoured: got '$got'"
+warn="$(cat "$TMP/cap-warn")"
+[[ "$warn" == *"$CAP_FILE"* && "$warn" == *"has held 0 for"* && "$warn" == *"TASKPUMP_POOL_CAP_STALE_SEC"* ]] \
+  && pass "and the expiry names the file, the age and the key" \
+  || fail "the stale-cap warning does not name what it should: '$warn'"
+# Self-healing: the file is cleared to the cap actually in force, so the warning
+# is said once instead of on every tick, and the next reader sees the truth.
+[[ "$(tr -dc '0-9' < "$CAP_FILE")" == "4" ]] \
+  && pass "the stale pause is cleared out of the file" \
+  || fail "the cap file still holds '$(cat "$CAP_FILE")'"
+got="$(JOBS=4 apl_read_cap 2>"$TMP/cap-warn2")"
+[[ "$got" == "4" && ! -s "$TMP/cap-warn2" ]] \
+  && pass "and the second read is silent, not a per-tick warning" \
+  || fail "the healed file warned again: '$(cat "$TMP/cap-warn2")'"
+
+# A fresh 0 — the live watchdog's heartbeat — is still obeyed.
+printf '0\n' >| "$CAP_FILE"
+[[ "$(JOBS=4 apl_read_cap 2>/dev/null)" == "0" ]] \
+  && pass "a freshly-stamped 0 is still a live pause" \
+  || fail "a fresh 0 was expired"
+
+# The expiry is opt-out-able, for a hand-written pause meant to outlive every
+# watchdog...
+printf '0\n' >| "$CAP_FILE"; touch -d '2 hours ago' "$CAP_FILE"
+[[ "$(JOBS=4 TASKPUMP_POOL_CAP_STALE_SEC=0 apl_read_cap 2>/dev/null)" == "0" ]] \
+  && pass "TASKPUMP_POOL_CAP_STALE_SEC=0 disables the expiry" \
+  || fail "the expiry fired with the window disabled"
+# ...and it applies to the PAUSE only. `echo 3 > .taskpump-pool-cap` is a
+# standing operator preference, not a pause: nothing has to keep proving it.
+printf '2\n' >| "$CAP_FILE"; touch -d '2 hours ago' "$CAP_FILE"
+[[ "$(JOBS=4 apl_read_cap 2>/dev/null)" == "2" ]] \
+  && pass "a stale POSITIVE cap never expires" \
+  || fail "an old positive cap was discarded: got '$(JOBS=4 apl_read_cap 2>/dev/null)'"
+
 # ── Live-agent counting: the other rotation input (docker ps, stubbed) ─────────
 echo "--- pool cap: apl_count_live_agents (docker ps stubbed) ---"
 cat >| "$BIN/docker" <<'EOF'
@@ -473,37 +517,55 @@ for good in T1 T1.1 F79.2 G9.12 build-thing v0.2.1; do
 done
 
 # One entry per way a poisoned id gets into a command: quote-escape, command
-# substitution, separator, path traversal, flag injection, whitespace, empty.
-while IFS= read -r bad; do
+# substitution, separator, path traversal, flag injection, whitespace, directory
+# reference. Each is paired with the words its rejection must SAY: asserting
+# only "non-zero, and something on stderr" would pass against a build where the
+# function does not exist at all (bash answers 127 with `command not found`),
+# which is no assertion about this change whatsoever.
+while IFS='|' read -r bad needle; do
   got=$(apl_id_reject_reason "$bad" 2>&1); rc=$?
-  [[ $rc -ne 0 && -n "$got" ]] \
-    && pass "id '$bad' is rejected with a reason" \
-    || fail "id '$bad' was accepted (rc=$rc)"
+  [[ $rc -ne 0 && "$got" == *"$needle"* ]] \
+    && pass "id '$bad' is rejected, and the reason says '$needle'" \
+    || fail "id '$bad': rc=$rc, expected a reason containing '$needle', got '$got'"
 done <<'EOF'
-G9.1'; touch /tmp/pwned; echo '
-G9.1$(id)
-a;b
-../../etc/passwd
-sub/dir
--rf
-has space
+G9.1'; touch /tmp/pwned; echo '|not safe in a path or a command argument
+G9.1$(id)|not safe in a path or a command argument
+a;b|not safe in a path or a command argument
+../../etc/passwd|not safe in a path or a command argument
+sub/dir|not safe in a path or a command argument
+has space|not safe in a path or a command argument
+-rf|reads as a flag
+..|is a directory reference, not a filename
 EOF
 got=$(apl_id_reject_reason "" 2>&1 || true)
-[[ -n "$got" ]] && pass "an empty id is rejected with a reason" || fail "empty id accepted"
+[[ "$got" == *"the task id is empty"* ]] \
+  && pass "an empty id is rejected, and the reason says so" \
+  || fail "empty id: expected 'the task id is empty', got '$got'"
 
-# The project's own grammar applies on top, but only when the project HAS one:
-# an install-default pattern refusing a consumer's legitimate ids would break
-# the rescue path this check exists to protect.
+# SAFETY and GRAMMAR are separate questions, and the sink answers them
+# differently. TASKPUMP_ID_PATTERN is the project's naming convention: an id
+# outside it is still one safe argv word, so a rescue path that refuses over it
+# strands a wedged agent's claim — and `tp task fsck --fix` filters on the same
+# pattern, so it will not repair those files either. It is reported, not refused.
 got=$(TASKPUMP_ID_PATTERN='^T[0-9]+(\.[0-9]+)?$' apl_id_reject_reason "F79.2" 2>&1 || true)
-[[ "$got" == *"TASKPUMP_ID_PATTERN"* ]] \
-  && pass "a filename-safe id outside the configured grammar is rejected by name" \
-  || fail "the configured grammar was not applied: '$got'"
-TASKPUMP_ID_PATTERN='^F[0-9]+(\.[0-9]+)?$' apl_id_reject_reason "F79.2" >/dev/null \
-  && pass "and the same id passes under the grammar it belongs to" \
-  || fail "F79.2 rejected under its own pattern"
-( unset TASKPUMP_ID_PATTERN; apl_id_reject_reason "WHATEVER-9" >/dev/null ) \
-  && pass "with no grammar configured only the §7.1 shape is enforced" \
-  || fail "an unconfigured grammar rejected a filename-safe id"
+[[ -z "$got" ]] \
+  && pass "the safety check does not refuse a filename-safe id over the grammar" \
+  || fail "apl_id_reject_reason applied TASKPUMP_ID_PATTERN: '$got'"
+got=$(TASKPUMP_ID_PATTERN='^T[0-9]+(\.[0-9]+)?$' apl_id_offgrammar_reason "F79.2" 2>&1 || true)
+[[ "$got" == *"does not match TASKPUMP_ID_PATTERN"* ]] \
+  && pass "and the advisory check names the grammar it missed" \
+  || fail "the configured grammar was not reported: '$got'"
+TASKPUMP_ID_PATTERN='^F[0-9]+(\.[0-9]+)?$' apl_id_offgrammar_reason "F79.2" >/dev/null \
+  && pass "the same id is quiet under the grammar it belongs to" \
+  || fail "F79.2 reported off-grammar under its own pattern"
+( unset TASKPUMP_ID_PATTERN; apl_id_offgrammar_reason "WHATEVER-9" >/dev/null ) \
+  && pass "with no grammar configured the advisory check says nothing" \
+  || fail "an unconfigured grammar reported a filename-safe id"
+# ...but an UNSAFE id is refused whatever the grammar says about it.
+got=$(TASKPUMP_ID_PATTERN='.*' apl_id_reject_reason "a;b" 2>&1 || true)
+[[ "$got" == *"not safe in a path or a command argument"* ]] \
+  && pass "a permissive grammar cannot admit an unsafe id" \
+  || fail "TASKPUMP_ID_PATTERN='.*' let 'a;b' through: '$got'"
 
 # The path form, used to refuse a worktree directory name this stack cannot
 # carry: `/` is allowed there and nowhere else.

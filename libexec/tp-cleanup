@@ -34,7 +34,11 @@
 #                                 --status measures (default `target`; set it to
 #                                 `build`, `node_modules`, `dist`, ... for your
 #                                 toolchain). Empty means no precondition: the
-#                                 reclaim command runs in every idle workspace.
+#                                 reclaim command runs in every idle workspace —
+#                                 the primary checkout included, on every
+#                                 --include-primary (which the disk watchdog's
+#                                 PANIC sweep always passes). Name the primary in
+#                                 TASKPUMP_EXTRA_BUSY_DIRS to hold it back.
 #   TASKPUMP_STUCK_THRESHOLD_MIN  log-stale cutoff, minutes (default 15)
 #   TASKPUMP_STOP_GRACE_SEC       stop grace period, seconds (default 30)
 #   TASKPUMP_MANIFEST             OPT-IN v1 parallel-run manifest (no default;
@@ -50,7 +54,16 @@
 #                                 primary root skips the primary even under
 #                                 --include-primary). The bare EXTRA_BUSY_DIRS
 #                                 spelling is the legacy one and still works;
-#                                 the prefixed name wins when both are set.
+#                                 the two lists are UNIONED, never ranked — the
+#                                 disk guard passes the bare name on its command
+#                                 line while a conf carries the prefixed one, and
+#                                 dropping either list deletes the build output
+#                                 it was set to protect. The skip line names the
+#                                 spelling (or both) that protected the entry.
+#
+# Exit status: 0 = swept, 2 = usage error (no mode, unknown arg, two modes, a
+# configured-but-missing TASKPUMP_MANIFEST), 3 = a configured reclaim command
+# failed in at least one workspace, so the sweep may have freed nothing.
 # HELP-END
 set -uo pipefail
 
@@ -110,14 +123,18 @@ RECLAIM_CMD="${TASKPUMP_RECLAIM_CMD:-}"
 # turns the precondition off (B9).
 RECLAIM_DIR="${TASKPUMP_RECLAIM_DIR-${RECLAIM_DIR-target}}"
 # Workspaces to leave alone even though no agent container is on them — a human
-# mid-compile, or the disk guard's own busy list. Canonical spelling first,
-# legacy second, the same precedence every other key here uses; the key name
-# that answered is kept so the skip line says which one to edit. The prefixed
-# name used to be inert, so the documented spelling protected nothing and the
-# sweep deleted exactly the build output it was set to save (B5).
-BUSY_EXTRA_KEY="EXTRA_BUSY_DIRS"
-[[ -n "${TASKPUMP_EXTRA_BUSY_DIRS:-}" ]] && BUSY_EXTRA_KEY="TASKPUMP_EXTRA_BUSY_DIRS"
-BUSY_EXTRA="${TASKPUMP_EXTRA_BUSY_DIRS:-${EXTRA_BUSY_DIRS:-}}"
+# mid-compile, or the disk guard's own busy list.
+#
+# UNION, not precedence. The prefixed name used to be inert, so the documented
+# spelling protected nothing and the sweep deleted exactly the build output it
+# was set to save (B5) — and a `:-` chain re-creates that harm through whichever
+# spelling loses: the live disk-guard chain passes the bare EXTRA_BUSY_DIRS on
+# its command line while a conf (or lib/config.sh's ARACHNE_→TASKPUMP_ bridge)
+# supplies the prefixed one, so ranking them silently unprotects a workspace
+# somebody explicitly named. Both lists are consulted; the skip line names the
+# spelling that matched, so "which one did it read" is never a guess.
+BUSY_EXTRA_CANONICAL="${TASKPUMP_EXTRA_BUSY_DIRS:-}"
+BUSY_EXTRA_LEGACY="${EXTRA_BUSY_DIRS:-}"
 
 usage() { apl_help "$0"; }
 
@@ -172,21 +189,35 @@ act_render() {
     printf '%s' "${out% }"
 }
 
-# ── checked_task_id <id> <source> -- 0 when this id may be handed to another
-#    tool, 1 (with a WARNING naming the source and the reason) when it may not.
+# ── checked_task_id <id> <source> <remedy> -- 0 when this id may be handed to
+#    another tool, 1 (with a WARNING naming the source, the reason and <remedy>)
+#    when it may not.
 #    Ids ENTER this tool from the filesystem: a ledger task file's frontmatter,
 #    a manifest row. Both are writable by anything that can write the repo — an
 #    agent with a bind-mounted checkout, a merged pull request — and neither
-#    goes through `tp task create`, which is where the id grammar used to be
-#    enforced. So the grammar is enforced here too, at the boundary where the
-#    string arrives, and a malformed id is refused with a diagnostic instead of
-#    being passed on (PI-C1 / PI-C4).
+#    goes through `tp task create`, which is where the id shape used to be
+#    enforced. So it is enforced here too, at the boundary where the string
+#    arrives, and an unsafe id is refused with a diagnostic instead of being
+#    passed on (PI-C1 / PI-C4).
+#
+#    <remedy> is the caller's, because the file to fix is the caller's: sending
+#    an operator to a task file's frontmatter for a bad row in a TSV manifest
+#    names the wrong file and `tp task fsck` will not find it either.
+#
+#    SAFETY refuses; GRAMMAR only warns. An id outside TASKPUMP_ID_PATTERN is
+#    still one safe argv word, and refusing to free a wedged agent over the
+#    project's naming convention would strand the claim — `tp task fsck --fix`
+#    filters on the same pattern, so it will not repair those files either.
 checked_task_id() {
-    local id="$1" source="$2" reason
+    local id="$1" source="$2" remedy="$3" reason
     if ! reason="$(apl_id_reject_reason "$id")"; then
         echo "WARN: ignoring the $source: $reason" >&2
-        echo "      Fix the task file's frontmatter (\`tp task fsck\` names it) and release the claim by hand." >&2
+        echo "      $remedy" >&2
         return 1
+    fi
+    if ! reason="$(apl_id_offgrammar_reason "$id")"; then
+        echo "WARN: the $source: $reason" >&2
+        echo "      Proceeding anyway — the id is safe to hand on as one argument, and a wedged agent is worse than an off-grammar id. $remedy" >&2
     fi
     return 0
 }
@@ -217,9 +248,15 @@ ledger_claims() {
 
 # ── claim_task_for <container-name> -- echo the task whose live ledger claim
 #    is held by the branch this container name encodes (<prefix><branch slug>,
-#    '/' → '-'), or return 1. This is the CANONICAL mapping: it works for every
-#    consumer with a ledger, needs no manifest, and tracks the agent as it moves
-#    through a phase instead of freezing the launch-time assignment.
+#    '/' → '-'). This is the CANONICAL mapping: it works for every consumer with
+#    a ledger, needs no manifest, and tracks the agent as it moves through a
+#    phase instead of freezing the launch-time assignment.
+#
+#    Three outcomes, three exit codes, because two of them are different facts
+#    about the world and the caller reports them differently: 0 = mapped, 1 = no
+#    claim for this container, 2 = a claim WAS found and its id was REFUSED.
+#    Collapsing 2 into 1 is what made the sweep print "no live ledger claim …
+#    maps this container to a task" over a claim it had just named on stderr.
 claim_task_for() {
     local cname="$1"
     local prefix; prefix="$(apl_agent_prefix)"
@@ -227,7 +264,9 @@ claim_task_for() {
     while IFS=$'\t' read -r branch task _rest; do
         [[ -z "$branch" || -z "$task" ]] && continue
         if [[ "$prefix${branch//\//-}" == "$cname" ]]; then
-            checked_task_id "$task" "live ledger claim held by branch '$branch'" || return 1
+            checked_task_id "$task" "live ledger claim held by branch '$branch'" \
+                "Fix the task file's frontmatter (\`tp task fsck\` names it) and release the claim by hand." \
+                || return 2
             echo "$task"; return 0
         fi
     done < <(ledger_claims)
@@ -235,10 +274,11 @@ claim_task_for() {
 }
 
 # ── manifest_task_for <container-name> -- echo the epic task id for a
-#    running container, or empty if no match. Opt-in fallback (see MANIFEST
-#    above): a manifest row is a launch-time constant, so it is consulted only
-#    when the ledger has no live claim for the branch. Compares each manifest
-#    branch transliterated to a slug ('/' → '-') against <prefix><slug>.
+#    running container. Opt-in fallback (see MANIFEST above): a manifest row is a
+#    launch-time constant, so it is consulted only when the ledger has no live
+#    claim for the branch. Compares each manifest branch transliterated to a slug
+#    ('/' → '-') against <prefix><slug>. Same three exit codes as claim_task_for:
+#    0 = mapped, 1 = no row, 2 = a row was found and its id was refused.
 manifest_task_for() {
     local cname="$1"
     [[ -f "$MANIFEST" ]] || return 1
@@ -248,7 +288,9 @@ manifest_task_for() {
         [[ -z "$name"   ]] && continue
         local slug="${branch//\//-}"
         if [[ "$prefix$slug" == "$cname" ]]; then
-            checked_task_id "$task" "manifest row for branch '$branch'" || return 1
+            checked_task_id "$task" "manifest row for branch '$branch'" \
+                "Fix that row in $MANIFEST and release the claim by hand." \
+                || return 2
             echo "$task"; return 0
         fi
     done < "$MANIFEST"
@@ -315,11 +357,24 @@ do_stuck() {
         #    canonical mapping; the opt-in manifest is only a fallback, because
         #    its row is a launch-time constant that goes stale the moment the
         #    agent moves on to another task.
-        local task; task="$(claim_task_for "$cname" || true)"
-        [[ -z "$task" ]] && task="$(manifest_task_for "$cname" || true)"
+        #
+        #    A REFUSED id is not a missing one, and gets its own line. A refused
+        #    live claim also stops the search: a launch-time manifest row must
+        #    not paper over the claim the ledger actually holds.
+        local task="" refused="" rc=0
+        task="$(claim_task_for "$cname")" || rc=$?
+        if (( rc == 2 )); then
+            refused="live ledger claim"
+        elif [[ -z "$task" ]]; then
+            rc=0
+            task="$(manifest_task_for "$cname")" || rc=$?
+            (( rc == 2 )) && refused="manifest row"
+        fi
         if [[ -n "$task" ]]; then
             act "$TP_LIBEXEC_DIR/tp-task" release "$task" \
                 --reason "tp-cleanup: stuck (log idle ${age}min)"
+        elif [[ -n "$refused" ]]; then
+            log "  $cname: the $refused for this container names an id this tool refuses to pass on (the WARN above says what is wrong); its task claim is NOT released — fix the id, then 'tp task release <id>'"
         else
             log "  $cname: no live ledger claim (and no manifest row) maps this container to a task; skipping the task release — check 'tp task list' and release it by hand"
         fi
@@ -343,9 +398,34 @@ busy_worktrees() {
     done < <(list_agent_containers)
 }
 
+# ── busy_extra_key <dir> -- echo the extra-busy-list spelling(s) that name
+#    <dir>, or return 1 when neither does. Both lists are searched: they are a
+#    union (see BUSY_EXTRA_CANONICAL above), and when both name the same entry
+#    the line says so rather than picking a winner.
+busy_extra_key() {
+    local dir="$1" keys=""
+    [[ -n "$dir" ]] || return 1
+    if [[ -n "$BUSY_EXTRA_CANONICAL" ]] && printf '%s\n' "$BUSY_EXTRA_CANONICAL" | grep -Fxq "$dir"; then
+        keys="TASKPUMP_EXTRA_BUSY_DIRS"
+    fi
+    if [[ -n "$BUSY_EXTRA_LEGACY" ]] && printf '%s\n' "$BUSY_EXTRA_LEGACY" | grep -Fxq "$dir"; then
+        [[ -n "$keys" ]] && keys="$keys + EXTRA_BUSY_DIRS" || keys="EXTRA_BUSY_DIRS"
+    fi
+    [[ -n "$keys" ]] || return 1
+    printf '%s' "$keys"
+}
+
 # ── reclaim_workspace <dir> <label> -- run the consumer's reclaim command with
-#    <dir> as the working directory. Returns 1 (no-op) when RECLAIM_DIR is
-#    configured and <dir> has no such directory to reclaim.
+#    <dir> as the working directory.
+#
+#    Three outcomes: 0 = reclaimed, 1 = nothing to do here (RECLAIM_DIR is
+#    configured and <dir> has no such directory), 2 = the command RAN and
+#    FAILED. The third used to be folded into the first — a WARNING was logged
+#    and 0 returned anyway — so the summary line counted the failure as a
+#    reclaim and contradicted the warning immediately above it, and the
+#    unattended PANIC sweep exited 0 having freed nothing. The old hardcoded
+#    `rm -rf` essentially never failed; an arbitrary consumer command
+#    (`npm run clean` with no package.json, an uninstalled toolchain) does.
 #
 #    This used to run `cargo clean` or `rm -rf <dir>/target` and never look at
 #    TASKPUMP_RECLAIM_CMD's value at all — the key was a switch that armed a
@@ -374,9 +454,11 @@ reclaim_workspace() {
         return 0
     fi
     printf '  $ cd %q && %s\n' "$dir" "$RECLAIM_CMD"
-    ( cd "$dir" && eval "$RECLAIM_CMD" ) \
-        || log "  WARNING: TASKPUMP_RECLAIM_CMD failed in $dir — nothing was reclaimed there"
-    return 0
+    if ( cd "$dir" && eval "$RECLAIM_CMD" ); then
+        return 0
+    fi
+    log "  WARNING: TASKPUMP_RECLAIM_CMD failed in $dir — nothing was reclaimed there"
+    return 2
 }
 
 # ── do_targets -- reclaim build output in every worktree (cheap to rebuild,
@@ -384,6 +466,10 @@ reclaim_workspace() {
 #    agent container so an in-flight build is never broken. With
 #    --include-primary it also reclaims the primary checkout's own build output.
 #    Runs only when a reclaim command is configured; see RECLAIM_CMD above.
+#
+#    Returns 3 when the reclaim command failed anywhere, so the caller that runs
+#    this unattended — the disk watchdog's PANIC sweep — can tell "reclaimed"
+#    from "tried and bought nothing".
 do_targets() {
     if [[ -z "$RECLAIM_CMD" ]]; then
         log "build reclaim skipped: TASKPUMP_RECLAIM_CMD unconfigured — nothing touched (set it to your project's reclaim command, e.g. 'cargo clean')"
@@ -393,8 +479,8 @@ do_targets() {
     [[ -z "$RECLAIM_DIR" ]] && probe="probe=none"
     log "reclaiming build output ($probe, dry-run=$DRY_RUN, include-primary=$INCLUDE_PRIMARY)"
     local busy; busy="$(busy_worktrees)"
-    local found=0 skipped=0
-    local wt rel unsafe
+    local found=0 skipped=0 failed=0 rc=0
+    local wt rel unsafe busy_key
     # DEFERRED (documented, not fixed): this glob is two levels deep while the
     # pump addresses a worktree as <base>/<branch-with-a-slash>. The two agree
     # only because the generated branches happen to contain exactly one slash;
@@ -421,14 +507,18 @@ do_targets() {
             skipped=$((skipped + 1))
             continue
         fi
-        if [[ -n "$BUSY_EXTRA" ]] && printf '%s\n' "$BUSY_EXTRA" | grep -Fxq "$wt"; then
-            log "  skip: $wt — busy ($BUSY_EXTRA_KEY)"
+        if busy_key="$(busy_extra_key "$wt")"; then
+            log "  skip: $wt — busy ($busy_key)"
             skipped=$((skipped + 1))
             continue
         fi
-        reclaim_workspace "$wt" "worktree" && found=$((found + 1))
+        rc=0; reclaim_workspace "$wt" "worktree" || rc=$?
+        case "$rc" in
+            0) found=$((found + 1)) ;;
+            2) failed=$((failed + 1)) ;;
+        esac
     done
-    if (( found == 0 && skipped == 0 )); then
+    if (( found == 0 && skipped == 0 && failed == 0 )); then
         # "Nothing to reclaim" is a finding, not a success: it is what a
         # consumer whose build output is not called `target/` sees on every
         # panic sweep while the disk fills (B9). Say what was looked for.
@@ -438,16 +528,28 @@ do_targets() {
             log "nothing to reclaim: no workspace found under $WORKTREES_DIR/*/*"
         fi
     else
-        log "reclaimed $found worktree workspace(s); skipped $skipped."
+        # The failure count is part of the sentence, not a footnote: a summary
+        # that reports a reclaim the WARNING two lines up says did not happen is
+        # the shape of defect this whole change exists to remove.
+        local tally="reclaimed $found worktree workspace(s); skipped $skipped."
+        (( failed > 0 )) && tally="reclaimed $found worktree workspace(s); skipped $skipped; FAILED $failed (TASKPUMP_RECLAIM_CMD returned non-zero there; that space was not freed)."
+        log "$tally"
     fi
     # The primary checkout's own build output — only when explicitly requested,
     # since a human may be building there. The watchdog passes --include-primary
     # under PANIC to buy the most space.
     if [[ -z "$RECLAIM_DIR" || -d "$REPO_ROOT/$RECLAIM_DIR" ]]; then
-        if [[ -n "$BUSY_EXTRA" ]] && printf '%s\n' "$BUSY_EXTRA" | grep -Fxq "$REPO_ROOT"; then
-            log "  skip: $REPO_ROOT — busy ($BUSY_EXTRA_KEY)"
+        if busy_key="$(busy_extra_key "$REPO_ROOT")"; then
+            log "  skip: $REPO_ROOT — busy ($busy_key)"
         elif [[ "$INCLUDE_PRIMARY" -eq 1 ]]; then
-            reclaim_workspace "$REPO_ROOT" "primary"
+            # With no probe configured there is no precondition left on this
+            # arm: an empty TASKPUMP_RECLAIM_DIR means the command runs in the
+            # primary checkout every time --include-primary is passed, and the
+            # unattended PANIC sweep always passes it. Say so where it happens.
+            [[ -z "$RECLAIM_DIR" ]] && \
+                log "  (TASKPUMP_RECLAIM_DIR is empty, so there is no precondition on this arm: the command runs in the primary checkout unconditionally — list it in TASKPUMP_EXTRA_BUSY_DIRS to hold it back)"
+            rc=0; reclaim_workspace "$REPO_ROOT" "primary" || rc=$?
+            (( rc == 2 )) && failed=$((failed + 1))
         elif [[ -n "$RECLAIM_DIR" ]]; then
             local size; size="$(du -sh "$REPO_ROOT/$RECLAIM_DIR" 2>/dev/null | cut -f1)"
             log "primary checkout: $REPO_ROOT/$RECLAIM_DIR ($size) — left alone (pass --include-primary to reclaim)"
@@ -455,6 +557,11 @@ do_targets() {
             log "primary checkout: $REPO_ROOT — left alone (pass --include-primary to reclaim)"
         fi
     fi
+    if (( failed > 0 )); then
+        log "build reclaim FAILED in $failed workspace(s): TASKPUMP_RECLAIM_CMD returned non-zero — exit 3, and assume no space was bought"
+        return 3
+    fi
+    return 0
 }
 
 # ── do_docker -- prune build cache + dangling containers/images. The
@@ -501,10 +608,16 @@ do_status() {
     "$(apl_docker)" system df 2>/dev/null || echo "(container runtime not available)"
 }
 
+# A failed reclaim has to survive to the exit status, --all included: the whole
+# point of counting it is that the unattended caller can see it, and `do_stuck;
+# do_targets; do_docker` would otherwise report the LAST command's status and
+# lose it.
+SWEEP_RC=0
 case "$MODE" in
     status)   do_status ;;
     stuck)    do_stuck ;;
-    targets)  do_targets ;;
+    targets)  do_targets || SWEEP_RC=$? ;;
     docker)   do_docker ;;
-    all)      do_stuck; echo; do_targets; echo; do_docker ;;
+    all)      do_stuck; echo; { do_targets || SWEEP_RC=$?; }; echo; do_docker ;;
 esac
+exit "$SWEEP_RC"

@@ -359,7 +359,11 @@ Modifiers: `--dry-run` prints what each step would run instead of running it, an
 `--include-primary` extends `--targets` to the primary checkout's own build
 output — off by default so a human's in-progress build is never wiped without
 asking. `-h`/`--help` exits 0; no mode, an unknown argument, two modes, or a
-configured-but-missing `TASKPUMP_MANIFEST` all exit **2**.
+configured-but-missing `TASKPUMP_MANIFEST` all exit **2**; a sweep whose
+`TASKPUMP_RECLAIM_CMD` returned non-zero in at least one workspace exits **3**
+(`--all` included — the failure is not lost behind the later steps), because a
+reclaim that failed bought no space and the caller driving it unattended has to
+be able to tell.
 
 The stuck heuristic is worth stating precisely, because it decides whether a
 container gets killed: **a running agent container whose agent log's mtime is
@@ -374,18 +378,43 @@ and their newest-heartbeat election and cannot disagree with them about which
 claim is live. `TASKPUMP_MANIFEST` is an opt-in fallback for a consumer still
 launching from a v1 TSV manifest; it has no default path, and a container that
 maps to neither is reported rather than guessed at: `no live ledger claim (and no
-manifest row) maps this container to a task; skipping the task release`.
+manifest row) maps this container to a task; skipping the task release`. That
+line means exactly what it says — **neither** source named this container — and
+nothing else reuses it.
 
-The id that claim carries is validated before it is used — the §7.1 shape "an id
-is a filename", plus `TASKPUMP_ID_PATTERN` where the project configures one. A
-task file can reach the ledger without passing `tp task create`'s check (written
-by hand, by an agent with a filesystem, by a merged pull request), so an id that
-fails is named on stderr and the claim is left for a human rather than handed to
-another command:
+The id that claim carries is validated before it is used, and the two things that
+can be wrong with it are reported differently:
+
+**Unsafe refuses.** The §7.1 shape — "an id is a filename", so no path separator,
+no whitespace, nothing outside `[A-Za-z0-9._-]`, no leading `-` — is what makes an
+id safe to pass as a path component and as one argv word. A task file can reach
+the ledger without passing `tp task create`'s check (written by hand, by an agent
+with a filesystem, by a merged pull request), so an id that fails this is named on
+stderr and the claim is left for a human rather than handed to another command:
 
 ```
-WARN: ignoring the live ledger claim held by branch 'feat/e': task id … contains
-      ''', which is not safe in a path or a command argument
+WARN: ignoring the live ledger claim held by branch 'feat/e': task id G9.1\'\;\ touch\ /tmp/pwned\;\ echo\ \' contains \', which is not safe in a path or a command argument
+      Fix the task file's frontmatter (`tp task fsck` names it) and release the claim by hand.
+[…]   tp-agent-feat-e: the live ledger claim for this container names an id this tool refuses to pass on (the WARN above says what is wrong); its task claim is NOT released — fix the id, then 'tp task release <id>'
+```
+
+The id is printed with `printf %q`, so the quoting it would need is shown rather
+than lost: `\'` is one apostrophe, not three characters of decoration.
+
+The remedy line follows the source: a bad id in a `TASKPUMP_MANIFEST` row says
+`Fix that row in <path>` instead, because it is not in any task file and
+`tp task fsck` will not find it.
+
+**Off-grammar only warns.** `TASKPUMP_ID_PATTERN` is the project's own naming
+convention, not a safety property: an id like `F79.2` under a conf pinning
+`^G[0-9]+…` is still one safe word. Refusing over it would leave a wedged agent's
+claim held — and `tp task fsck --fix` filters on the same pattern, so it will not
+repair the file either. The rescue says so and releases the claim anyway:
+
+```
+WARN: the live ledger claim held by branch 'feat/e': task id ZZ9 does not match TASKPUMP_ID_PATTERN ^T[0-9]+(\.[0-9]+)?$
+      Proceeding anyway — the id is safe to hand on as one argument, and a wedged agent is worse than an off-grammar id. Fix the task file's frontmatter (`tp task fsck` names it) and release the claim by hand.
+  (dry-run) …/tp-task release ZZ9 --reason tp-cleanup:\ stuck\ \(log\ idle\ 120min\)
 ```
 
 #### What `--targets` runs, and where
@@ -420,6 +449,20 @@ $ tp cleanup --targets --dry-run
      run TASKPUMP_RECLAIM_CMD in every idle workspace)
 ```
 
+Note what the empty value costs on the **primary** arm. `--include-primary` is
+gated by that same probe, so with `TASKPUMP_RECLAIM_DIR=''` there is no
+precondition left on it at all: the command runs in the primary checkout every
+time `--include-primary` is passed, and the disk watchdog's PANIC sweep always
+passes it. The sweep says so where it happens; list the primary root in
+`TASKPUMP_EXTRA_BUSY_DIRS` if a human may be building there.
+
+**A reclaim command that fails is not a reclaim.** The per-workspace `WARNING:
+TASKPUMP_RECLAIM_CMD failed in <dir>` is counted as a failure, not a success: the
+summary reads `reclaimed N worktree workspace(s); skipped M; FAILED K …` and the
+sweep exits 3. An arbitrary consumer command fails routinely — `npm run clean` in
+a workspace with no `package.json`, a toolchain that is not installed — where the
+hardcoded `rm -rf` it replaced essentially never did.
+
 The pump's own per-tick reclaim pass still carries the hardcoded `target/`
 precondition; on a project whose build output is elsewhere it frees nothing
 per-tick, and `tp cleanup --targets` (which the disk watchdog drives under PANIC)
@@ -428,7 +471,10 @@ is the pass that works.
 **A workspace whose directory name this stack cannot carry is skipped, with a
 warning.** Directory names under the worktrees base are chosen by whoever can
 create a directory there, so a name containing anything outside
-`[A-Za-z0-9._/-]` is refused rather than swept.
+`[A-Za-z0-9._/-]` is refused rather than swept. Such a workspace's build output
+is then never reclaimed by this sweep at all, so remove it by hand — the pump can
+still create one (`apl_branch_slug_reject_reason` admits `'`, `$` and `(`, which
+this skip does not), and that gap is open.
 
 **The workspace is the install root, not the caller's.** `REPO_ROOT` here
 defaults to the parent of the script's own directory — not to `$PWD`'s git
@@ -442,12 +488,18 @@ The one caller that no longer needs telling is `tp disk-watchdog`: its PANIC
 sweep passes its own resolved workspace down as `TASKPUMP_CLEANUP_REPO_ROOT`.
 
 Finally: the extra-busy-directory list is read as `TASKPUMP_EXTRA_BUSY_DIRS`,
-with the unprefixed `EXTRA_BUSY_DIRS` still honoured as the legacy spelling and
-the prefixed one winning when both are set. The skip line names the spelling
-that answered:
+with the unprefixed `EXTRA_BUSY_DIRS` still honoured as the legacy spelling, and
+the two are **unioned** — not ranked. Ranking them would silently unprotect
+everything the losing spelling named, which is the same harm as not reading the
+key at all: the live `arachne-disk-guard` chain passes the bare name on its
+command line while a conf (or `lib/config.sh`'s generic `ARACHNE_`→`TASKPUMP_`
+promotion) supplies the prefixed one, so both are routinely set at once by
+different parties. The skip line names the spelling that matched, or both:
 
 ```
   skip: …/.worktrees/feat/a — busy (TASKPUMP_EXTRA_BUSY_DIRS)
+  skip: …/.worktrees/feat/b — busy (EXTRA_BUSY_DIRS)
+  skip: …/.worktrees/feat/c — busy (TASKPUMP_EXTRA_BUSY_DIRS + EXTRA_BUSY_DIRS)
 ```
 
 ---
@@ -601,10 +653,18 @@ The loop is a three-state machine over free space on `TASKPUMP_DISK_MOUNT`
 
 Anything between the pause and recover thresholds holds the current state. The
 "original cap" is `TASKPUMP_ORIGINAL_CAP`, else whatever the cap file held at
-startup, else `TASKPUMP_JOBS_FALLBACK` (6). `TASKPUMP_PANIC_RECLAIM=0` keeps the
-prune but never touches build directories. `--gate` answers against the *pause*
-threshold only and **fails open**: a mount it cannot read is `free=unknown —
-failing open (feed OK)`, exit 0.
+startup — **unless that is `0`**, which is somebody else's pause and not a cap to
+restore to (a watchdog that adopted it would "recover" to zero and hold the wedge
+it was started to clear) — else `TASKPUMP_JOBS_FALLBACK` (6). The startup line
+says which: `original_cap=6 (…/.taskpump-pool-cap held 0, which is a pause and
+not a cap; fell back)`. `TASKPUMP_PANIC_RECLAIM=0` keeps the prune but never
+touches build directories. `--gate` answers against the *pause* threshold only
+and **fails open**: a mount it cannot read is `free=unknown — failing open (feed
+OK)`, exit 0.
+
+Its PANIC sweep also checks `tp cleanup`'s exit status: a reclaim whose command
+failed logs `WARNING: the reclaim sweep reported failures … assume it bought no
+space` rather than letting the transcript read as though the panic was answered.
 
 #### The cap-file path, and how it used to fail
 
@@ -646,6 +706,40 @@ tp-pump plan — phases T1, grain phase, cap 2, ceiling 95%
 A file with no digits in it at all is still garbage and still falls back to
 `JOBS`. The `disk-low` feed gate remains the other half of the mechanism, so
 `--no-disk-gate` still turns off both the gate and the watchdog together.
+
+**…and a `0` is only as good as the process holding it.** The pump does not
+overwrite an existing cap file unless `--jobs` was passed, so without a liveness
+rule a `0` left behind by a killed watchdog caps the *next* unattended run at
+zero — launching nothing, reporting `status: running`, paging nobody. Three
+mechanisms keep that from happening, and they are worth knowing together:
+
+1. **The pause is re-stamped while it is held.** Every poll in `PAUSED`/`PANIC`
+   touches the cap file. No log line — nothing has changed — but the mtime is the
+   evidence that somebody is still holding it.
+2. **It is handed back on the way out.** The watch loop's `EXIT`/`INT`/`TERM`
+   path restores the original cap if the file still reads `0`, saying
+   `releasing the pool-cap pause on exit: a 0 left in … would pause the next run
+   too`. (`--once` deliberately does not: its cap is meant to outlive it, and
+   rule 3 is what ends that one. `--gate` never writes a cap at all.) While no
+   watchdog runs, the `disk-low` feed gate — not this file — is what holds the
+   line under pressure.
+3. **An unrefreshed `0` expires.** A `0` whose file has not been touched for
+   `TASKPUMP_POOL_CAP_STALE_SEC` (default 900s, 30× the default poll) is ignored
+   by the cap reader, which says so once and clears the file to the cap actually
+   in force:
+
+   ```
+   WARNING: pool cap file …/.taskpump-pool-cap has held 0 for 7200s with nothing refreshing it (TASKPUMP_POOL_CAP_STALE_SEC=900).
+            A live tp-disk-watchdog re-stamps its pause every poll, so this 0 outlived the process that wrote it — using cap 4 and cleared it to 4.
+   ```
+
+   Set `TASKPUMP_POOL_CAP_STALE_SEC=0` to disable the expiry — for a pause
+   written by hand that must outlive every watchdog. A **positive** cap never
+   expires: `echo 3 > .taskpump-pool-cap` is a standing operator preference, not
+   a pause, and nothing has to keep proving it. The heartbeat has to beat faster
+   than the window, so a `TASKPUMP_DISK_POLL` at or above it is called out at
+   startup (`WARNING: poll 1200s >= TASKPUMP_POOL_CAP_STALE_SEC 900s …`) — with
+   the defaults, 30s against 900s, there is 30× of margin.
 
 Its PANIC sweep also passes its resolved workspace to `tp cleanup` as
 `TASKPUMP_CLEANUP_REPO_ROOT`, so the reclaim runs against the workspace being
