@@ -148,11 +148,12 @@ on the status.
 #### 2.1 Exit 0 does not mean drained
 
 §10 reads, for the pump specifically: *drained, and a supervisor must not restart
-it.* That is true of exactly one of the seven invocations that reach `exit 0`:
+it.* That is true of exactly one of the eight invocations that reach `exit 0`:
 
 | Invocation | What 0 means |
 |---|---|
 | a full run that ends | **Drained.** The loop broke on `is_drained`, then `graduate_trunk`, `ops_push`, `write_state drained` and the drain notification ran. Do not restart. |
+| `--detach` | **Nothing has drained, and nothing has even been attempted yet.** The 0 reports that the run was successfully handed to a transient `systemd --user` unit (or to `setsid`+`nohup`); the run itself begins after this process is gone and may still be going hours later. This is the sharpest edge of the seven non-drain zeros, because it is the one an operator is most likely to script: the exit status arrives immediately, looks exactly like a completed drain, and the range it was pointed at has not been touched. |
 | `--once` | One tick ran. The range is in whatever state that tick left it. State file says `stopped`. |
 | `--dry-run` | A plan was printed: no image build, no launches, no ledger mutation, no state file. The gate chain *is* consulted, so a gate with a cache of its own may still have written one. |
 | `--list` | A plan was printed. |
@@ -340,6 +341,17 @@ With the flag on, six things change:
    and optionally `push` (only when `TASKPUMP_PUMP_TRUNK_PUSH=1`); on conflict
    `merge --abort` and quarantine; on a red build `reset --hard` back and
    quarantine.
+   **The build gate has a hardcoded Rust default, and leaving
+   `TASKPUMP_BUILD_GATE` unset does not mean "no gate".** With no command
+   configured, `run_build_gate` runs `cargo check --workspace` in the trunk
+   worktree, and then `./smoke_test.sh` if one is executable there. On a project
+   that is not Rust, `cargo check` fails — 101 where cargo exists, 127 where it
+   does not — so with `--integration-trunk` on, **every** merge is `reset --hard`
+   and quarantined as a red build, the lead task is flipped to `needs-review`,
+   and the operator is notified that their build is broken. Nothing is lost (the
+   branch still holds the work), but the stated cause is wrong and the trunk
+   never advances. Set `TASKPUMP_BUILD_GATE` to your own command, or to `true` to
+   accept every merge, before turning the trunk on outside a Rust project.
 5. **Quarantine is a merge verdict, not a work verdict.** The unit's lead task is
    flipped to `needs-review` — *unless it is already `done`*, in which case it
    stays `done`, because the broken thing is the merge. Both wordings notify. A
@@ -553,13 +565,15 @@ unless individually overridden:
 | `.taskpump-pump.log` | the `setsid` detach fallback only |
 | `.auto-trunk.lock` | the first `--integration-trunk` run |
 | `.auto-trunk-quarantine` | appended on each failed trunk merge; read once, at graduation, to fill in the PR body |
-
-The last two are in the fs-guard's allowlist alongside `.worktrees/` and `ops`,
-because they are untracked files the supervisor itself creates in the repo root
-— without that entry the contamination guard would fire on every tick for the
-rest of the drain.
 | `<worktree>/.taskpump-phase-brief.md` | each launch |
 | `<worktree>/.taskpump-resume.md` | each **resume** — and actively deleted on a normal launch, so a fresh drain of a reused worktree cannot inherit a previous resume's instructions |
+
+The two `.auto-trunk*` files are in the fs-guard's allowlist alongside
+`.worktrees/` and `ops`, because they are untracked files the supervisor itself
+creates in the repo root — without that entry the contamination guard would fire
+on every tick for the rest of the drain. The last two rows are the exception to
+the heading above: they are written inside the unit's own worktree, not in
+`TASKPUMP_STATE_DIR`.
 
 The cap-file write is placed below every startup abort and above the banner on
 purpose: a pump that never ticked must not clobber a number a previous run, an
@@ -716,7 +730,7 @@ have to wait out the rest of the tick before the `TERM` trap can stamp the file.
 
 ### 13. Notifications
 
-Five messages go through `pump_notify`, which logs the message first and then
+Six messages go through `pump_notify`, which logs the message first and then
 delivers it. Nothing else notifies.
 
 | Message | When |
@@ -737,10 +751,14 @@ stdin, and fails on every notice.
 
 A configured command that fails is reported — with its exit status, the fact that
 nothing was delivered, and its first *speaking* line of stderr, labelled as
-exactly that rather than offered as the cause. Three distinct warnings, because
-three distinct things can be true: the program is not on `PATH`; it failed and
-said something; it failed and said nothing (only then does the pump mention the
-stdin contract, and it mentions it as something to check). The `notify-send`
+exactly that rather than offered as the cause. Four distinct warnings, because
+four distinct things can be true: the program is not on `PATH` (asked *before*
+the run, so the shell's own `command not found` is never quoted back as though
+the notifier had said it); it failed and said something; it failed and wrote
+only blank or control bytes, so there is nothing quotable — reported as that,
+never as silence; and it failed and said nothing at all (only then does the pump
+mention the stdin contract, and it mentions it as something to check rather than
+as the diagnosis). The `notify-send`
 fallback stays quiet: nobody configured it, a headless host has no session bus,
 and the log line is still the record.
 

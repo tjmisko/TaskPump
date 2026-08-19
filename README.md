@@ -250,9 +250,16 @@ That last line is the one people leave out, and it is the one that bites: the
 monitor's scratchpad (`n` in the TUI) writes a note file into a directory at the
 repository root, which is neither ignored by default nor in the contamination
 guard's allowlist. Take one note during a drain and the guard reports
-`FS-GUARD: primary checkout dirty outside allowlist: .taskpump-monitor-notes/`
+
+```
+FS-GUARD: primary checkout dirty outside allowlist:
+?? .taskpump-monitor-notes/
+```
+
 on every tick for the rest of the run, and pushes a desktop notification the
-first time.
+first time. Note the line break: the header and the offending paths are separate
+lines (`lib/pump-lib.sh:590`), so grep for `dirty outside allowlist` rather than
+for a whole sentence naming the path.
 
 Then run `tp task resolve --all`. It prints which ledger every invocation from
 here will touch and how it decided — it is the diagnostic every error message

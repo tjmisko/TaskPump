@@ -180,10 +180,10 @@ minute because two of the three are traps:
 
 | Gate | Flag | Conf key | What the key actually does |
 |---|---|---|---|
-| `net-health` | — | `TASKPUMP_HEALTH_GATE=1` | Works, and is the only way in: the gate is off by default and the key is what adds it to the chain. |
+| `net-health` | `--no-health-gate` | `TASKPUMP_HEALTH_GATE=1` | Works, and is the only way *in*: the gate is off by default and the key is what adds it to the chain. The flag is the way back out, and it wins over the key — `--no-health-gate` drops the gate from the chain even when the key asked for it. |
 | `claude-usage` | `--no-usage-gate` | `TASKPUMP_USAGE_GATE` | **Nothing.** The pump initialises this switch to 1 unconditionally and re-exports it to every gate, overwriting whatever the conf or the environment said. |
 | `disk-low` | `--no-disk-gate` | `TASKPUMP_DISK_GATE` | **Nothing**, for the same reason — and the flag additionally suppresses the background disk watchdog ([PUMP-MECHANISMS.md §3](PUMP-MECHANISMS.md#3-budget-gated-launching-that-never-kills-in-flight-work)). |
-| `claude-token-fresh` | — | `TASKPUMP_TOKEN_GATE=0` | Reaches the gate, which then returns "feed" immediately. But there is **no `--no-token-gate` flag**, and the gate is emitted into the default chain unconditionally, so it stays on the `gates:` line and still prints its skip note. |
+| `claude-token-fresh` | — | `TASKPUMP_TOKEN_GATE=0` | Reaches the gate, which returns "feed" immediately and **silently** (`lib/pump-lib.sh:516` returns before any output). But there is **no `--no-token-gate` flag**, and the gate is emitted into the default chain unconditionally, so it stays on the `gates:` line whether it is doing anything or not. Do not read a `skipped:` line as the sign of a disabled gate — that note means the gate ran and could not find usable credentials. |
 
 Demonstrated, not inferred: a run started with `TASKPUMP_DISK_GATE=0
 TASKPUMP_USAGE_GATE=0 TASKPUMP_TOKEN_GATE=0` in its environment hands a probe

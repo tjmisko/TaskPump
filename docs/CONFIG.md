@@ -317,7 +317,7 @@ narrower key that wins over a general one for a single tool —
 somewhere other than the base every other tool assumes. Write the canonical name
 in both cases; reach for an override only when a tool genuinely needs to differ.
 
-### 3.0 Six keys that do not mean what their name suggests
+### 3.0 Seven keys that do not mean what their name suggests
 
 These are the traps a reader of the key names alone falls into. Each is written
 out again in its own section; they are collected here because the cost of
@@ -601,8 +601,10 @@ verbs answer from the install's own ledger and refuses only the mutating ones,
 was found above `$PWD`, `$PWD` is not inside a consumer repository, and no pin
 was given. A drain planned there would cut branches and worktrees inside
 TaskPump itself. The check runs before argument parsing, so `--dry-run` and
-`--help` refuse too. The escapes it names are `TASKPUMP_WORKSPACE_ROOT`, or an
-explicit `TASKPUMP_TASKS_DIR` / `TASKPUMP_PUMP_TASKS_DIR`; the vendored layout
+`--help` refuse too. Three things get you out of it — `TASKPUMP_WORKSPACE_ROOT`,
+or an explicit `TASKPUMP_TASKS_DIR` / `TASKPUMP_PUMP_TASKS_DIR` — but the
+message itself names only the first, so the other two are escapes you have to
+already know about (`libexec/tp-pump:115`). The vendored layout
 (the install at or inside the caller's worktree) is exempt, because there the
 fallback is simply correct.
 

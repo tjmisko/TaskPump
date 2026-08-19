@@ -233,8 +233,10 @@ table both of those read.
 | `q` `:q` | quit |
 | `PgUp` `PgDn` | page the viewport (`Ctrl-u` / `Ctrl-d`, `Space` / `b`) |
 
-Three things the panel does not say. The letter keys accept either case (`Q`, `J`,
-`N` and so on all work). `g` is a **prefix** resolved before the tab's own keymap
+Three things the panel does not say. The letter keys accept either case (`Q`,
+`J`, `N` and so on all work) with one exception: `b`, the `PgUp` alias, has no
+uppercase arm (`libexec/tp-monitor:2280,2308`), so `B` does nothing on either
+tab. `g` is a **prefix** resolved before the tab's own keymap
 sees the key, and any key other than `g`, `t` or `T` cancels a pending `g` rather
 than being swallowed by it — a half-typed motion never eats a command. And the
 arrow keys switch tab on *neither* tab, on purpose: they are the node cursor's
@@ -243,7 +245,8 @@ other is the kind of thing you learn by losing your place.
 
 #### Colour
 
-Four families and no colour outside them, with three rules that hold the system
+Three families — STATE, CHROME and RESOURCE — and no colour outside them, with
+three rules that hold the system
 together: every escape re-opens with `0;` (SGR attributes are sticky, and a
 leaked `2` has twice washed out an entire region); **state is never carried by
 colour alone** — a glyph or a word always carries it too, which is what makes the
@@ -313,7 +316,8 @@ liveness read all invoke a literal `docker`. On a host running `podman` — with
 `TASKPUMP_DOCKER=podman` configured and honoured by the pump, the runner and
 `tp cleanup` — the monitor's SESSIONS tab reports `(no tp-agent containers
 running or recently exited)` for a fleet that is running perfectly well, and the
-GRAPH tab draws every claimed task as `⧗ claimed, idle` rather than `▶ running`.
+GRAPH tab draws every claimed task as `⧗ claimed, idle` rather than
+`▶ in progress`.
 Filed as a code bug. There is no workaround inside the monitor; a `docker` shim
 on `PATH` is the only lever.
 
@@ -337,8 +341,11 @@ too slow to run every paint) and the disk sizing (60s).
 ### `tp cleanup`
 
 One-button rescue for a parallel run: hung agents, orphaned build output, a
-container runtime full of dead layers. Exactly one mode is required, and
-supplying two is an error.
+container runtime full of dead layers. A mode is required, and supplying two
+mutually exclusive *destructive* modes is an error — but `--status` carries no
+duplicate-mode guard of its own, so `tp cleanup --all --status` is accepted and
+quietly runs only the read-only pass. If you meant to reclaim and got a report,
+that pairing is why.
 
 | Mode | What it does |
 |---|---|
@@ -448,7 +455,8 @@ come from `and()`/`or()` on a direction bitmask, which `mawk` and BWK awk do not
 have and would silently mis-render every junction instead of failing. Both the
 presence of `gawk` and its GNU-ness are probed up front, each with its own
 message. `TASKPUMP_AWK` points at a differently-named binary. It also needs
-bash 4+, checked at line 1.
+bash 4+, checked at `libexec/tp-dag-render:59-62` — after the shebang, so a
+bash 3 host reaches a real diagnostic rather than a syntax error.
 
 **One parsing gap worth knowing.** The frontmatter reader collects blockers only
 from a YAML **block list**:

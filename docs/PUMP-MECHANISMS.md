@@ -1,8 +1,10 @@
 # Pump Mechanisms
 
 The pump is a supervisor that keeps a pool of agents working a task DAG for days
-without a human in the loop. This document specifies the six mechanisms that
-make that survivable, and why each one is shaped the way it is.
+without a human in the loop. This document specifies the five mechanisms that
+make that survivable (§1–§5), and why each one is shaped the way it is. Two
+sections follow that are not mechanisms and say so: §6 is the resolution rule
+all five stand on, and §7 is the contract a re-implementer can rely on.
 
 Every mechanism here was rebuilt at least once after an unattended run failed in
 a way that looked like success. That history is the point: each section states
@@ -11,8 +13,10 @@ rules and discards the reasons will rediscover the incidents.
 
 The pump implements these against the ledger described in
 [LEDGER-CONTRACT.md](LEDGER-CONTRACT.md). They are separable — a different
-supervisor, in a different language, can implement all six against the same
-ledger — which is exactly what this document is for.
+supervisor, in a different language, can implement all five against the same
+ledger — which is exactly what this document is for. (§7's table carries six
+rows: the five mechanisms and the resolution rule, because a consumer has to
+honour that one too.)
 
 ---
 
@@ -59,8 +63,8 @@ no longer clear.
 **And a step that is not there: there is no "observe".** Nothing asks the runner
 once per tick and hands the answer down. Each pass that needs to know whether an
 agent is alive asks at the moment it asks — the orphan reclaim, the plan (once
-per unit), the stall detector, the pool count — so the call count grows with the
-range: against a stub runner, one `--once` tick issued seven `list` invocations
+per unit), the pool count, the drain test, and every state-file write, which
+carries a live count of its own — so the call count grows with the range: against a stub runner, one `--once` tick issued seven `list` invocations
 for a one-phase range, eight for two phases and ten for four. Only the
 *capability* probe ("does this runner answer `list` at all?") is cached, once
 per process. Two obligations fall out of that, both on the runner: `list` is on

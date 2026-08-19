@@ -92,15 +92,23 @@ agents with **no image, no name and no branch**, and — because `AGENT_MODEL` a
 to its own defaults for the model and the turn budget. It launches. It launches
 the wrong thing, at the wrong budget, under a name liveness cannot map back.
 
-Two of the shipped runners' fallbacks work anyway, and it is worth knowing why,
-because it is not this table. `runners/claude-docker` reads
-`first_set TP_IMAGE ARACHNE_IMAGE`, and `ARACHNE_IMAGE` *is* usually set — not by
+Exactly one of the shipped runner's legacy fallbacks can be relied on, and it is
+worth knowing why, because the reason is not this table. `runners/claude-docker`
+reads `first_set TP_IMAGE ARACHNE_IMAGE`, and `ARACHNE_IMAGE` *is* set — not by
 the launch environment, but because `TASKPUMP_IMAGE` is a configuration key and
 `lib/config.sh` back-promotes every `TASKPUMP_X` to `ARACHNE_X` in the pump's own
-environment, which the runner inherits. The same accounts for
-`ARACHNE_ENTRYPOINT` and `ARACHNE_PUMP_OPS_DIR`. It does **not** account for
-`ARACHNE_BRANCH` or `ARACHNE_CONTAINER_NAME`, which correspond to no
-configuration key and are genuinely absent from a launch environment.
+environment, which the runner inherits. That fallback holds because the key is
+**required**: a real run aborts until `TASKPUMP_IMAGE` names an image, so the
+promotion has always happened by the time a runner is launched.
+
+The same mechanism explains `ARACHNE_ENTRYPOINT` and `ARACHNE_PUMP_OPS_DIR` and
+does **not** rescue them, because `TASKPUMP_ENTRYPOINT` and
+`TASKPUMP_PUMP_OPS_DIR` are optional and unset by default — there is nothing to
+promote unless an operator has set them, so in a default configuration those two
+legacy names reach a runner as empty. `ARACHNE_BRANCH` and
+`ARACHNE_CONTAINER_NAME` are worse still: they correspond to no configuration
+key at all, so no promotion can ever produce them and they are absent from every
+launch environment.
 
 **So: read `TP_*`.** It is the only spelling the pump guarantees for all
 twenty-one.
@@ -591,8 +599,11 @@ whatever happens to be two directories up.
 
 **What the image must provide for tp to function:** `bash` 4+, `git`, `jq`, and
 mikefarah's `yq` v4 (the ledger is read and written through yq's front-matter
-modes — the Python `yq` shares nothing but the name). Those four are what the
-ledger verbs need, and an image with only those runs `tp task` correctly.
+modes — the Python `yq` shares nothing but the name). Those four are the
+*distinctive* requirements — the ones a minimal image will not already have.
+They are not the whole list: the ledger verbs also shell out to `awk`, `date`
+and `paste`, so a genuinely empty base image needs coreutils and an awk beside
+the four above before `tp task` runs correctly.
 
 **Plus `gawk`, specifically GNU awk**, if anything in the container is going to
 run `tp dag-render` or `tp monitor`. The DAG layout uses `and()`/`or()` bit
