@@ -24,7 +24,14 @@
 #
 # ── Syntax ───────────────────────────────────────────────────────────────────
 # This file is sourced by bash with allexport on, so it is `KEY=value` per line.
-# Quote any value containing spaces: `TASKPUMP_NOTIFY_CMD='notify-send -u low'`.
+# Quote any value containing spaces:
+#     TASKPUMP_NOTIFY_CMD='logger -t taskpump'
+# The notifier here is logger and not anything desktop because this line is
+# about the quoting and gets copied by people who are not reading it for
+# notifications: a configured notifier reads the message on stdin, which logger
+# does and an argv-style desktop notifier does not, and it has to work headless,
+# which is where a long run lives. The key's own entry below has the desktop
+# wrapper and what it needs.
 #
 # ── Reading this file ────────────────────────────────────────────────────────
 # Every key is commented out and annotated with the default the tool falls back
@@ -137,7 +144,14 @@
 # TASKPUMP_PUMP_NO_GH=      # 1 = skip all gh CLI calls (default: 0)
 # TASKPUMP_NOTIFY_CMD=      # command that reads a notification on stdin. Unset falls
 #                           #   back to notify-send when present, else log only. Set to
-#                           #   `true` to silence.
+#                           #   `true` to silence. A desktop popup needs a wrapper and a
+#                           #   session bus to deliver to:
+#                           #   TASKPUMP_NOTIFY_CMD='xargs -0 notify-send -u low TaskPump'
+#                           #   (without -0, xargs splits the message at whitespace into
+#                           #   extra positionals notify-send rejects). Headless —
+#                           #   enable-linger, ssh — there is no bus and every notice
+#                           #   fails, so there use
+#                           #   TASKPUMP_NOTIFY_CMD='logger -t taskpump'
 # TASKPUMP_PUMP_PROG_NAME=  # the name the pump answers to as itself — diagnostics,
 #                           #   the plan header, the notify title, the transient
 #                           #   systemd unit (default: tp-pump)

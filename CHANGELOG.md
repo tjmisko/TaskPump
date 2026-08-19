@@ -64,7 +64,29 @@ all of them exited cleanly while telling an operator something untrue.
   warning that reports a notifier which drops its message names the **program**
   and its exit status rather than the whole `TASKPUMP_NOTIFY_CMD` value, which for
   a webhook notifier copied a credential into a stderr stream `--detach`
-  persists. (#35)
+  persists.
+
+  That warning states only what a non-zero exit establishes. Its first spelling
+  appended "TASKPUMP_NOTIFY_CMD takes the message on stdin, not as an argument"
+  to every failure — one cause asserted for all of them, and the wrong one on a
+  headless host, where a wrapper that honours the stdin contract exactly still
+  fails for want of a session bus (measured: exit 123, `Failed to execute child
+  process "dbus-launch"`) and the operator was being sent to fix the part they
+  had right. It now quotes the first line the notifier itself wrote to
+  stderr (bounded, control characters stripped, the value's arguments still never
+  echoed), and names the stdin contract as something to check only when the
+  notifier wrote nothing at all.
+
+  The same change exposed the value the tree was telling operators to copy.
+  `TASKPUMP_NOTIFY_CMD='notify-send -u low'` was the example both syntax sections
+  reached for when they needed a value with a space in it — the one shape the key
+  cannot take, silently dropping every notice before this and warning on every
+  notice after. Those two sites now show `logger -t taskpump`, which reads stdin
+  and works on the headless host a long run actually lives on; the desktop
+  notifier moved to the key's own entry in docs/CONFIG.md §3.2, where the wrapper
+  it needs (`xargs -0`, `-0` explained), the session bus it needs, and the
+  headless alternative can all be stated. Every documented value is re-read out
+  of the shipped files by the pump suite and driven through a real drain. (#35)
 
 - **A failed ops pull quotes git's diagnosis, not git's progress banner.** The
   warning quoted the first non-blank line of `git pull --ff-only`, which for the

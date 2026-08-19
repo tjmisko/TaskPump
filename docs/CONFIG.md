@@ -186,8 +186,15 @@ Quote anything containing spaces:
 
 ```bash
 TASKPUMP_TASKS_DIR=tasks
-TASKPUMP_NOTIFY_CMD='notify-send -u low'
+TASKPUMP_NOTIFY_CMD='logger -t taskpump'
 ```
+
+The notifier here is `logger` rather than anything desktop because this example
+is about the quoting and gets copied by people who are not reading it for
+notifications: a configured notifier reads the message on **stdin**, which
+`logger` does and an argv-style desktop notifier does not, and it has to work
+where the pump actually runs — a headless host with no session bus is where a
+long run lives (§3.2 has the desktop wrapper and what it needs).
 
 Because it is sourced, it is executable code. Treat it as you would any file you
 run: do not source a `taskpump.conf` you have not read.
@@ -351,12 +358,44 @@ toolchain:
 | `TASKPUMP_SUBMODULE_PROBE` | A path that proves the ledger submodule is populated in a fresh worktree, letting the pump skip its per-worktree `git submodule update --init --recursive`. **No default**: unset, the (idempotent, cheap) init always runs. The probe is a pure optimization — and a sharp one: a path that exists for the wrong reason skips the init some *other* submodule still needs, silently. Set it only to a path that proves everything you need populated. |
 | `TASKPUMP_GATES` | Ordered list of gates to consult before launching (§[GATES.md](GATES.md)). |
 | `TASKPUMP_PRE_TICK_HOOKS` | Commands run at the start of each tick — ledger refresh, repo hygiene, contamination checks. |
-| `TASKPUMP_NOTIFY_CMD` | The command that delivers notifications. Set it to `true` to silence them. |
+| `TASKPUMP_NOTIFY_CMD` | The command that delivers notifications, which it receives on **stdin** — see the recipes below. Unset, the pump falls back to `notify-send <prog-name> <message>` wherever notify-send is on PATH. Set it to `true` to silence them; every message is logged either way. |
 
 `TASKPUMP_GATES` and `TASKPUMP_PRE_TICK_HOOKS` are both **newline-separated
 command lines**, and each entry's first word must be an executable path. A bare
 gate name, or a comma-separated list, is skipped with a warning rather than run —
 which reads as "the gate passed".
+
+**Notifications.** `TASKPUMP_NOTIFY_CMD` is a command line that gets the message
+on **stdin**; that is the whole contract. Anything that reads stdin works, and an
+argv-style notifier (`notify-send`, `terminal-notifier`) needs a wrapper that
+turns the message into an argument:
+
+```bash
+TASKPUMP_NOTIFY_CMD='logger -t taskpump'                    # journal/syslog; works headless
+TASKPUMP_NOTIFY_CMD='xargs -0 notify-send -u low TaskPump'  # desktop popup; needs a session
+```
+
+`-0` is load-bearing. Without it `xargs` splits the message at whitespace and
+hands `notify-send` a summary, a body, and however many positionals are left
+over, which it rejects (`Invalid number of options.`, reported by `xargs` as
+exit 123). `xargs` also caps one argument list at ~128 KiB (`xargs
+--show-limits`), so an unusually large notice — a pre-tick hook with thousands
+of paths to report — fails as well. And the desktop line needs what any desktop
+notification needs: a session bus with a notification daemon on it. A pump left
+running under `loginctl enable-linger` (§3.8) or started over ssh has neither,
+so there every notice fails — with whatever your libnotify says about the
+missing bus — while the same run with the key unset would have been silent.
+`logger` is the value that survives that host.
+
+A configured command that exits non-zero is reported with its exit status and
+its first line of stderr, labelled as exactly that. The pump does not infer a
+cause: it has no grammar for an arbitrary notifier's output, so it quotes what
+the notifier said and leaves the reading to you — the first line is often the
+reason and sometimes a banner. A notifier that writes nothing is reported as
+having written nothing, and one that is not on `PATH` is reported as missing
+rather than as having failed. The command's arguments are never printed, because
+a webhook notifier keeps its token there. The full message is in the log either
+way.
 
 **Testing and inspection seams:**
 

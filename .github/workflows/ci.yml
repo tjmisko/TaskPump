@@ -61,10 +61,14 @@ jobs:
           sudo apt-get update -qq
           # gawk: the DAG layout engine is a gawk program; ubuntu ships mawk by
           # default, which lacks the array and printf behaviour it relies on.
-          # jq, git, util-linux (flock), coreutils (timeout) are already present
-          # on the runner; naming them here makes a change in the runner image
-          # fail at this step rather than deep inside a suite.
-          sudo apt-get install -y --no-install-recommends gawk jq git util-linux coreutils
+          # jq, git, util-linux (flock, and logger — the headless
+          # TASKPUMP_NOTIFY_CMD docs/CONFIG.md ships), coreutils (timeout),
+          # findutils (xargs, which the desktop notifier recipe in the same
+          # section is built from and which the pump suite drives through a real
+          # tick) are already present on the runner; naming them here makes a
+          # change in the runner image fail at this step rather than deep inside
+          # a suite.
+          sudo apt-get install -y --no-install-recommends gawk jq git util-linux coreutils findutils
           gawk --version | head -1
           jq --version
 
