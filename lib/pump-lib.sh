@@ -217,6 +217,72 @@ apl_agent_prefix() { printf '%s' "${TASKPUMP_AGENT_PREFIX:-tp-agent-}"; }
 # spelling; DOCKER is the legacy one every existing harness sets.
 apl_docker() { printf '%s' "${TASKPUMP_DOCKER:-${DOCKER:-docker}}"; }
 
+# ── Name safety: what may be carried as a path component or an argument ───────
+# The characters a name may use if it has to survive being a directory name, a
+# container name, and a word in a command this stack builds. Everything outside
+# it — a quote, a `$`, a `;`, a newline, a space — is refused at the boundary
+# rather than escaped at each of the dozen places it is later spliced, because
+# the escaping is what keeps going wrong (PI-C1: a ledger id carrying `'; …`
+# reached tp-cleanup's host eval).
+APL_SAFE_NAME_CHARS='A-Za-z0-9._-'
+
+# apl_unsafe_name_reason <what> <value> [extra-allowed] — one line naming the
+# first character of <value> outside the safe set (plus any characters in
+# <extra-allowed>, e.g. `/` for a path), and exit 1. Nothing and exit 0 when
+# every character is safe. An empty <value> is safe here: emptiness is a
+# different fault, and each caller words it for itself.
+#
+# <extra-allowed> goes FIRST in the bracket expression, because the safe set
+# ends in `-` and a `-` anywhere but last opens a character range: appending
+# `/` produced `[A-Za-z0-9._-/]`, i.e. the range `_` to `/`, which silently
+# stopped allowing the `/` it was added for.
+apl_unsafe_name_reason() {
+  local what="$1" value="$2" extra="${3:-}"
+  local stripped="${value//[$extra$APL_SAFE_NAME_CHARS]/}"
+  [[ -z "$stripped" ]] && return 0
+  printf '%s %q contains %q, which is not safe in a path or a command argument\n' \
+    "$what" "$value" "${stripped:0:1}"
+  return 1
+}
+
+# apl_id_reject_reason <id> — empty output and exit 0 when <id> may be handed on
+# as a task id; one line saying what is wrong and exit 1 when it may not.
+#
+# docs/LEDGER-CONTRACT.md §7.1 already states the rule — "an id is a filename":
+# no path separators, no whitespace, no character that is unsafe in a filename.
+# What was missing is anyone enforcing it on the way IN. `tp task create` and
+# `tp task fsck` check the id a human types; a task file written by hand, by an
+# agent with a filesystem, or by a merged pull request never passes either, and
+# every read path downstream trusted the contract's promise instead of the
+# bytes. Ids ENTER this stack from the filesystem, so they are checked there.
+#
+# Two rules, deliberately separate:
+#   * the §7.1 shape, which every consumer shares and nothing may opt out of;
+#   * TASKPUMP_ID_PATTERN, the project's own grammar, applied only when the
+#     caller has one configured — an install-default grammar refusing a
+#     consumer's legitimate ids would break the rescue path it protects.
+apl_id_reject_reason() {
+  local id="$1" reason
+  if [[ -z "$id" ]]; then
+    printf 'the task id is empty\n'; return 1
+  fi
+  if [[ "$id" == -* ]]; then
+    printf 'task id %q starts with "-", which every CLI it is handed to reads as a flag\n' "$id"
+    return 1
+  fi
+  if [[ "$id" == "." || "$id" == ".." ]]; then
+    printf 'task id %q is a directory reference, not a filename\n' "$id"; return 1
+  fi
+  if ! reason="$(apl_unsafe_name_reason 'task id' "$id")"; then
+    printf '%s\n' "$reason"; return 1
+  fi
+  if [[ -n "${TASKPUMP_ID_PATTERN:-}" ]] && ! [[ "$id" =~ $TASKPUMP_ID_PATTERN ]]; then
+    printf 'task id %q does not match TASKPUMP_ID_PATTERN %s\n' "$id" "$TASKPUMP_ID_PATTERN"
+    return 1
+  fi
+  return 0
+}
+
 # apl_branch_slug_reject_reason <branch> — empty output and exit 0 when the
 # branch can carry an agent name; one line saying what is wrong and exit 1 when
 # it cannot.

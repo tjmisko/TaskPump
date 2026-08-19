@@ -452,6 +452,64 @@ got=$(apl_branch_slug_reject_reason "feat/a/b" 2>&1 || true)
   && pass "the reason names the ambiguous slug it would have produced" \
   || fail "the reason does not show the collision: '$got'"
 
+echo "--- the id-safety rule: §7.1 is a rule, not a promise ---"
+# docs/LEDGER-CONTRACT.md §7.1 has always said "an id is a filename", and until
+# now only `tp task create` and `tp task fsck` ever checked. A task file written
+# by hand, by an agent with a filesystem, or by a merged pull request passes
+# neither, and its id used to travel unchecked all the way into a command
+# (PI-C1). This is the shared check the read paths call.
+for good in T1 T1.1 F79.2 G9.12 build-thing v0.2.1; do
+  apl_id_reject_reason "$good" >/dev/null \
+    && pass "id '$good' is accepted" \
+    || fail "id '$good' was rejected: $(apl_id_reject_reason "$good")"
+done
+
+# One entry per way a poisoned id gets into a command: quote-escape, command
+# substitution, separator, path traversal, flag injection, whitespace, empty.
+while IFS= read -r bad; do
+  got=$(apl_id_reject_reason "$bad" 2>&1); rc=$?
+  [[ $rc -ne 0 && -n "$got" ]] \
+    && pass "id '$bad' is rejected with a reason" \
+    || fail "id '$bad' was accepted (rc=$rc)"
+done <<'EOF'
+G9.1'; touch /tmp/pwned; echo '
+G9.1$(id)
+a;b
+../../etc/passwd
+sub/dir
+-rf
+has space
+EOF
+got=$(apl_id_reject_reason "" 2>&1 || true)
+[[ -n "$got" ]] && pass "an empty id is rejected with a reason" || fail "empty id accepted"
+
+# The project's own grammar applies on top, but only when the project HAS one:
+# an install-default pattern refusing a consumer's legitimate ids would break
+# the rescue path this check exists to protect.
+got=$(TASKPUMP_ID_PATTERN='^T[0-9]+(\.[0-9]+)?$' apl_id_reject_reason "F79.2" 2>&1 || true)
+[[ "$got" == *"TASKPUMP_ID_PATTERN"* ]] \
+  && pass "a filename-safe id outside the configured grammar is rejected by name" \
+  || fail "the configured grammar was not applied: '$got'"
+TASKPUMP_ID_PATTERN='^F[0-9]+(\.[0-9]+)?$' apl_id_reject_reason "F79.2" >/dev/null \
+  && pass "and the same id passes under the grammar it belongs to" \
+  || fail "F79.2 rejected under its own pattern"
+( unset TASKPUMP_ID_PATTERN; apl_id_reject_reason "WHATEVER-9" >/dev/null ) \
+  && pass "with no grammar configured only the §7.1 shape is enforced" \
+  || fail "an unconfigured grammar rejected a filename-safe id"
+
+# The path form, used to refuse a worktree directory name this stack cannot
+# carry: `/` is allowed there and nowhere else.
+apl_unsafe_name_reason 'worktree directory' 'feat/g3' '/' >/dev/null \
+  && pass "a slash is safe in a path when the caller allows it" \
+  || fail "feat/g3 rejected as a path: $(apl_unsafe_name_reason 'worktree directory' 'feat/g3' '/')"
+got=$(apl_unsafe_name_reason 'worktree directory' "feat/x'\$(id)'y" '/' 2>&1 || true)
+[[ "$got" == *"worktree directory"* && -n "$got" ]] \
+  && pass "a quote in a directory name is named as unsafe" \
+  || fail "an unsafe directory name was accepted: '$got'"
+apl_unsafe_name_reason 'task id' 'feat/g3' >/dev/null \
+  && fail "a slash was accepted where the caller allowed no extras" \
+  || pass "and the same slash is unsafe when the caller allows no extras"
+
 echo "--- pool cap: one shared fallback, not three private ones ---"
 CAP_FILE="$TMP/absent-cap"
 [[ "$(JOBS=4 apl_read_cap)" == "4" ]] && pass "caller's JOBS wins when no cap file exists" \

@@ -376,6 +376,18 @@ launching from a v1 TSV manifest; it has no default path, and a container that
 maps to neither is reported rather than guessed at: `no live ledger claim (and no
 manifest row) maps this container to a task; skipping the task release`.
 
+The id that claim carries is validated before it is used — the §7.1 shape "an id
+is a filename", plus `TASKPUMP_ID_PATTERN` where the project configures one. A
+task file can reach the ledger without passing `tp task create`'s check (written
+by hand, by an agent with a filesystem, by a merged pull request), so an id that
+fails is named on stderr and the claim is left for a human rather than handed to
+another command:
+
+```
+WARN: ignoring the live ledger claim held by branch 'feat/e': task id … contains
+      ''', which is not safe in a path or a command argument
+```
+
 #### Two traps in `--targets`
 
 **`TASKPUMP_RECLAIM_CMD` is a switch here, not a command.** The sweep runs only
@@ -393,6 +405,11 @@ The pump's own per-tick reclaim pass is the one that executes the key verbatim.
 If your project is not Rust-shaped, `tp cleanup --targets` will either find no
 `target/` and do nothing, or delete a directory called `target/` that means
 something else to you. Preview with `--dry-run` before trusting it.
+
+**A workspace whose directory name this stack cannot carry is skipped, with a
+warning.** Directory names under the worktrees base are chosen by whoever can
+create a directory there, so a name containing anything outside
+`[A-Za-z0-9._/-]` is refused rather than swept.
 
 **The workspace is the install root, not the caller's.** `REPO_ROOT` here
 defaults to the parent of the script's own directory — not to `$PWD`'s git

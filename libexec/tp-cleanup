@@ -128,12 +128,48 @@ if [[ -n "$MANIFEST" && ! -f "$MANIFEST" ]]; then
 fi
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
-# Every caller passes ONE pre-quoted command string, so eval-as-string is the
-# honest form; "$@" only pretended this took a word vector.
+
+# act <argv...> -- run one command, or print what it would have been under
+# --dry-run. An ARGV VECTOR, never a command string.
+#
+# This used to end in `eval "$*"`, on the premise that "every caller passes ONE
+# pre-quoted command string". The premise is what failed: the callers built
+# those strings by interpolating values — a worktree directory name from a glob,
+# a task id read out of the ledger — inside single quotes, and a value carrying
+# a single quote of its own closes the quoting and the rest of it runs as the
+# operator, on the host, from a watchdog nobody is watching (PI-C1 / PI-D4).
+# There is no quoting discipline that survives that; there is only not parsing
+# data as shell. Words in, words out.
 act() {
-    if [[ "$DRY_RUN" -eq 1 ]]; then echo "  (dry-run) $*"
-    else echo "  $ $*"; eval "$*"
+    if [[ "$DRY_RUN" -eq 1 ]]; then printf '  (dry-run) %s\n' "$(act_render "$@")"
+    else printf '  $ %s\n' "$(act_render "$@")"; "$@"
     fi
+}
+
+# act_render <argv...> -- the command as a copy-pasteable shell line. %q, so a
+# value that would need quoting shows its quoting instead of losing it.
+act_render() {
+    local out; out="$(printf '%q ' "$@")"
+    printf '%s' "${out% }"
+}
+
+# ── checked_task_id <id> <source> -- 0 when this id may be handed to another
+#    tool, 1 (with a WARNING naming the source and the reason) when it may not.
+#    Ids ENTER this tool from the filesystem: a ledger task file's frontmatter,
+#    a manifest row. Both are writable by anything that can write the repo — an
+#    agent with a bind-mounted checkout, a merged pull request — and neither
+#    goes through `tp task create`, which is where the id grammar used to be
+#    enforced. So the grammar is enforced here too, at the boundary where the
+#    string arrives, and a malformed id is refused with a diagnostic instead of
+#    being passed on (PI-C1 / PI-C4).
+checked_task_id() {
+    local id="$1" source="$2" reason
+    if ! reason="$(apl_id_reject_reason "$id")"; then
+        echo "WARN: ignoring the $source: $reason" >&2
+        echo "      Fix the task file's frontmatter (\`tp task fsck\` names it) and release the claim by hand." >&2
+        return 1
+    fi
+    return 0
 }
 
 # ── ledger_claims -- "branch<TAB>task<TAB>turns<TAB>goal" rows, one per branch
@@ -172,6 +208,7 @@ claim_task_for() {
     while IFS=$'\t' read -r branch task _rest; do
         [[ -z "$branch" || -z "$task" ]] && continue
         if [[ "$prefix${branch//\//-}" == "$cname" ]]; then
+            checked_task_id "$task" "live ledger claim held by branch '$branch'" || return 1
             echo "$task"; return 0
         fi
     done < <(ledger_claims)
@@ -192,6 +229,7 @@ manifest_task_for() {
         [[ -z "$name"   ]] && continue
         local slug="${branch//\//-}"
         if [[ "$prefix$slug" == "$cname" ]]; then
+            checked_task_id "$task" "manifest row for branch '$branch'" || return 1
             echo "$task"; return 0
         fi
     done < "$MANIFEST"
@@ -248,11 +286,12 @@ do_stuck() {
         log "  $cname: STUCK (log idle ${age}min)"
         # 1) snapshot worktree progress
         if [[ -d "$wt/.git" || -f "$wt/.git" ]]; then
-            act "git -C '$wt' add -A"
-            act "git -C '$wt' -c user.name=tp-cleanup -c user.email=cleanup@taskpump.local commit -m 'wip: tp-cleanup pre-stop snapshot' --allow-empty"
+            act git -C "$wt" add -A
+            act git -C "$wt" -c user.name=tp-cleanup -c user.email=cleanup@taskpump.local \
+                commit -m 'wip: tp-cleanup pre-stop snapshot' --allow-empty
         fi
         # 2) stop the container
-        act "$(apl_docker) stop --time=$DOCKER_GRACE_SEC '$cname'"
+        act "$(apl_docker)" stop "--time=$DOCKER_GRACE_SEC" "$cname"
         # 3) release the task claim, if known. The ledger's live claim is the
         #    canonical mapping; the opt-in manifest is only a fallback, because
         #    its row is a launch-time constant that goes stale the moment the
@@ -260,7 +299,8 @@ do_stuck() {
         local task; task="$(claim_task_for "$cname" || true)"
         [[ -z "$task" ]] && task="$(manifest_task_for "$cname" || true)"
         if [[ -n "$task" ]]; then
-            act "'$TP_LIBEXEC_DIR/tp-task' release '$task' --reason 'tp-cleanup: stuck (log idle ${age}min)'"
+            act "$TP_LIBEXEC_DIR/tp-task" release "$task" \
+                --reason "tp-cleanup: stuck (log idle ${age}min)"
         else
             log "  $cname: no live ledger claim (and no manifest row) maps this container to a task; skipping the task release — check 'tp task list' and release it by hand"
         fi
@@ -294,9 +334,9 @@ reclaim_target() {
     local size; size="$(du -sh "$dir/target" 2>/dev/null | cut -f1)"
     log "  $label: $dir/target ($size)"
     if command -v cargo >/dev/null 2>&1 && [[ -f "$dir/Cargo.toml" ]]; then
-        act "cargo clean --manifest-path '$dir/Cargo.toml'"
+        act cargo clean --manifest-path "$dir/Cargo.toml"
     else
-        act "rm -rf '$dir/target'"
+        act rm -rf "$dir/target"
     fi
     return 0
 }
@@ -314,12 +354,25 @@ do_targets() {
     log "reclaiming build target/ dirs (dry-run=$DRY_RUN, include-primary=$INCLUDE_PRIMARY)"
     local busy; busy="$(busy_worktrees)"
     local found=0 skipped=0
-    local wt
+    local wt rel unsafe
     # DEFERRED (documented, not fixed): this glob is two levels deep while the
     # pump addresses a worktree as <base>/<branch-with-a-slash>. The two agree
     # only because the generated branches happen to contain exactly one slash;
     # a flat branch name would be invisible here.
     for wt in "$WORKTREES_DIR"/*/*; do
+        [[ -d "$wt" ]] || continue
+        # A directory name is attacker-chosen input: anyone who can create a
+        # directory under the worktrees base — a tracked path in a hostile
+        # repository, an agent with a bind-mounted checkout — picks these bytes.
+        # act() no longer parses them as shell, but a name this stack cannot
+        # carry has nothing to do here either, and a silent skip would be worse
+        # than none (PI-D4).
+        rel="${wt#"$WORKTREES_DIR"/}"
+        if ! unsafe="$(apl_unsafe_name_reason 'worktree directory' "$rel" '/')"; then
+            log "  skip: $wt — $unsafe"
+            skipped=$((skipped + 1))
+            continue
+        fi
         [[ -d "$wt/target" ]] || continue
         if printf '%s\n' "$busy" | grep -Fxq "$wt"; then
             log "  skip: $wt/target — live agent container"
@@ -362,8 +415,8 @@ do_docker() {
         log "$docker_bin not on PATH; skipping."
         return
     fi
-    act "$docker_bin builder prune -af"
-    act "$docker_bin system prune -f"
+    act "$docker_bin" builder prune -af
+    act "$docker_bin" system prune -f
     log "docker prune complete."
 }
 

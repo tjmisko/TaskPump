@@ -593,6 +593,17 @@ numerically.
 Ids must not contain path separators, whitespace, or characters that are unsafe
 in a filename: an id is a filename.
 
+That rule is checked on the way **in** as well as on the way out. `create` and
+`fsck` validate the id a human types, but a task file can also arrive without
+passing either — written by hand, by an agent with a filesystem, or by a merged
+pull request — so a consumer that reads an id back off disk and hands it to
+another command re-checks it there. `tp cleanup`'s stuck-agent rescue does:
+an id outside the shape (or outside `TASKPUMP_ID_PATTERN`, where the project
+configures one) is named on stderr and left unreleased rather than passed on.
+Ids from `tp task`'s own read paths — `next`, `ready --json`, `list --json` —
+are **not** yet re-checked; treat what they emit as ledger content, not as a
+word you may splice into a command.
+
 ### 7.2 Phase derivation
 
 The phase is the id up to the **first** `.`:

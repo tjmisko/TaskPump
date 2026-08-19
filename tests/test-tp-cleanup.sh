@@ -88,8 +88,8 @@ assert_has "reclaimed 2, skipped 0 live"     "$out" "reclaimed 2 worktree target
 assert_has "primary left alone by default"   "$out" "left alone (pass --include-primary to reclaim)"
 assert_no  "primary not reclaimed by default" "$out" "primary: $FIX/target"
 if command -v cargo >/dev/null 2>&1; then
-  assert_has "feat/a uses cargo clean (Cargo.toml present)" "$out" "cargo clean --manifest-path '$FIX/.worktrees/feat/a/Cargo.toml'"
-  assert_has "feat/b falls back to rm -rf (no Cargo.toml)"  "$out" "rm -rf '$FIX/.worktrees/feat/b/target'"
+  assert_has "feat/a uses cargo clean (Cargo.toml present)" "$out" "cargo clean --manifest-path $FIX/.worktrees/feat/a/Cargo.toml"
+  assert_has "feat/b falls back to rm -rf (no Cargo.toml)"  "$out" "rm -rf $FIX/.worktrees/feat/b/target"
 else
   echo "  (cargo not installed — skipping cargo-clean branch assertion)"
 fi
@@ -174,7 +174,7 @@ out="$(TASKPUMP_CLEANUP_REPO_ROOT="$FIX" TASKPUMP_TASKS_DIR="$CT" \
        TASKPUMP_PUMP_STATE_FILE="$FIX/no-pump-state" \
        STUB_LIVE="arachne-agent-feat-a" "$CLEANUP" --stuck --dry-run 2>&1)"
 assert_has "the stale-log agent is detected"           "$out" "STUCK (log idle"
-assert_has "the release comes from the ledger claim"   "$out" "release 'T1.1'"
+assert_has "the release comes from the ledger claim"   "$out" "release T1.1 "
 assert_no  "no reference to the retired Arachne path"  "$out" "parallel-manifest"
 
 echo "--- Test 9: --stuck with no claim and no manifest skips the release LOUDLY ---"
@@ -186,7 +186,7 @@ out="$(TASKPUMP_CLEANUP_REPO_ROOT="$FIX" TASKPUMP_TASKS_DIR="$CT" \
 assert_has "the container is still stopped"            "$out" "docker stop"
 assert_has "the skip names its reason"                 "$out" "no live ledger claim"
 assert_has "the skip is explicit, not silent"          "$out" "skipping the task release"
-assert_no  "nothing was released on a guess"           "$out" "release '"
+assert_no  "nothing was released on a guess"           "$out" "tp-task release"
 
 echo "--- Test 10: a configured manifest that does not exist is a loud error (#7) ---"
 # Same rule as TASKPUMP_CONFIG: an explicit request for a specific file must
@@ -215,9 +215,9 @@ out="$(TASKPUMP_MANIFEST="$FIX/manifest.tsv" TASKPUMP_CLEANUP_REPO_ROOT="$FIX" \
        TASKPUMP_TASKS_DIR="$CT" TASKPUMP_PUMP_STATE_FILE="$FIX/no-pump-state" \
        STUB_LIVE=$'arachne-agent-feat-a\narachne-agent-feat-b' \
        "$CLEANUP" --stuck --dry-run 2>&1)"
-assert_has "the live ledger claim outranks the manifest row" "$out" "release 'T1.1'"
+assert_has "the live ledger claim outranks the manifest row" "$out" "release T1.1 "
 assert_no  "the stale manifest row for feat/a is not used"   "$out" "T9.8"
-assert_has "the manifest still rescues a claim-less branch"  "$out" "release 'T9.9'"
+assert_has "the manifest still rescues a claim-less branch"  "$out" "release T9.9 "
 
 echo "--- Test 12: the rescue sees claims OUTSIDE the pump state's phase range ---"
 # The renderer narrows --claims to the pump state's phases, but a stuck agent
@@ -234,7 +234,7 @@ printf '{"phases":"T1"}\n' >| "$FIX/pump.state"
 out="$(TASKPUMP_CLEANUP_REPO_ROOT="$FIX" TASKPUMP_TASKS_DIR="$CT" \
        TASKPUMP_PUMP_STATE_FILE="$FIX/pump.state" \
        STUB_LIVE="arachne-agent-feat-c" "$CLEANUP" --stuck --dry-run 2>&1)"
-assert_has "the out-of-range claim is still released"   "$out" "release 'T5.1'"
+assert_has "the out-of-range claim is still released"   "$out" "release T5.1 "
 assert_no  "no silent skip for the out-of-range claim"  "$out" "no live ledger claim"
 
 echo "--- Test 13: TASKPUMP_MANIFEST_SUBPATH reaches tp-cleanup (monitor parity) ---"
@@ -251,7 +251,7 @@ touch -d '2 hours ago' "$FIX/.worktrees/feat/d/.taskpump-agent.log"
 out="$(TASKPUMP_MANIFEST_SUBPATH="sub-manifest.tsv" TASKPUMP_CLEANUP_REPO_ROOT="$FIX" \
        TASKPUMP_TASKS_DIR="$CT" TASKPUMP_PUMP_STATE_FILE="$FIX/no-pump-state" \
        STUB_LIVE="arachne-agent-feat-d" "$CLEANUP" --stuck --dry-run 2>&1)"
-assert_has "a SUBPATH manifest rescues a claim-less branch" "$out" "release 'T9.7'"
+assert_has "a SUBPATH manifest rescues a claim-less branch" "$out" "release T9.7 "
 
 echo "--- Test 14: a broken claim renderer is loud, never a fake 'no claim' ---"
 out="$(TASKPUMP_DAG_BIN=/bin/false TASKPUMP_CLEANUP_REPO_ROOT="$FIX" \
@@ -262,6 +262,76 @@ out="$(TASKPUMP_DAG_BIN="$FIX/no-such-renderer" TASKPUMP_CLEANUP_REPO_ROOT="$FIX
        TASKPUMP_TASKS_DIR="$CT" TASKPUMP_PUMP_STATE_FILE="$FIX/no-pump-state" \
        STUB_LIVE="arachne-agent-feat-b" "$CLEANUP" --stuck --dry-run 2>&1)"
 assert_has "a missing renderer is named"      "$out" "renderer not executable"
+
+echo "--- Test 15: a ledger task id carrying a shell metacharacter is REFUSED ---"
+# PI-C1, the operator-machine RCE. The rescue reads the task id out of a task
+# file's frontmatter and used to splice it into a command string that act()
+# ended in `eval`. A single quote in the id closes that quoting, and the rest of
+# it runs as the operator, on the host, from a watchdog running unattended — and
+# a task file is writable by anything that can write the repo (an agent with a
+# bind-mounted checkout, a merged pull request), never having passed the
+# create-time id check. Two independent things are asserted here: the payload
+# does not execute, and the malformed id is refused with a diagnostic rather
+# than passed on.
+PWN="$FIX/CLEANUP_PWNED"
+rm -f "$PWN"
+# Written straight to disk under a well-behaved FILE name, because that is the
+# shape of the attack: nothing forces a task file's frontmatter id to be the
+# name of the file it lives in, and nothing but `tp task create` — which this
+# writer bypasses exactly as an agent or a merged PR does — ever checked it.
+mkclaim_file() {  # $1 = file, $2 = id, $3 = claimed_by branch
+  printf -- '---\nid: "%s"\nphase: "G9"\nstatus: in_progress\nclaimed_by: %s\nclaimed_at: "2026-08-13T10:00:00Z"\nlast_heartbeat_ts: "2026-08-13T10:30:00Z"\nturn_budget_remaining: 4\ngoal: "poisoned"\nblockers: []\n---\nbody\n' \
+    "$2" "$3" >| "$1"
+}
+mkclaim_file "$CT/G9-poison.md" "G9.1'; touch $PWN; echo '" feat/e
+mkdir -p "$FIX/.worktrees/feat/e"
+touch -d '2 hours ago' "$FIX/.worktrees/feat/e/.taskpump-agent.log"
+out="$(TASKPUMP_CLEANUP_REPO_ROOT="$FIX" TASKPUMP_TASKS_DIR="$CT" \
+       TASKPUMP_PUMP_STATE_FILE="$FIX/no-pump-state" \
+       STUB_LIVE="arachne-agent-feat-e" "$CLEANUP" --stuck 2>&1)"
+[[ ! -e "$PWN" ]] && pass "the payload in the task id did not execute" \
+                  || fail "the id was evaluated: $PWN exists"
+assert_has "the poisoned id is named and refused"  "$out" "WARN: ignoring the live ledger claim held by branch 'feat/e'"
+assert_has "the diagnostic says what is wrong"     "$out" "which is not safe in a path or a command argument"
+assert_has "and the release is skipped, not faked" "$out" "skipping the task release"
+assert_no  "no release was attempted with it"      "$out" "release G9.1"
+rm -f "$CT/G9-poison.md"
+
+# The project's own grammar is enforced too, once the consumer has one: an id
+# that is filename-safe but outside TASKPUMP_ID_PATTERN never reaches a command.
+mkclaim ZZ9 feat/e in_progress
+out="$(TASKPUMP_CLEANUP_REPO_ROOT="$FIX" TASKPUMP_TASKS_DIR="$CT" \
+       TASKPUMP_ID_PATTERN='^T[0-9]+(\.[0-9]+)?$' \
+       TASKPUMP_PUMP_STATE_FILE="$FIX/no-pump-state" \
+       STUB_LIVE="arachne-agent-feat-e" "$CLEANUP" --stuck --dry-run 2>&1)"
+assert_has "an off-grammar id is refused by name"  "$out" "does not match TASKPUMP_ID_PATTERN"
+assert_no  "and never reaches the release"         "$out" "release ZZ9"
+# ...and the same id passes once the pattern is the consumer's own.
+out="$(TASKPUMP_CLEANUP_REPO_ROOT="$FIX" TASKPUMP_TASKS_DIR="$CT" \
+       TASKPUMP_ID_PATTERN='^ZZ[0-9]+$' \
+       TASKPUMP_PUMP_STATE_FILE="$FIX/no-pump-state" \
+       STUB_LIVE="arachne-agent-feat-e" "$CLEANUP" --stuck --dry-run 2>&1)"
+assert_has "a conforming id is released as one argv word" "$out" "release ZZ9 --reason"
+rm -f "$CT/ZZ9.md"
+
+echo "--- Test 16: a worktree directory name is data, not shell (PI-D4) ---"
+# The same defect through the other door: `$dir` comes from a glob over the
+# worktrees base, so anyone who can create a directory there chose the bytes
+# that reached the eval. The sweep must neither execute them nor pretend the
+# workspace was reclaimed.
+# The canary is written relative to the sweep's own working directory, which is
+# where the substitution would land — and a name with no `/` in it, so the
+# fixture is one directory rather than a tree mkdir -p invented.
+D4="$FIX/d4"; CANARY="D4_PWNED"
+rm -f "$D4/$CANARY"
+# The apostrophe is the whole attack: it closes the single quote the tool
+# wrapped the path in, and everything after it is parsed as shell.
+mkdir -p "$D4/.worktrees/feat/x'\$(touch $CANARY)'y/target" "$D4/.worktrees/feat/ok/target"
+out="$(cd "$D4" && TASKPUMP_CLEANUP_REPO_ROOT="$D4" STUB_LIVE="" "$CLEANUP" --targets 2>&1)"
+[[ ! -e "$D4/$CANARY" ]] && pass "a command substitution in a directory name did not run" \
+                         || fail "the directory name was evaluated: $D4/$CANARY exists"
+assert_has "the unsafe workspace is skipped by name" "$out" "worktree directory"
+assert_has "and the well-named one is still reclaimed" "$out" "$D4/.worktrees/feat/ok/target"
 
 echo
 echo "=============================================="
