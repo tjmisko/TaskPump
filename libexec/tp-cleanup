@@ -23,8 +23,13 @@
 #   3. Releases the task claim so the next run can re-pick it.
 #
 # Configuration (taskpump.conf or the environment; legacy names still work):
-#   TASKPUMP_RECLAIM_CMD          the consumer's reclaim command; while unset
-#                                 the --targets sweep touches nothing
+#   TASKPUMP_RECLAIM_CMD          the SWITCH that arms the --targets sweep, not
+#                                 the command it runs: while unset the sweep
+#                                 touches nothing, and once set the sweep runs
+#                                 `cargo clean` (or `rm -rf <dir>/target`) on
+#                                 each idle workspace regardless of the value.
+#                                 The pump's own per-tick reclaim is the pass
+#                                 that executes this key verbatim.
 #   TASKPUMP_STUCK_THRESHOLD_MIN  log-stale cutoff, minutes (default 15)
 #   TASKPUMP_STOP_GRACE_SEC       stop grace period, seconds (default 30)
 #   TASKPUMP_MANIFEST             OPT-IN v1 parallel-run manifest (no default;
@@ -34,11 +39,14 @@
 #   TASKPUMP_WORKTREES_DIR        base dir holding the agent worktrees
 #   TASKPUMP_AGENT_LOG_NAME       the agent log inside each worktree
 #   TASKPUMP_RECLAIM_PRIMARY      1 = same as --include-primary
-#   TASKPUMP_EXTRA_BUSY_DIRS      newline-separated workspace roots --targets
+#   EXTRA_BUSY_DIRS               newline-separated workspace roots --targets
 #                                 must also skip (the disk guard passes
 #                                 compiler-busy workspaces here; a listed
 #                                 primary root skips the primary even under
-#                                 --include-primary)
+#                                 --include-primary). Read UNPREFIXED only —
+#                                 there is no TASKPUMP_ spelling of this one,
+#                                 and setting TASKPUMP_EXTRA_BUSY_DIRS skips
+#                                 nothing.
 # HELP-END
 set -uo pipefail
 
