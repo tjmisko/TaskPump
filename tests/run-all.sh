@@ -269,6 +269,7 @@ if [[ -n "$STATE_EVENTS" ]]; then
     printf '  * TASKPUMP_STATE_DIR moves the state-dir names in one key:\n      .taskpump-pump.state, -pool-cap, -pump.log, -usage-reset,\n      -disk-watchdog.log, .auto-trunk.lock, .auto-trunk-quarantine\n' >&2
     printf '  * it does NOT move the pre-tick hook mark file — TASKPUMP_HOOK_MARK_FILE\n    outranks the state dir, and tests/suite-prologue.sh already sets it for\n    every suite, which is why .taskpump-fsguard.notified is covered\n' >&2
     printf '  * TASKPUMP_WORKSPACE_ROOT moves the workspace-side names\n      .taskpump-agent.log, -phase-brief.md, -resume.md, -goal.md\n    which follow the worktree an agent runs in, not the state dir\n' >&2
+    printf '  * .taskpump-task.lock is tp-task'\''s, not the pump'\''s: acquire_state_lock\n    puts it in the git toplevel above TASKPUMP_TASKS_DIR, so a suite that trips\n    it ran a mutating verb (no TASKPUMP_TASK_NOCOMMIT=1) on a ledger that\n    resolves inside this checkout\n' >&2
     printf '  * .git/info/exclude is derived from the repo root via --git-common-dir\n    (apl_ensure_worktrees_visible), so NO state-dir pin moves it: a suite that\n    trips it has to drive a git repo of its own\n' >&2
     names+=("(repo run state)")
     results+=("FAILED (littered)")
