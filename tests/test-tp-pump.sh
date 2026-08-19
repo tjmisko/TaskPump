@@ -1049,6 +1049,33 @@ have "$out" 'STALLED after [0-9]+ idle ticks' && pass "stall exit pages with a r
 # else, and telling those apart is the whole point (Test 37).
 have "$out" 'nothing launchable, nothing resumable' && pass "stall page explains why nothing ran" || fail "stall page lacks the cause:\n$out"
 
+# 19m: the OTHER way a tick ends with a full plan and nothing started, and the
+# one that is not a failure at all — the resume budget retiring a task. Nothing
+# reached launch_unit, so "every launch attempt failed" would describe a launch
+# that was never attempted, and the escalation it actually did (needs-review,
+# human paged) would go unmentioned in the page that follows it.
+stall_fixture
+STUB_LIVE="" STUB_AHEAD=3 STUB_HEAD=7777ccc rtick --resume-max 1 >/dev/null 2>&1
+rc=0
+out=$(PATH="$BIN:$PATH" TASKPUMP_NOTIFY_CMD=true ARACHNE_PUMP_NO_LAUNCH=1 \
+      ARACHNE_CLAIM_STALE_HOURS=99999 ARACHNE_PUMP_OPS_DIR="$TMP/noops" \
+      ARACHNE_PUMP_STATE_FILE="$STATE19" ARACHNE_POOL_CAP_FILE="$TMP/cap" \
+      ARACHNE_PUMP_LOG="$TMP/pump19.log" ARACHNE_PHASE_BRIEF_TEMPLATE="$TPL" \
+      TASKPUMP_PUMP_STALL_EXIT_TICKS=1 STUB_LIVE="" STUB_AHEAD=3 STUB_HEAD=7777ccc \
+      timeout 60 "$PUMP" --no-health-gate --phases F97 --tick 1 --resume-max 1 2>&1) || rc=$?
+reason19=$(jq -r '.paused_reason // empty' "$STATE19" 2>/dev/null)
+[[ "$rc" -eq 3 ]] && pass "a tick whose only candidate the resume budget retired is idle" \
+  || fail "exit=$rc, want 3:\n$out"
+have "$reason19" '1 unit\(s\) planned, none started' \
+  && pass "should say a unit was planned and none started" \
+  || fail "the stall reason does not say what happened: $reason19"
+have "$reason19" 'resume budget spent on F97\.1 — escalated to needs-review' \
+  && pass "should carry the resume refusal into the stall reason" \
+  || fail "the stall reason names no refusal: $reason19"
+have "$reason19" 'every launch attempt failed' \
+  && fail "reported a failed launch attempt for a tick that attempted none: $reason19" \
+  || pass "should not report failed launches when no launch was attempted"
+
 # ── Test 20: --detach hands the terminal to the monitor ───────────────────────
 # The detach itself is stubbed: systemd-run records its argv to a marker instead
 # of creating a unit, so no supervisor is ever launched. The marker is asserted
@@ -2487,9 +2514,13 @@ rc=0; out=$(ARACHNE_PUMP_NO_LAUNCH=1 loop37 --jobs 0 2>&1) || rc=$?
 [[ "$(jq -r '.status' "$STATE37" 2>/dev/null)" == "stalled" ]] \
   && pass "should stamp status=stalled at cap 0, never running" \
   || fail "state after the cap-0 run: $(cat "$STATE37" 2>/dev/null)"
-have "$(reason37)" 'pool cap is 0' \
-  && pass "should name the cap in the stall reason when the cap refused the work" \
-  || fail "the stall reason does not name the cap: $(reason37)"
+# Anchored, and the whole sentence: the negative check below cannot carry this
+# on its own — a reason of `received SIGTERM` (what the pre-fix run leaves,
+# because it never stalls and the timeout kills it) also fails to contain
+# "nothing launchable", so on its own that check passes for the wrong reason.
+have "$(reason37)" '^no live agents; the pool cap is 0, so 1 launchable unit\(s\) were never started$' \
+  && pass "should name the cap, and only the cap, in the stall reason" \
+  || fail "the stall reason is not the cap sentence: $(reason37)"
 have "$(reason37)" 'nothing launchable' \
   && fail "the page said 'nothing launchable' over a plan that was full: $(reason37)" \
   || pass "should not report 'nothing launchable' about work the cap refused"
