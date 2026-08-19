@@ -227,7 +227,7 @@ assert_has "an empty probe runs the command in every idle workspace" "$out" "(dr
 # it happens rather than leaving the operator to infer it.
 out="$(TASKPUMP_CLEANUP_REPO_ROOT="$B9" STUB_LIVE="" TASKPUMP_RECLAIM_CMD='npm run clean' \
        TASKPUMP_RECLAIM_DIR='' "$CLEANUP" --targets --include-primary --dry-run 2>&1)"
-assert_has "the unconditional primary arm is announced" "$out" "TASKPUMP_RECLAIM_DIR is empty, so there is no precondition on this arm"
+assert_has "the unconditional primary arm is announced" "$out" "no build-output precondition on this arm: TASKPUMP_RECLAIM_DIR is empty"
 assert_has "and it names the key that holds it back"    "$out" "TASKPUMP_EXTRA_BUSY_DIRS"
 
 echo "--- Test 7c: a reclaim command that FAILS is never counted as a reclaim ---"

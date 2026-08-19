@@ -454,10 +454,13 @@ reclaim_workspace() {
         return 0
     fi
     printf '  $ cd %q && %s\n' "$dir" "$RECLAIM_CMD"
-    if ( cd "$dir" && eval "$RECLAIM_CMD" ); then
-        return 0
-    fi
-    log "  WARNING: TASKPUMP_RECLAIM_CMD failed in $dir — nothing was reclaimed there"
+    local rc=0
+    ( cd "$dir" && eval "$RECLAIM_CMD" ) || rc=$?
+    [[ "$rc" -eq 0 ]] && return 0
+    # Not "nothing was reclaimed": a command that fails half-way may have freed
+    # something, and this tool cannot know. What it can say is what it does with
+    # the failure — which is refuse to count the workspace.
+    log "  WARNING: TASKPUMP_RECLAIM_CMD failed in $dir (rc=$rc) — that workspace is NOT counted as reclaimed; assume its build output is still there"
     return 2
 }
 
@@ -547,7 +550,7 @@ do_targets() {
             # primary checkout every time --include-primary is passed, and the
             # unattended PANIC sweep always passes it. Say so where it happens.
             [[ -z "$RECLAIM_DIR" ]] && \
-                log "  (TASKPUMP_RECLAIM_DIR is empty, so there is no precondition on this arm: the command runs in the primary checkout unconditionally — list it in TASKPUMP_EXTRA_BUSY_DIRS to hold it back)"
+                log "  (no build-output precondition on this arm: TASKPUMP_RECLAIM_DIR is empty, so the command runs in the primary checkout on every --include-primary — list it in TASKPUMP_EXTRA_BUSY_DIRS to hold it back)"
             rc=0; reclaim_workspace "$REPO_ROOT" "primary" || rc=$?
             (( rc == 2 )) && failed=$((failed + 1))
         elif [[ -n "$RECLAIM_DIR" ]]; then
