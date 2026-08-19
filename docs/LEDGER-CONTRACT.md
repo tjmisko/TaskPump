@@ -124,10 +124,16 @@ is already there.
 
 ## 3. Frontmatter schema
 
-Every field below is written by `tp task create`, except the three marked
+Every field below is written by `tp task create`, except the **eight** marked
 *(verb-added)*, which appear the first time a verb needs them. A reader must
 treat an absent field as its documented default; a writer should emit the full
 set.
+
+The eight are `wiring_deferred` and `wiring_deferred_note` (Completion),
+`scrub_reason` (Supervision), and all five of the Review block. `create` emits
+the other twenty unconditionally, in the order §2.1 shows, and emits none of
+these — so a file carrying none of the eight is a well-formed task, not an
+incomplete one, and `fsck` says so (§11.1).
 
 ### Identity
 
@@ -225,12 +231,21 @@ Six values. No others are valid.
 
 | Status | Meaning | Who sets it | Eligible? |
 |---|---|---|---|
-| `open` | Available. The only status the frontier will surface. | `create`, `release`, `reopen` | yes, if blockers are done |
+| `open` | Available. The only status the frontier will surface. | `create`, `release`, `reopen`, `verdict --request-changes` (the implementation, and every member of its chain), `fsck --fix` (stamping a file that has no `status` at all) | yes, if blockers are done |
 | `in_progress` | Claimed by a branch and being worked. | `claim` | no |
-| `done` | Complete. Satisfies other tasks' blockers. | `complete` | no |
+| `done` | Complete. Satisfies other tasks' blockers. | `complete`, `verdict --approve` (the review task), `verdict --request-changes` when the round bound is spent (the gate task — its ruling was delivered) | no |
 | `blocked` | Cannot proceed: an external dependency, a missing decision, a genuine upstream gap. | `block` | no |
-| `needs-review` | A human must look before an agent picks it up again. | `scrub` (budget exhausted, heartbeat stale), `needs-review`, the pump's escalation path | no |
+| `needs-review` | A human must look before an agent picks it up again. | `scrub` (budget exhausted, heartbeat stale), `needs-review`, `verdict` when the round bound is spent (the implementation), the pump's escalation path | no |
 | `stuck` | Repeated unproductive cycles — the work is going nowhere on its own. | `scrub` (failure streak) | no |
+
+**`verdict` is in three of those rows, and that is the point of it.** A single
+change-request ruling moves the implementation task and re-arms every member of
+its review chain; the exhaustion case moves the gate to `done` and the
+implementation to `needs-review` in the same commit. An implementer reading only
+this table would build a state machine whose `open` is reachable from three
+verbs when it is reachable from five, and would have no writer at all for the
+review flow. §5.12 is the full account; this row exists so the summary does not
+contradict it.
 
 `blocked` and `needs-review` differ in *who* can clear them. `blocked` says the
 world must change: an upstream merge, a credential, an answer. `needs-review`
@@ -697,6 +712,58 @@ lose:
   distinction existed, a deadlocked pump idled for 563 ticks over seven hours
   while `systemd` reported it healthy.
 
+### 10.1 Conformance note — where the tools diverge from the table above (v0.2.1)
+
+> **The table in §10 is frozen and is not edited here.** This note records, for
+> the release you are reading, exactly where `tp task` and `tp pump` do not
+> implement it. **For a consumer writing code against TaskPump today, the tools
+> are authoritative and this note is what to key on**; the frozen table states
+> the intended protocol, and reconciling the two is a behaviour change, which a
+> PATCH release may not make. Both divergences are filed as bugs.
+
+**Neither `tp task` nor `tp pump` ever exits 2.** Row `2 | any tool | Bad CLI
+arguments` does not hold for the two tools this contract is about. Both route
+every usage error through a `die` that exits **1** — an unknown verb, an unknown
+flag, a required argument omitted, an out-of-range value. Observed at this
+revision: `tp task bogus`, `tp task claim` with no id, `tp pump --bogus` and
+`tp pump --phases` with no value all exit 1. (`tp pump --phases` with no value
+additionally fails as an unbound-variable error from bash rather than a
+diagnostic, which is its own bug.)
+
+Exit 2 is not fictional — it is simply produced elsewhere. `tp <unknown>`, the
+`bin/tp` dispatcher's own unknown-command path, exits 2; so do `tp init`,
+`tp cleanup`, both watchdogs, and both shipped runners' unknown-verb arms
+(`RUNNERS.md §1.3` depends on that last one). So a consumer must **not** read
+exit 2 as "bad arguments, generically". Read it as: the dispatcher did not
+recognise the command, or a peripheral tool rejected its own arguments.
+
+*What to key on instead:* for `tp task`, distinguish outcomes by the codes that
+are real — `3` (ledger violations, from `scrub` and `fsck`), `10` (pause /
+escalate, from `resume-attempt`), `1` for everything else including `next`'s
+empty frontier. Do not try to separate "bad arguments" from "operation failed"
+by exit code; they are the same code. Parse stderr, or do not distinguish.
+
+**`tp pump` exit 0 does not mean drained.** Row `0 | everything | For the pump
+specifically: drained, and a supervisor must not restart it` holds only for the
+loop's own terminal exit. Every non-loop mode also exits 0 on success:
+`--dry-run`, `--list`, `--once`, `--render-brief`, `--render-resume-note`,
+`--help`, and `--detach` (which exits 0 in the *foreground* process as soon as
+the supervisor is detached — the run it started has not even ticked). A `--once`
+tick exits 0 whether it launched three agents, launched none because a gate
+paused it, or found nothing to do.
+
+This matters most where the table says it matters: a `systemd` unit keyed on
+"exit 0 means drained, do not restart" is correct only because the unit runs the
+pump in loop mode. Wire the same rule around `--once` in a cron job and every
+tick reports a successful drain.
+
+*What to key on instead:* the **state file**. The pump stamps a terminal status
+into it on every exit path, including the signal handlers, precisely so that a
+reader does not have to infer the outcome from a process's exit code —
+`drained`, `stalled`, `paused`, `stopped`, each with a reason string. `3` still
+means deadlock unambiguously; `0` means "this invocation finished", and the file
+says what it finished doing.
+
 ---
 
 ## 11. Minimal conformance
@@ -766,6 +833,12 @@ Checked per file:
 - `id` equals the filename stem (§2) and matches the configured id pattern (§7);
 - `status` is one of the six values of §4;
 - `review_role`, where present, is `reviewer` or `adjudicator` (§3 "Review");
+- `review_role`, where present, is accompanied by a `review_of`. `review_role`
+  is what makes a task a review task, and every verb that acts on one resolves
+  its subject through `review_of` — so a role with no subject is a task the
+  frontier hides (§6) and `verdict` refuses outright: open work that nothing can
+  dispatch and nothing can close, with no diagnostic until someone runs the verb
+  by hand;
 - `blockers` carries no empty entry. An empty string names no task: the
   dangling-blocker check skips it and so does §6, so it is a dependency in the
   file and in no reader;
@@ -788,7 +861,27 @@ Checked whole-ledger — what no single-file tool can do:
   all of its edges already drawn. fsck is the check that sees the whole graph;
 - every `review_of` names an existing task file, and never the task itself
   (§5.12): a dangling one is a chain whose verdict can never land, and no
-  per-file read would ever say so.
+  per-file read would ever say so;
+- **gate coverage**: a task that blocks on an implementation under a *live*
+  review chain also blocks on that chain's gate task. This is the check that
+  keeps a review gate from failing open. `review` wires the gate into every
+  downstream blocker list at chain-creation time, and the authoring verbs carry
+  it along afterwards, so the CLI cannot produce the uncovered shape — but an
+  imported ledger can, and so can a hand edit or a deliberate
+  `blockers --remove` of the gate. The result is not a task that stalls, which
+  is how most ledger damage announces itself; it is a task that goes **eligible
+  the moment the implementation completes, with the verdict unrendered** and
+  every other reader silent about it. A review that fails open is not a review,
+  so this is a violation rather than a warning.
+
+  The check is deliberately narrow, and the exclusions are the contract as much
+  as the rule is. The gate is the adjudicator, or the lone reviewer; a panel
+  with no adjudicator has no gate and is not checked, because there is nothing
+  to check against. A chain member blocking on its own subject is exempt — a
+  reviewer blocks its implementation by design. And a chain whose gate is
+  already `done` is exempt, because a rendered verdict has already gated that
+  edge; reopening the subject re-arms the chain (§5.7) and the check applies
+  again.
 
 Exit codes follow scrub's convention (§10): **3** when violations were found
 (actionable — one line names each), **0** on a clean ledger with no output, and
