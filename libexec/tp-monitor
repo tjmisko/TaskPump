@@ -123,6 +123,27 @@ _tp_self_root="$(CDPATH='' cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")"
 tp_load_config
 # shellcheck source=../lib/pump-lib.sh
 . "$TP_LIB_DIR/pump-lib.sh"
+# shellcheck source=../lib/tty-safe.sh
+. "$TP_LIB_DIR/tty-safe.sh"
+
+# mon_safe -- make the named variables safe to print, in place. Everything this
+# dashboard shows about the fleet is written by somebody else — a task's title
+# and goal, a claim's branch, an agent's log line — and a terminal executes what
+# it is handed, so a hostile ledger entry or a quoted line of repo content could
+# repaint a blocked row green, erase the line above it, or set the window title.
+# One rule, one place (lib/tty-safe.sh); the palette this file emits itself is
+# wrapped AROUND the sanitised value and is unaffected.
+#
+# Applied where a value is COMPOSED, not where it is printed: the session cache
+# is a TSV whose rows are later truncated to the terminal width, and truncating
+# a half-sanitised row is how you cut a control sequence in two.
+mon_safe() {  # $@ = variable NAMES
+    local __v
+    for __v in "$@"; do
+        tp_display_safe "${!__v}"
+        printf -v "$__v" '%s' "$TP_SAFE"
+    done
+}
 
 # The container runtime, resolved through the SAME accessor the pump, cleanup and
 # both runners use — TASKPUMP_DOCKER, then DOCKER, then `docker`. The monitor
@@ -709,6 +730,10 @@ pump_summary_line() {
     last_tick="${_pf[6]:-}"
     [[ -z "${phases:-}" ]] && phases="?"
     [[ -z "${status:-}" ]] && status="?"
+    # The state file is written by the supervisor, but paused_reason splices in
+    # text the supervisor was handed — a gate's complaint, a claimant's branch —
+    # so the whole summary line is display-sanitised like every other row.
+    mon_safe phases status reason pump_host last_tick
 
     # Reader skepticism (issue #22): the state file is a HINT, not an oracle. A
     # dead pump cannot retract its last `running` write — the G3 drain left one
@@ -979,10 +1004,23 @@ sessions_compute() {
                 [[ "$cstate" == running && "$secs" -gt 120 ]] && stale=1
             fi
         fi
+        # Every field below came out of the ledger, the container runtime or the
+        # filesystem, and the cache they are written to is a TAB-separated record
+        # the paint path later truncates — so they are sanitised HERE, once, in
+        # the writer. cstate/age/stale are this file's own words and need none.
+        mon_safe name tstat task up branch turns goal
         printf 'S\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$name" "$cstate" "$tstat" "$task" "$up" "$age" "$stale" "$branch" "$turns" "$goal"
         local ln
         while IFS= read -r ln; do
+            # The agent log is the most exposed string in the tool: it carries
+            # whatever an agent narrated, including repository content it was
+            # asked to read back. The jq feed filter's gsub("\\s+") does not
+            # touch ESC, so this is the only thing standing between a hostile
+            # file and the supervisor's dashboard.
+            mon_safe ln
+            # Blank BEFORE or AFTER sanitising is the same non-event: a line
+            # that was nothing but control bytes has nothing left to show.
             [[ -z "${ln// }" ]] && continue
             printf 'L\t%s\n' "$ln"
         done < <(log_events "$logf")
@@ -1352,6 +1390,12 @@ graph_load_index() {
     local id lay pos cx y st by tb ra bl live goal b
     while IFS=$'\t' read -r id lay pos cx y st by tb ra bl live goal; do
         [[ -z "$id" ]] && continue
+        # The index is the ledger's own words for this task, and the detail bar
+        # prints four of these columns verbatim. Sanitised on the way IN, so the
+        # cursor's status line cannot be repainted by a task file. `id` is left
+        # alone deliberately — it is the key every lookup and `o` is done by, and
+        # a rewritten key names nothing.
+        mon_safe st by tb ra bl goal
         GLAY[$id]=$lay; GPOS[$id]=$pos; GCX[$id]=$cx; GY[$id]=$y
         GST[$id]=$st;   GBY[$id]=$by;   GTB[$id]=$tb; GRA[$id]=$ra
         GBL[$id]=$bl;   GLIVE[$id]=$live; GGOAL[$id]=$goal
@@ -1554,7 +1598,10 @@ graph_detail_lines() {
             parts+=" $bid$bg"
         done
     fi
-    printf '%s%s%s  %s%s %s%s%s\n' "$C_STRONG" "$CURSOR" "$ST_RST" "$hue" "$glyph" "$word" "$ST_RST" "$parts"
+    # The id is the one ledger string kept raw (it is the lookup key), so it is
+    # sanitised here, at its only print site.
+    local cur="$CURSOR"; mon_safe cur
+    printf '%s%s%s  %s%s %s%s%s\n' "$C_STRONG" "$cur" "$ST_RST" "$hue" "$glyph" "$word" "$ST_RST" "$parts"
     printf '%s  %s%s\n' "$BAR_EMPTY" "${GGOAL[$CURSOR]:-}" "$BAR_RST"
 }
 

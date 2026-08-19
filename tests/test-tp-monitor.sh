@@ -1526,7 +1526,7 @@ RTC="$TMP/runtime-sess.tsv"
 rtmon() { TASKPUMP_DOCKER="$BIN/podman" TASKPUMP_MONITOR_REPO_ROOT="$SFR" \
           TASKPUMP_TASKS_DIR="$CTD" TASKPUMP_PUMP_STATE_FILE="$CPS" \
           TASKPUMP_MONITOR_SESS_CACHE="$RTC" TASKPUMP_MONITOR_COLS=140 \
-          "$CLI" "$@" 2>/dev/null | strip_ansi; }
+          "$CLI" 2>/dev/null | strip_ansi; }
 rtmon >/dev/null; sleep 2; rt=$(rtmon)
 grep -qE 'feat-f97 .*F97\.3:in_progress' <<<"$rt" \
     && pass "TASKPUMP_DOCKER supplies the SESSIONS sweep (podman host sees its fleet)" \
@@ -1558,6 +1558,90 @@ rtdisk >/dev/null; sleep 2; rtd=$(rtdisk)
 grep -q 'docker img 42.5G' <<<"$rtd" \
     && pass "the disk gauge's runtime breakdown comes from TASKPUMP_DOCKER" \
     || fail "disk breakdown ignored TASKPUMP_DOCKER:\n$rtd"
+
+# ── Test 39: ledger and log text cannot repaint the panel (PI-E2 / PI-D8) ─────
+# Everything this dashboard says about the fleet is written by somebody else: a
+# task's title, a claim's branch, an agent's narration (which routinely quotes
+# repository content back). A terminal executes what it is handed, so raw CSI in
+# any of those repaints a row, erases the line above it, or sets the window
+# title — and the panel the operator uses to decide whether a multi-day drain is
+# healthy is exactly the thing that gets forged. lib/tty-safe.sh strips the
+# control bytes; the monitor's own palette must survive untouched.
+echo "--- Test 39: no injected escapes reach the terminal ---"
+ESC=$'\033'
+# Only the monitor's own colours are ESC [ 0 … m (every constant re-opens with
+# 0;, palette rule R1). Removing that shape and finding an ESC left over means
+# something else got through — a CSI the tool would never emit, an OSC, a basic
+# ANSI colour the palette bans outright (rule R3).
+strip_palette() { sed -r 's/\x1b\[0[0-9;]*m//g'; }
+esc_count() { tr -cd "$ESC" | wc -c | tr -d ' '; }
+
+ETD="$TMP/esc-tasks"; mkdir -p "$ETD"
+etask() {  # <id> <claimed_by>
+    {
+        echo '---'; echo "id: \"$1\""; echo 'phase: "F98"'; echo 'status: in_progress'
+        printf 'title: "benign %s[1;32mDONE%s[0m %s[8mhidden"\n' "$ESC" "$ESC" "$ESC"
+        printf 'claimed_by: "%s"\n' "$2"
+        echo 'claimed_at: "2026-08-05T10:00:00Z"'
+        echo 'last_heartbeat_ts: "2026-08-05T10:30:00Z"'
+        echo 'turn_budget_remaining: 4'; echo 'blockers: []'
+        echo '---'; echo body
+    } >| "$ETD/$1.md"
+}
+etask F98.1 "feat/e"
+etask F98.2 "feat/x${ESC}[2K${ESC}[1;32mALL-CLEAR"
+EFR="$TMP/escroot"; mkdir -p "$EFR/.worktrees/feat/e"
+# A stream-json narration carrying an OSC title-set, a cursor-up and an erase.
+# The default feed filter's gsub("\\s+";" ") does not touch ESC, so this is the
+# whole of what stands between a hostile file and the dashboard.
+printf '%s\n' '{"type":"assistant","message":{"content":[{"text":"step done \u001b]0;PWNEDTITLE\u0007\u001b[1A\u001b[2KFLEET HEALTHY"}]}}' \
+    >| "$EFR/.worktrees/feat/e/.arachne-agent.log"
+cat >| "$BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+for a in "$@"; do
+  case "$a" in
+    '{{.Names}}|{{.State}}|{{.Status}}') echo 'arachne-agent-feat-e|running|Up 3 minutes'; exit 0 ;;
+    '{{.Names}}') echo 'arachne-agent-feat-e'; exit 0 ;;
+  esac
+done
+exit 0
+EOF
+chmod +x "$BIN/docker"
+EPS="$TMP/esc-pump.state"
+printf '%s' '{"phases":"F98","started_at":"2026-08-05T09:00:00Z","status":"running"}' >| "$EPS"
+ESC_CACHE="$TMP/esc-sess.tsv"
+emon() { TASKPUMP_MONITOR_REPO_ROOT="$EFR" TASKPUMP_TASKS_DIR="$ETD" \
+         TASKPUMP_PUMP_STATE_FILE="$EPS" TASKPUMP_MONITOR_SESS_CACHE="$ESC_CACHE" \
+         TASKPUMP_MONITOR_COLS=140 "$CLI" "$@" 2>/dev/null; }
+emon --glance >/dev/null; sleep 2; esess=$(emon --glance)
+
+left=$(printf '%s' "$esess" | strip_palette | esc_count)
+[[ "$left" == "0" ]] \
+    && pass "SESSIONS renders no escape the monitor did not emit itself" \
+    || fail "$left injected ESC bytes reached the SESSIONS panel:\n$(printf '%s' "$esess" | /usr/bin/cat -v)"
+# Sanitising must not swallow the content: a neutered line still reads.
+grep -aq 'FLEET HEALTHY' <<<"$esess" \
+    && pass "the feed line's own words survive sanitising" \
+    || fail "the log line was swallowed, not sanitised:\n$esess"
+grep -aq 'benign' <<<"$esess" \
+    && pass "the task title survives sanitising in the detail bar" \
+    || fail "the title was swallowed, not sanitised:\n$esess"
+
+# The GRAPH tab's status bar prints the same ledger strings, plus the branch a
+# claim was written with (PI-E8's payload arrives here).
+egraph=$(emon --tab graph --cursor F98.2)
+gleft=$(printf '%s' "$egraph" | strip_palette | esc_count)
+[[ "$gleft" == "0" ]] \
+    && pass "GRAPH renders no escape the monitor did not emit itself" \
+    || fail "$gleft injected ESC bytes reached the GRAPH detail bar:\n$(printf '%s' "$egraph" | /usr/bin/cat -v)"
+grep -aq 'ALL-CLEAR' <<<"$egraph" \
+    && pass "the claimed branch survives sanitising in the detail bar" \
+    || fail "the branch was swallowed, not sanitised:\n$egraph"
+# Positive control: the monitor's own palette is untouched by all of the above.
+printf '%s' "$esess" | grep -aq $'\033\[0;38;5;245m' \
+    && pass "the monitor's own colours still reach the terminal" \
+    || fail "sanitising ate the palette:\n$(printf '%s' "$esess" | /usr/bin/cat -v)"
+printf '#!/usr/bin/env bash\nexit 0\n' >| "$BIN/docker"; chmod +x "$BIN/docker"
 
 echo
 echo "=============================================="

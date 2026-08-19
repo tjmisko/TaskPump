@@ -339,6 +339,29 @@ therefore tens of milliseconds and the first frame is instant; cold caches show
 docker session table (2s), the eligible-frontier scan (8s — it is a ~3s scan, far
 too slow to run every paint) and the disk sizing (60s).
 
+#### Nothing it displays can repaint it
+
+Every string on this dashboard was written by somebody else: a task's title and
+goal come out of the ledger, a branch out of a claim, a feed line out of an
+agent's log — which routinely quotes repository content back. A terminal
+executes what it is handed, so raw CSI in any of those repaints a `blocked` row
+green, `ESC[2K\r` erases the line being read and writes another, `ESC[1A` walks
+back over the row above, and an OSC sets the window title. The panel an operator
+uses to decide whether a drain is healthy is precisely the thing worth forging.
+
+So every externally-sourced value goes through `lib/tty-safe.sh`'s
+`tp_display_safe` — TAB folded to a space, every other C0 byte, DEL and the C1
+range dropped — and it is applied where the value is **composed**, not where it
+is printed: the session records are sanitised in the background worker before
+they reach the TSV cache, because the paint path later truncates those rows to
+the terminal width and truncating a half-sanitised row is how you cut a control
+sequence in two. The GRAPH tab's node index gets the same treatment on load.
+Task **ids** are deliberately left as they are — they are the key every lookup
+and the `o` open are done by, and a rewritten key names nothing — so they are
+sanitised at their one print site instead. The monitor's own palette is composed
+*around* sanitised values and is unaffected. `--json`-shaped output and cache
+keys keep their original bytes for the same reason.
+
 ---
 
 ### `tp cleanup`
@@ -501,6 +524,24 @@ Tool *results* are the exception: only `Bash` results are shown at all, and only
 when they mention `error`/`failed`/`panicked` (red, last 15 lines) or `test
 result`/`Finished`/`warning` (dim, last 3 lines). Everything else is dropped, so
 a quiet run prints nothing between the tool calls.
+
+**Nothing in the stream can steer your terminal.** Every field this prints was
+written by somebody else — an agent's narration, a tool call's arguments, and,
+worst, the stdout of a command the agent ran over whatever the repository
+contains. So each is passed through `lib/tty-safe.sh`'s `tp_display_safe`, which
+folds TAB to a space and drops every other C0 byte, DEL and the C1 range; the
+words survive, the control sequences do not. The colours above are the only
+escapes the tool emits, and they wrap the sanitised text rather than coming out
+of it.
+
+This is not hypothetical hardening. The printer used `echo -e`, which *expands*
+backslash escapes — so a literal `\e[2J` sitting in a test fixture, harmless in
+the JSON and harmless to `jq`, became a real screen-clear on the way to the
+operator's terminal. Add an OSC and it rewrites the window title; add `ESC[<n>A`
+and it walks back over the failure lines already on screen and overwrites them
+with `0 errors, all tests passed`. The command an operator is told to watch a
+multi-day drain with was the one place a hostile repository could write directly
+onto their screen. `tests/test-tp-stream-fmt.sh` holds both halves of it.
 
 ---
 

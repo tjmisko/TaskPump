@@ -18,32 +18,70 @@
 #   Cyan    = ralph iteration markers
 #
 # Every other tool_result is dropped, not printed.
+#
+# ── Nothing from the stream steers the terminal ──────────────────────────────
+# Every field below is written by somebody else — an agent's narration, a tool
+# call's arguments, and (worst) the stdout of a command the agent ran over
+# whatever the repository contains. So each one goes through tp_display_safe
+# before it is printed, and each is printed with `printf '%s'`, never `echo -e`.
+#
+# The `echo -e` this file used to print with was the second half of the hole: it
+# expands backslash escapes, so a repository did not even need a raw ESC byte to
+# reach the operator's terminal — a literal `\e[2J` in a test fixture, surviving
+# jq as two harmless characters, became a real screen-clear on the way out. The
+# palette below is the only thing allowed to emit control bytes, which is why it
+# is spelled with $'...' (already-decoded) rather than left for a printer to
+# interpret. See lib/tty-safe.sh.
 
 # ── TaskPump config core ──────────────────────────────────────────────────────
 _tp_self_root="$(CDPATH='' cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 # shellcheck source=../lib/config.sh
 . "$_tp_self_root/lib/config.sh"
 tp_load_config
+# shellcheck source=../lib/tty-safe.sh
+. "$TP_LIB_DIR/tty-safe.sh"
 
-BLUE='\033[0;34m'
-YELLOW='\033[0;33m'
-GREEN='\033[0;32m'
-RED='\033[0;31m'
-CYAN='\033[0;36m'
-DIM='\033[0;90m'
-RESET='\033[0m'
+BLUE=$'\033[0;34m'
+YELLOW=$'\033[0;33m'
+GREEN=$'\033[0;32m'
+RED=$'\033[0;31m'
+CYAN=$'\033[0;36m'
+DIM=$'\033[0;90m'
+RESET=$'\033[0m'
 
 MAX_RESULT_LINES=15
+
+# say -- one sanitised line in one colour. The colour wraps the datum; the datum
+# never carries colour of its own.
+say() {  # $1 = colour  $2... = text pieces, joined with a space
+    local color="$1"; shift
+    tp_display_safe "$*"
+    printf '%s%s%s\n' "$color" "$TP_SAFE" "$RESET"
+}
+
+# say_block -- the same, for text that is legitimately several lines (assistant
+# narration, a result body, a tail of command output). Sanitising the block whole
+# would delete the newlines along with the escapes and glue it into one line, so
+# each line is sanitised and coloured on its own.
+say_block() {  # $1 = colour  $2 = text
+    local color="$1" text="$2" l
+    [[ -n "$text" ]] || return 0
+    while IFS= read -r l || [[ -n "$l" ]]; do
+        tp_display_safe "$l"
+        printf '%s%s%s\n' "$color" "$TP_SAFE" "$RESET"
+    done <<<"$text"
+}
 
 while IFS= read -r line; do
     # Pass through non-JSON lines (ralph iteration markers, smoke test, etc.)
     if ! echo "$line" | jq -e . &>/dev/null 2>&1; then
         if echo "$line" | grep -q "Ralph iteration"; then
-            echo -e "${CYAN}${line}${RESET}"
+            say "$CYAN" "$line"
         elif echo "$line" | grep -q "BLOCKED\|ERROR\|error"; then
-            echo -e "${RED}${line}${RESET}"
+            say "$RED" "$line"
         else
-            echo "$line"
+            tp_display_safe "$line"
+            printf '%s\n' "$TP_SAFE"
         fi
         continue
     fi
@@ -53,7 +91,7 @@ while IFS= read -r line; do
         assistant)
             msg=$(echo "$line" | jq -r '.message.content[]? | select(.type=="text") | .text' 2>/dev/null)
             if [[ -n "$msg" ]]; then
-                echo -e "${BLUE}${msg}${RESET}"
+                say_block "$BLUE" "$msg"
             fi
             ;;
         result)
@@ -61,8 +99,8 @@ while IFS= read -r line; do
             cost=$(echo "$line" | jq -r '.cost_usd // empty' 2>/dev/null)
             turns=$(echo "$line" | jq -r '.num_turns // empty' 2>/dev/null)
             if [[ -n "$msg" ]]; then
-                echo -e "${GREEN}--- RESULT (${turns} turns, \$${cost}) ---${RESET}"
-                echo -e "${GREEN}${msg}${RESET}"
+                say "$GREEN" "--- RESULT ($turns turns, \$$cost) ---"
+                say_block "$GREEN" "$msg"
             fi
             ;;
         tool_use)
@@ -70,36 +108,36 @@ while IFS= read -r line; do
             case "$tool" in
                 Read)
                     path=$(echo "$line" | jq -r '.input.file_path // empty' 2>/dev/null)
-                    echo -e "${YELLOW}[Read] ${path}${RESET}"
+                    say "$YELLOW" "[Read] $path"
                     ;;
                 Edit)
                     path=$(echo "$line" | jq -r '.input.file_path // empty' 2>/dev/null)
-                    echo -e "${YELLOW}[Edit] ${path}${RESET}"
+                    say "$YELLOW" "[Edit] $path"
                     ;;
                 Write)
                     path=$(echo "$line" | jq -r '.input.file_path // empty' 2>/dev/null)
-                    echo -e "${YELLOW}[Write] ${path}${RESET}"
+                    say "$YELLOW" "[Write] $path"
                     ;;
                 Bash)
                     cmd=$(echo "$line" | jq -r '.input.command // empty' 2>/dev/null)
                     desc=$(echo "$line" | jq -r '.input.description // empty' 2>/dev/null)
                     if [[ -n "$desc" ]]; then
-                        echo -e "${YELLOW}[Bash] ${desc}${RESET}"
+                        say "$YELLOW" "[Bash] $desc"
                     else
-                        echo -e "${YELLOW}[Bash] ${cmd:0:120}${RESET}"
+                        say "$YELLOW" "[Bash] ${cmd:0:120}"
                     fi
                     ;;
                 Grep)
                     pat=$(echo "$line" | jq -r '.input.pattern // empty' 2>/dev/null)
                     path=$(echo "$line" | jq -r '.input.path // "." ' 2>/dev/null)
-                    echo -e "${YELLOW}[Grep] /${pat}/ in ${path}${RESET}"
+                    say "$YELLOW" "[Grep] /$pat/ in $path"
                     ;;
                 Glob)
                     pat=$(echo "$line" | jq -r '.input.pattern // empty' 2>/dev/null)
-                    echo -e "${YELLOW}[Glob] ${pat}${RESET}"
+                    say "$YELLOW" "[Glob] $pat"
                     ;;
                 *)
-                    echo -e "${YELLOW}[${tool}]${RESET}"
+                    say "$YELLOW" "[$tool]"
                     ;;
             esac
             ;;
@@ -109,9 +147,9 @@ while IFS= read -r line; do
             if [[ "$tool" == "Bash" ]]; then
                 output=$(echo "$line" | jq -r '.output // empty' 2>/dev/null)
                 if echo "$output" | grep -qi "error\|failed\|FAILED\|panicked"; then
-                    echo -e "${RED}$(echo "$output" | tail -n $MAX_RESULT_LINES)${RESET}"
+                    say_block "$RED" "$(echo "$output" | tail -n $MAX_RESULT_LINES)"
                 elif echo "$output" | grep -qi "test result\|Finished\|warning"; then
-                    echo -e "${DIM}$(echo "$output" | tail -n 3)${RESET}"
+                    say_block "$DIM" "$(echo "$output" | tail -n 3)"
                 fi
             fi
             ;;
