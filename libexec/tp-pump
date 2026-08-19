@@ -416,13 +416,17 @@ usage() { apl_help "$0"; }
 # vocabulary is already fixed at 0/1, and `false`, `no` and `off` mean nothing
 # anywhere. Two of the three were out of reach of that arithmetic while the pump
 # pinned them to literals and read no key; TASKPUMP_HEALTH_GATE never was, and
-# has carried the same exposure all along. Now that all three are honoured, an
-# unparsed value is the worst of both outcomes: `[[ "$X" -eq 1 ]]` under `set -u`
-# aborts the shell with a raw bash trace where it runs in the main shell (the
-# disk-watchdog spawn), and inside default_gates' command substitution it kills
-# only the subshell — truncating the chain mid-list and leaving the run to print
-# `GATE: feed-ok` over gates nobody asked to turn off. So the value is parsed
-# once, here, and anything outside the vocabulary is refused by name.
+# has carried the same exposure all along. An unparsed value in an arithmetic
+# test under `set -u` is the worst of both outcomes, and the pump had one of
+# each: on the disk-watchdog spawn, which runs in the main shell, it aborted the
+# run with a raw bash trace and no diagnostic; inside default_gates' command
+# substitution it killed only the subshell, truncating the chain mid-list and
+# leaving the run to print `GATE: feed-ok` over gates nobody asked to turn off.
+# So the value is parsed once, here, and anything outside the vocabulary is
+# refused by name. The pump's own three comparisons are string tests now as
+# well (see default_gates), which is why nothing below can reproduce either
+# shape — but the gates these values are exported to still read them as
+# numbers, so 0/1 is the vocabulary either way.
 #
 # Read from the environment rather than from the shell variables, so a
 # --no-*-gate flag on this one run cannot hide a conf key that will be unparsed
