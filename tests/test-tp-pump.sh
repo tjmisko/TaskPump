@@ -299,8 +299,16 @@ have "$err" 'notify command failed' \
 # examples are re-read out of those files rather than restated here, so a
 # rewrite that reintroduces an argv-style value fails on the value's own
 # behaviour instead of on a grep for one spelling.
+#
+# Every program a documented value names is stubbed, and every stub appends what
+# it was handed to one record, so the question this asks is the one the harness
+# can answer: did the message the pump wrote to stdin reach the notifier's own
+# hands. Whether the notifier's own back end is reachable — a session bus for
+# notify-send, a syslog socket for logger — is a property of the host, not of
+# the value, and is docs/CONFIG.md §3.2's to state rather than this suite's to
+# assert.
 NBIN="$TMP/notify-bin"; mkdir -p "$NBIN"
-NREC="$TMP/notify-send.record"
+NREC="$TMP/notify.record"
 # Faithful where it matters: the real notify-send takes its summary from argv,
 # never reads stdin, and exits 1 with exactly this line when argv carries none.
 # The short options that consume an argument are spelled out because a stub that
@@ -324,13 +332,41 @@ exit 0
 EOF
 chmod +x "$NBIN/notify-send"
 
-notify_examples() {  # notify_examples <file> → each documented value, one per line
+# logger(1) is the other half of the same contract and the headless value the
+# docs now lead with, so it is stubbed on the same terms: util-linux's logger
+# takes the message from argv when argv carries one and reads stdin only when it
+# does not, which is the distinction this whole test exists to police. Stubbed
+# rather than real because the real one needs a syslog socket, and a suite that
+# passed or failed on whether the host runs a journal would be measuring the
+# host.
+cat >| "$NBIN/logger" <<EOF
+#!/usr/bin/env bash
+REC="$NREC"
+EOF
+cat >> "$NBIN/logger" <<'EOF'
+pos=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -t|-p|-n|-u|-f|-P|--tag|--priority) shift 2 ;;
+    --) shift; pos+=("$@"); break ;;
+    -*) shift ;;
+    *) pos+=("$1"); shift ;;
+  esac
+done
+if [[ ${#pos[@]} -gt 0 ]]; then printf '%s\n' "${pos[*]}" >> "$REC"; else cat >> "$REC"; fi
+exit 0
+EOF
+chmod +x "$NBIN/logger"
+
+notify_examples() {  # notify_examples <file> → each documented value, once, one per line
   local match value
+  # sort -u because a file documents one value in more than one place — the
+  # syntax example and the key's own entry — and that is one value to check.
   while IFS= read -r match; do
     value="${match#TASKPUMP_NOTIFY_CMD=}"
     value="${value#\'}"; value="${value%\'}"
     printf '%s\n' "$value"
-  done < <(grep -oE "TASKPUMP_NOTIFY_CMD='[^']+'|TASKPUMP_NOTIFY_CMD=[^ '\"#]+" "$1")
+  done < <(grep -oE "TASKPUMP_NOTIFY_CMD='[^']+'|TASKPUMP_NOTIFY_CMD=[^ '\"#]+" "$1") | sort -u
 }
 
 # One drained tick per documented value; the record is what the stub was
@@ -367,12 +403,13 @@ for conf_doc in "$TP_ROOT/docs/CONFIG.md" "$TP_ROOT/taskpump.conf.example"; do
       # is silence, and 8e above owns the reason that silence must not be a warning.
       pass "should stay silent when TASKPUMP_NOTIFY_CMD is the silencer $rel documents (true)"
     elif grep -q 'drained' "$NREC"; then
-      pass "should deliver the drain notice when TASKPUMP_NOTIFY_CMD is the value $rel documents ($example)"
+      pass "should hand the drain notice to its notifier when TASKPUMP_NOTIFY_CMD is the value $rel documents ($example)"
     else
-      # Only notify-send is stubbed, so this arm cannot tell a value that drops
-      # the message from one that delivers it through some other program; it
-      # says so rather than naming a cause it did not establish.
-      fail "$rel documents TASKPUMP_NOTIFY_CMD='$example', which exits 0 but never handed the message to the stubbed notify-send — either the value drops what the pump feeds it on stdin, or it delivers through a program this harness does not stub yet"
+      # Only the notifiers the docs name are stubbed, so this arm cannot tell a
+      # value that drops the message from one that delivers it through some
+      # other program; it says so rather than naming a cause it did not
+      # establish.
+      fail "$rel documents TASKPUMP_NOTIFY_CMD='$example', which exits 0 but never handed the message to a notifier this harness stubs (notify-send, logger) — either the value drops what the pump feeds it on stdin, or it delivers through a program this harness does not stub yet"
     fi
   done < <(notify_examples "$conf_doc")
   [[ "$n" -ge 1 ]] && pass "$rel still carries a TASKPUMP_NOTIFY_CMD example to check ($n)" \

@@ -75,7 +75,18 @@ all of them exited cleanly while telling an operator something untrue.
   had right. It now quotes the first line the notifier itself wrote to
   stderr (bounded, control characters stripped, the value's arguments still never
   echoed), and names the stdin contract as something to check only when the
-  notifier wrote nothing at all. (#35)
+  notifier wrote nothing at all.
+
+  The same change exposed the value the tree was telling operators to copy.
+  `TASKPUMP_NOTIFY_CMD='notify-send -u low'` was the example both syntax sections
+  reached for when they needed a value with a space in it — the one shape the key
+  cannot take, silently dropping every notice before this and warning on every
+  notice after. Those two sites now show `logger -t taskpump`, which reads stdin
+  and works on the headless host a long run actually lives on; the desktop
+  notifier moved to the key's own entry in docs/CONFIG.md §3.2, where the wrapper
+  it needs (`xargs -0`, `-0` explained), the session bus it needs, and the
+  headless alternative can all be stated. Every documented value is re-read out
+  of the shipped files by the pump suite and driven through a real drain. (#35)
 
 - **A failed ops pull quotes git's diagnosis, not git's progress banner.** The
   warning quoted the first non-blank line of `git pull --ff-only`, which for the
