@@ -3044,8 +3044,10 @@ usage() {
   printf 'usage: %s <command> [args]\n\n' "$TASKPUMP_PROG_NAME"
   cat <<'EOF'
 Commands:
-  next [--branch <b>] [--phase <FN>] Emit next ready task as JSON (incl. goal).
-                                     --phase scopes to one epic (e.g. F51).
+  next [--branch <b>] [--phase <TN>] Emit next ready task as JSON (incl. goal).
+                                     --phase scopes to one phase (e.g. T51; a
+                                       bare 51 or a full id T51.2 also resolve
+                                       to that phase).
                                      Review tasks are skipped unless
                                        --include-reviews: an in-context agent
                                        loop must never claim the review of its
@@ -3128,15 +3130,18 @@ Commands:
   verdict <review-id> [--branch <b>] --approve [--findings -|"..."]
           | --request-changes --findings -|"..."
                                      Render a review's outcome through existing
-                                       state-machine doors. --approve completes
-                                       the review task (findings to its body);
-                                       a panel reviewer's approve is its report.
+                                       state-machine doors. EITHER verdict
+                                       requires the reviewed task to be done —
+                                       a review is of completed work, and one
+                                       rendered over a moving target reviews
+                                       nothing. --approve completes the review
+                                       task (findings to its body); a panel
+                                       reviewer's approve is its report.
                                      A claimed review needs --branch matching
                                        claimed_by; an unclaimed one rules with a
                                        warning (nothing records who ruled).
                                        --request-changes (gate task only,
-                                       findings required, requires the reviewed
-                                       task to be done) appends the findings to
+                                       findings required) appends the findings to
                                        the IMPLEMENTATION task's body, reopens
                                        it (completion markers shed, prior
                                        commits preserved in the note), re-arms
