@@ -155,7 +155,7 @@ reclaim_targets() {
     fi
     local args=(--targets --include-primary)
     [[ "$DRY_RUN" -eq 1 ]] && args+=(--dry-run)
-    log "  reclaiming build target/ dirs (worktrees + primary) to buy space"
+    log "  reclaiming build output (worktrees + primary) to buy space"
     # The workspace this watchdog guards is the workspace whose build output is
     # worth reclaiming. cleanup resolves its own root from its install dir, so
     # without this the panic sweep walks the TaskPump checkout's worktrees and

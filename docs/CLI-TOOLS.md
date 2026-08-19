@@ -388,23 +388,42 @@ WARN: ignoring the live ledger claim held by branch 'feat/e': task id … contai
       ''', which is not safe in a path or a command argument
 ```
 
-#### Two traps in `--targets`
+#### What `--targets` runs, and where
 
-**`TASKPUMP_RECLAIM_CMD` is a switch here, not a command.** The sweep runs only
-when the key is set — but what it then runs is `cargo clean` where a
-`Cargo.toml` is present and `rm -rf <dir>/target` otherwise, *regardless of the
-key's value*. Demonstrated on a fixture:
+**`TASKPUMP_RECLAIM_CMD` is the command.** The sweep runs only when the key is
+set, and what it runs is that key's value, with each workspace as the working
+directory — the same key, with the same meaning, that the pump's per-tick reclaim
+pass executes:
 
 ```
 $ TASKPUMP_RECLAIM_CMD='echo MY-CUSTOM-RECLAIM' tp cleanup --targets --dry-run
 […]   worktree: …/.worktrees/feat/a/target (16K)
-  (dry-run) rm -rf '…/.worktrees/feat/a/target'
+  (dry-run) cd …/.worktrees/feat/a && echo MY-CUSTOM-RECLAIM
 ```
 
-The pump's own per-tick reclaim pass is the one that executes the key verbatim.
-If your project is not Rust-shaped, `tp cleanup --targets` will either find no
-`target/` and do nothing, or delete a directory called `target/` that means
-something else to you. Preview with `--dry-run` before trusting it.
+It used to be a *switch*: any value armed a hardcoded `cargo clean` /
+`rm -rf <dir>/target` pair and the value itself was never read, so a consumer who
+set the key to their project's real reclaim command got the Rust sweep instead.
+
+**`TASKPUMP_RECLAIM_DIR` decides which workspaces are worth reclaiming**
+(default `target`). It is a *probe*, not the thing that gets deleted: a workspace
+with no such directory is skipped, and one that has it gets `TASKPUMP_RECLAIM_CMD`
+run in it. Set it to whatever your build writes — `build`, `dist`,
+`node_modules` — or to the empty string to drop the precondition and run the
+reclaim command in every idle workspace. When nothing matches, the sweep says so
+and names the key:
+
+```
+$ tp cleanup --targets --dry-run
+[…] nothing to reclaim: no workspace under …/.worktrees/*/* has a target/
+    (set TASKPUMP_RECLAIM_DIR to the directory your build writes, or empty to
+     run TASKPUMP_RECLAIM_CMD in every idle workspace)
+```
+
+The pump's own per-tick reclaim pass still carries the hardcoded `target/`
+precondition; on a project whose build output is elsewhere it frees nothing
+per-tick, and `tp cleanup --targets` (which the disk watchdog drives under PANIC)
+is the pass that works.
 
 **A workspace whose directory name this stack cannot carry is skipped, with a
 warning.** Directory names under the worktrees base are chosen by whoever can
@@ -428,7 +447,7 @@ the prefixed one winning when both are set. The skip line names the spelling
 that answered:
 
 ```
-  skip: …/.worktrees/feat/a/target — busy (TASKPUMP_EXTRA_BUSY_DIRS)
+  skip: …/.worktrees/feat/a — busy (TASKPUMP_EXTRA_BUSY_DIRS)
 ```
 
 ---

@@ -266,6 +266,13 @@
 #                           #   the workspace as its cwd, e.g. 'cargo clean'
 #                           #   (default: empty = the reclaim pass and the tp-cleanup
 #                           #   --targets sweep are no-ops that log themselves unconfigured)
+# TASKPUMP_RECLAIM_DIR=     # the build-output dir that marks a workspace as worth
+#                           #   reclaiming, and the one tp-cleanup --status measures
+#                           #   (default: target). A PROBE, not the thing deleted: set it
+#                           #   to whatever your build writes (build, dist,
+#                           #   node_modules), or to empty to run TASKPUMP_RECLAIM_CMD in
+#                           #   every idle workspace. Read by tp-cleanup only — the
+#                           #   pump's per-tick pass still hardcodes target/.
 # TASKPUMP_DISK_RECLAIM=    # 0 = switch off the pump's per-tick reclaim of FINISHED
 #                           #   phases' build output (default: 1). Not disk-pressure
 #                           #   conditional despite the name — the pass runs every tick,

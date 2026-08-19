@@ -481,7 +481,8 @@ toolchain:
 | `TASKPUMP_BUILD_GATE` | `tp pump` | **unset ⇒ `cargo check --workspace`, then `./smoke_test.sh` when the workspace has one** | The command that must pass before work is integrated. `cargo check` for Rust, `npm test` for Node, whatever your project's "is it broken" question is. `TASKPUMP_PUMP_BUILD_CMD` overrides it for the merge queue. The unset case is not "no gate": see below. |
 | `TASKPUMP_VERIFY_CMDS` | `tp pump` | empty | Newline-separated commands a task must leave green, quoted into the brief. Empty by default — the templates' verify sections drop out until a consumer names its own bar. |
 | `TASKPUMP_PROJECT_BRIEF` | `tp pump` | a generic "read CLAUDE.md, CONTRIBUTING.md, or equivalent" paragraph | One paragraph pointing an agent at the project's own contributor documentation. |
-| `TASKPUMP_RECLAIM_CMD` | `tp pump`, `tp cleanup` | empty | How to reclaim build output from a finished workspace, so a multi-day run's disk footprint stays bounded. Empty by default: unconfigured, the per-tick reclaim pass and the `tp cleanup --targets` sweep touch nothing and log themselves unconfigured. |
+| `TASKPUMP_RECLAIM_CMD` | `tp pump`, `tp cleanup` | empty | How to reclaim build output from a finished workspace, so a multi-day run's disk footprint stays bounded. Both readers execute this value, with the workspace as the working directory. Empty by default: unconfigured, the per-tick reclaim pass and the `tp cleanup --targets` sweep touch nothing and log themselves unconfigured. |
+| `TASKPUMP_RECLAIM_DIR` | `tp cleanup` | `target` | The build-output directory that marks a workspace as worth reclaiming, and the one `--status` measures. A *probe*, not the thing deleted: a workspace that has it gets `TASKPUMP_RECLAIM_CMD` run in it, one that does not is skipped. Set it to whatever your build writes (`build`, `dist`, `node_modules`), or to the empty string to drop the precondition entirely. The pump's own per-tick pass does not read this key — its `target/` precondition is still hardcoded. |
 | `TASKPUMP_DISK_RECLAIM` | `tp pump` | `1` | `0` switches off the pump's per-tick reclaim of finished phases' build output. Despite the name it is not disk-pressure-conditional — the pass runs every tick, before the feed gate, precisely so a paused run keeps freeing space. The watchdog's pressure-driven reclaim is `TASKPUMP_PANIC_RECLAIM` (§3.7). |
 | `TASKPUMP_BRIEF_TEMPLATE` | `tp pump` | `<install>/templates/phase-drain-brief.md` | The parameterized brief a launched agent is handed at `--grain phase`. `TASKPUMP_PHASE_BRIEF_TEMPLATE` is the explicit spelling of the same thing and wins when both are set. |
 | `TASKPUMP_TASK_BRIEF_TEMPLATE` | `tp pump` | `<install>/templates/task-brief.md` | The brief a `--grain task` container is handed. A separate template on purpose: the phase brief's working method *is* the in-context `next --phase` loop, which at task grain would claim the siblings the pump has already dispatched elsewhere. |
@@ -797,7 +798,7 @@ consumers.
 | `TASKPUMP_ORIGINAL_CAP` | `tp disk-watchdog` | the cap file's contents at start, else `TASKPUMP_JOBS_FALLBACK` | The cap to restore once free space recovers. Nothing in this tree writes it — it is there for a caller that starts the watchdog when the cap has already been lowered, and so has to be told what "restored" means. |
 
 Cleanup also reads `TASKPUMP_WORKTREES_DIR` (as a path), `TASKPUMP_RECLAIM_CMD`,
-`TASKPUMP_EXTRA_BUSY_DIRS`,
+`TASKPUMP_RECLAIM_DIR`, `TASKPUMP_EXTRA_BUSY_DIRS`,
 `TASKPUMP_AGENT_LOG_NAME`, `TASKPUMP_AGENT_PREFIX` (through
 `lib/pump-lib.sh`'s one accessor), `TASKPUMP_DAG_BIN` and the
 opt-in `TASKPUMP_MANIFEST`; the disk watchdog reads `TASKPUMP_STATE_DIR` and
@@ -811,8 +812,8 @@ Unlike `tp task`, `tp pump`, `tp monitor` and `tp dag-render`, which resolve fro
 directory — the TaskPump install. Run from a consumer repo with no key set, it
 sweeps and measures the install instead of your project and reports on that,
 which reads as a clean sweep: from a fixture repo carrying
-`.worktrees/feat/x/target`, `tp cleanup --targets --dry-run` said `no worktree
-target dirs to reclaim` until `TASKPUMP_CLEANUP_REPO_ROOT` named the fixture.
+`.worktrees/feat/x/target`, `tp cleanup --targets --dry-run` said `nothing to
+reclaim` until `TASKPUMP_CLEANUP_REPO_ROOT` named the fixture.
 
 `tp disk-watchdog` resolves the workspace the way the pump does (a discovered
 conf's directory, else the caller's git worktree, else the install root), so the
@@ -830,7 +831,7 @@ would have been discarded anyway (`TASKPUMP_POOL_CAP_FILE`, §3.2).
 `taskpump.conf` (the file is sourced with `allexport`, so a bare `KEY=value` is
 exported like any other). `ARACHNE_EXTRA_BUSY_DIRS` reaches the canonical name
 through the legacy bridge like every other key. The skip line names the spelling
-that answered — `skip: <worktree>/target — busy (TASKPUMP_EXTRA_BUSY_DIRS)` — so
+that answered — `skip: <worktree> — busy (TASKPUMP_EXTRA_BUSY_DIRS)` — so
 which one the sweep read is never a guess. The prefixed spelling used to have no
 reader at all, which meant the documented way to protect a mid-compile workspace
 reclaimed exactly that workspace.

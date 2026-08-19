@@ -23,13 +23,18 @@
 #   3. Releases the task claim so the next run can re-pick it.
 #
 # Configuration (taskpump.conf or the environment; legacy names still work):
-#   TASKPUMP_RECLAIM_CMD          the SWITCH that arms the --targets sweep, not
-#                                 the command it runs: while unset the sweep
-#                                 touches nothing, and once set the sweep runs
-#                                 `cargo clean` (or `rm -rf <dir>/target`) on
-#                                 each idle workspace regardless of the value.
-#                                 The pump's own per-tick reclaim is the pass
-#                                 that executes this key verbatim.
+#   TASKPUMP_RECLAIM_CMD          the command the --targets sweep RUNS in each
+#                                 idle workspace, with that workspace as the
+#                                 working directory — the same key, with the
+#                                 same meaning, that the pump's per-tick reclaim
+#                                 executes. Unset, the sweep touches nothing and
+#                                 says so.
+#   TASKPUMP_RECLAIM_DIR          the build-output directory that says a
+#                                 workspace is worth reclaiming, and the one
+#                                 --status measures (default `target`; set it to
+#                                 `build`, `node_modules`, `dist`, ... for your
+#                                 toolchain). Empty means no precondition: the
+#                                 reclaim command runs in every idle workspace.
 #   TASKPUMP_STUCK_THRESHOLD_MIN  log-stale cutoff, minutes (default 15)
 #   TASKPUMP_STOP_GRACE_SEC       stop grace period, seconds (default 30)
 #   TASKPUMP_MANIFEST             OPT-IN v1 parallel-run manifest (no default;
@@ -94,10 +99,16 @@ MODE=""
 INCLUDE_PRIMARY="${TASKPUMP_RECLAIM_PRIMARY:-${RECLAIM_PRIMARY:-0}}"
 # The build-output sweep runs only when the consumer has said how build output
 # is reclaimed (TASKPUMP_RECLAIM_CMD, the same key the pump's per-tick pass
-# reads). The sweep's own target/ + cargo-clean logic is Rust-shaped, and a
-# rescue tool guessing at another toolchain's build dirs is worse than one that
-# says it is unconfigured (G1.7; examples/arachne.conf pins 'cargo clean').
+# reads), and it runs exactly that command — a rescue tool guessing at another
+# toolchain's build dirs is worse than one that says it is unconfigured (G1.7;
+# examples/arachne.conf pins 'cargo clean').
 RECLAIM_CMD="${TASKPUMP_RECLAIM_CMD:-}"
+# Which directory means "this workspace is holding build output". Rust's
+# `target` is the default because it is what this sweep has always looked for;
+# it is a PROBE, not the thing that gets deleted, so a project whose `target/`
+# means something else still only ever has RECLAIM_CMD run against it. Empty
+# turns the precondition off (B9).
+RECLAIM_DIR="${TASKPUMP_RECLAIM_DIR-${RECLAIM_DIR-target}}"
 # Workspaces to leave alone even though no agent container is on them — a human
 # mid-compile, or the disk guard's own busy list. Canonical spelling first,
 # legacy second, the same precedence every other key here uses; the key name
@@ -322,7 +333,7 @@ do_stuck() {
 
 # ── busy_worktrees -- emit the .worktrees paths that currently host a live
 #    prefix-named agent container (one per line). Used to skip a worktree whose
-#    agent is mid-build, so reclaiming target/ never yanks the rug from a
+#    agent is mid-build, so reclaiming build output never yanks the rug from a
 #    running session. Empty when docker is absent or no agents run.
 busy_worktrees() {
     local cname
@@ -332,34 +343,55 @@ busy_worktrees() {
     done < <(list_agent_containers)
 }
 
-# ── reclaim_target <dir> <label> -- free a Rust build dir's target/. Prefers
-#    `cargo clean` (respects the workspace layout / CARGO_TARGET_DIR); falls
-#    back to rm -rf when cargo or the manifest is absent. Honours --dry-run via
-#    act(). Returns 1 (no-op) when there is no target/ to reclaim.
-reclaim_target() {
+# ── reclaim_workspace <dir> <label> -- run the consumer's reclaim command with
+#    <dir> as the working directory. Returns 1 (no-op) when RECLAIM_DIR is
+#    configured and <dir> has no such directory to reclaim.
+#
+#    This used to run `cargo clean` or `rm -rf <dir>/target` and never look at
+#    TASKPUMP_RECLAIM_CMD's value at all — the key was a switch that armed a
+#    hardcoded Rust sweep. So a consumer who set it to their project's actual
+#    reclaim command got `rm -rf target/` instead, and a consumer whose build
+#    output is anywhere else got a sweep that reported success having freed
+#    nothing (B9). One key, one meaning, in both consumers: the pump's per-tick
+#    pass already executed this value verbatim, and now so does the rescue.
+#
+#    The `eval` here is the only one left in this tool, and it is deliberate:
+#    RECLAIM_CMD is a shell command line the OPERATOR wrote, in the same trust
+#    domain as the shell running this script (lib/config.sh sources the whole
+#    conf under `set -a` before this line is reached). Nothing read from the
+#    ledger or from a directory name is ever evaluated — see act().
+reclaim_workspace() {
     local dir="$1" label="$2"
-    [[ -d "$dir/target" ]] || return 1
-    local size; size="$(du -sh "$dir/target" 2>/dev/null | cut -f1)"
-    log "  $label: $dir/target ($size)"
-    if command -v cargo >/dev/null 2>&1 && [[ -f "$dir/Cargo.toml" ]]; then
-        act cargo clean --manifest-path "$dir/Cargo.toml"
+    if [[ -n "$RECLAIM_DIR" ]]; then
+        [[ -d "$dir/$RECLAIM_DIR" ]] || return 1
+        local size; size="$(du -sh "$dir/$RECLAIM_DIR" 2>/dev/null | cut -f1)"
+        log "  $label: $dir/$RECLAIM_DIR ($size)"
     else
-        act rm -rf "$dir/target"
+        log "  $label: $dir"
     fi
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        printf '  (dry-run) cd %q && %s\n' "$dir" "$RECLAIM_CMD"
+        return 0
+    fi
+    printf '  $ cd %q && %s\n' "$dir" "$RECLAIM_CMD"
+    ( cd "$dir" && eval "$RECLAIM_CMD" ) \
+        || log "  WARNING: TASKPUMP_RECLAIM_CMD failed in $dir — nothing was reclaimed there"
     return 0
 }
 
-# ── do_targets -- reclaim build output (target/) in every worktree (cheap to
-#    rebuild, typically 2-6 GB each), SKIPPING any worktree that currently hosts
-#    a live agent container so an in-flight build is never broken. With
-#    --include-primary it also reclaims the primary checkout's own target/.
+# ── do_targets -- reclaim build output in every worktree (cheap to rebuild,
+#    typically 2-6 GB each), SKIPPING any worktree that currently hosts a live
+#    agent container so an in-flight build is never broken. With
+#    --include-primary it also reclaims the primary checkout's own build output.
 #    Runs only when a reclaim command is configured; see RECLAIM_CMD above.
 do_targets() {
     if [[ -z "$RECLAIM_CMD" ]]; then
-        log "target reclaim skipped: TASKPUMP_RECLAIM_CMD unconfigured — nothing touched (set it to your project's reclaim command, e.g. 'cargo clean')"
+        log "build reclaim skipped: TASKPUMP_RECLAIM_CMD unconfigured — nothing touched (set it to your project's reclaim command, e.g. 'cargo clean')"
         return 0
     fi
-    log "reclaiming build target/ dirs (dry-run=$DRY_RUN, include-primary=$INCLUDE_PRIMARY)"
+    local probe="probe=$RECLAIM_DIR/"
+    [[ -z "$RECLAIM_DIR" ]] && probe="probe=none"
+    log "reclaiming build output ($probe, dry-run=$DRY_RUN, include-primary=$INCLUDE_PRIMARY)"
     local busy; busy="$(busy_worktrees)"
     local found=0 skipped=0
     local wt rel unsafe
@@ -381,35 +413,46 @@ do_targets() {
             skipped=$((skipped + 1))
             continue
         fi
-        [[ -d "$wt/target" ]] || continue
+        if [[ -n "$RECLAIM_DIR" && ! -d "$wt/$RECLAIM_DIR" ]]; then
+            continue
+        fi
         if printf '%s\n' "$busy" | grep -Fxq "$wt"; then
-            log "  skip: $wt/target — live agent container"
+            log "  skip: $wt — live agent container"
             skipped=$((skipped + 1))
             continue
         fi
         if [[ -n "$BUSY_EXTRA" ]] && printf '%s\n' "$BUSY_EXTRA" | grep -Fxq "$wt"; then
-            log "  skip: $wt/target — busy ($BUSY_EXTRA_KEY)"
+            log "  skip: $wt — busy ($BUSY_EXTRA_KEY)"
             skipped=$((skipped + 1))
             continue
         fi
-        reclaim_target "$wt" "worktree" && found=$((found + 1))
+        reclaim_workspace "$wt" "worktree" && found=$((found + 1))
     done
     if (( found == 0 && skipped == 0 )); then
-        log "no worktree target dirs to reclaim."
-    else
-        log "reclaimed $found worktree target dir(s); skipped $skipped live."
-    fi
-    # The primary checkout's own target/ — only when explicitly requested, since
-    # a human may be building there. The watchdog passes --include-primary under
-    # PANIC to buy the most space.
-    if [[ -d "$REPO_ROOT/target" ]]; then
-        if [[ -n "$BUSY_EXTRA" ]] && printf '%s\n' "$BUSY_EXTRA" | grep -Fxq "$REPO_ROOT"; then
-            log "  skip: $REPO_ROOT/target — busy ($BUSY_EXTRA_KEY)"
-        elif [[ "$INCLUDE_PRIMARY" -eq 1 ]]; then
-            reclaim_target "$REPO_ROOT" "primary"
+        # "Nothing to reclaim" is a finding, not a success: it is what a
+        # consumer whose build output is not called `target/` sees on every
+        # panic sweep while the disk fills (B9). Say what was looked for.
+        if [[ -n "$RECLAIM_DIR" ]]; then
+            log "nothing to reclaim: no workspace under $WORKTREES_DIR/*/* has a $RECLAIM_DIR/ (set TASKPUMP_RECLAIM_DIR to the directory your build writes, or empty to run TASKPUMP_RECLAIM_CMD in every idle workspace)"
         else
-            local size; size="$(du -sh "$REPO_ROOT/target" 2>/dev/null | cut -f1)"
-            log "primary checkout target: $REPO_ROOT/target ($size) — left alone (pass --include-primary to reclaim)"
+            log "nothing to reclaim: no workspace found under $WORKTREES_DIR/*/*"
+        fi
+    else
+        log "reclaimed $found worktree workspace(s); skipped $skipped."
+    fi
+    # The primary checkout's own build output — only when explicitly requested,
+    # since a human may be building there. The watchdog passes --include-primary
+    # under PANIC to buy the most space.
+    if [[ -z "$RECLAIM_DIR" || -d "$REPO_ROOT/$RECLAIM_DIR" ]]; then
+        if [[ -n "$BUSY_EXTRA" ]] && printf '%s\n' "$BUSY_EXTRA" | grep -Fxq "$REPO_ROOT"; then
+            log "  skip: $REPO_ROOT — busy ($BUSY_EXTRA_KEY)"
+        elif [[ "$INCLUDE_PRIMARY" -eq 1 ]]; then
+            reclaim_workspace "$REPO_ROOT" "primary"
+        elif [[ -n "$RECLAIM_DIR" ]]; then
+            local size; size="$(du -sh "$REPO_ROOT/$RECLAIM_DIR" 2>/dev/null | cut -f1)"
+            log "primary checkout: $REPO_ROOT/$RECLAIM_DIR ($size) — left alone (pass --include-primary to reclaim)"
+        else
+            log "primary checkout: $REPO_ROOT — left alone (pass --include-primary to reclaim)"
         fi
     fi
 }
@@ -446,8 +489,13 @@ do_status() {
         printf "  %-40s  log_age=%s min\n" "$cname" "$age"
     done < <(list_agent_containers)
     echo
-    echo "## Worktree target/ sizes"
-    du -sh "$WORKTREES_DIR"/*/*/target 2>/dev/null | sort -h | tail -20 || echo "(none)"
+    if [[ -n "$RECLAIM_DIR" ]]; then
+        echo "## Worktree $RECLAIM_DIR/ sizes"
+        du -sh "$WORKTREES_DIR"/*/*/"$RECLAIM_DIR" 2>/dev/null | sort -h | tail -20 || echo "(none)"
+    else
+        echo "## Worktree sizes (TASKPUMP_RECLAIM_DIR is empty: whole workspaces)"
+        du -sh "$WORKTREES_DIR"/*/* 2>/dev/null | sort -h | tail -20 || echo "(none)"
+    fi
     echo
     echo "## Docker storage"
     "$(apl_docker)" system df 2>/dev/null || echo "(container runtime not available)"

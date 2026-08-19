@@ -336,15 +336,17 @@ The reclaim pass *inside* the tick (step 7) is the narrower of the two: it
 touches only the workspaces the plan just filed as `DONE`, never the primary,
 and never one with a live agent.
 
-**Both passes carry the same trap, and it is worth knowing before you rely on
-either.** Neither one asks your reclaim command what to reclaim. Each first
-looks for a directory literally named `target/` and skips anything without one,
-so the whole mechanism is Rust-shaped, and no configuration key overrides that
-name. A project that builds into `build/`, `dist/` or `node_modules/` gets a
-reclaim pass that runs every tick, logs nothing, and frees nothing — with
-`TASKPUMP_RECLAIM_CMD` set and looking configured. The disk discipline you think
-you have is the pool-cap drop and the runtime prune; the build-output half is
-inert.
+**The two passes no longer agree about what "build output" means, and the
+difference decides whether either one frees anything.** Both look for a
+directory before running your reclaim command, and skip a workspace that does
+not have one. The watchdog's pass — `tp cleanup --targets` — takes that
+directory's name from `TASKPUMP_RECLAIM_DIR` (default `target`, empty for "no
+precondition"), and says so when nothing matched. The pump's per-tick pass still
+hardcodes `target/`: on a project that builds into `build/`, `dist/` or
+`node_modules/` it runs every tick, logs nothing, and frees nothing — with
+`TASKPUMP_RECLAIM_CMD` set and looking configured. So on a non-Rust project the
+per-tick half of the build-output discipline is still inert, and the panic sweep
+is the half that works once `TASKPUMP_RECLAIM_DIR` names your build directory.
 
 ---
 

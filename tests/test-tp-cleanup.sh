@@ -68,7 +68,7 @@ echo "--- Test 0: --targets with no reclaim command configured touches nothing (
 # says so — a rescue tool guessing at a toolchain's build dirs is worse than one
 # that reports itself unconfigured.
 out="$(TASKPUMP_RECLAIM_CMD= ARACHNE_CLEANUP_REPO_ROOT="$FIX" STUB_LIVE="" "$CLEANUP" --targets --dry-run 2>&1)"
-assert_has "unconfigured sweep logs the no-op line" "$out" "target reclaim skipped: TASKPUMP_RECLAIM_CMD unconfigured"
+assert_has "unconfigured sweep logs the no-op line" "$out" "build reclaim skipped: TASKPUMP_RECLAIM_CMD unconfigured"
 assert_no  "unconfigured sweep lists no worktree"   "$out" "$FIX/.worktrees/feat/a/target"
 assert_no  "unconfigured sweep plans no command"    "$out" "(dry-run)"
 [[ -f "$FIX/.worktrees/feat/a/target/x" && -f "$FIX/.worktrees/feat/b/target/x" ]] \
@@ -79,20 +79,23 @@ out="$(TASKPUMP_RECLAIM_CMD= ARACHNE_CLEANUP_REPO_ROOT="$FIX" STUB_LIVE="" "$CLE
 assert_no  "unconfigured sweep ignores --include-primary" "$out" "primary: $FIX/target"
 
 echo "--- Test 1: --targets --dry-run reclaims both worktrees, leaves primary ---"
-# The cargo-shaped target/ sweep, under the suite-level examples/arachne.conf
-# pin TASKPUMP_RECLAIM_CMD='cargo clean' (G1.7: configured is what arms it).
+# The target/-probed sweep, under the suite-level examples/arachne.conf pin
+# TASKPUMP_RECLAIM_CMD='cargo clean' (G1.7: configured is what arms it).
 out="$(ARACHNE_CLEANUP_REPO_ROOT="$FIX" STUB_LIVE="" "$CLEANUP" --targets --dry-run 2>&1)"
 assert_has "feat/a target listed"            "$out" "$FIX/.worktrees/feat/a/target"
 assert_has "feat/b target listed"            "$out" "$FIX/.worktrees/feat/b/target"
-assert_has "reclaimed 2, skipped 0 live"     "$out" "reclaimed 2 worktree target dir(s); skipped 0 live"
+assert_has "reclaimed 2, skipped 0"          "$out" "reclaimed 2 worktree workspace(s); skipped 0."
 assert_has "primary left alone by default"   "$out" "left alone (pass --include-primary to reclaim)"
 assert_no  "primary not reclaimed by default" "$out" "primary: $FIX/target"
-if command -v cargo >/dev/null 2>&1; then
-  assert_has "feat/a uses cargo clean (Cargo.toml present)" "$out" "cargo clean --manifest-path $FIX/.worktrees/feat/a/Cargo.toml"
-  assert_has "feat/b falls back to rm -rf (no Cargo.toml)"  "$out" "rm -rf $FIX/.worktrees/feat/b/target"
-else
-  echo "  (cargo not installed — skipping cargo-clean branch assertion)"
-fi
+# B9: the CONFIGURED command is what runs, in the workspace, in both workspaces.
+# It used to be a switch that armed a hardcoded `cargo clean` / `rm -rf target`
+# pair, so a consumer who set this key to their project's actual reclaim command
+# got the Rust sweep instead — and a consumer whose build output lives anywhere
+# else got a pass that reported success having freed nothing.
+assert_has "the configured command runs in feat/a" "$out" "(dry-run) cd $FIX/.worktrees/feat/a && cargo clean"
+assert_has "the configured command runs in feat/b" "$out" "(dry-run) cd $FIX/.worktrees/feat/b && cargo clean"
+assert_no  "no hardcoded rm -rf of the probe dir"  "$out" "rm -rf"
+assert_no  "no hardcoded cargo --manifest-path"    "$out" "--manifest-path"
 
 echo "--- Test 2: --include-primary also reclaims the primary checkout ---"
 out="$(ARACHNE_CLEANUP_REPO_ROOT="$FIX" STUB_LIVE="" "$CLEANUP" --targets --include-primary --dry-run 2>&1)"
@@ -103,8 +106,8 @@ assert_has "RECLAIM_PRIMARY=1 == --include-primary" "$out" "primary: $FIX/target
 
 echo "--- Test 3: a worktree with a live agent container is skipped ---"
 out="$(ARACHNE_CLEANUP_REPO_ROOT="$FIX" STUB_LIVE="arachne-agent-feat-a" "$CLEANUP" --targets --dry-run 2>&1)"
-assert_has "feat/a skipped (live agent)"     "$out" "skip: $FIX/.worktrees/feat/a/target — live agent container"
-assert_has "reclaimed 1, skipped 1 live"     "$out" "reclaimed 1 worktree target dir(s); skipped 1 live."
+assert_has "feat/a skipped (live agent)"     "$out" "skip: $FIX/.worktrees/feat/a — live agent container"
+assert_has "reclaimed 1, skipped 1"          "$out" "reclaimed 1 worktree workspace(s); skipped 1."
 assert_no  "feat/a not acted on while live"  "$out" "worktree: $FIX/.worktrees/feat/a/target"
 assert_has "feat/b still reclaimed"          "$out" "worktree: $FIX/.worktrees/feat/b/target"
 
@@ -134,7 +137,7 @@ out="$(ARACHNE_DISK_REPO_ROOT="$FIX" FREE_GB_OVERRIDE=3 PANIC_THRESHOLD_GB=5 PAU
        "$WATCHDOG" --once --dry-run 2>&1)"
 assert_has "panic state entered (free=3 < panic=5)" "$out" "HEALTHY → PANIC"
 # Toolchain-neutral wording (G1.7): the watchdog names no build system.
-assert_has "reclaim_targets ran"                    "$out" "reclaiming build target/ dirs (worktrees + primary)"
+assert_has "reclaim_targets ran"                    "$out" "reclaiming build output (worktrees + primary)"
 assert_has "cleanup invoked with targets+primary+dry-run" "$out" "STUB-CLEANUP-CALLED args: --targets --include-primary --dry-run"
 # The panic sweep must run against the workspace this watchdog guards. cleanup
 # resolves its own root from its install dir, so without this it walks the
@@ -161,24 +164,44 @@ echo "--- Test 7: the busy-workspace skip, in BOTH spellings (B5) ---"
 # spellings are honoured now, canonical first — and the skip line names the key
 # that answered, so "which one did it read" is never a guess again.
 out="$(ARACHNE_CLEANUP_REPO_ROOT="$FIX" STUB_LIVE="" EXTRA_BUSY_DIRS="$FIX/.worktrees/feat/a" "$CLEANUP" --targets --dry-run 2>&1)"
-assert_has "feat/a skipped via the legacy EXTRA_BUSY_DIRS" "$out" "skip: $FIX/.worktrees/feat/a/target — busy (EXTRA_BUSY_DIRS)"
+assert_has "feat/a skipped via the legacy EXTRA_BUSY_DIRS" "$out" "skip: $FIX/.worktrees/feat/a — busy (EXTRA_BUSY_DIRS)"
 assert_has "feat/b still reclaimed"              "$out" "worktree: $FIX/.worktrees/feat/b/target"
 out="$(ARACHNE_CLEANUP_REPO_ROOT="$FIX" STUB_LIVE="" TASKPUMP_EXTRA_BUSY_DIRS="$FIX/.worktrees/feat/a" "$CLEANUP" --targets --dry-run 2>&1)"
-assert_has "feat/a skipped via the canonical TASKPUMP_EXTRA_BUSY_DIRS" "$out" "skip: $FIX/.worktrees/feat/a/target — busy (TASKPUMP_EXTRA_BUSY_DIRS)"
-assert_no  "the protected workspace is not reclaimed"  "$out" "worktree: $FIX/.worktrees/feat/a/target"
+assert_has "feat/a skipped via the canonical TASKPUMP_EXTRA_BUSY_DIRS" "$out" "skip: $FIX/.worktrees/feat/a — busy (TASKPUMP_EXTRA_BUSY_DIRS)"
+assert_no  "the protected workspace is not reclaimed"  "$out" "cd $FIX/.worktrees/feat/a &&"
 assert_has "feat/b is still reclaimed alongside it"    "$out" "worktree: $FIX/.worktrees/feat/b/target"
 # The canonical spelling wins when both are set — the precedence every other key
 # in this tool uses.
 out="$(ARACHNE_CLEANUP_REPO_ROOT="$FIX" STUB_LIVE="" \
        TASKPUMP_EXTRA_BUSY_DIRS="$FIX/.worktrees/feat/a" EXTRA_BUSY_DIRS="$FIX/.worktrees/feat/b" \
        "$CLEANUP" --targets --dry-run 2>&1)"
-assert_has "the canonical spelling outranks the legacy one" "$out" "skip: $FIX/.worktrees/feat/a/target — busy (TASKPUMP_EXTRA_BUSY_DIRS)"
+assert_has "the canonical spelling outranks the legacy one" "$out" "skip: $FIX/.worktrees/feat/a — busy (TASKPUMP_EXTRA_BUSY_DIRS)"
 out="$(ARACHNE_CLEANUP_REPO_ROOT="$FIX" STUB_LIVE="" EXTRA_BUSY_DIRS="$FIX" "$CLEANUP" --targets --include-primary --dry-run 2>&1)"
-assert_has "busy primary skipped despite --include-primary" "$out" "skip: $FIX/target — busy (EXTRA_BUSY_DIRS)"
+assert_has "busy primary skipped despite --include-primary" "$out" "skip: $FIX — busy (EXTRA_BUSY_DIRS)"
 assert_no  "busy primary not reclaimed"          "$out" "primary: $FIX/target"
 out="$(ARACHNE_CLEANUP_REPO_ROOT="$FIX" STUB_LIVE="" TASKPUMP_EXTRA_BUSY_DIRS="$FIX" "$CLEANUP" --targets --include-primary --dry-run 2>&1)"
-assert_has "the canonical spelling protects the primary too" "$out" "skip: $FIX/target — busy (TASKPUMP_EXTRA_BUSY_DIRS)"
+assert_has "the canonical spelling protects the primary too" "$out" "skip: $FIX — busy (TASKPUMP_EXTRA_BUSY_DIRS)"
 assert_no  "the canonically-protected primary is not reclaimed" "$out" "primary: $FIX/target"
+
+echo "--- Test 7b: the reclaim probe dir is configurable (B9) ---"
+# Every reclaim path used to be gated on a directory literally named `target/`,
+# so on a workspace that builds anywhere else the sweep freed nothing and said
+# it had succeeded. TASKPUMP_RECLAIM_DIR names the directory that means "this
+# workspace is holding build output"; empty turns the precondition off.
+B9="$FIX/b9"; mkdir -p "$B9/.worktrees/feat/n/node_modules" "$B9/.worktrees/feat/p"
+out="$(TASKPUMP_CLEANUP_REPO_ROOT="$B9" STUB_LIVE="" TASKPUMP_RECLAIM_CMD='npm run clean' \
+       "$CLEANUP" --targets --dry-run 2>&1)"
+assert_has "a non-Rust workspace reclaims nothing under the default probe" "$out" "nothing to reclaim: no workspace under $B9/.worktrees/*/* has a target/"
+assert_has "and the diagnostic names the key that fixes it" "$out" "set TASKPUMP_RECLAIM_DIR"
+assert_no  "nothing was planned against it"                 "$out" "(dry-run) cd"
+out="$(TASKPUMP_CLEANUP_REPO_ROOT="$B9" STUB_LIVE="" TASKPUMP_RECLAIM_CMD='npm run clean' \
+       TASKPUMP_RECLAIM_DIR=node_modules "$CLEANUP" --targets --dry-run 2>&1)"
+assert_has "the configured probe finds the workspace"  "$out" "worktree: $B9/.worktrees/feat/n/node_modules"
+assert_has "and runs the configured command there"     "$out" "(dry-run) cd $B9/.worktrees/feat/n && npm run clean"
+assert_no  "the probe-less workspace is left alone"    "$out" "cd $B9/.worktrees/feat/p"
+out="$(TASKPUMP_CLEANUP_REPO_ROOT="$B9" STUB_LIVE="" TASKPUMP_RECLAIM_CMD='npm run clean' \
+       TASKPUMP_RECLAIM_DIR='' "$CLEANUP" --targets --dry-run 2>&1)"
+assert_has "an empty probe runs the command in every idle workspace" "$out" "(dry-run) cd $B9/.worktrees/feat/p && npm run clean"
 
 echo "--- Test 8: --stuck maps container→task from the LEDGER claim, no manifest (#7) ---"
 # tp-cleanup used to default TASKPUMP_MANIFEST to Arachne's
@@ -350,11 +373,12 @@ rm -f "$D4/$CANARY"
 # The apostrophe is the whole attack: it closes the single quote the tool
 # wrapped the path in, and everything after it is parsed as shell.
 mkdir -p "$D4/.worktrees/feat/x'\$(touch $CANARY)'y/target" "$D4/.worktrees/feat/ok/target"
-out="$(cd "$D4" && TASKPUMP_CLEANUP_REPO_ROOT="$D4" STUB_LIVE="" "$CLEANUP" --targets 2>&1)"
+out="$(cd "$D4" && TASKPUMP_CLEANUP_REPO_ROOT="$D4" STUB_LIVE="" TASKPUMP_RECLAIM_CMD='echo RECLAIMED' \
+       "$CLEANUP" --targets 2>&1)"
 [[ ! -e "$D4/$CANARY" ]] && pass "a command substitution in a directory name did not run" \
                          || fail "the directory name was evaluated: $D4/$CANARY exists"
 assert_has "the unsafe workspace is skipped by name" "$out" "worktree directory"
-assert_has "and the well-named one is still reclaimed" "$out" "$D4/.worktrees/feat/ok/target"
+assert_has "and the well-named one is still reclaimed" "$out" "cd $D4/.worktrees/feat/ok && echo RECLAIMED"
 
 echo "--- Test 17: the watchdog drives the WORKSPACE's cap file, not the install's (B8) ---"
 # The cap file is the documented choke point between these two processes: the
