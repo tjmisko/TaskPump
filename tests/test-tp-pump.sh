@@ -327,6 +327,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ ${#pos[@]} -ge 1 ]] || { echo "No summary specified." >&2; exit 1; }
+# libnotify takes a summary and an optional body, and NOTHING else. Accepting
+# any count here made the stub pass `xargs notify-send …` without -0 — the exact
+# trap docs/CONFIG.md's paragraph exists to warn about, which fails exit 123 on
+# a real host — so the guard went green on the one value it most needed to catch.
+[[ ${#pos[@]} -le 2 ]] || { echo "Invalid number of options." >&2; exit 1; }
 printf '%s\n' "${pos[*]}" >> "$REC"
 exit 0
 EOF
@@ -536,7 +541,12 @@ else
   printf 'SKIP: mount guard — no runner at %s yet (lands on integration)\n' "$RUNNER_SH"
 fi
 # The pump must no longer carry mounts of its own: launching is the runner's.
-grep -qE -- '-v +"' "$PUMP" && fail "the pump still mounts things itself" \
+# A mount SPEC is what this looks for, so the colon is part of the pattern:
+# `-v "$X:$Y"` is a mount, `command -v "$prog"` is a lookup, and the older bare
+# `-v +"` matched both — it went red the first time this file asked whether a
+# configured notifier exists before running it (pump_notify). Widening it back
+# would trade a guard that names mounts for one that names quotes.
+grep -qE -- '-v +"[^"]*:' "$PUMP" && fail "the pump still mounts things itself" \
   || pass "the pump carries no container mounts"
 
 echo "--- Test 12b: the runner contract the pump exports ---"

@@ -388,11 +388,14 @@ missing bus — while the same run with the key unset would have been silent.
 `logger` is the value that survives that host.
 
 A configured command that exits non-zero is reported with its exit status and
-the first line it wrote to stderr. The pump does not infer a cause from the exit
-status — the notifier's own words are the diagnosis — and it never prints the
-command's arguments, because a webhook notifier keeps its token there (what the
-notifier itself writes to stderr is the notifier's own choice). The full message
-is in the log either way.
+its first line of stderr, labelled as exactly that. The pump does not infer a
+cause: it has no grammar for an arbitrary notifier's output, so it quotes what
+the notifier said and leaves the reading to you — the first line is often the
+reason and sometimes a banner. A notifier that writes nothing is reported as
+having written nothing, and one that is not on `PATH` is reported as missing
+rather than as having failed. The command's arguments are never printed, because
+a webhook notifier keeps its token there. The full message is in the log either
+way.
 
 **Testing and inspection seams:**
 
