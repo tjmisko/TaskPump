@@ -419,7 +419,11 @@ must exist as a local branch. A range whose upstream phases predate the pump, or
 were merged and had their branches deleted, walks straight to exit 3 while being
 told a reason the repository does not support. Either drop `--integration-trunk`
 for that range, run it at `--grain task`, or recreate the blocker phase's branch
-so the ancestry question has something to answer. This is filed as a code bug.
+so the ancestry question has something to answer. Filed as
+[#74](https://github.com/tjmisko/TaskPump/issues/74) for the diagnostic — the
+wait names a branch that never existed and never says so — and
+[#75](https://github.com/tjmisko/TaskPump/issues/75) for the missing escape
+hatch that task grain already has.
 
 ---
 

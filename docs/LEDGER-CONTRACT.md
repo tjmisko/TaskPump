@@ -735,7 +735,11 @@ lose:
 > are authoritative and this note is what to key on**; the frozen table states
 > the intended protocol, and reconciling the two is a behaviour change, which a
 > PATCH release may not make. The first two entries below are divergences and
-> are filed as bugs; the third is not a divergence at all but a deliberate
+> are filed as [#71](https://github.com/tjmisko/TaskPump/issues/71) (exit 2 is
+> reserved for bad arguments and neither tool ever emits it) and
+> [#72](https://github.com/tjmisko/TaskPump/issues/72) (exit 0 does not mean
+> drained, and the state file cannot tell you either); the third is not a
+> divergence at all but a deliberate
 > widening, recorded here because the table's parenthetical would otherwise read
 > as the whole rule.
 

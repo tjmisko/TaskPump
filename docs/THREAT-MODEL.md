@@ -1107,16 +1107,18 @@ did not write means:
   ([#89](https://github.com/tjmisko/TaskPump/issues/89)), so "it looked fine" is
   not evidence.
 
-**What would change it.** All of §6's S1 through S3 landing, plus two things
-that are not yet issues at this revision and should become tasks in the security
+**What would change it.** All of §6's S1 through S3 landing, plus two controls
+that are design decisions rather than code fixes, and that belong in the security
 phase range:
 
-1. **A provenance gate on the ledger.** A task file whose git author is outside a
+1. **A provenance gate on the ledger**
+   ([#138](https://github.com/tjmisko/TaskPump/issues/138)). A task file whose git author is outside a
    configured trusted set must not be schedulable until a human says so. This is
    named in the mitigation for [#96](https://github.com/tjmisko/TaskPump/issues/96)
    but is a design decision rather than a code fix, and it is the single control
    that makes "accept task files from a PR stream" thinkable at all.
-2. **An operator-owned policy root.** Agent settings, the pre-flight hook and the
+2. **An operator-owned policy root**
+   ([#139](https://github.com/tjmisko/TaskPump/issues/139)). Agent settings, the pre-flight hook and the
    brief templates must resolve from a path outside the repository, with the
    repo-carried variant refused rather than merged. That is the direction
    [#78](https://github.com/tjmisko/TaskPump/issues/78) argues for; until it
@@ -1284,7 +1286,7 @@ delete the promise first and schedule the enforcement second.
 |---|---|
 | Tier 1 — own repo, supervised | Nothing. Available today, with §5's two caveats. |
 | Tier 2 — own repo, unattended | S1 + S4 + S5. S4 is the load-bearing one: without it, "unattended" means the agents' own restraint is the only thing bounding a multi-day run. |
-| Tier 3 — untrusted repo or PR stream | S1 + S2 + S3, **plus** ledger provenance and an operator-owned policy root (§5, Tier 3), neither of which is filed as an issue yet. |
+| Tier 3 — untrusted repo or PR stream | S1 + S2 + S3, **plus** ledger provenance ([#138](https://github.com/tjmisko/TaskPump/issues/138)) and an operator-owned policy root ([#139](https://github.com/tjmisko/TaskPump/issues/139)), both of which are design decisions rather than code fixes (§5, Tier 3). |
 
 ---
 
