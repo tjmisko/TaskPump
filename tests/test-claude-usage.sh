@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # test-arachne-usage.sh — fixture-driven tests for scripts/arachne-usage.
 #
 # The live HTTP path is smoke-tested manually (`arachne-usage --percent` vs the

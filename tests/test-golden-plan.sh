@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # test-golden-plan.sh — the prime-directive test.
 #
 # TaskPump is being generalized out of Arachne, and the one promise that

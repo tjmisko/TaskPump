@@ -340,18 +340,10 @@ meeting one for the first time during an unattended run is a day.
   there while `tp pump`, `tp monitor` and `tp dag-render` honour it. The pump's
   frontier comes from that CLI, so the two halves disagree and the pump reports
   the range drained. Write `TASKPUMP_LEDGER_PROBE`.
-- **`TASKPUMP_USAGE_GATE` and `TASKPUMP_DISK_GATE` are not switches under the
-  pump.** The pump hardcodes both to 1 and exports them over whatever the
-  operator set; only `--no-usage-gate` / `--no-disk-gate` drop those gates.
 - **`TASKPUMP_TASK_EXT` does not change the ledger.** `tp task` hardcodes `.md`.
   The key only tells the *readers* (`tp monitor`, `tp dag-render`, the container
   entrypoint) to look for a different extension, which desynchronises them from
   the writer.
-- **`TASKPUMP_EXTRA_BUSY_DIRS` has no reader; `EXTRA_BUSY_DIRS` does.** The
-  prefixed spelling is the one four places in this tree have documented, and
-  `tp cleanup` reads the bare one. Since the key exists to keep a reclaim sweep
-  off a workspace that is mid-compile, the prefixed spelling deletes exactly the
-  build output it was set to protect.
 
 ### 3.1 Ledger — `tp task` (core)
 
@@ -363,7 +355,7 @@ The keys a generic project actually needs.
 | `TASKPUMP_LEDGER_PROBE` | `tp task`, `tp pump`, `tp monitor`, `tp dag-render` | `tasks` | The path, relative to a candidate workspace, whose presence means "this workspace owns a ledger". It is how a worktree's own ledger is told apart from the primary's. A *discovered* `taskpump.conf` marks its own directory as the first candidate, ahead of `$PWD`'s worktree root — a directory carrying its own conf and ledger owns them even inside a larger TaskPump-shaped repo. |
 | `TASKPUMP_TASKS_SUBDIR` | `tp pump`, `tp monitor`, `tp dag-render` — **not `tp task`** | — | The fallback spelling of the key above, and a trap: see below. Write `TASKPUMP_LEDGER_PROBE`. |
 | `TASKPUMP_WORKSPACE_ROOT` | `tp task`, `tp pump` | none | The workspace this CLI resolves its ledger inside when no tasks dir is named outright — the pin for a run whose `$PWD` proves nothing (a container, a CI step, a shell in `$HOME`). The same key the pump reads (§3.2), deliberately: a shell that pins the workspace and runs both tools must not get `ready --count` = 0 `via install-root` from one and the pinned frontier from the other (issue #45). `resolve --all` then reports `via workspace-pin`, and `TASKPUMP_CODE_REPO` defaults to the pinned workspace on the same condition — name a tasks dir and the pin decides neither. `tp monitor` and `tp dag-render` do not read it; in a pinned shell they still answer from `$PWD`. |
-| `TASKPUMP_ID_PATTERN` | `tp task` | `^T[0-9]+(\.[0-9]+)?$` | The regex ids must match (§[LEDGER-CONTRACT.md §7](LEDGER-CONTRACT.md#7-the-id-grammar-contract)). |
+| `TASKPUMP_ID_PATTERN` | `tp task`, `tp cleanup` | `^T[0-9]+(\.[0-9]+)?$` (`tp task`'s own default; `tp cleanup` applies it only when a conf or the environment sets it) | The regex ids must match (§[LEDGER-CONTRACT.md §7](LEDGER-CONTRACT.md#7-the-id-grammar-contract)). `tp task create` and `fsck` **enforce** it. `tp cleanup`'s stuck-agent rescue only **reports** a mismatch and releases the claim anyway: it is a naming convention, not a safety property, and a rescue that refused over it would strand a wedged agent's claim (the §7.1 filename shape is the rule that does refuse there). |
 | `TASKPUMP_CODE_REPO` | `tp task` | the resolved workspace root | The repository whose commits the heartbeat productivity check measures. Distinct from the ledger repo — they are frequently different. |
 | `TASKPUMP_TASK_OUT` | `tp task`, entrypoint | `<parent of the tasks dir>/.next-task` | Path of the JSON "next task" surface file. |
 | `TASKPUMP_TASK_PUSH` | `tp task` | `0` | `1` to `git push` after each state commit. Off by default: local-first. `TASKPUMP_PUSH` is accepted as a fallback spelling. |
@@ -428,7 +420,7 @@ consistent — a sigil the pattern does not accept produces tasks nothing can gr
 | `TASKPUMP_WORKSPACE_ROOT` | `tp pump`, `tp task` | the config anchor (a discovered conf's directory, else the caller's worktree root) | The workspace the pump **drives** — the default image-build context, the repository phase branches and agent worktrees are created in, the state-dir default, every `git` surface of a run. Never derived from where the tools are installed, so a vendored TaskPump's own checkout is never mistaken for the workspace (issue #32). Set it to pin a container/CI run whose `$PWD` proves nothing. Naming a missing directory is a loud error. The install's own assets (`lib/`, `libexec/`, `gates/`, `runners/`, `templates/`, `hooks/`) stay script-relative regardless. Not pump-scoped: `tp task` resolves its ledger through the same pin (§3.1), so the two tools cannot answer differently in one pinned shell. |
 | `TASKPUMP_JOBS` | `tp pump` | `4` | Concurrent pool cap. This is the key the pump reads; `TASKPUMP_PUMP_JOBS` is the systemd unit's name for the same number, which it passes as `--jobs`. A standing preference: the cap file below outranks it, so an unflagged run uses whatever the last retune left there. |
 | `TASKPUMP_JOBS_FALLBACK` | `lib/pump-lib.sh`, `tp disk-watchdog` — **not reachable from `tp pump`** | `6` | The cap `apl_read_cap` falls back to for a caller that passes none. The pump always passes its own `JOBS` (defaulted to 4 above), so this number cannot decide a pump run: with no cap file and no `--jobs`, `TASKPUMP_JOBS_FALLBACK=99 tp pump --dry-run` still plans `cap 4`. Its live consumer is the disk watchdog, which uses it as the cap to restore when it has no other record of one. |
-| `TASKPUMP_POOL_CAP_FILE` | `tp pump`, `tp disk-watchdog` | `<state dir>/.taskpump-pool-cap` | A file holding the live cap, re-read each tick so concurrency can be retuned mid-run. An explicit `--jobs` sets it at startup — the flag is an instruction about this run, and a number a previous run left behind must not outrank it (issue #44). That write happens once the run has cleared its prerequisites, so a startup that aborts (no image, no runner, failed build) leaves the file exactly as it found it. The startup banner prints the cap in force and names which of the two set it. |
+| `TASKPUMP_POOL_CAP_FILE` | `tp pump`, `tp disk-watchdog` | `<state dir>/.taskpump-pool-cap` | A file holding the live cap, re-read each tick so concurrency can be retuned mid-run. Any non-negative integer counts, **`0` included** — that is how the disk watchdog says "launch nothing" — while a file holding no digits at all falls back to `JOBS`. A `0` is a *held* pause and expires if nothing refreshes it (`TASKPUMP_POOL_CAP_STALE_SEC`, §3.7); a positive cap does not. An explicit `--jobs` sets it at startup — the flag is an instruction about this run, and a number a previous run left behind must not outrank it (issue #44). That write happens once the run has cleared its prerequisites, so a startup that aborts (no image, no runner, failed build) leaves the file exactly as it found it. The startup banner prints the cap in force and names which of the two set it. |
 | `TASKPUMP_TICK` | `tp pump` | `30` | Seconds between supervisor ticks. |
 | `TASKPUMP_STAGGER` | `tp pump` | `3` | Seconds between launches within a single tick. |
 | `TASKPUMP_PUMP_TASKS_DIR` | `tp pump` | `TASKPUMP_TASKS_DIR`, else `<workspace>/<ledger probe>` | Tasks directory for the pump alone, independent of the ledger checkout — lets the pump be tested against a flat fixture. It feeds the pump's own dependency scan and the worktree handoff; the frontier itself comes from the ledger CLI, which resolves separately. |
@@ -486,7 +478,8 @@ toolchain:
 | `TASKPUMP_BUILD_GATE` | `tp pump` | **unset ⇒ `cargo check --workspace`, then `./smoke_test.sh` when the workspace has one** | The command that must pass before work is integrated. `cargo check` for Rust, `npm test` for Node, whatever your project's "is it broken" question is. `TASKPUMP_PUMP_BUILD_CMD` overrides it for the merge queue. The unset case is not "no gate": see below. |
 | `TASKPUMP_VERIFY_CMDS` | `tp pump` | empty | Newline-separated commands a task must leave green, quoted into the brief. Empty by default — the templates' verify sections drop out until a consumer names its own bar. |
 | `TASKPUMP_PROJECT_BRIEF` | `tp pump` | a generic "read CLAUDE.md, CONTRIBUTING.md, or equivalent" paragraph | One paragraph pointing an agent at the project's own contributor documentation. |
-| `TASKPUMP_RECLAIM_CMD` | `tp pump`, `tp cleanup` | empty | How to reclaim build output from a finished workspace, so a multi-day run's disk footprint stays bounded. Empty by default: unconfigured, the per-tick reclaim pass and the `tp cleanup --targets` sweep touch nothing and log themselves unconfigured. |
+| `TASKPUMP_RECLAIM_CMD` | `tp pump`, `tp cleanup` | empty | How to reclaim build output from a finished workspace, so a multi-day run's disk footprint stays bounded. Both readers execute this value, with the workspace as the working directory. Empty by default: unconfigured, the per-tick reclaim pass and the `tp cleanup --targets` sweep touch nothing and log themselves unconfigured. |
+| `TASKPUMP_RECLAIM_DIR` | `tp cleanup` | `target` | The build-output directory that marks a workspace as worth reclaiming, and the one `--status` measures. A *probe*, not the thing deleted: a workspace that has it gets `TASKPUMP_RECLAIM_CMD` run in it, one that does not is skipped. Set it to whatever your build writes (`build`, `dist`, `node_modules`), or to the empty string to drop the precondition entirely — which also drops the last precondition on the **primary checkout** under `--include-primary` (the disk watchdog's PANIC sweep always passes it), so the command then runs there unconditionally; list the primary root in `TASKPUMP_EXTRA_BUSY_DIRS` if a human may be building in it. The pump's own per-tick pass does not read this key — its `target/` precondition is still hardcoded. |
 | `TASKPUMP_DISK_RECLAIM` | `tp pump` | `1` | `0` switches off the pump's per-tick reclaim of finished phases' build output. Despite the name it is not disk-pressure-conditional — the pass runs every tick, before the feed gate, precisely so a paused run keeps freeing space. The watchdog's pressure-driven reclaim is `TASKPUMP_PANIC_RECLAIM` (§3.7). |
 | `TASKPUMP_BRIEF_TEMPLATE` | `tp pump` | `<install>/templates/phase-drain-brief.md` | The parameterized brief a launched agent is handed at `--grain phase`. `TASKPUMP_PHASE_BRIEF_TEMPLATE` is the explicit spelling of the same thing and wins when both are set. |
 | `TASKPUMP_TASK_BRIEF_TEMPLATE` | `tp pump` | `<install>/templates/task-brief.md` | The brief a `--grain task` container is handed. A separate template on purpose: the phase brief's working method *is* the in-context `next --phase` loop, which at task grain would claim the siblings the pump has already dispatched elsewhere. |
@@ -498,9 +491,12 @@ toolchain:
 | `TASKPUMP_NOTIFY_CMD` | `tp pump` | unset ⇒ `notify-send <prog-name> <message>` wherever notify-send is on PATH | The command that delivers notifications, which it receives on **stdin** — see the recipes below. Unset, the pump falls back to `notify-send <prog-name> <message>` wherever notify-send is on PATH. Set it to `true` to silence them; every message is logged either way. |
 
 `TASKPUMP_GATES` and `TASKPUMP_PRE_TICK_HOOKS` are both **newline-separated
-command lines**, and each entry's first word must be an executable path. A bare
-gate name, or a comma-separated list, is skipped with a warning rather than run —
-which reads as "the gate passed".
+command lines**, and each entry's first word must be the path to an executable
+file. A bare name, a comma-separated list, an unresolvable relative path or a
+directory **refuses the run** at startup — exit 1, before any mode, naming the
+entry and the key it came from. It used to be skipped with a warning and then
+reported as `GATE: feed-ok`, which reads as "the gate passed"
+([GATES.md §1.0](GATES.md#10-how-taskpump_gates-is-spelled-and-how-it-fails)).
 
 **The unset `TASKPUMP_BUILD_GATE` runs `cargo`.** `run_build_gate` in
 `libexec/tp-pump` uses a configured command *instead of* its default, not in
@@ -615,7 +611,7 @@ Which runner launches agents, and how. See [RUNNERS.md](RUNNERS.md).
 | Key | Read by | Default | What it configures |
 |---|---|---|---|
 | `TASKPUMP_RUNNER` | `tp pump` | `<install>/runners/claude-docker/runner.sh` | The runner **executable** to launch agents with — a path, not a runner name. |
-| `TASKPUMP_DOCKER` | `tp pump`, `lib/pump-lib.sh` | `docker` | The container-runtime binary. |
+| `TASKPUMP_DOCKER` | `tp pump`, `lib/pump-lib.sh` (so `tp cleanup` and both watchdogs), `tp monitor`, `runners/claude-docker` | `docker` | The container-runtime binary, resolved everywhere by `apl_docker`: this key, then `DOCKER`, then `docker`. The claude-docker runner resolves the same two keys in the same order — and no others — and uses that one answer for `launch`, `stop` and `list` alike. |
 | `TASKPUMP_IMAGE` | `tp pump` | **none** | The image to run. A real run (never `--dry-run`) aborts before any launch when it is unset — a wrong silent image is worse than a loud missing one. See [RUNNERS.md §4.0](RUNNERS.md#40-the-image-contract). |
 | `TASKPUMP_IMAGE_BUILD` | `tp pump` | unset ⇒ `docker build -t <image> <workspace>` | The command that builds the image before the first launch. This is the tree's one key tested with `+set`: **unset** means "run that default build", **set to the empty string** means "skip the build entirely" — which is what a runner pulling a prebuilt image wants. Because the conf is sourced with `allexport`, a bare `TASKPUMP_IMAGE_BUILD=` line in a `taskpump.conf` is the second of those, not the first. |
 | `TASKPUMP_ENTRYPOINT` | `tp pump` | `/entrypoint.sh` | In-image entrypoint path — where the image contract bakes the shipped runner's own `entrypoint.sh`. Only that entrypoint runs `TASKPUMP_PRE_FLIGHT`, so pinning another path leaves a configured hook read by nothing (issue #5). |
@@ -676,7 +672,7 @@ container the shipped runner starts.
 | Key | Read by | Default | What it configures |
 |---|---|---|---|
 | `TASKPUMP_GATES` | `tp pump` | `gates/claude-token-fresh`, `<usage bin> --gate`, `gates/disk-low` — plus `gates/net-health` at the head when `TASKPUMP_HEALTH_GATE=1` | The ordered gate list. A configured value replaces the chain outright and is used verbatim. |
-| `TASKPUMP_USAGE_GATE` | `gates/claude-usage` | `1` — **and the pump overwrites it** | Whether the usage gate answers. The pump hardcodes `1` and exports it over the operator's value: see below. |
+| `TASKPUMP_USAGE_GATE` | `tp pump`, `gates/claude-usage` | `1` | Whether the usage gate is in the default chain and answers. `0` drops `<usage bin> --gate` from the chain and reaches the gate as `0`, so a `claude-usage` entry kept in a custom `TASKPUMP_GATES` disables itself too. `--no-usage-gate` forces `0` for one run. `0` or `1` only — any other value is refused by name at startup. |
 | `TASKPUMP_USAGE` | `tp pump`, `tp monitor` | `<install>/gates/claude-usage` | The binary that answers the usage question. |
 | `TASKPUMP_USAGE_CEILING` | `tp pump`, `gates/claude-usage` | `95` | The utilization percent at which launching pauses. `--usage-ceiling` overrides for a run. |
 | `TASKPUMP_USAGE_ENDPOINT` | `gates/claude-usage` | `https://api.anthropic.com/api/oauth/usage` | The OAuth usage endpoint. |
@@ -687,24 +683,42 @@ container the shipped runner starts.
 | `TASKPUMP_USAGE_DEBUG` | `gates/claude-usage` | `0` | `1` traces the probe to stderr. |
 | `TASKPUMP_TOKEN_GATE` | `lib/pump-lib.sh` (`gates/claude-token-fresh`) | `1` | `0` makes the credential-freshness gate answer feed-ok without looking. The pump does not export this one, so it works. |
 | `TASKPUMP_TOKEN_MARGIN_S` | `lib/pump-lib.sh` | `600` | Seconds of token TTL headroom the gate wants. |
-| `TASKPUMP_HEALTH_GATE` | `tp pump`, `gates/net-health` | `0` under the pump; `1` when the gate is run standalone | Whether the host-health gate runs. It ships off: `1` puts it at the head of the default chain. A `net-health` entry in a custom `TASKPUMP_GATES` still needs this key to probe. |
+| `TASKPUMP_HEALTH_GATE` | `tp pump`, `gates/net-health` | `0` under the pump; `1` when the gate is run standalone | Whether the host-health gate runs. It ships off: `1` puts it at the head of the default chain. A `net-health` entry in a custom `TASKPUMP_GATES` still needs this key to probe. `0` or `1` only — any other value is refused by name at startup. |
 | `TASKPUMP_HEALTH_WINDOW` | `tp pump`, `gates/net-health` | `120` | How many seconds back the gate looks. |
 | `TASKPUMP_HEALTH_PROBE_CMD` | `lib/pump-lib.sh` | empty ⇒ `journalctl -k -b 0 --since '<window> sec ago'` | The command whose output is searched. |
 | `TASKPUMP_HEALTH_SIGNATURES` | `lib/pump-lib.sh` | `Failed to alloc SKB\|Firmware reported general error\|Timeout on response for query command` | The failure signatures it matches. The shipped set is one machine's WiFi firmware; a consumer enabling the gate on other hardware replaces them. |
-| `TASKPUMP_DISK_GATE` | `lib/pump-lib.sh`, `gates/disk-low` | `1` — **and the pump overwrites it** | Whether the low-disk gate answers. Its floor is `TASKPUMP_DISK_PAUSE_GB`, shared with the watchdog (§3.7). |
+| `TASKPUMP_DISK_GATE` | `tp pump`, `lib/pump-lib.sh`, `gates/disk-low` | `1` | Whether the low-disk gate is in the default chain and answers. Its floor is `TASKPUMP_DISK_PAUSE_GB`, shared with the watchdog (§3.7). `0` also suppresses the auto-started disk watchdog, exactly as `--no-disk-gate` does — the spawn is guarded on the same switch. `0` or `1` only — any other value is refused by name at startup. |
 | `TASKPUMP_DISK_WATCHDOG` | `tp pump`, `gates/disk-low`, `lib/pump-lib.sh` | `<install>/libexec/tp-disk-watchdog` | The watchdog binary the gate asks for the free-space answer. |
 
-**Two of these enable-flags do nothing under `tp pump`.** The pump assigns
-`USAGE_GATE=1` and `DISK_GATE=1` as literals — only `--no-usage-gate` and
-`--no-disk-gate` move them — and then exports `TASKPUMP_USAGE_GATE` and
-`TASKPUMP_DISK_GATE` into every gate's environment from those literals, so an
-operator's value is overwritten before any gate reads it.
-`TASKPUMP_USAGE_GATE=0 tp pump --dry-run` still prints
-`gates: claude-token-fresh -> claude-usage -> disk-low`, and so does
-`TASKPUMP_DISK_GATE=0`. Both keys work as documented when the gate script is run
-by hand. Use the flags for a run, or drop the gate from `TASKPUMP_GATES`
-permanently. `TASKPUMP_TOKEN_GATE` and `TASKPUMP_HEALTH_GATE` are not clobbered
-this way and do what they say.
+**All four enable-flags mean the same thing under `tp pump` and standalone.**
+`TASKPUMP_USAGE_GATE` and `TASKPUMP_DISK_GATE` used to be the exceptions: the
+pump assigned `USAGE_GATE=1` / `DISK_GATE=1` as literals, read neither key, and
+then exported `TASKPUMP_USAGE_GATE` and `TASKPUMP_DISK_GATE` into every gate's
+environment *from those literals* — so `TASKPUMP_USAGE_GATE=0 tp pump --dry-run`
+printed `gates: claude-token-fresh -> claude-usage -> disk-low` and the gate
+itself read its own switch back as `1`. Both keys are now read where
+`TASKPUMP_HEALTH_GATE` always was, so `TASKPUMP_USAGE_GATE=0` and
+`--no-usage-gate` are the same instruction with different lifetimes: the key is
+a standing preference, the flag is about one run, and the flag wins when both
+are given. One consequence worth knowing: `TASKPUMP_DISK_GATE=0` now also
+suppresses the auto-started disk watchdog, because that spawn is guarded on the
+same switch ([PUMP-MECHANISMS.md §3](PUMP-MECHANISMS.md#3-budget-gated-launching-that-never-kills-in-flight-work)).
+
+**And the vocabulary is `0` or `1`, checked.** All three switches the pump reads
+— `TASKPUMP_HEALTH_GATE`, `TASKPUMP_USAGE_GATE`, `TASKPUMP_DISK_GATE` — are
+numeric, because every consumer of them in the tree tests them arithmetically
+(`gates/disk-low`, `gates/claude-usage`, `lib/pump-lib.sh`). There is no word
+form: `TASKPUMP_USAGE_GATE=false` is `tp pump: TASKPUMP_USAGE_GATE must be 0 or 1
+(got 'false')` and exit 1, before any mode. Empty or unset means the default. The
+check reads the environment rather than the value after flags, so
+`--no-usage-gate` does not paper over a key that would be unreadable on the next
+run without it. The reason it is a refusal and not a shrug: an unreadable switch
+used to reach a `[[ … -eq 1 ]]` test, where under `set -u` it either killed the
+run with a raw bash trace or — inside the command substitution that assembles
+the chain — killed only that subshell, silently truncating the gate list and
+leaving the run to report `GATE: feed-ok` over gates nobody turned off. The pump
+now compares its own three as strings as well, so the refusal is the diagnosis
+rather than the only thing standing between a typo and that.
 
 ### 3.5 Monitor — `tp monitor`
 
@@ -799,9 +813,11 @@ consumers.
 | `TASKPUMP_DISK_RECOVER_GB` | `tp disk-watchdog` | `20` | Free above this restores the original cap. |
 | `TASKPUMP_DISK_COOLDOWN` | `tp disk-watchdog` | `180` | Seconds to wait after a reclaim before another. |
 | `TASKPUMP_PANIC_RECLAIM` | `tp disk-watchdog` | `1` | `0` prunes only and never cleans build dirs. This is the pressure-driven reclaim; `TASKPUMP_DISK_RECLAIM` (§3.2) is the pump's unconditional per-tick one. |
-| `TASKPUMP_ORIGINAL_CAP` | `tp disk-watchdog` | the cap file's contents at start, else `TASKPUMP_JOBS_FALLBACK` | The cap to restore once free space recovers. Nothing in this tree writes it — it is there for a caller that starts the watchdog when the cap has already been lowered, and so has to be told what "restored" means. |
+| `TASKPUMP_ORIGINAL_CAP` | `tp disk-watchdog` | the cap file's contents at start, else `TASKPUMP_JOBS_FALLBACK` | The cap to restore once free space recovers. Nothing in this tree writes it — it is there for a caller that starts the watchdog when the cap has already been lowered, and so has to be told what "restored" means. A cap file holding `0` is **not** taken as this default: `0` is somebody else's pause, and a watchdog that adopted it would "recover" to zero. The startup line says when that happened. |
+| `TASKPUMP_POOL_CAP_STALE_SEC` | `tp pump` (through `lib/pump-lib.sh`), `tp disk-watchdog` (to warn when its poll is slower than the window) | `900` | How long a cap file holding **`0`** stays believable without being refreshed. The watchdog re-stamps its pause every poll and hands it back when it exits, so a `0` that has gone this long unrefreshed is not being held by anything: the reader ignores it (naming the file, the age and the window on stderr) and clears the file to the cap actually in force. `0` disables the expiry. A positive cap never expires — that is a standing preference, not a pause. |
 
 Cleanup also reads `TASKPUMP_WORKTREES_DIR` (as a path), `TASKPUMP_RECLAIM_CMD`,
+`TASKPUMP_RECLAIM_DIR`, `TASKPUMP_EXTRA_BUSY_DIRS`,
 `TASKPUMP_AGENT_LOG_NAME`, `TASKPUMP_AGENT_PREFIX` (through
 `lib/pump-lib.sh`'s one accessor), `TASKPUMP_DAG_BIN` and the
 opt-in `TASKPUMP_MANIFEST`; the disk watchdog reads `TASKPUMP_STATE_DIR` and
@@ -809,36 +825,40 @@ opt-in `TASKPUMP_MANIFEST`; the disk watchdog reads `TASKPUMP_STATE_DIR` and
 task it should release through the ledger's live claim; the manifest is
 consulted only as a fallback, and only when it is configured.
 
-**Both `_REPO_ROOT` defaults are script-relative, not caller-relative.** Unlike
-`tp task`, `tp pump`, `tp monitor` and `tp dag-render`, which resolve from
-`$PWD`, `tp cleanup` and `tp disk-watchdog` default their repository to the
-parent of the script's own directory — the TaskPump install. Run from a consumer
-repo with no key set, they sweep and measure the install instead of your project
-and report on that, which reads as a clean sweep: from a fixture repo carrying
-`.worktrees/feat/x/target`, `tp cleanup --targets --dry-run` said `no worktree
-target dirs to reclaim` until `TASKPUMP_CLEANUP_REPO_ROOT` named the fixture.
+**`tp cleanup`'s `_REPO_ROOT` default is script-relative, not caller-relative.**
+Unlike `tp task`, `tp pump`, `tp monitor` and `tp dag-render`, which resolve from
+`$PWD`, `tp cleanup` defaults its repository to the parent of the script's own
+directory — the TaskPump install. Run from a consumer repo with no key set, it
+sweeps and measures the install instead of your project and reports on that,
+which reads as a clean sweep: from a fixture repo carrying
+`.worktrees/feat/x/target`, `tp cleanup --targets --dry-run` said `nothing to
+reclaim` until `TASKPUMP_CLEANUP_REPO_ROOT` named the fixture.
 
-The pump does not set either key for the tools it starts. It launches the disk
-watchdog with a bare `nohup`, so the watchdog inherits the pump's environment
-and nothing more: its repo root is the install, and — since its state dir
-defaults to that same repo root — so is its `TASKPUMP_POOL_CAP_FILE`. Whenever
-the install and the workspace are different directories (every layout except
-dogfooding), the cap file the watchdog writes under pressure is not the one the
-pump re-reads each tick. Set `TASKPUMP_STATE_DIR` or `TASKPUMP_POOL_CAP_FILE`
-explicitly for a run that wants the watchdog's cap changes to land, and
-`TASKPUMP_DISK_REPO_ROOT` for one that wants its reclaim to touch your project.
+`tp disk-watchdog` resolves the workspace the way the pump does (a discovered
+conf's directory, else the caller's git worktree, else the install root), so the
+cap file it writes is the one the pump re-reads each tick, and its PANIC sweep
+passes that workspace down to `tp cleanup` as `TASKPUMP_CLEANUP_REPO_ROOT`.
+`TASKPUMP_WORKSPACE_ROOT` pins it explicitly for both; `TASKPUMP_DISK_REPO_ROOT`
+overrides it for the watchdog alone. Until this was fixed the watchdog defaulted
+to the install like cleanup, so on every layout except dogfooding the cap file it
+wrote under pressure was not the one the pump read — and the `0` it wrote there
+would have been discarded anyway (`TASKPUMP_POOL_CAP_FILE`, §3.2).
 
-**`tp cleanup`'s busy-directory list is spelled without the prefix.** The tool's
-own `--help`, this document and `taskpump.conf.example` have all named it
-`TASKPUMP_EXTRA_BUSY_DIRS`; the code reads the bare `EXTRA_BUSY_DIRS` and there
-is no assignment between the two. With `TASKPUMP_EXTRA_BUSY_DIRS=<worktree>`,
-`tp cleanup --targets --dry-run` planned `rm -rf <worktree>/target`; with
-`EXTRA_BUSY_DIRS=<worktree>` it printed
-`skip: <worktree>/target — busy (EXTRA_BUSY_DIRS)`. The bare name is what works,
-including from a `taskpump.conf` (the file is sourced with `allexport`, so a
-bare `KEY=value` is exported like any other). `ARACHNE_EXTRA_BUSY_DIRS` is inert
-too — the legacy bridge only rewrites `ARACHNE_*` to `TASKPUMP_*`, and neither
-spelling is the one being read.
+**`tp cleanup`'s busy-directory list is the UNION of both spellings.**
+`TASKPUMP_EXTRA_BUSY_DIRS` is the canonical name; the bare `EXTRA_BUSY_DIRS` is
+the legacy one and still works, including from a `taskpump.conf` (the file is
+sourced with `allexport`, so a bare `KEY=value` is exported like any other).
+`ARACHNE_EXTRA_BUSY_DIRS` reaches the canonical name through the legacy bridge
+like every other key. Both lists are consulted, and neither outranks the other:
+this is the one key here where precedence would be a defect rather than a
+convention, because the two spellings are routinely set by *different parties* —
+the live `arachne-disk-guard` chain passes the bare name on its command line
+while a conf (or an inherited `ARACHNE_` key) supplies the prefixed one — so
+ranking them silently unprotects everything the loser named. The skip line names
+the spelling that matched, or both: `skip: <worktree> — busy
+(TASKPUMP_EXTRA_BUSY_DIRS + EXTRA_BUSY_DIRS)`. The prefixed spelling used to have
+no reader at all, which meant the documented way to protect a mid-compile
+workspace reclaimed exactly that workspace.
 
 ### 3.8 The systemd unit
 

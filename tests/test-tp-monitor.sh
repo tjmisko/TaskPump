@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # test-arachne-monitor.sh — fixture-driven tests for scripts/arachne-monitor.
 #
 # Covers the pure-rendering surfaces: the --demo bars (cell math + critical
@@ -12,8 +14,8 @@
 # Run: ./scripts/test-arachne-monitor.sh  (exits non-zero on any failure)
 set -uo pipefail
 
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
-TP_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
+TP_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd)
 CLI="$TP_ROOT/libexec/tp-monitor"
 
 # Hermeticity: the shared prologue ignores any taskpump.conf in the repo this
@@ -386,9 +388,9 @@ gtask() {  # <id> <status> <claimed_by> [blocker ...]
 }
 #   .1 ─┬─ .2 ─── .4 ─── .6      (.6 also blocked by .1: a 3-layer span)
 #       └─ .3 ─── .5
-gtask F96.1 done        ""
-gtask F96.2 done        ""        F96.1
-gtask F96.3 done        ""        F96.1
+gtask F96.1 'done'        ""
+gtask F96.2 'done'        ""        F96.1
+gtask F96.3 'done'        ""        F96.1
 gtask F96.4 in_progress feat/f96  F96.2
 gtask F96.5 open        ""        F96.3
 gtask F96.6 open        ""        F96.4 F96.1
@@ -474,8 +476,7 @@ gopen() {  # $1 = cursor, $2 = moves
     TASKPUMP_PUMP_STATE_FILE="$GPS" TASKPUMP_TASKS_DIR="$GTD" TASKPUMP_MONITOR_COLS=100 \
         TASKPUMP_MONITOR_OPEN_CMD="$BIN/fake-editor --open" \
         "$CLI" --tab graph --cursor "$1" --moves "$2" >/dev/null 2>&1
-    local i
-    for i in 1 2 3 4 5 6 7 8 9 10; do [[ -s "$MARK" ]] && break; sleep 0.2; done
+    for _ in 1 2 3 4 5 6 7 8 9 10; do [[ -s "$MARK" ]] && break; sleep 0.2; done
     cat "$MARK" 2>/dev/null
 }
 opened=$(gopen F96.5 o)
@@ -510,7 +511,7 @@ claim() {  # <id> <status> <branch> <claimed_at> <heartbeat> [blocker ...]
     } >| "$CTD/$id.md"
 }
 CTD="$TMP/ctasks"; mkdir -p "$CTD"
-claim F97.1 done        ""        ""                     null
+claim F97.1 'done'        ""        ""                     null
 # Both claimed by feat/f97; .3 heartbeated more recently, so it is the live one.
 claim F97.2 in_progress feat/f97  "2026-08-05T10:00:00Z" '"2026-08-05T10:30:00Z"' F97.1
 claim F97.3 in_progress feat/f97  "2026-08-05T11:00:00Z" '"2026-08-05T11:30:00Z"' F97.1
@@ -1237,7 +1238,7 @@ XC="$TMP/x-sess.tsv"
 # TASKPUMP_AGENT_PREFIX is emptied so the suite's exported pin cannot mask the
 # TASKPUMP_AGENT_CONTAINER_PREFIX spelling this test exists to exercise — the
 # monitor reads the empty value as unset and falls through.
-xmon() { TASKPUMP_AGENT_PREFIX= \
+xmon() { TASKPUMP_AGENT_PREFIX='' \
          TASKPUMP_AGENT_CONTAINER_PREFIX=runner TASKPUMP_AGENT_LOG_NAME=agent.jsonl \
          TASKPUMP_WORKTREES_DIR=trees TASKPUMP_MONITOR_REPO_ROOT="$XR" \
          TASKPUMP_TASKS_DIR="$GTD" TASKPUMP_MONITOR_SESS_CACHE="$XC" \
@@ -1251,11 +1252,11 @@ grep -q 'custom-shaped feed line' <<<"$xout" \
 # The empty-state copy names the configured prefix rather than a fixed one.
 # (TASKPUMP_AGENT_PREFIX emptied again, same reason as xmon above.)
 printf '#!/usr/bin/env bash\nexit 0\n' >| "$BIN/docker"; chmod +x "$BIN/docker"
-empty_x=$(TASKPUMP_AGENT_PREFIX= TASKPUMP_AGENT_CONTAINER_PREFIX=runner \
+empty_x=$(TASKPUMP_AGENT_PREFIX='' TASKPUMP_AGENT_CONTAINER_PREFIX=runner \
           TASKPUMP_MONITOR_SESS_CACHE="$TMP/x-empty.tsv" \
           TASKPUMP_MONITOR_COLS=100 "$CLI" 2>/dev/null | strip_ansi)
 for _ in 1 2 3 4 5; do grep -q 'containers running' <<<"$empty_x" && break
-                       sleep 0.5; empty_x=$(TASKPUMP_AGENT_PREFIX= TASKPUMP_AGENT_CONTAINER_PREFIX=runner \
+                       sleep 0.5; empty_x=$(TASKPUMP_AGENT_PREFIX='' TASKPUMP_AGENT_CONTAINER_PREFIX=runner \
                        TASKPUMP_MONITOR_SESS_CACHE="$TMP/x-empty.tsv" TASKPUMP_MONITOR_COLS=100 \
                        "$CLI" 2>/dev/null | strip_ansi); done
 grep -q '(no runner containers running or recently exited)' <<<"$empty_x" \
@@ -1312,7 +1313,7 @@ spawn_argv() {  # $@ = extra env assignments → the argv faketerm was handed
         TASKPUMP_PUMP_STATE_FILE="$GPS" TASKPUMP_TASKS_DIR="$GTD" \
         TASKPUMP_MONITOR_REPO_ROOT="$TMP/spawnrepo" TASKPUMP_MONITOR_COLS=100 \
         "$@" "$CLI" --tab graph --cursor F96.5 --moves o >/dev/null 2>&1
-    local i; for i in 1 2 3 4 5 6 7 8 9 10; do [[ -s "$TMP/argv.txt" ]] && break; sleep 0.2; done
+    for _ in 1 2 3 4 5 6 7 8 9 10; do [[ -s "$TMP/argv.txt" ]] && break; sleep 0.2; done
     cat "$TMP/argv.txt" 2>/dev/null
 }
 want="start --always-new-process --class arachne-task --cwd $TMP/spawnrepo -- fake-ed $GTD/F96.5.md"
@@ -1494,6 +1495,246 @@ grep -q 'pump\[F80\]: stopped — received SIGTERM' <<<"$tout" \
     || fail "stopped state mangled:\n$tout"
 grep -q 'STALE' <<<"$tout" && fail "terminal state mislabeled STALE:\n$tout" \
     || pass "no STALE label on a terminal state"
+
+# ── Test 38: the container runtime is resolved, never spelled `docker` (B11) ──
+# Every other tool reaches the runtime through lib/pump-lib.sh's apl_docker
+# (TASKPUMP_DOCKER → DOCKER → docker). The monitor used to call `docker` by name
+# in three places, so on a podman host — TASKPUMP_DOCKER=podman, honoured by the
+# pump, the runner and tp cleanup — the SESSIONS tab reported an empty fleet, the
+# GRAPH tab drew every claimed task as idle, and the disk gauge lost its runtime
+# breakdown, all for a fleet that was running fine.
+#
+# The stub is reachable ONLY through TASKPUMP_DOCKER: `docker` on PATH is the
+# suite's no-containers stub, so each assertion below fails against the literal
+# spelling and passes against the resolver.
+echo "--- Test 38: TASKPUMP_DOCKER is the runtime (B11) ---"
+cat >| "$BIN/podman" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == system && "${2:-}" == df ]]; then
+  printf 'Images\t42.5GB\t1GB (2%%)\n'
+  exit 0
+fi
+for a in "$@"; do
+  case "$a" in
+    '{{.Names}}|{{.State}}|{{.Status}}') echo 'arachne-agent-feat-f97|running|Up 3 minutes'; exit 0 ;;
+    '{{.Names}}') echo 'arachne-agent-feat-f97'; exit 0 ;;
+  esac
+done
+exit 0
+EOF
+chmod +x "$BIN/podman"
+RTC="$TMP/runtime-sess.tsv"
+rtmon() { TASKPUMP_DOCKER="$BIN/podman" TASKPUMP_MONITOR_REPO_ROOT="$SFR" \
+          TASKPUMP_TASKS_DIR="$CTD" TASKPUMP_PUMP_STATE_FILE="$CPS" \
+          TASKPUMP_MONITOR_SESS_CACHE="$RTC" TASKPUMP_MONITOR_COLS=140 \
+          "$CLI" 2>/dev/null | strip_ansi; }
+rtmon >/dev/null; sleep 2; rt=$(rtmon)
+grep -qE 'feat-f97 .*F97\.3:in_progress' <<<"$rt" \
+    && pass "TASKPUMP_DOCKER supplies the SESSIONS sweep (podman host sees its fleet)" \
+    || fail "session sweep ignored TASKPUMP_DOCKER:\n$rt"
+grep -q 'containers running or recently exited' <<<"$rt" \
+    && fail "the fleet reported empty while TASKPUMP_DOCKER named a live agent:\n$rt" \
+    || pass "no empty-fleet copy when the resolved runtime has agents"
+# GRAPH liveness reads the same runtime: a claimed task whose branch has a live
+# container is ▶ in progress, not ⧗ claimed, idle.
+rtg=$(TASKPUMP_DOCKER="$BIN/podman" TASKPUMP_MONITOR_REPO_ROOT="$SFR" \
+      TASKPUMP_TASKS_DIR="$CTD" TASKPUMP_PUMP_STATE_FILE="$CPS" \
+      TASKPUMP_MONITOR_COLS=140 "$CLI" --tab graph --cursor F97.3 2>/dev/null | strip_ansi)
+grep -q 'in progress' <<<"$rtg" \
+    && pass "TASKPUMP_DOCKER supplies the GRAPH tab's liveness signal" \
+    || fail "graph liveness ignored TASKPUMP_DOCKER:\n$rtg"
+grep -q 'claimed, idle' <<<"$rtg" \
+    && fail "a live claim drew as idle while TASKPUMP_DOCKER named its container:\n$rtg" \
+    || pass "a live claim is not drawn idle under a resolved runtime"
+# The disk gauge's runtime breakdown comes from the same binary. This is the one
+# assertion that has to let the background sizing worker really run, so the main
+# root is a git repo: disk_compute's last step is `git worktree list`, and under
+# `set -o pipefail` a non-repo aborts the worker before the cache is written.
+RTM="$TMP/runtime-main"; mkdir -p "$RTM"; git -C "$RTM" init -q 2>/dev/null
+RDC="$TMP/runtime-disk.tsv"; rm -f "$RDC"
+rtdisk() { TASKPUMP_DOCKER="$BIN/podman" TASKPUMP_MONITOR_DISK=1 \
+           TASKPUMP_MONITOR_DISK_CACHE="$RDC" TASKPUMP_MONITOR_MAIN_ROOT="$RTM" \
+           DF_AVAIL_KB=52428800 "$CLI" 2>/dev/null | strip_ansi; }
+rtdisk >/dev/null; sleep 2; rtd=$(rtdisk)
+grep -q 'podman img 42.5G' <<<"$rtd" \
+    && pass "the disk gauge's runtime breakdown comes from TASKPUMP_DOCKER" \
+    || fail "disk breakdown ignored TASKPUMP_DOCKER:\n$rtd"
+# ...and says whose numbers they are. `docker img 42.5G` under a podman runtime
+# is a label naming a runtime that produced none of the figures beside it.
+grep -q 'docker img' <<<"$rtd" \
+    && fail "podman's footprint is labelled 'docker':\n$rtd" \
+    || pass "the breakdown is labelled with the runtime it was read from"
+
+# ── Test 39: ledger and log text cannot repaint the panel (PI-E2 / PI-D8) ─────
+# Everything this dashboard says about the fleet is written by somebody else: a
+# task's title, a claim's branch, an agent's narration (which routinely quotes
+# repository content back). A terminal executes what it is handed, so raw CSI in
+# any of those repaints a row, erases the line above it, or sets the window
+# title — and the panel the operator uses to decide whether a multi-day drain is
+# healthy is exactly the thing that gets forged. lib/tty-safe.sh strips the
+# control bytes; the monitor's own palette must survive untouched.
+echo "--- Test 39: no injected escapes reach the terminal ---"
+ESC=$'\033'
+C1=$'\233'     # raw 8-bit CSI — what ESC [ is on a terminal in 8-bit mode
+C1OSC=$'\235'  # raw 8-bit OSC
+# The tool's own colours, read out of the tool's own source. Matching them by
+# SHAPE (ESC [ 0 … m) would also swallow an injected `ESC[0;5m` blink or
+# `ESC[0;30;40m` black-on-black — payloads that hide a row as well as conceal
+# does — and the count below would then be counting the attacker's escapes as
+# the palette's. These are the literal strings the tool can emit; an ESC left
+# after removing them is one the tool would never have written.
+#
+# The GRAPH tab needs a second source: its canvas is drawn by tp dag-render and
+# printed as it arrives, so the renderer's palette (lib/dag-layout.awk) is on
+# screen too and is equally not-the-attacker's. Comment lines are excluded, or a
+# sequence merely DISCUSSED in the source would be treated as one the tool emits.
+palette_of() {  # $@ = source files -> the SGR parameter strings they can emit
+    LC_ALL=C grep -hv '^[[:space:]]*#' "$@" \
+        | LC_ALL=C grep -oE '\\033\[[0-9;]*m' \
+        | sed 's/^\\033\[//; s/m$//' | sort -u
+}
+palette_sed() {  # $@ = parameter strings -> a sed program deleting each exactly
+    local prog='' p
+    for p in "$@"; do prog+="s/\\x1b\\[${p}m//g;"; done
+    printf '%s' "$prog"
+}
+mapfile -t PALETTE  < <(palette_of "$CLI")
+mapfile -t GPALETTE < <(palette_of "$CLI" "$TP_ROOT/lib/dag-layout.awk")
+[[ ${#PALETTE[@]} -ge 10 && ${#GPALETTE[@]} -gt ${#PALETTE[@]} ]] \
+    && pass "the palettes were read from the tools' own sources (${#PALETTE[@]} monitor, ${#GPALETTE[@]} with the canvas)" \
+    || fail "could not read the palettes out of the sources; the strips below would be meaningless"
+PAL_SED=$(palette_sed "${PALETTE[@]}")
+GPAL_SED=$(palette_sed "${GPALETTE[@]}")
+strip_palette()  { sed -e "$PAL_SED"; }
+strip_gpalette() { sed -e "$GPAL_SED"; }
+esc_count() { tr -cd "$ESC" | wc -c | tr -d ' '; }
+# A stray 8-bit byte census, done by decoding rather than counting: the monitor
+# prints plenty of legitimate 0x80-0x9F bytes as the middle of its own glyphs
+# (`▶` is 0xE2 0x96 0xB6), so the question is not "is that byte present" but "is
+# it part of a character". iconv answers exactly that — invalid UTF-8 is a
+# non-zero exit — and a raw C1 from the ledger is by construction invalid.
+utf8_valid() { iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; }
+command -v iconv >/dev/null 2>&1 \
+    || fail "iconv is missing; the raw-C1 census below cannot run"
+
+ETD="$TMP/esc-tasks"; mkdir -p "$ETD"
+etask() {  # <id> <claimed_by>
+    {
+        echo '---'; echo "id: \"$1\""; echo 'phase: "F98"'; echo 'status: in_progress'
+        # Both encodings of the same forgery: the ESC form, and the 8-bit form
+        # where the single byte 0x9B is CSI and 0x9D is OSC. A strip built out of
+        # [[:cntrl:]] covers the first and not the second.
+        printf 'title: "benign %s[1;32mDONE%s[0m %s[8mhidden %s[1;32mRAW8 %sPWNED8BIT"\n' \
+            "$ESC" "$ESC" "$ESC" "$C1" "$C1OSC"
+        printf 'claimed_by: "%s"\n' "$2"
+        echo 'claimed_at: "2026-08-05T10:00:00Z"'
+        echo 'last_heartbeat_ts: "2026-08-05T10:30:00Z"'
+        echo 'turn_budget_remaining: 4'; echo 'blockers: []'
+        echo '---'; echo body
+    } >| "$ETD/$1.md"
+}
+etask F98.1 "feat/e"
+etask F98.2 "feat/x${ESC}[2K${ESC}[1;32mALL-CLEAR${C1}[2KRAW8CLEAR"
+EFR="$TMP/escroot"; mkdir -p "$EFR/.worktrees/feat/e"
+# A stream-json narration carrying an OSC title-set, a cursor-up and an erase.
+# The default feed filter's gsub("\\s+";" ") does not touch ESC, so this is the
+# whole of what stands between a hostile file and the dashboard.
+printf '%s\n' '{"type":"assistant","message":{"content":[{"text":"step done \u001b]0;PWNEDTITLE\u0007\u001b[1A\u001b[2KFLEET HEALTHY"}]}}' \
+    >| "$EFR/.worktrees/feat/e/.arachne-agent.log"
+cat >| "$BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+for a in "$@"; do
+  case "$a" in
+    '{{.Names}}|{{.State}}|{{.Status}}') echo 'arachne-agent-feat-e|running|Up 3 minutes'; exit 0 ;;
+    '{{.Names}}') echo 'arachne-agent-feat-e'; exit 0 ;;
+  esac
+done
+exit 0
+EOF
+chmod +x "$BIN/docker"
+EPS="$TMP/esc-pump.state"
+printf '%s' '{"phases":"F98","started_at":"2026-08-05T09:00:00Z","status":"running"}' >| "$EPS"
+ESC_CACHE="$TMP/esc-sess.tsv"
+emon() { TASKPUMP_MONITOR_REPO_ROOT="$EFR" TASKPUMP_TASKS_DIR="$ETD" \
+         TASKPUMP_PUMP_STATE_FILE="$EPS" TASKPUMP_MONITOR_SESS_CACHE="$ESC_CACHE" \
+         TASKPUMP_MONITOR_COLS=140 "$CLI" "$@" 2>/dev/null; }
+emon --glance >/dev/null; sleep 2; esess=$(emon --glance)
+
+left=$(printf '%s' "$esess" | strip_palette | esc_count)
+[[ "$left" == "0" ]] \
+    && pass "SESSIONS renders no escape the monitor did not emit itself" \
+    || fail "$left injected ESC bytes reached the SESSIONS panel:\n$(printf '%s' "$esess" | /usr/bin/cat -v)"
+# Sanitising must not swallow the content: a neutered line still reads.
+grep -aq 'FLEET HEALTHY' <<<"$esess" \
+    && pass "the feed line's own words survive sanitising" \
+    || fail "the log line was swallowed, not sanitised:\n$esess"
+grep -aq 'benign' <<<"$esess" \
+    && pass "the task title survives sanitising in the detail bar" \
+    || fail "the title was swallowed, not sanitised:\n$esess"
+# The 8-bit half of the same attack. A raw 0x9B from the ledger is invalid UTF-8
+# wherever it lands, so a panel that still decodes cleanly is a panel it did not
+# reach — while the monitor's own glyphs, which carry plenty of 0x80-0x9F bytes
+# inside legal characters, keep decoding.
+printf '%s' "$esess" | utf8_valid \
+    && pass "no stray 8-bit byte from the ledger reaches the SESSIONS panel" \
+    || fail "a raw C1 byte reached SESSIONS:\n$(printf '%s' "$esess" | /usr/bin/cat -v)"
+printf '%s' "$esess" | grep -aqF "${C1}[1;32m" \
+    && fail "the 8-bit CSI payload survived into SESSIONS:\n$(printf '%s' "$esess" | /usr/bin/cat -v)" \
+    || pass "no raw 8-bit CSI in the SESSIONS panel"
+grep -aq 'RAW8' <<<"$esess" \
+    && pass "the 8-bit payload's own words survive sanitising" \
+    || fail "the 8-bit payload was swallowed, not sanitised:\n$esess"
+
+# The GRAPH tab's status bar prints the same ledger strings, plus the branch a
+# claim was written with (PI-E8's payload arrives here).
+egraph=$(emon --tab graph --cursor F98.2)
+gleft=$(printf '%s' "$egraph" | strip_gpalette | esc_count)
+[[ "$gleft" == "0" ]] \
+    && pass "GRAPH renders no escape the monitor or the renderer did not emit itself" \
+    || fail "$gleft injected ESC bytes reached the GRAPH tab:\n$(printf '%s' "$egraph" | /usr/bin/cat -v)"
+grep -aq 'ALL-CLEAR' <<<"$egraph" \
+    && pass "the claimed branch survives sanitising in the detail bar" \
+    || fail "the branch was swallowed, not sanitised:\n$egraph"
+printf '%s' "$egraph" | utf8_valid \
+    && pass "no stray 8-bit byte from a claim reaches the GRAPH detail bar" \
+    || fail "a raw C1 byte reached the GRAPH detail bar:\n$(printf '%s' "$egraph" | /usr/bin/cat -v)"
+printf '%s' "$egraph" | grep -aqF "${C1}[2K" \
+    && fail "the 8-bit erase payload survived into GRAPH:\n$(printf '%s' "$egraph" | /usr/bin/cat -v)" \
+    || pass "no raw 8-bit CSI in the GRAPH detail bar"
+grep -aq 'RAW8CLEAR' <<<"$egraph" \
+    && pass "the 8-bit branch payload's own words survive sanitising" \
+    || fail "the 8-bit branch payload was swallowed, not sanitised:\n$egraph"
+# Positive control: the monitor's own palette is untouched by all of the above.
+printf '%s' "$esess" | grep -aq $'\033\[0;38;5;245m' \
+    && pass "the monitor's own colours still reach the terminal" \
+    || fail "sanitising ate the palette:\n$(printf '%s' "$esess" | /usr/bin/cat -v)"
+printf '#!/usr/bin/env bash\nexit 0\n' >| "$BIN/docker"; chmod +x "$BIN/docker"
+
+
+# ── Test 39b: the pump summary row is a rendered row like any other ───────────
+#
+# The summary row reads the pump state file, and the numbers in it are what an
+# operator glances at to decide whether a drain is progressing. tp-pump writes
+# open_tasks with `jq --argjson`, so the legitimate writer can only emit a
+# number — but in the ledger==primary shape the runner mounts the root holding
+# that file read-write, so an agent can write the field. A row that prints it
+# raw lets an agent paint its own status line.
+echo "--- Test 39b: the pump summary row sanitises the state file ---"
+PS39="$TMP/39b-pump.state"
+# , not a raw ESC: a raw control byte is invalid inside a JSON string, and
+# a state file jq cannot parse renders as no pump at all rather than as a
+# forged row.
+printf '%s' "{\"phases\":\"F98\",\"last_tick\":\"2026-08-05T09:00:00Z\",\"open_tasks\":\"7\\u001b[2K\\u001b[1;32mALL-GREEN\",\"status\":\"running\",\"paused_reason\":\"\",\"pid\":$$,\"host\":\"$(hostname)\"}" >| "$PS39"
+s39=$(TASKPUMP_MONITOR_REPO_ROOT="$EFR" TASKPUMP_TASKS_DIR="$ETD" \
+      TASKPUMP_PUMP_STATE_FILE="$PS39" TASKPUMP_MONITOR_SESS_CACHE="$TMP/39b.tsv" \
+      TASKPUMP_MONITOR_COLS=140 "$CLI" --glance 2>/dev/null)
+
+grep -aq 'ALL-GREEN' <<<"$s39" \
+    && pass "the summary row renders the state file's open_tasks field" \
+    || fail "the row never reached the payload, so this asserts nothing:\n$s39"
+[[ "$(printf '%s' "$s39" | strip_palette | esc_count)" == "0" ]] \
+    && pass "no escape from the pump state file reaches the summary row" \
+    || fail "an injected escape survived into the summary row:\n$(printf '%s' "$s39" | /usr/bin/cat -v)"
 
 echo
 echo "=============================================="

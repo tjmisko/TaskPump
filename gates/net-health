@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # gates/net-health — pause launching while the host's network looks wedged.
 #
 # THE GATE CONTRACT

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # gates/example-gate — a no-op gate, here to be copied.
 #
 # A gate answers one question before the pump launches anything: is it a good

@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # tp-disk-watchdog -- pause new agent launches when free disk drops below a
 # threshold, and when space gets critical buy it back by cleaning worktree and
 # primary build dirs (`tp cleanup --targets --include-primary`, which skips any
@@ -30,7 +32,15 @@
 #   TASKPUMP_DISK_MOUNT         mount to measure (default /)
 #   TASKPUMP_DISK_PROBE         command that reports free space
 #   TASKPUMP_POOL_CAP_FILE      the live pool cap this drives
-#   TASKPUMP_ORIGINAL_CAP       cap to restore (default: the cap file at start)
+#   TASKPUMP_ORIGINAL_CAP       cap to restore (default: the cap file at start,
+#                               unless that holds 0 — a pause is not a cap to
+#                               restore to — in which case the shared fallback)
+#   TASKPUMP_POOL_CAP_STALE_SEC how long a written 0 stays believable to the
+#                               pump without a refresh (read by the shared cap
+#                               reader). The watch loop re-stamps its pause every
+#                               poll and hands it back on exit, so a 0 that
+#                               reaches this window is one a SIGKILLed watchdog,
+#                               a `--once` run or a hand edit left behind.
 #   TASKPUMP_PANIC_RECLAIM      0 = prune only, never clean build dirs
 #   TASKPUMP_STARTUP_GRACE_SEC / TASKPUMP_EMPTY_GRACE_CHECKS  as --auto-exit above
 # HELP-END
@@ -44,10 +54,20 @@ tp_load_config
 # shellcheck source=../lib/pump-lib.sh
 . "$TP_LIB_DIR/pump-lib.sh"
 
-# REPO_ROOT is the parent of this script's dir; overridable so the panic-reclaim
-# path can be unit-tested against a fixture tree with a stub arachne-cleanup.
-_default_repo_root="$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)"
-REPO_ROOT="${TASKPUMP_DISK_REPO_ROOT:-$_default_repo_root}"
+# REPO_ROOT is the WORKSPACE this watchdog is guarding, resolved by the same
+# rule the pump uses (tp_resolve_workspace) — because the cap file it writes is
+# the file the pump reads, and the two have to name the same path or the
+# mechanism is decorative.
+#
+# It used to default to the parent of this script's own directory. From a
+# consumer repo with no TASKPUMP_STATE_DIR that is the INSTALLATION, so the
+# watchdog wrote its cap into the TaskPump checkout while the pump read the
+# workspace's — the watchdog logged "pool cap → 0" under disk pressure and the
+# pump kept launching at full cap (B8). TASKPUMP_DISK_REPO_ROOT stays as the
+# test seam, and TASKPUMP_WORKSPACE_ROOT pins the workspace explicitly exactly
+# as it does for the pump.
+tp_resolve_workspace
+REPO_ROOT="${TASKPUMP_DISK_REPO_ROOT:-${TASKPUMP_WORKSPACE_ROOT:-$TP_WS_ROOT}}"
 STATE_DIR="${TASKPUMP_STATE_DIR:-$REPO_ROOT}"
 CAP_FILE="${TASKPUMP_POOL_CAP_FILE:-${CAP_FILE:-$STATE_DIR/.taskpump-pool-cap}}"
 POLL="${TASKPUMP_DISK_POLL:-${POLL:-30}}"
@@ -61,10 +81,25 @@ MOUNT="${TASKPUMP_DISK_MOUNT:-${MOUNT:-/}}"
 # The final fallback is the shared TASKPUMP_JOBS_FALLBACK from pump-lib, not a
 # third private 6.
 ORIGINAL_CAP="${TASKPUMP_ORIGINAL_CAP:-${ORIGINAL_CAP:-}}"
+ORIGINAL_CAP_NOTE="TASKPUMP_ORIGINAL_CAP"
 if [[ -z "$ORIGINAL_CAP" && -f "$CAP_FILE" ]]; then
     ORIGINAL_CAP="$(tr -dc '0-9' < "$CAP_FILE" 2>/dev/null || true)"
+    ORIGINAL_CAP_NOTE="$CAP_FILE"
 fi
-ORIGINAL_CAP="${ORIGINAL_CAP:-$TASKPUMP_JOBS_FALLBACK}"
+# A 0 is a PAUSE somebody was holding, never a cap to restore TO — whichever
+# spelling supplied it. Snapshotting the cap file's 0 made a watchdog started
+# against a stale one "recover" to 0, i.e. hold the very wedge it was launched to
+# clear; and restoring to 0 on the way out would log a release that released
+# nothing. The pause is not this process's to inherit: while nothing is
+# throttling, the launch loop's own disk gate is what keeps the line.
+if [[ "$ORIGINAL_CAP" == "0" ]]; then
+    ORIGINAL_CAP_NOTE="$ORIGINAL_CAP_NOTE held 0, which is a pause and not a cap; fell back"
+    ORIGINAL_CAP=""
+fi
+if [[ -z "$ORIGINAL_CAP" ]]; then
+    [[ "$ORIGINAL_CAP_NOTE" == *"fell back" ]] || ORIGINAL_CAP_NOTE="TASKPUMP_JOBS_FALLBACK"
+    ORIGINAL_CAP="$TASKPUMP_JOBS_FALLBACK"
+fi
 
 DRY_RUN=0; ONCE=0; AUTO_EXIT=0; GATE=0
 STARTUP_GRACE_SEC="${TASKPUMP_STARTUP_GRACE_SEC:-${STARTUP_GRACE_SEC:-120}}"
@@ -113,11 +148,28 @@ free_gb() {
         | awk 'NR==2 {gsub("G",""); print $1}'
 }
 
-# ── set_cap <n> -- write the live pool cap. Idempotent (no-op when unchanged).
+# CAP_LOWERED is 1 while THIS process is the one holding the pause — set when a
+# `set_cap 0` lands, cleared when we put a real cap back. It is what the exit
+# path checks: a watchdog that dies still holding the pause must not leave the 0
+# behind, because the pump does not overwrite an existing cap file unless --jobs
+# was passed, so that 0 would govern the next unattended run too.
+CAP_LOWERED=0
+
+# ── set_cap <n> -- write the live pool cap. Idempotent in VALUE, but a repeat of
+#    a 0 still re-stamps the file's mtime: the shared cap reader treats a 0 that
+#    nothing has refreshed as a pause whose holder died (apl_read_cap /
+#    TASKPUMP_POOL_CAP_STALE_SEC), so this heartbeat is what tells "still paused"
+#    apart from "abandoned". No log line for a heartbeat — it says nothing new.
 set_cap() {
     local n="$1" cur=""
     [[ -f "$CAP_FILE" ]] && cur="$(tr -dc '0-9' < "$CAP_FILE" 2>/dev/null || true)"
-    if [[ "$cur" == "$n" ]]; then return 0; fi
+    if [[ "$cur" == "$n" ]]; then
+        if [[ "$n" == "0" ]]; then
+            [[ "$DRY_RUN" -eq 0 ]] && touch "$CAP_FILE" 2>/dev/null
+            CAP_LOWERED=1
+        fi
+        return 0
+    fi
     if [[ "$DRY_RUN" -eq 1 ]]; then
         log "  (dry-run) would set pool cap $cur → $n via $CAP_FILE"
         return 0
@@ -126,7 +178,30 @@ set_cap() {
         log "  WARNING: could not write cap file $CAP_FILE (permissions?)"
         return 1
     fi
+    if [[ "$n" == "0" ]]; then CAP_LOWERED=1; else CAP_LOWERED=0; fi
     log "  pool cap $cur → $n ($CAP_FILE)"
+}
+
+# ── release_cap_on_exit -- put a real cap back if we are still holding the
+#    pause. A killed watchdog used to leave its 0 in the cap file, and the next
+#    unattended run read that 0 as a live pause, launched nothing, and reported
+#    `status: running` with no page. A pause is only as good as the process
+#    holding it, so the process hands it back on the way out.
+#
+#    Only the WATCH loop installs this. `--once` is a one-shot whose cap is meant
+#    to outlive it (the reader's staleness window is what expires that one), and
+#    `--gate` never writes a cap at all.
+#
+#    Guarded on the file still reading 0: if an operator or a pump has written a
+#    real cap since, that is a newer decision than ours and it stands.
+release_cap_on_exit() {
+    [[ "$CAP_LOWERED" -eq 1 ]] || return 0
+    local cur=""
+    [[ -f "$CAP_FILE" ]] && cur="$(tr -dc '0-9' < "$CAP_FILE" 2>/dev/null || true)"
+    [[ "$cur" == "0" ]] || return 0
+    CAP_LOWERED=0
+    log "releasing the pool-cap pause on exit: a 0 left in $CAP_FILE would pause the next run too. The launch loop's disk gate, not this file, holds the line while no watchdog is running."
+    set_cap "$ORIGINAL_CAP"
 }
 
 # ── reclaim_targets -- reclaim worktree + primary build output to buy back
@@ -145,8 +220,21 @@ reclaim_targets() {
     fi
     local args=(--targets --include-primary)
     [[ "$DRY_RUN" -eq 1 ]] && args+=(--dry-run)
-    log "  reclaiming build target/ dirs (worktrees + primary) to buy space"
-    "$cleanup" "${args[@]}" 2>&1 | sed 's/^/    cleanup: /'
+    log "  reclaiming build output (worktrees + primary) to buy space"
+    # The workspace this watchdog guards is the workspace whose build output is
+    # worth reclaiming. cleanup resolves its own root from its install dir, so
+    # without this the panic sweep walks the TaskPump checkout's worktrees and
+    # frees nothing (the same wrong-root family as the cap file above).
+    # rc matters here. The sweep runs the consumer's own reclaim command, and an
+    # arbitrary command fails routinely (`npm run clean` in a workspace with no
+    # package.json, a cargo toolchain that is not installed) — which the old
+    # hardcoded `rm -rf` essentially never did. pipefail carries tp-cleanup's
+    # status through the sed, so a PANIC transcript never reads as though space
+    # was bought when the reclaim itself failed.
+    if ! TASKPUMP_CLEANUP_REPO_ROOT="$REPO_ROOT" \
+           "$cleanup" "${args[@]}" 2>&1 | sed 's/^/    cleanup: /'; then
+        log "  WARNING: the reclaim sweep reported failures (see the cleanup: lines above) — assume it bought no space"
+    fi
 }
 
 # ── docker_panic -- run cleanup --docker to free space immediately.
@@ -190,6 +278,12 @@ react() {
                 set_cap "$ORIGINAL_CAP" ;;
         esac
         LAST_STATE="$NEW"
+    elif [[ "$DRY_RUN" -eq 0 && ( "$NEW" == "PAUSED" || "$NEW" == "PANIC" ) ]]; then
+        # Still holding the pause. set_cap re-stamps the cap file's mtime without
+        # logging, which is the liveness signal the reader expires a 0 against;
+        # if something raised the cap under us it also re-asserts the 0, and says
+        # so, because that IS a change worth a line.
+        set_cap 0
     fi
 }
 
@@ -212,13 +306,29 @@ if [[ "$GATE" -eq 1 ]]; then
 fi
 
 mode="watch"; [[ "$ONCE" -eq 1 ]] && mode="once"; [[ "$DRY_RUN" -eq 1 ]] && mode="$mode/dry-run"
-log "tp-disk-watchdog starting ($mode): mount=$MOUNT poll=${POLL}s pause<${PAUSE_THRESHOLD_GB}G panic<${PANIC_THRESHOLD_GB}G recover>${RECOVER_THRESHOLD_GB}G original_cap=$ORIGINAL_CAP"
+log "tp-disk-watchdog starting ($mode): mount=$MOUNT poll=${POLL}s pause<${PAUSE_THRESHOLD_GB}G panic<${PANIC_THRESHOLD_GB}G recover>${RECOVER_THRESHOLD_GB}G original_cap=$ORIGINAL_CAP ($ORIGINAL_CAP_NOTE)"
+
+# The heartbeat only works if it beats faster than the reader's patience. A poll
+# at or above the staleness window means a pause this watchdog is genuinely
+# holding can be expired out from under it between two re-stamps — the pump would
+# resume launching under live disk pressure — so the misconfiguration is named
+# rather than left to be discovered as a mystery.
+_cap_stale_window="${TASKPUMP_POOL_CAP_STALE_SEC:-900}"
+if [[ "$POLL" =~ ^[0-9]+$ && "$_cap_stale_window" =~ ^[0-9]+$ ]] \
+   && (( _cap_stale_window > 0 && POLL >= _cap_stale_window )); then
+    log "  WARNING: poll ${POLL}s >= TASKPUMP_POOL_CAP_STALE_SEC ${_cap_stale_window}s — a pause this watchdog is still holding can expire between re-stamps and let the pump launch under pressure. Lower the poll or raise the window."
+fi
 
 if [[ "$ONCE" -eq 1 ]]; then
     react
     exit 0
 fi
 
+# The pause this loop holds dies with the loop. EXIT covers a normal return and
+# --auto-exit's own `exit 0`; INT/TERM get a handler that exits, which then runs
+# the EXIT trap — release_cap_on_exit clears CAP_LOWERED, so running twice is a
+# no-op rather than a double restore.
+trap 'release_cap_on_exit' EXIT
 trap 'log "stopping."; exit 0' INT TERM
 while true; do
     react

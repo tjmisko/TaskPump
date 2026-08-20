@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # test-conf-hermeticity.sh — the suites must be hermetic against a consumer conf
 # in the repo they run from (G0.3).
 #

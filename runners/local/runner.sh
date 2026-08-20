@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # runners/local/runner.sh — the local process runner. RUNNER CONTRACT v2.
 #
 # Starts an agent as a plain host process. This is the runner that makes "any

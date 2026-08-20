@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # runners/claude-docker/Dockerfile — the TaskPump dogfood agent image (G0.2).
 #
 # The concrete instance of the image contract (docs/RUNNERS.md §4.0): the

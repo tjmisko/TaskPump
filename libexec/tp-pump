@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # tp-pump — usage-governed, DAG-aware, keep-acquiring task-loop supervisor.
 #
 # A singular HOST-level loop (so there is no cross-agent claim race) that points
@@ -262,8 +264,18 @@ HEALTH_WINDOW="${TASKPUMP_HEALTH_WINDOW:-${HEALTH_WINDOW:-120}}"
 # so it ships OFF: TASKPUMP_HEALTH_GATE=1 opts it into the default chain, ahead
 # of the generic three. The reference consumer pins 1 in examples/arachne.conf.
 HEALTH_GATE="${TASKPUMP_HEALTH_GATE:-0}"
-USAGE_GATE=1
-DISK_GATE=1
+# The other two ship ON, and their keys are how a conf turns them off. They used
+# to be pinned to 1 here and read no key at all, which made TASKPUMP_USAGE_GATE=0
+# and TASKPUMP_DISK_GATE=0 worse than inert: export_gate_env below re-exports
+# these shell variables, so the operator's 0 was overwritten with 1 inside every
+# gate process — a switch that looked set, read back as unset, and went on
+# metering. The --no-*-gate flags force 0 either way, and still win, because they
+# are parsed after this.
+#
+# All three switches are 0/1 and nothing else — see check_gate_switch below,
+# which refuses any other value before the first arithmetic test reads it.
+USAGE_GATE="${TASKPUMP_USAGE_GATE:-1}"
+DISK_GATE="${TASKPUMP_DISK_GATE:-1}"
 BRANCH_PREFIX="${TASKPUMP_PUMP_BRANCH_PREFIX:-${TASKPUMP_BRANCH_PREFIX:-feat/}}"
 BASE_REF="${TASKPUMP_PUMP_BASE:-${TASKPUMP_BASE:-main}}"
 BASE_GIVEN=0      # set when --base is passed explicitly (gates the trunk override)
@@ -303,6 +315,19 @@ RESUME_MAX="${TASKPUMP_PUMP_RESUME_MAX:-${TASKPUMP_RESUME_MAX:-3}}"
 # >1 so a container dying mid-tick cannot trip it.
 STALL_EXIT_TICKS="${TASKPUMP_PUMP_STALL_EXIT_TICKS:-${TASKPUMP_STALL_EXIT_TICKS:-3}}"
 STALL_TICKS=0
+# Why the last idle tick was idle, and the last refusal that made it so. The
+# counter alone cannot tell an empty frontier from a plan full of work nothing
+# would start, and those want different repairs — so the page carries the
+# difference instead of saying "nothing launchable" over four launchable units.
+#
+# Two variables and not one, because "nothing started" and "every launch failed"
+# are different facts: a resume the budget correctly retired never reaches
+# launch_unit, so it refuses a unit without any launch having been attempted.
+# LAUNCH_FAILURES counts attempts that actually failed; LAST_START_REFUSAL
+# carries the most recent reason of either kind.
+STALL_CAUSE=""
+LAST_START_REFUSAL=""
+LAUNCH_FAILURES=0
 RESUME_TASK_ID=""
 LAST_PARKED_FP=""
 CAP_FILE="${TASKPUMP_POOL_CAP_FILE:-$STATE_DIR/.taskpump-pool-cap}"
@@ -385,6 +410,39 @@ usage() { apl_help "$0"; }
 [[ "$MODE" == "help" ]] && { usage; exit 0; }
 
 [[ -n "$PHASES" ]] || die "--phases is required (e.g. --phases F55..F63)"
+
+# ── Gate enable switches: 0 or 1, and nothing else ────────────────────────────
+# Every reader of these keys in the tree tests them arithmetically —
+# `[[ "${TASKPUMP_DISK_GATE:-1}" -eq 1 ]]` in gates/disk-low and lib/pump-lib.sh,
+# `[[ "${TASKPUMP_USAGE_GATE:-1}" -eq 1 ]]` in gates/claude-usage — so the
+# vocabulary is already fixed at 0/1, and `false`, `no` and `off` mean nothing
+# anywhere. Two of the three were out of reach of that arithmetic while the pump
+# pinned them to literals and read no key; TASKPUMP_HEALTH_GATE never was, and
+# has carried the same exposure all along. An unparsed value in an arithmetic
+# test under `set -u` is the worst of both outcomes, and the pump had one of
+# each: on the disk-watchdog spawn, which runs in the main shell, it aborted the
+# run with a raw bash trace and no diagnostic; inside default_gates' command
+# substitution it killed only the subshell, truncating the chain mid-list and
+# leaving the run to print `GATE: feed-ok` over gates nobody asked to turn off.
+# So the value is parsed once, here, and anything outside the vocabulary is
+# refused by name. The pump's own three comparisons are string tests now as
+# well (see default_gates), which is why nothing below can reproduce either
+# shape — but the gates these values are exported to still read them as
+# numbers, so 0/1 is the vocabulary either way.
+#
+# Read from the environment rather than from the shell variables, so a
+# --no-*-gate flag on this one run cannot hide a conf key that will be unparsed
+# again tomorrow when the flag is not passed.
+check_gate_switch() {  # check_gate_switch <key> <value>
+  [[ "$2" =~ ^[01]$ ]] && return 0
+  die "$1 must be 0 or 1 (got '$2')
+  1 enables the gate, 0 disables it. There is no word form: every gate in the
+  tree reads these keys as numbers, so 'false', 'no' and 'off' are values the
+  pump and the gate would disagree about. Leave the key unset for the default."
+}
+check_gate_switch TASKPUMP_HEALTH_GATE "${TASKPUMP_HEALTH_GATE:-0}"
+check_gate_switch TASKPUMP_USAGE_GATE  "${TASKPUMP_USAGE_GATE:-1}"
+check_gate_switch TASKPUMP_DISK_GATE   "${TASKPUMP_DISK_GATE:-1}"
 
 # A missing ledger must never read as a drained range: open_count and
 # frontier_phases mask tp-task's refusal into "0 open tasks" with their
@@ -1005,27 +1063,148 @@ detect_stalled_orphans() {
 # silently halt a multi-day drain. Every gate shipped here fails open too.
 #
 # The default chain is token freshness, the usage ceiling, and free disk — with
-# the three --no-*-gate flags dropping their entry. The shipped net-health gate
-# is host-hardware policy and OFF by default; TASKPUMP_HEALTH_GATE=1 opts it in
-# at the head of the chain (a wedged host is the cheapest, most binding check).
-# A configured TASKPUMP_GATES replaces the whole chain and is used verbatim; the
-# flags still export their disable switches, so a gate that honors them keeps
-# working either way — note that means a net-health entry in a custom chain also
-# needs TASKPUMP_HEALTH_GATE=1 to actually probe.
+# each entry dropped by its own switch, which is the TASKPUMP_*_GATE key or the
+# matching --no-*-gate flag, the flag winning where both are given. The shipped
+# net-health gate is host-hardware policy and OFF by default;
+# TASKPUMP_HEALTH_GATE=1 opts it in at the head of the chain (a wedged host is
+# the cheapest, most binding check). A configured TASKPUMP_GATES replaces the
+# whole chain and is used verbatim; export_gate_env still exports the three
+# switches with the values in force, so a gate that honors them keeps working
+# either way — note that means a net-health entry in a custom chain also needs
+# TASKPUMP_HEALTH_GATE=1 to actually probe.
+#
+# The switches are compared as STRINGS, not arithmetically. check_gate_switch
+# has already refused anything but 0 or 1, so the two spellings agree — but this
+# function runs inside a command substitution, where a fatal arithmetic error
+# kills the subshell and silently truncates the chain rather than the run. A
+# comparison that cannot be fatal is the belt for that suspenders.
 default_gates() {
-  [[ "$HEALTH_GATE" -eq 1 ]] && printf '%s\n' "$TP_GATES_DIR/net-health"
+  [[ "$HEALTH_GATE" == 1 ]] && printf '%s\n' "$TP_GATES_DIR/net-health"
   printf '%s\n' "$TP_GATES_DIR/claude-token-fresh"
-  [[ "$USAGE_GATE" -eq 1 ]] && printf '%s\n' "$USAGE_BIN --gate"
-  [[ "$DISK_GATE"  -eq 1 ]] && printf '%s\n' "$TP_GATES_DIR/disk-low"
+  [[ "$USAGE_GATE" == 1 ]] && printf '%s\n' "$USAGE_BIN --gate"
+  [[ "$DISK_GATE"  == 1 ]] && printf '%s\n' "$TP_GATES_DIR/disk-low"
+  return 0
+}
+
+# The chain in force. `${TASKPUMP_GATES:-…}` falls back on an EMPTY value as well
+# as an unset one — so the test for "the operator configured this" has to be the
+# same -n test, spelled once, and it lives in chain_entry_source below.
+active_gates() { printf '%s' "${TASKPUMP_GATES:-$(default_gates)}"; }
+active_hooks() { printf '%s' "${TASKPUMP_PRE_TICK_HOOKS:-$(default_pre_tick_hooks)}"; }
+
+# Which key put this entry in the chain. Not "which chain is in force": the
+# default gate chain is assembled from more than one key, and blaming the whole
+# chain for an entry TASKPUMP_USAGE named is the same class of wrong answer this
+# validation exists to remove — a diagnostic that sends the operator to check
+# the syntax of a variable they never set.
+chain_entry_source() {  # chain_entry_source <gate|hook> <first word of the entry>
+  local kind="$1" first="$2"
+  if [[ "$kind" == gate ]]; then
+    [[ -n "${TASKPUMP_GATES:-}" ]] && { printf 'TASKPUMP_GATES'; return 0; }
+    # default_gates emits `$USAGE_BIN --gate`, so the entry's first word is the
+    # first word of USAGE_BIN — which is TASKPUMP_USAGE's value when that key is
+    # set, and a shipped path when it is not.
+    [[ -n "${TASKPUMP_USAGE:-}" && "$first" == "${USAGE_BIN%% *}" ]] \
+      && { printf 'TASKPUMP_USAGE'; return 0; }
+    printf 'the default gate chain'
+    return 0
+  fi
+  [[ -n "${TASKPUMP_PRE_TICK_HOOKS:-}" ]] && { printf 'TASKPUMP_PRE_TICK_HOOKS'; return 0; }
+  printf 'the default pre-tick hook chain'
+}
+
+# ── Chain validation (gates and pre-tick hooks) ────────────────────────────────
+# Both chains are newline-separated command lines whose first whitespace-
+# delimited word must be an executable REGULAR FILE. Every other shape used to
+# cost one line on stderr and then a full-throated `GATE: feed-ok` for the rest
+# of the run: a bare gate name, a comma-separated list (read as ONE entry) and a
+# relative path that does not resolve from $PWD were `not executable, skipping`,
+# while a DIRECTORY passed the old `-x` test outright and failed at exec time as
+# `failed (rc=126); feeding anyway`. Different lines, one outcome.
+#
+# That is strictly worse than configuring no gate at all. An operator who wired
+# a usage ceiling and got a typo believes they are metered for the next three
+# days, and the plan they check agrees with them: the `gates:` line is built
+# from the same strings without the executability test, so a wired gate and a
+# skipped one printed identically. The same misspelling in
+# TASKPUMP_PRE_TICK_HOOKS silently disables fs-guard, the contamination guard.
+#
+# So an entry that cannot run refuses the run, in the same place every other
+# misconfiguration is refused (docs/CLI-PUMP.md §6) and before any mode —
+# --dry-run included, because that is the mode an operator uses to CONFIRM a
+# chain, and confirming has to be able to say no.
+#
+# What the refusal SAYS is per-entry, because the fix is: a chain the operator
+# wrote gets the chain-syntax rules, TASKPUMP_USAGE gets its own key back, and a
+# shipped path gets "your install is incomplete" — none of which is improved by
+# reading either of the other two.
+validate_chain() {  # validate_chain <gate|hook> <chain text>
+  local kind="$1" chain="$2" noun key shipped_dir example spec src advice
+  if [[ "$kind" == gate ]]; then
+    noun="gate"; key="TASKPUMP_GATES"; shipped_dir="$TP_GATES_DIR"
+    example="  TASKPUMP_GATES=\"$TP_GATES_DIR/disk-low
+  $TP_GATES_DIR/claude-usage --gate --ceiling 80\""
+  else
+    noun="pre-tick hook"; key="TASKPUMP_PRE_TICK_HOOKS"; shipped_dir="$TP_ROOT/hooks"
+    example="  TASKPUMP_PRE_TICK_HOOKS=\"$TP_ROOT/hooks/gitignore-repair
+  $TP_ROOT/hooks/fs-guard\""
+  fi
+  while IFS= read -r spec; do
+    [[ -z "${spec//[[:space:]]/}" ]] && continue
+    # A chain entry is a command line; splitting on whitespace is the point.
+    # shellcheck disable=SC2086
+    set -- $spec
+    # -f as well as -x: `[[ -x dir ]]` is true for any searchable directory, so
+    # pointing the key at gates/ or hooks/ used to pass validation and then
+    # reproduce the exact symptom this check exists to stop — a plausible
+    # `gates:` line, `GATE: feed-ok`, and one rc=126 warning on stderr.
+    [[ -f "$1" && -x "$1" ]] && continue
+    src="$(chain_entry_source "$kind" "$1")"
+    case "$src" in
+      "$key")
+        advice="Each line of $key is one command line whose FIRST WORD is the path to an
+executable; arguments follow it on the same line. A bare name does not work —
+nothing searches \$PATH — and a comma-separated list is read as a single entry,
+not as several:
+
+$example
+
+Only that first word is checked, so several ${noun}s written on ONE line are
+still one command line: the first runs and the rest are handed to it as
+arguments. One per line.
+
+A relative first word is resolved against the directory the pump runs from, so
+the same configuration works from the repository root and fails from any
+subdirectory; an absolute path costs nothing and cannot do that."
+        ;;
+      TASKPUMP_USAGE)
+        advice="TASKPUMP_USAGE names the binary the usage gate runs, and the default chain
+uses it verbatim — so this is not a chain-syntax error and $key is not
+involved. Point the key at an executable file, or drop the usage gate instead:
+TASKPUMP_USAGE_GATE=0 standingly, or --no-usage-gate for one run."
+        ;;
+      *)
+        advice="This entry is a ${noun} shipped with TaskPump, under $shipped_dir — so the
+chain is not the mistake. The file is missing, is not a regular file, or has
+lost its execute bit: repair the install, or name a chain of your own in $key."
+        ;;
+    esac
+    die "$noun entry is not an executable file: $1
+  (from $src)
+$advice
+
+This is a refusal and not a warning because everywhere else the operator can
+look, a skipped $noun and a $noun that passed look exactly alike."
+  done <<<"$chain"
   return 0
 }
 
 # The active chain as one display line: each entry's executable basename in
-# consultation order. Dry-run prints it, so an operator can confirm a gate is
-# wired and ordered as intended without waiting for one to trip (GATES.md §4).
+# consultation order. Dry-run prints it, and so does a real run's startup banner
+# — the two must never disagree about what this run consults (GATES.md §4).
 gate_chain_line() {
   local gates spec line=""
-  gates="${TASKPUMP_GATES:-$(default_gates)}"
+  gates="$(active_gates)"
   while IFS= read -r spec; do
     [[ -z "${spec//[[:space:]]/}" ]] && continue
     # A gate entry is a command line; splitting on whitespace is the point.
@@ -1073,13 +1252,20 @@ feed_gate() {
   GATE_NOTES=""
   export_gate_env
   local gates spec rc reason
-  gates="${TASKPUMP_GATES:-$(default_gates)}"
+  gates="$(active_gates)"
   while IFS= read -r spec; do
     [[ -z "${spec//[[:space:]]/}" ]] && continue
     # A gate entry is a command line; splitting on whitespace is the point.
     # shellcheck disable=SC2086
     set -- $spec
-    if [[ ! -x "$1" ]]; then
+    if [[ ! -f "$1" || ! -x "$1" ]]; then
+      # Startup validation already refused every unrunnable entry, so reaching
+      # here means the gate was deleted or un-chmod'd DURING the drain — days
+      # long, so it happens. A warning on stderr is the whole disclosure, and
+      # deliberately so: this branch is only ever reached from a tick, and a
+      # tick has no `GATE:` line to hang a note under — print_plan is plan-mode
+      # only. Halting a live drain over it would be worse than the skip, so the
+      # run continues, one warning per tick, for as long as it lasts.
       warn "gate not executable, skipping: $1"
       continue
     fi
@@ -1437,13 +1623,20 @@ escalate_stalled() {
 # Relaunch a starved unit to continue its orphaned task. Identical at either
 # grain: the bound, the reopen, the note and the relaunch are one mechanism
 # (docs/PUMP-MECHANISMS.md §4) asked about a phase or about a single task.
+# Every arm that gives up records WHY in LAST_START_REFUSAL, and none of them
+# touches LAUNCH_FAILURES: a resume refused here never reached launch_unit, so
+# no launch was attempted and "every launch attempt failed" would be a false
+# account of the tick. The escalation arm is the sharpest case — the budget
+# retired the task and paged a human, which is the mechanism working.
 resume_unit() {
   local unit="$1"
   local id="${STALL_TASK[$unit]:-}"
-  [[ -n "$id" ]] || return 1
+  [[ -n "$id" ]] || { LAST_START_REFUSAL="$unit: no stalled task id recorded"; return 1; }
   local branch; branch="$(unit_branch "$unit")"
   local head; head="$(git -C "$REPO_ROOT" rev-parse "$branch" 2>/dev/null || true)"
-  [[ -n "$head" ]] || { warn "resume $unit: cannot resolve head of $branch"; return 1; }
+  [[ -n "$head" ]] || {
+    LAST_START_REFUSAL="$unit: cannot resolve head of $branch"
+    warn "resume $unit: cannot resolve head of $branch"; return 1; }
 
   # Bookkeep the attempt HERE rather than inside launch_unit: a unit that is
   # detected but not launched — pool cap reached, feed gate shut — must not burn
@@ -1452,9 +1645,12 @@ resume_unit() {
   verdict="$("$TASK_BIN" resume-attempt "$id" --head "$head" --max "$RESUME_MAX" 2>/dev/null)" || rc=$?
   if (( rc == 10 )); then
     escalate_stalled "$unit" "$id" "$verdict"
+    LAST_START_REFUSAL="$unit: resume budget spent on $id — escalated to needs-review, not relaunched"
     return 1
   fi
-  (( rc == 0 )) || { warn "resume $unit: resume-attempt $id failed (rc=$rc)"; return 1; }
+  (( rc == 0 )) || {
+    LAST_START_REFUSAL="$unit: resume-attempt $id failed (rc=$rc)"
+    warn "resume $unit: resume-attempt $id failed (rc=$rc)"; return 1; }
 
   # A scrub-parked task has to come back to `open` before the container's
   # safety-net claim can take it (claim accepts open, or in_progress on the same
@@ -1463,7 +1659,9 @@ resume_unit() {
   if [[ "$status" == "needs-review" || "$status" == "stuck" ]]; then
     "$TASK_BIN" reopen "$id" \
       --reason "Pump auto-resume ($verdict): committed work on $branch, container dead; relaunching to continue." \
-      >/dev/null 2>&1 || { warn "resume $unit: reopen $id failed"; return 1; }
+      >/dev/null 2>&1 || {
+        LAST_START_REFUSAL="$unit: reopen $id failed"
+        warn "resume $unit: reopen $id failed"; return 1; }
   fi
 
   log "resuming $unit task $id ($verdict, was $status, head $(printf '%s' "$head" | cut -c1-12))"
@@ -1527,6 +1725,8 @@ launch_unit() {
     # greps this file for the volume-flag-then-quoted-path spelling and cannot
     # tell git's verbose flag from a docker mount without it.
     ign_src="$(git -C "$REPO_ROOT" check-ignore -v -- "$wt" 2>/dev/null | head -1)"
+    LAUNCH_FAILURES=$((LAUNCH_FAILURES + 1))
+    LAST_START_REFUSAL="$unit: worktree still gitignored ($wt; deciding pattern: ${ign_src:-unknown})"
     warn "worktree still gitignored: $wt (deciding pattern: ${ign_src:-unknown}) — skipping $unit"
     return 1
   fi
@@ -1540,6 +1740,8 @@ launch_unit() {
   if [[ "$INTEGRATION" -eq 1 ]] && git -C "$REPO_ROOT" rev-parse --verify "refs/heads/$INTEGRATION_TRUNK" >/dev/null 2>&1; then
     if ! git -C "$wt" merge --no-ff --no-edit "$INTEGRATION_TRUNK" >/dev/null 2>&1; then
       git -C "$wt" merge --abort >/dev/null 2>&1 || true
+      LAUNCH_FAILURES=$((LAUNCH_FAILURES + 1))
+      LAST_START_REFUSAL="$unit: worktree conflicts with $INTEGRATION_TRUNK ($wt)"
       warn "worktree $wt conflicts with $INTEGRATION_TRUNK; skipping launch of $unit"
       quarantine_unit "$unit" "$(git -C "$wt" rev-parse HEAD 2>/dev/null)" "worktree merge conflict"
       return 1
@@ -1602,6 +1804,8 @@ launch_unit() {
     "$RUNNER" launch
   ) || rc=$?
   if (( rc != 0 )); then
+    LAUNCH_FAILURES=$((LAUNCH_FAILURES + 1))
+    LAST_START_REFUSAL="$unit: runner failed (rc=$rc): $RUNNER"
     warn "runner failed to launch $unit (rc=$rc): $RUNNER"
     return 1
   fi
@@ -2314,13 +2518,16 @@ default_pre_tick_hooks() {
 
 run_pre_tick_hooks() {
   local hooks spec rc out all=""
-  hooks="${TASKPUMP_PRE_TICK_HOOKS:-$(default_pre_tick_hooks)}"
+  hooks="$(active_hooks)"
   while IFS= read -r spec; do
     [[ -z "${spec//[[:space:]]/}" ]] && continue
     # A hook entry is a command line; splitting on whitespace is the point.
     # shellcheck disable=SC2086
     set -- $spec
-    if [[ ! -x "$1" ]]; then
+    if [[ ! -f "$1" || ! -x "$1" ]]; then
+      # As with a gate: unreachable at startup (validate_chain refused), so this
+      # is a hook that stopped being executable mid-drain, and the warning is
+      # the whole disclosure — there is no plan line to hang a note under here.
       warn "pre-tick hook not executable, skipping: $1"
       continue
     fi
@@ -2463,6 +2670,8 @@ do_tick() {
   local cap have launched=0 p
   cap="$(effective_cap)"
   have="$(apl_count_live_agents)"
+  LAST_START_REFUSAL=""
+  LAUNCH_FAILURES=0
   for p in "${PLAN_LAUNCH[@]:-}"; do
     [[ -z "$p" ]] && continue
     (( have >= cap )) && break
@@ -2483,22 +2692,65 @@ do_tick() {
   done
   [[ "$launched" -gt 0 ]] && log "tick: launched $launched (live=$have/$cap)"
 
-  # Deadlock detector. Nothing running, nothing launchable, nothing resumable ⇒
-  # no later tick can change state by itself, so idling is pointless — this is
-  # the 7-hour/563-tick silence the F79 stall produced. Counted over consecutive
-  # ticks so a container dying mid-tick cannot trip it; gate-paused ticks return
-  # before this point and never count.
-  if (( have == 0 )) && [[ -z "${PLAN_LAUNCH[*]:-}" && -z "${PLAN_RESUME[*]:-}" ]]; then
+  # Deadlock detector. Nothing running and nothing STARTED ⇒ this tick made no
+  # progress, and no later tick can change that by itself, so idling is
+  # pointless — the 7-hour/563-tick silence the F79 stall produced.
+  #
+  # The test is on the OUTCOME, not on the plan. It used to ask whether
+  # PLAN_LAUNCH and PLAN_RESUME were empty, which is a question about intent,
+  # and it answered "not deadlocked" whenever the plan stayed full of work that
+  # never started: a pool cap of 0 refuses every candidate, a launch that fails
+  # every tick (gitignored worktree, trunk conflict, runner failure) leaves its
+  # unit in the plan, and a resume the budget has retired leaves it there too.
+  # Each reset the counter every tick, so STALL_EXIT_TICKS was never reached and
+  # the run wrote `running` forever — the same founding failure through doors
+  # this detector was not watching, which is why the question is now about the
+  # outcome and not about an enumeration of doors. A tick that launched
+  # something, or that has a live agent, is progress whatever the plan says.
+  #
+  # Counted over consecutive ticks so a container dying mid-tick cannot trip it;
+  # gate-paused ticks return before this point and never count.
+  if (( have == 0 && launched == 0 )); then
     STALL_TICKS=$((STALL_TICKS + 1))
+    STALL_CAUSE="$(idle_cause "$cap")"
   else
     STALL_TICKS=0
+    STALL_CAUSE=""
   fi
   write_state running ""
   return 0
 }
 
-# No live agents, nothing launchable, nothing resumable, and open work left:
-# hand the range to a human instead of spinning. Exits non-zero so the systemd
+# Why the tick that just ended made no progress, in the words the page needs.
+# Four different conditions reach the deadlock exit and they demand different
+# repairs — an empty frontier is a ledger question, a cap of 0 is a pool
+# question, a plan full of launches that all failed is a launch question, and a
+# plan whose units were refused before any launch (a resume the budget retired,
+# say) is none of those. Saying "nothing launchable" over the last three sends
+# the operator to look for missing tasks that are all right there; saying "every
+# launch attempt failed" over a tick that attempted no launch is the same error
+# one step in.
+idle_cause() {  # idle_cause <cap in force>
+  local cap="$1" planned=$(( ${#PLAN_LAUNCH[@]} + ${#PLAN_RESUME[@]} ))
+  local last="${LAST_START_REFUSAL:+; last: $LAST_START_REFUSAL}"
+  if (( planned == 0 )); then
+    printf 'nothing launchable, nothing resumable'
+  elif (( cap == 0 )); then
+    printf 'the pool cap is 0, so %d launchable unit(s) were never started' "$planned"
+  elif (( LAUNCH_FAILURES > 0 )); then
+    # Nothing started and at least one launch was attempted, so every attempt
+    # that was made failed.
+    printf 'every launch attempt failed — %d unit(s) planned, none started%s' "$planned" "$last"
+  else
+    printf '%d unit(s) planned, none started%s' "$planned" "$last"
+  fi
+}
+
+# No live agents, nothing STARTED for STALL_EXIT_TICKS consecutive ticks, and
+# open work left: hand the range to a human instead of spinning. Not the same
+# test as "nothing launchable" — a cap of 0, a launcher that fails every tick,
+# and a resume the budget retired all reach here with a full plan, and
+# idle_cause is what tells them apart in the page. Exits non-zero so the systemd
 # unit reports `failed` rather than sitting green while making no progress.
 stall_exit() {
   local attention inflight reason
@@ -2531,7 +2783,10 @@ stall_exit() {
     claim_list+="${claim_list:+, }$phrase"
   done
   (( inflight > ${#named[@]} )) && claim_list+=", and $((inflight - ${#named[@]})) more"
-  reason="no live agents, nothing launchable, nothing resumable"
+  # The cause the counter actually recorded, not a fixed sentence. "nothing
+  # launchable" is true only when the plan was empty; said over a plan the cap
+  # or a failing launcher refused, it is a page that describes the wrong fault.
+  reason="no live agents; ${STALL_CAUSE:-nothing launchable, nothing resumable}"
   # A stall the drain test's new middle question produced (issue #48) shows the
   # operator `open_tasks: 0` next to `status: stalled`, which on its own reads as
   # "finished, but paged anyway". Name the claims, or the state file explains the
@@ -2545,7 +2800,7 @@ stall_exit() {
   # Same list in both channels, bounded the same way: the state file and the page
   # are read minutes apart by the same person, and two different accounts of one
   # stall is the reason to distrust both.
-  pump_notify "$PHASES STALLED after $STALL_TICKS idle ticks — $(open_count) open task(s) and $inflight in-flight claim(s) remain, none can launch, and no orphaned claim is resumable.${claim_list:+ In flight: $claim_list.} $attention task(s) need human review (blocked/stuck/needs-review)."
+  pump_notify "$PHASES STALLED after $STALL_TICKS idle ticks — $(open_count) open task(s) and $inflight in-flight claim(s) remain: ${STALL_CAUSE:-nothing launchable, nothing resumable}.${claim_list:+ In flight: $claim_list.} $attention task(s) need human review (blocked/stuck/needs-review)."
   exit 3
 }
 
@@ -2812,6 +3067,11 @@ exec_monitor() {
 # wrong plan, and finding that out only at launch time is finding it out too
 # late. No-op at phase grain, where the prefix probe above already answered.
 validate_unit_names
+# And refuse a gate or a pre-tick hook that cannot run, for the same reason one
+# step further out: a chain entry that is skipped is, everywhere the operator
+# can see, a chain entry that passed. Before every mode, --dry-run included.
+validate_chain gate "$(active_gates)"
+validate_chain hook "$(active_hooks)"
 
 case "$MODE" in
   render)
@@ -2946,7 +3206,7 @@ fi
 # run-parallel.sh does, so disk pressure also drops the live pool cap (cap-file
 # path) on top of the feed gate. --auto-exit retires it once no agents remain.
 # Skipped for --once / NO_LAUNCH ticks and when the disk gate is disabled.
-if [[ "$MODE" == "run" && "$DISK_GATE" -eq 1 && "${TASKPUMP_PUMP_NO_LAUNCH:-0}" -ne 1 ]]; then
+if [[ "$MODE" == "run" && "$DISK_GATE" == 1 && "${TASKPUMP_PUMP_NO_LAUNCH:-0}" -ne 1 ]]; then
   nohup "$DISK_WATCHDOG_BIN" --auto-exit \
     >>"$DISK_WATCHDOG_LOG" 2>&1 </dev/null &
   disown "$!" 2>/dev/null || true
@@ -2963,6 +3223,11 @@ CAP_NOTE="live via $CAP_FILE"
 [[ "$JOBS_GIVEN" -eq 1 ]] && CAP_NOTE="--jobs, then live via $CAP_FILE"
 [[ "$JOBS_GIVEN" -eq 1 && "$CAP_FILE_STAMPED" -eq 0 ]] && CAP_NOTE="--jobs (cap file unwritable; no live retuning)"
 log "Pump: phases=$PHASES grain=$GRAIN cap=$(effective_cap) ($CAP_NOTE) ceiling=${CEILING}% tick=${TICK}s"
+# The same line --dry-run prints, from the same function, in the mode that
+# actually spends money. An operator confirms a chain with --dry-run and then
+# starts the real run; if only one of the two ever named the chain, "the plan
+# said the gate was wired" could not be checked against what the run consulted.
+log "gates: $(gate_chain_line)"
 log "Singular supervisor; Ctrl-C stops feeding but leaves running agents. Monitor: $MONITOR_BIN"
 
 # ── Exit honesty (issue #22) ───────────────────────────────────────────────────

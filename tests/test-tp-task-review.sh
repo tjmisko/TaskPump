@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # test-tp-task-review.sh — review gates: reviewer tasks in the DAG (issue #12).
 #
 # The mechanism under test is deliberately thin: `review` synthesizes ordinary

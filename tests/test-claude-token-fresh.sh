@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # test-claude-token-fresh.sh — the token gate's absent-input behaviour.
 #
 # This gate ships in the DEFAULT gate chain, which means it runs on hosts that

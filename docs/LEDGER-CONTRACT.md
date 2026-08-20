@@ -593,6 +593,21 @@ numerically.
 Ids must not contain path separators, whitespace, or characters that are unsafe
 in a filename: an id is a filename.
 
+That rule is checked on the way **in** as well as on the way out. `create` and
+`fsck` validate the id a human types, but a task file can also arrive without
+passing either — written by hand, by an agent with a filesystem, or by a merged
+pull request — so a consumer that reads an id back off disk and hands it to
+another command re-checks it there. `tp cleanup`'s stuck-agent rescue does: an id
+outside **this shape** is named on stderr and left unreleased rather than passed
+on. `TASKPUMP_ID_PATTERN` is a separate question there — it is a naming
+convention, not a safety property, so an id that is filename-safe but off-grammar
+is reported and still released; refusing to free a wedged agent over a
+convention would strand the claim, and `tp task fsck --fix` filters on the same
+pattern and will not repair the file either.
+Ids from `tp task`'s own read paths — `next`, `ready --json`, `list --json` —
+are **not** yet re-checked; treat what they emit as ledger content, not as a
+word you may splice into a command.
+
 ### 7.2 Phase derivation
 
 The phase is the id up to the **first** `.`:
@@ -719,7 +734,14 @@ lose:
 > implement it. **For a consumer writing code against TaskPump today, the tools
 > are authoritative and this note is what to key on**; the frozen table states
 > the intended protocol, and reconciling the two is a behaviour change, which a
-> PATCH release may not make. Both divergences are filed as bugs.
+> PATCH release may not make. The first two entries below are divergences and
+> are filed as [#71](https://github.com/tjmisko/TaskPump/issues/71) (exit 2 is
+> reserved for bad arguments and neither tool ever emits it) and
+> [#72](https://github.com/tjmisko/TaskPump/issues/72) (exit 0 does not mean
+> drained, and the state file cannot tell you either); the third is not a
+> divergence at all but a deliberate
+> widening, recorded here because the table's parenthetical would otherwise read
+> as the whole rule.
 
 **Neither `tp task` nor `tp pump` ever exits 2.** Row `2 | any tool | Bad CLI
 arguments` does not hold for the two tools this contract is about. Both route
@@ -763,6 +785,17 @@ reader does not have to infer the outcome from a process's exit code —
 `drained`, `stalled`, `paused`, `stopped`, each with a reason string. `3` still
 means deadlock unambiguously; `0` means "this invocation finished", and the file
 says what it finished doing.
+
+**`tp pump` exit 3 is wider than the row's parenthetical, on purpose.** Row
+`3 | tp pump` glosses the deadlock as "nothing live, launchable, or resumable
+for N consecutive ticks". The pump asks the question one step later: nothing
+live and **nothing started**, for N consecutive ticks. The narrower predicate
+was the literal implementation once, and it answered "not deadlocked" whenever
+the plan stayed full of work that never started — a pool cap of 0, launches that
+fail every tick, a resume the budget has retired. The code and its meaning are
+unchanged (`3` is deadlock: page a human, restart
+under `Restart=on-failure`); only the set of conditions that reach it is
+complete now. The reason string in the state file names which one it was.
 
 ---
 

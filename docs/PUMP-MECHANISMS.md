@@ -297,13 +297,20 @@ The shipped gates are described in [GATES.md](GATES.md). The pump does not know
 what any of them measure — a gate is an executable that exits 10 to pause and
 prints one line of reason, and gates run in configured order.
 
-**Gates fail open.** A gate that errors, times out, or is missing lets the run
+**A gate that RAN fails open.** A gate that errors or times out lets the run
 continue with a warning. This is the counterintuitive half, and it is not
 negligence: a meter that cannot be read is not evidence of a problem. If an
 unreachable usage endpoint paused the pump, then every transient network blip
 would wedge a multi-day run, and the failure mode of the safety mechanism would
 be worse than the failure it prevents. A gate is a *governor*, not an
 interlock — the sandbox is what enforces safety.
+
+A chain entry the pump could never run at all is the other case, and it takes
+the opposite answer: it **refuses the run** at startup, because a gate that does
+not exist is not a meter being generous, it is an operator who believes they are
+metered and is not ([GATES.md §1.0](GATES.md#10-how-taskpump_gates-is-spelled-and-how-it-fails)).
+A gate that disappears *mid*-drain stays a skip-with-a-warning, since halting a
+live run over it would cost more than it saves.
 
 The pool cap is enforced alongside the gates, and is **live-retunable**: the cap
 is read from a file each tick, so an operator can lower concurrency mid-run
@@ -327,24 +334,30 @@ running build is never broken; and it delegates to `tp cleanup --targets`, which
 does nothing at all unless `TASKPUMP_RECLAIM_CMD` is configured — so an
 unconfigured consumer gets the cap drop and the prune and no deletion. Setting
 that key is what arms the rest. `TASKPUMP_PANIC_RECLAIM=0` keeps the prune and
-drops the build-dir reclaim, and the **flag** `--no-disk-gate` suppresses the
-watchdog spawn along with the gate — the flag, and not the `TASKPUMP_DISK_GATE`
-key, which does not reach this decision at all
-([GATES.md §2.1](GATES.md#21-turning-a-default-gate-off-is-not-symmetric)).
+drops the build-dir reclaim, and turning the disk gate off suppresses the
+watchdog spawn along with the gate — **either way of turning it off**, the flag
+`--no-disk-gate` or the key `TASKPUMP_DISK_GATE=0`, because the spawn is guarded
+on the one switch both of them set. (The key used to be inert here: the pump
+pinned that switch to `1` and read no key, so only the flag reached this
+decision. It now does what it says, which means a conf carrying
+`TASKPUMP_DISK_GATE=0` and expecting the watchdog to keep running loses the
+watchdog — see [GATES.md §2.1](GATES.md#21-turning-a-default-gate-off-is-not-symmetric).)
 
 The reclaim pass *inside* the tick (step 7) is the narrower of the two: it
 touches only the workspaces the plan just filed as `DONE`, never the primary,
 and never one with a live agent.
 
-**Both passes carry the same trap, and it is worth knowing before you rely on
-either.** Neither one asks your reclaim command what to reclaim. Each first
-looks for a directory literally named `target/` and skips anything without one,
-so the whole mechanism is Rust-shaped, and no configuration key overrides that
-name. A project that builds into `build/`, `dist/` or `node_modules/` gets a
-reclaim pass that runs every tick, logs nothing, and frees nothing — with
-`TASKPUMP_RECLAIM_CMD` set and looking configured. The disk discipline you think
-you have is the pool-cap drop and the runtime prune; the build-output half is
-inert.
+**The two passes no longer agree about what "build output" means, and the
+difference decides whether either one frees anything.** Both look for a
+directory before running your reclaim command, and skip a workspace that does
+not have one. The watchdog's pass — `tp cleanup --targets` — takes that
+directory's name from `TASKPUMP_RECLAIM_DIR` (default `target`, empty for "no
+precondition"), and says so when nothing matched. The pump's per-tick pass still
+hardcodes `target/`: on a project that builds into `build/`, `dist/` or
+`node_modules/` it runs every tick, logs nothing, and frees nothing — with
+`TASKPUMP_RECLAIM_CMD` set and looking configured. So on a non-Rust project the
+per-tick half of the build-output discipline is still inert, and the panic sweep
+is the half that works once `TASKPUMP_RECLAIM_DIR` names your build directory.
 
 ---
 
@@ -421,12 +434,57 @@ meant to stop it.
 
 ### Deadlock exit
 
-The other half of the fix: when nothing is live, launchable, *or* resumable for
-N consecutive ticks, the pump **notifies and exits 3** rather than idling green.
-`systemd`'s `Restart=on-failure` catches it; a drained pump exits 0 and is
-deliberately not restarted.
+The other half of the fix: when a tick ends with **nothing live and nothing
+started**, N consecutive times, the pump **notifies and exits 3** rather than
+idling green. `systemd`'s `Restart=on-failure` catches it; a drained pump exits 0
+and is deliberately not restarted.
 
 N is greater than one so a container dying mid-tick cannot trip it.
+
+**The counter reads the outcome of the tick, not the plan**, and that distinction
+is the whole mechanism. It first asked whether anything was *launchable* —
+whether `PLAN_LAUNCH` and `PLAN_RESUME` were empty — which is a question about
+intent rather than about progress, and it answered "not deadlocked" whenever the
+plan stayed full of work that never started. Two of those are where the
+supervisor is most stuck:
+
+- **a pool cap of 0.** Every candidate is refused by the cap, the plan stays
+  full, and the counter reset every tick. The run wrote `status: running`
+  indefinitely over work it would never start.
+- **a launch that fails every time.** `launch_unit` returns 1 with a warning on
+  three paths — a worktree a global `core.excludesFile` still ignores, a
+  worktree that conflicts with the integration trunk, and a runner that will not
+  start — and none of them removes the unit from the plan. The pump warned once
+  per tick, forever, and stayed green. The gitignored-worktree arm is not
+  hypothetical: that exact condition is what made the 2026-08-13 canary launch
+  nothing.
+
+A third, quieter one is a `RESUME` candidate refused before any launch — the
+resume budget retiring a task escalates it and returns, leaving the unit in the
+plan for that tick.
+
+All of them are the same failure the detector exists to catch, arriving through
+doors it was not watching, and enumerating doors is how a detector goes stale.
+Asking "did this tick start anything?" closes every one of them with a single
+question, because a tick that started nothing and has nothing running made no
+progress by definition — while a tick that launched something, or that has a
+live agent, is progress whatever the plan says.
+
+The page has to name which one it was. `stall_exit` records the cause of the
+idle ticks and quotes it:
+
+- `nothing launchable, nothing resumable` — the frontier really was empty;
+- `the pool cap is 0, so 4 launchable unit(s) were never started`;
+- `every launch attempt failed — 4 unit(s) planned, none started; last: <the
+  last refusal>` — at least one launch was attempted and every attempt failed;
+- `4 unit(s) planned, none started; last: <the last refusal>` — nothing started,
+  but no launch was attempted either. The resume budget retiring a task is this
+  case: `resume_unit` escalates to `needs-review`, pages, and returns without
+  ever reaching `launch_unit`, so calling that a failed launch attempt would
+  describe a launch that never happened.
+
+They demand different repairs, and "nothing launchable" said over a plan that
+was full sends the operator to look for missing tasks that are all right there.
 
 A range with **zero open tasks** can reach this exit too, and must: the drain
 test asks about in-flight claims as well as open tasks, so a claim nobody is
@@ -516,7 +574,7 @@ For a supervisor re-implementing these mechanisms against the same ledger:
 |---|---|
 | 1. Frontier | Eligibility is `open ∧ blockers all done`, recomputed per query. `--count` (all open in range) vs `--count-eligible` (frontier size) answer the drain test and the stall test respectively — with the drain test additionally requiring no `in_progress` task in range, since a claim is not `open` and unfinished work must never read as finished. At task grain, concurrency additionally requires disjoint declared `files:`; an empty list is exclusive. |
 | 2. Liveness | Never derived from task status. An orphan with no commits is released to `open`; an orphan with commits is not. |
-| 3. Gates | Exit 10 = pause launching. Exit 0 = feed. Anything else = fail open with a warning. Never kills a running agent. |
+| 3. Gates | Exit 10 = pause launching. Exit 0 = feed. Anything else = fail open with a warning. A chain entry that cannot be run at all refuses the run at startup instead. Never kills a running agent. |
 | 4. Resume | Bounded by a no-progress counter in the ledger, reset by branch-head movement, exhausting to `needs-review`. Deadlock exits 3; drained exits 0. |
 | 5. Tripwires | Turn budget → `needs-review`; failure streak → `stuck`; staleness → `needs-review`. All reopenable. |
 | 6. Resolution | Caller's workspace, explicit configuration wins, resolution is inspectable. |

@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # tp dag-render -- render the task DAG for a phase range as a layered ASCII
 # graph, for the tp-monitor GRAPH tab.
 #

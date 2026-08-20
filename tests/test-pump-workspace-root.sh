@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # test-pump-workspace-root.sh — the pump's context must be the CALLER's, not
 # its own (issues #32, #31). Shared root cause: an anchor derived from the
 # pump's own location — the install dir for REPO_ROOT, the resolved $0 plus a

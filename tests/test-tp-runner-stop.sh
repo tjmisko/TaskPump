@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # test-tp-runner-stop.sh — the `stop` half of RUNNER CONTRACT v1.
 #
 # docs/RUNNERS.md §1.2 promises stop is idempotent: "stopping an agent that is

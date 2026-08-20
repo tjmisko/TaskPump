@@ -307,19 +307,22 @@ the directory, `TASKPUMP_MONITOR_NOTES_DIR` relocates it, and
 `TASKPUMP_MONITOR_NOTES_FILE` overrides the resolved path outright. Add the
 directory to `.gitignore`.
 
-#### It talks to `docker` by name
+#### Which container runtime it talks to
 
-Every other tool in the tree reaches the container runtime through
-`apl_docker`, which resolves `TASKPUMP_DOCKER`, then `DOCKER`, then `docker`.
-The monitor does not: its disk gauge, its session sweep and its GRAPH-tab
-liveness read all invoke a literal `docker`. On a host running `podman` — with
-`TASKPUMP_DOCKER=podman` configured and honoured by the pump, the runner and
-`tp cleanup` — the monitor's SESSIONS tab reports `(no tp-agent containers
-running or recently exited)` for a fleet that is running perfectly well, and the
-GRAPH tab draws every claimed task as `⧗ claimed, idle` rather than
-`▶ in progress`.
-Filed as a code bug. There is no workaround inside the monitor; a `docker` shim
-on `PATH` is the only lever.
+The same one everything else does. The monitor reaches the runtime through
+`apl_docker` (`lib/pump-lib.sh`), which resolves `TASKPUMP_DOCKER`, then
+`DOCKER`, then `docker`, and it resolves it **once at startup** — the disk
+gauge's runtime breakdown, the session sweep and the GRAPH tab's liveness signal
+all speak to that one binary.
+
+It did not always. Those three call sites used to spell `docker`
+literally, so on a host running `podman` — with `TASKPUMP_DOCKER=podman`
+configured and honoured by the pump, the runner and `tp cleanup` — the SESSIONS
+tab reported `(no tp-agent containers running or recently exited)` for a fleet
+that was running perfectly well, the GRAPH tab drew every claimed task as
+`⧗ claimed, idle` rather than `▶ in progress`, and the disk gauge lost its
+`docker img … · cont …` line. A supervisor's dashboard lying about the fleet it
+is supervising, with no in-tool workaround.
 
 #### Where it reads, and what it caches
 
@@ -335,6 +338,54 @@ therefore tens of milliseconds and the first frame is instant; cold caches show
 `…` placeholders that fill in within a couple of seconds. The three TTLs are the
 docker session table (2s), the eligible-frontier scan (8s — it is a ~3s scan, far
 too slow to run every paint) and the disk sizing (60s).
+
+#### Nothing it displays can repaint it
+
+Every string on this dashboard was written by somebody else: a task's title and
+goal come out of the ledger, a branch out of a claim, a feed line out of an
+agent's log — which routinely quotes repository content back. A terminal
+executes what it is handed, so raw CSI in any of those repaints a `blocked` row
+green, `ESC[2K\r` erases the line being read and writes another, `ESC[1A` walks
+back over the row above, and an OSC sets the window title. The panel an operator
+uses to decide whether a drain is healthy is precisely the thing worth forging.
+
+So every value that reaches a row from a source the operator does not write —
+the ledger, the container runtime, an agent's log, the pump state file, the
+filesystem — goes through `lib/tty-safe.sh`'s `tp_display_safe`: TAB folded to a
+space, every other C0 byte and DEL dropped, and C1 dropped in both encodings it
+can arrive in (`0xC2` followed by `0x80`–`0x9F`, and a bare `0x80`–`0x9F` byte
+standing outside any UTF-8 sequence). Well-formed UTF-8 is left byte-for-byte
+alone, so the words survive. What is *not* stripped is a `0x80`–`0x9F` byte that
+is part of a legal character — `→` is `0xE2 0x86 0x92` — which a terminal
+decoding UTF-8 does not read as a control and a terminal in 8-bit mode does; see
+`lib/tty-safe.sh`'s header for why no strip can keep UTF-8 and also emit no C1
+byte.
+
+It is applied where the value is **composed**, not where it is printed: the
+session records are sanitised in the background worker before they reach the TSV
+cache, because the paint path later truncates those rows to the terminal width
+and truncating a half-sanitised row is how you cut a control sequence in two.
+The GRAPH tab's node index gets the same treatment on load, the pump summary
+line and the disk breakdown likewise. The monitor's own palette is composed
+*around* sanitised values and is unaffected.
+
+Three things are deliberately **not** covered, and all three are worth knowing:
+
+- **The GRAPH tab's canvas.** It is drawn by `tp dag-render`, and the monitor
+  prints that output as it arrives. Whatever the renderer does with a task id or
+  title is the renderer's business; the monitor sanitises the detail bar above
+  the canvas, not the canvas itself.
+- **The notes panel.** Those lines are the operator's own, typed at the `n`
+  prompt or edited into the notes file by hand, and by default they live in the
+  primary checkout — which the container runner mounts **read-only**, so an
+  agent has no path to them. They are printed as written.
+- **The task id in the GRAPH index.** It is the key every lookup and the `o`
+  open are done by, and a rewritten key names nothing, so it is kept raw and
+  sanitised at its one print site (the detail bar) instead. The SESSIONS cache
+  is the other way round: there the id is a *field* of a TSV record, so it is
+  sanitised with the rest of the row and `o` on that tab opens by the sanitised
+  value — a task whose id carried control bytes would not open from there.
+  `tp task create` refuses to make such an id (`TASKPUMP_ID_PATTERN`).
 
 ---
 
@@ -359,7 +410,11 @@ Modifiers: `--dry-run` prints what each step would run instead of running it, an
 `--include-primary` extends `--targets` to the primary checkout's own build
 output — off by default so a human's in-progress build is never wiped without
 asking. `-h`/`--help` exits 0; no mode, an unknown argument, two modes, or a
-configured-but-missing `TASKPUMP_MANIFEST` all exit **2**.
+configured-but-missing `TASKPUMP_MANIFEST` all exit **2**; a sweep whose
+`TASKPUMP_RECLAIM_CMD` returned non-zero in at least one workspace exits **3**
+(`--all` included — the failure is not lost behind the later steps), because a
+reclaim that failed bought no space and the caller driving it unattended has to
+be able to tell.
 
 The stuck heuristic is worth stating precisely, because it decides whether a
 container gets killed: **a running agent container whose agent log's mtime is
@@ -374,25 +429,102 @@ and their newest-heartbeat election and cannot disagree with them about which
 claim is live. `TASKPUMP_MANIFEST` is an opt-in fallback for a consumer still
 launching from a v1 TSV manifest; it has no default path, and a container that
 maps to neither is reported rather than guessed at: `no live ledger claim (and no
-manifest row) maps this container to a task; skipping the task release`.
+manifest row) maps this container to a task; skipping the task release`. That
+line means exactly what it says — **neither** source named this container — and
+nothing else reuses it.
 
-#### Two traps in `--targets`
+The id that claim carries is validated before it is used, and the two things that
+can be wrong with it are reported differently:
 
-**`TASKPUMP_RECLAIM_CMD` is a switch here, not a command.** The sweep runs only
-when the key is set — but what it then runs is `cargo clean` where a
-`Cargo.toml` is present and `rm -rf <dir>/target` otherwise, *regardless of the
-key's value*. Demonstrated on a fixture:
+**Unsafe refuses.** The §7.1 shape — "an id is a filename", so no path separator,
+no whitespace, nothing outside `A-Za-z0-9._-`, no leading `-` (every CLI would
+read it as a flag), and not empty, `.` or `..` — is what makes an id safe to pass
+as a path component and as one argv word. A task file can reach
+the ledger without passing `tp task create`'s check (written by hand, by an agent
+with a filesystem, by a merged pull request), so an id that fails this is named on
+stderr and the claim is left for a human rather than handed to another command:
+
+```
+WARN: ignoring the live ledger claim held by branch 'feat/e': task id G9.1\'\;\ touch\ /tmp/pwned\;\ echo\ \' contains \', which is not safe in a path or a command argument
+      Fix the task file's frontmatter (`tp task fsck` names it) and release the claim by hand.
+[…]   tp-agent-feat-e: the live ledger claim for this container names an id this tool refuses to pass on (the WARN above says what is wrong); its task claim is NOT released — fix the id, then 'tp task release <id>'
+```
+
+The id is printed with `printf %q`, so the quoting it would need is shown rather
+than lost: `\'` is one apostrophe, not three characters of decoration.
+
+The remedy line follows the source: a bad id in a `TASKPUMP_MANIFEST` row says
+`Fix that row in <path>` instead, because it is not in any task file and
+`tp task fsck` will not find it.
+
+**Off-grammar only warns.** `TASKPUMP_ID_PATTERN` is the project's own naming
+convention, not a safety property: an id like `F79.2` under a conf pinning
+`^G[0-9]+…` is still one safe word. Refusing over it would leave a wedged agent's
+claim held — and `tp task fsck --fix` filters on the same pattern, so it will not
+repair the file either. The rescue says so and releases the claim anyway:
+
+```
+WARN: the live ledger claim held by branch 'feat/e': task id ZZ9 does not match TASKPUMP_ID_PATTERN ^T[0-9]+(\.[0-9]+)?$
+      Proceeding anyway — the id is safe to hand on as one argument, and a wedged agent is worse than an off-grammar id. Fix the task file's frontmatter (`tp task fsck` names it) and release the claim by hand.
+  (dry-run) …/tp-task release ZZ9 --reason tp-cleanup:\ stuck\ \(log\ idle\ 120min\)
+```
+
+#### What `--targets` runs, and where
+
+**`TASKPUMP_RECLAIM_CMD` is the command.** The sweep runs only when the key is
+set, and what it runs is that key's value, with each workspace as the working
+directory — the same key, with the same meaning, that the pump's per-tick reclaim
+pass executes:
 
 ```
 $ TASKPUMP_RECLAIM_CMD='echo MY-CUSTOM-RECLAIM' tp cleanup --targets --dry-run
 […]   worktree: …/.worktrees/feat/a/target (16K)
-  (dry-run) rm -rf '…/.worktrees/feat/a/target'
+  (dry-run) cd …/.worktrees/feat/a && echo MY-CUSTOM-RECLAIM
 ```
 
-The pump's own per-tick reclaim pass is the one that executes the key verbatim.
-If your project is not Rust-shaped, `tp cleanup --targets` will either find no
-`target/` and do nothing, or delete a directory called `target/` that means
-something else to you. Preview with `--dry-run` before trusting it.
+It used to be a *switch*: any value armed a hardcoded `cargo clean` /
+`rm -rf <dir>/target` pair and the value itself was never read, so a consumer who
+set the key to their project's real reclaim command got the Rust sweep instead.
+
+**`TASKPUMP_RECLAIM_DIR` decides which workspaces are worth reclaiming**
+(default `target`). It is a *probe*, not the thing that gets deleted: a workspace
+with no such directory is skipped, and one that has it gets `TASKPUMP_RECLAIM_CMD`
+run in it. Set it to whatever your build writes — `build`, `dist`,
+`node_modules` — or to the empty string to drop the precondition and run the
+reclaim command in every idle workspace. When nothing matches, the sweep says so
+and names the key:
+
+```
+$ tp cleanup --targets --dry-run
+[…] nothing to reclaim: no workspace under …/.worktrees/*/* has a target/ (set TASKPUMP_RECLAIM_DIR to the directory your build writes, or empty to run TASKPUMP_RECLAIM_CMD in every idle workspace)
+```
+
+Note what the empty value costs on the **primary** arm. `--include-primary` is
+gated by that same probe, so with `TASKPUMP_RECLAIM_DIR=''` there is no
+precondition left on it at all: the command runs in the primary checkout every
+time `--include-primary` is passed, and the disk watchdog's PANIC sweep always
+passes it. The sweep says so where it happens; list the primary root in
+`TASKPUMP_EXTRA_BUSY_DIRS` if a human may be building there.
+
+**A reclaim command that fails is not a reclaim.** The per-workspace `WARNING:
+TASKPUMP_RECLAIM_CMD failed in <dir>` is counted as a failure, not a success: the
+summary reads `reclaimed N worktree workspace(s); skipped M; FAILED K …` and the
+sweep exits 3. An arbitrary consumer command fails routinely — `npm run clean` in
+a workspace with no `package.json`, a toolchain that is not installed — where the
+hardcoded `rm -rf` it replaced essentially never did.
+
+The pump's own per-tick reclaim pass still carries the hardcoded `target/`
+precondition; on a project whose build output is elsewhere it frees nothing
+per-tick, and `tp cleanup --targets` (which the disk watchdog drives under PANIC)
+is the pass that works.
+
+**A workspace whose directory name this stack cannot carry is skipped, with a
+warning.** Directory names under the worktrees base are chosen by whoever can
+create a directory there, so a name containing anything outside
+`[A-Za-z0-9._/-]` is refused rather than swept. Such a workspace's build output
+is then never reclaimed by this sweep at all, so remove it by hand — the pump can
+still create one (`apl_branch_slug_reject_reason` admits `'`, `$` and `(`, which
+this skip does not), and that gap is open.
 
 **The workspace is the install root, not the caller's.** `REPO_ROOT` here
 defaults to the parent of the script's own directory — not to `$PWD`'s git
@@ -402,10 +534,23 @@ in any vendored layout (TaskPump as a submodule or subtree) `tp cleanup
 --targets` sweeps the *vendored TaskPump checkout's* `.worktrees/` and leaves the
 consumer's alone. Set `TASKPUMP_CLEANUP_REPO_ROOT` — or
 `TASKPUMP_WORKTREES_DIR`, which it also honours — to point it at the real one.
+The one caller that no longer needs telling is `tp disk-watchdog`: its PANIC
+sweep passes its own resolved workspace down as `TASKPUMP_CLEANUP_REPO_ROOT`.
 
-Finally: the extra-busy-directory list is read as the **unprefixed**
-`EXTRA_BUSY_DIRS`. There is no `TASKPUMP_` spelling of it in the code, so
-`TASKPUMP_EXTRA_BUSY_DIRS` skips nothing.
+Finally: the extra-busy-directory list is read as `TASKPUMP_EXTRA_BUSY_DIRS`,
+with the unprefixed `EXTRA_BUSY_DIRS` still honoured as the legacy spelling, and
+the two are **unioned** — not ranked. Ranking them would silently unprotect
+everything the losing spelling named, which is the same harm as not reading the
+key at all: the live `arachne-disk-guard` chain passes the bare name on its
+command line while a conf (or `lib/config.sh`'s generic `ARACHNE_`→`TASKPUMP_`
+promotion) supplies the prefixed one, so both are routinely set at once by
+different parties. The skip line names the spelling that matched, or both:
+
+```
+  skip: …/.worktrees/feat/a — busy (TASKPUMP_EXTRA_BUSY_DIRS)
+  skip: …/.worktrees/feat/b — busy (EXTRA_BUSY_DIRS)
+  skip: …/.worktrees/feat/c — busy (TASKPUMP_EXTRA_BUSY_DIRS + EXTRA_BUSY_DIRS)
+```
 
 ---
 
@@ -499,6 +644,28 @@ when they mention `error`/`failed`/`panicked` (red, last 15 lines) or `test
 result`/`Finished`/`warning` (dim, last 3 lines). Everything else is dropped, so
 a quiet run prints nothing between the tool calls.
 
+**Nothing in the stream can steer your terminal.** Every field this prints was
+written by somebody else — an agent's narration, a tool call's arguments, and,
+worst, the stdout of a command the agent ran over whatever the repository
+contains. So each is passed through `lib/tty-safe.sh`'s `tp_display_safe`, which
+folds TAB to a space and drops every other C0 byte, DEL, and C1 in both
+encodings — `0xC2` followed by `0x80`–`0x9F`, and a bare `0x80`–`0x9F` byte
+standing outside any UTF-8 sequence. The words survive and well-formed UTF-8 is
+untouched, which is also the limit of it: a `0x80`–`0x9F` byte inside a legal
+multi-byte character is kept, and on a terminal running in 8-bit mode that byte
+is a control (`lib/tty-safe.sh`'s header says why no strip can have it both
+ways). The colours above are the only escapes the tool emits, and they wrap the
+sanitised text rather than coming out of it.
+
+This is not hypothetical hardening. The printer used `echo -e`, which *expands*
+backslash escapes — so a literal `\e[2J` sitting in a test fixture, harmless in
+the JSON and harmless to `jq`, became a real screen-clear on the way to the
+operator's terminal. Add an OSC and it rewrites the window title; add `ESC[<n>A`
+and it walks back over the failure lines already on screen and overwrites them
+with `0 errors, all tests passed`. The command an operator is told to watch a
+multi-day drain with was the one place a hostile repository could write directly
+onto their screen. `tests/test-tp-stream-fmt.sh` holds both halves of it.
+
 ---
 
 ### `tp agent-watchdog`
@@ -558,51 +725,98 @@ The loop is a three-state machine over free space on `TASKPUMP_DISK_MOUNT`
 
 Anything between the pause and recover thresholds holds the current state. The
 "original cap" is `TASKPUMP_ORIGINAL_CAP`, else whatever the cap file held at
-startup, else `TASKPUMP_JOBS_FALLBACK` (6). `TASKPUMP_PANIC_RECLAIM=0` keeps the
-prune but never touches build directories. `--gate` answers against the *pause*
-threshold only and **fails open**: a mount it cannot read is `free=unknown —
-failing open (feed OK)`, exit 0.
+startup — **unless that is `0`**, which is somebody else's pause and not a cap to
+restore to (a watchdog that adopted it would "recover" to zero and hold the wedge
+it was started to clear) — else `TASKPUMP_JOBS_FALLBACK` (6). The startup line
+says which: `original_cap=6 (…/.taskpump-pool-cap held 0, which is a pause and
+not a cap; fell back)`. `TASKPUMP_PANIC_RECLAIM=0` keeps the prune but never
+touches build directories. `--gate` answers against the *pause* threshold only
+and **fails open**: a mount it cannot read is `free=unknown — failing open (feed
+OK)`, exit 0.
 
-#### Two reasons the cap-file path may do nothing
+Its PANIC sweep also checks `tp cleanup`'s exit status: a reclaim whose command
+failed logs `WARNING: the reclaim sweep reported failures … assume it bought no
+space` rather than letting the transcript read as though the panic was answered.
+
+#### The cap-file path, and how it used to fail
 
 The pump auto-starts this watchdog for every real run with the disk gate on
 ([CLI-PUMP.md §9](CLI-PUMP.md#9-side-effects-of-a-real-run)), described there as
-belt-and-suspenders on top of the `disk-low` feed gate. At this revision the
-belt is not attached:
+belt-and-suspenders on top of the `disk-low` feed gate. The belt is attached: the
+watchdog resolves the workspace the same way the pump does, and a `0` in the cap
+file caps at zero.
 
-**The cap file it writes is resolved from the install root.** Like `tp cleanup`,
-this tool's `REPO_ROOT` defaults to the parent of its own script directory rather
-than to the caller's git worktree. Run from a consumer repo with no
-`TASKPUMP_STATE_DIR` set, it names the *installation's* cap file while the pump
-reads the *workspace's*:
+**The cap file is the workspace's.** `REPO_ROOT` here is resolved through the
+same workspace rule the pump, the monitor, `tp task` and `tp dag-render` use — a
+discovered `taskpump.conf`'s directory, else the caller's git worktree, else the
+install root — so both processes name the same file:
 
 ```
-$ cd ~/project && FREE_GB_OVERRIDE=1 tp disk-watchdog --once --dry-run
-[…]   (dry-run) would set pool cap  → 0 via /path/to/taskpump/.taskpump-pool-cap
+$ cd ~/project && FREE_GB_OVERRIDE=1 tp disk-watchdog --once
+[…]   pool cap  → 0 (/home/you/project/.taskpump-pool-cap)
 $ cd ~/project && tp pump --phases T1 --once
-[…] Pump: … cap=4 (live via /home/you/project/.taskpump-pool-cap) …
+[…] Pump: … cap=0 (live via /home/you/project/.taskpump-pool-cap) …
 ```
 
-`TASKPUMP_POOL_CAP_FILE` or `TASKPUMP_STATE_DIR` — set in the `taskpump.conf`
-both processes discover, so they cannot diverge — fixes this.
+`TASKPUMP_WORKSPACE_ROOT` pins it explicitly, exactly as it does for the pump,
+and `TASKPUMP_POOL_CAP_FILE` / `TASKPUMP_STATE_DIR` still override the filename
+outright. It used to default to the parent of its own script directory — the
+*installation* — so from a consumer repo it wrote a cap file the pump never read
+while logging `pool cap → 0` as though it had throttled something.
 
-**And a cap file containing `0` is ignored anyway.** The shared cap reader takes
-the file's value only when it is `>= 1`, so a `0` falls through to the caller's
-own `JOBS`:
+**A cap file containing `0` means launch nothing.** The shared cap reader used to
+take the file's value only when it was `>= 1`, so the only number this watchdog
+ever writes fell through to the caller's own `JOBS`:
 
 ```
 $ echo 0 > .taskpump-pool-cap && tp pump --phases T1 --list | head -1
-tp-pump plan — phases T1, grain phase, cap 4, ceiling 95%
+tp-pump plan — phases T1, grain phase, cap 0, ceiling 95%
 $ echo 2 > .taskpump-pool-cap && tp pump --phases T1 --list | head -1
 tp-pump plan — phases T1, grain phase, cap 2, ceiling 95%
 ```
 
-So `set_cap 0` under `PAUSED` and `PANIC` does not stop the pump launching. The
-`disk-low` feed gate does, and it is the mechanism actually holding the line —
-which is why `--no-disk-gate` turning off both the gate *and* the watchdog is
-less lossy than it looks. Both of these are filed as code bugs; until they are
-fixed, treat the watchdog's reclaim and prune as its useful half and the gate as
-the thing that governs the feed.
+A file with no digits in it at all is still garbage and still falls back to
+`JOBS`. The `disk-low` feed gate remains the other half of the mechanism, so
+`--no-disk-gate` still turns off both the gate and the watchdog together.
+
+**…and a `0` is only as good as the process holding it.** The pump does not
+overwrite an existing cap file unless `--jobs` was passed, so without a liveness
+rule a `0` left behind by a killed watchdog caps the *next* unattended run at
+zero: it launches nothing while nothing is wrong with the disk, and whether the
+supervisor then idles or gives up, the cap it is obeying is wrong either way.
+Three mechanisms keep that from happening, and they are worth knowing together:
+
+1. **The pause is re-stamped while it is held.** Every poll in `PAUSED`/`PANIC`
+   touches the cap file. No log line — nothing has changed — but the mtime is the
+   evidence that somebody is still holding it.
+2. **It is handed back on the way out.** The watch loop's `EXIT`/`INT`/`TERM`
+   path restores the original cap if the file still reads `0`, saying
+   `releasing the pool-cap pause on exit: a 0 left in … would pause the next run
+   too`. (`--once` deliberately does not: its cap is meant to outlive it, and
+   rule 3 is what ends that one. `--gate` never writes a cap at all.) While no
+   watchdog runs, the `disk-low` feed gate — not this file — is what holds the
+   line under pressure.
+3. **An unrefreshed `0` expires.** A `0` whose file has not been touched for
+   `TASKPUMP_POOL_CAP_STALE_SEC` (default 900s, 30× the default poll) is ignored
+   by the cap reader, which says so once and clears the file to the cap actually
+   in force:
+
+   ```
+   WARNING: pool cap file …/.taskpump-pool-cap has held 0 for 7200s with nothing refreshing it (TASKPUMP_POOL_CAP_STALE_SEC window: 900s).
+            A live tp-disk-watchdog re-stamps its pause every poll, so nothing is holding this one any more — using cap 4 and cleared it to 4.
+   ```
+
+   Set `TASKPUMP_POOL_CAP_STALE_SEC=0` to disable the expiry — for a pause
+   written by hand that must outlive every watchdog. A **positive** cap never
+   expires: `echo 3 > .taskpump-pool-cap` is a standing operator preference, not
+   a pause, and nothing has to keep proving it. The heartbeat has to beat faster
+   than the window, so a `TASKPUMP_DISK_POLL` at or above it is called out at
+   startup (`WARNING: poll 1200s >= TASKPUMP_POOL_CAP_STALE_SEC 900s …`) — with
+   the defaults, 30s against 900s, there is 30× of margin.
+
+Its PANIC sweep also passes its resolved workspace to `tp cleanup` as
+`TASKPUMP_CLEANUP_REPO_ROOT`, so the reclaim runs against the workspace being
+guarded rather than against whatever `tp cleanup` would have resolved for itself.
 
 ---
 

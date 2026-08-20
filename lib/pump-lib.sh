@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # pump-lib.sh — shared helpers for the supervisor, its gates, its hooks, and the
 # rescue tools.
 #
@@ -139,17 +141,88 @@ apl_network_unhealthy() {
 # meant. One constant, two documented consumers.
 : "${TASKPUMP_JOBS_FALLBACK:=6}"
 
+# How long a cap of 0 stays believable without anything refreshing it. A live
+# tp-disk-watchdog re-stamps the file's mtime on every poll for exactly as long
+# as it is holding the pause, so an unrefreshed 0 is evidence that whoever wrote
+# it is gone. 0 disables the expiry (a hand-written pause meant to outlive every
+# watchdog); the default is 30x the watchdog's default 30s poll.
+: "${TASKPUMP_POOL_CAP_STALE_SEC:=900}"
+
+# apl_file_age_sec <path> — whole seconds since <path> was last modified. Exits
+# 1 with no output when it cannot be stat'ed at all, so a caller can tell "old"
+# apart from "unknown" instead of treating an unreadable file as ancient.
+apl_file_age_sec() {
+  local f="$1" now mt
+  now="$(date +%s)" || return 1
+  mt="$(stat -c '%Y' "$f" 2>/dev/null || stat -f '%m' "$f" 2>/dev/null)" || return 1
+  [[ "$mt" =~ ^[0-9]+$ ]] || return 1
+  echo $(( now - mt ))
+}
+
 # apl_read_cap — the live concurrency cap: CAP_FILE's contents if it holds a
-# positive integer (live-retunable mid-run), else the caller's JOBS, else
+# non-negative integer (live-retunable mid-run), else the caller's JOBS, else
 # TASKPUMP_JOBS_FALLBACK. Lets an operator `echo 3 > .taskpump-pool-cap` without
 # restarting the supervisor.
+#
+# ZERO IS A VALUE, not garbage. It is the one number the disk watchdog ever
+# writes — `set_cap 0` is how PAUSED and PANIC stop new launches — and this
+# reader used to require `>= 1`, so that 0 fell through to the caller's JOBS and
+# the pump kept launching at full cap through the pressure the watchdog had
+# already detected and logged (B8). A cap of 0 means launch nothing; a file that
+# holds no digits at all is still garbage and still falls back.
+#
+# ...but a 0 IS A HELD PAUSE, and a pause nobody is holding any more is a wedge.
+# Honouring 0 with no liveness rule is how a watchdog killed mid-PANIC caps the
+# NEXT unattended run at zero, forever, silently: the pump does not overwrite an
+# existing cap file unless --jobs was passed, so the number outlives the process
+# whose state it described. A watchdog that is still alive re-stamps the file
+# every poll, so a 0 older than TASKPUMP_POOL_CAP_STALE_SEC is not being held by
+# anything, and is expired here — named on stderr, and rewritten with the cap
+# actually in force so the file stops lying and the warning is said once rather
+# than every tick. A POSITIVE cap never expires: `echo 3 > .taskpump-pool-cap` is
+# a standing operator preference, not a pause, and nothing has to keep proving it.
 apl_read_cap() {
   local c="${JOBS:-$TASKPUMP_JOBS_FALLBACK}"
-  if [[ -n "${CAP_FILE:-}" && -f "$CAP_FILE" ]]; then
-    local v; v="$(tr -dc '0-9' < "$CAP_FILE" 2>/dev/null || true)"
-    [[ -n "$v" && "$v" -ge 1 ]] && c="$v"
+  [[ -n "${CAP_FILE:-}" && -f "$CAP_FILE" ]] || { echo "$c"; return 0; }
+  local v; v="$(tr -dc '0-9' < "$CAP_FILE" 2>/dev/null || true)"
+  [[ "$v" =~ ^[0-9]+$ ]] || { echo "$c"; return 0; }
+  if [[ "$v" != "0" ]]; then echo "$v"; return 0; fi
+
+  local window="${TASKPUMP_POOL_CAP_STALE_SEC:-900}" window_note="" age
+  # A window that is not a number falls back to the default — and SAYS it did,
+  # in the same breath as the number it used, because a silently-ignored config
+  # value is the defect this whole file keeps closing.
+  if ! [[ "$window" =~ ^[0-9]+$ ]]; then
+    window_note="; the configured value $(printf '%q' "$window") is not a number and was ignored"
+    window=900
   fi
+  # No expiry configured, or an mtime we cannot read: honour the pause. Refusing
+  # to pause because a stat failed would be the same class of error in reverse.
+  if (( window == 0 )) || ! age="$(apl_file_age_sec "$CAP_FILE")"; then
+    echo 0; return 0
+  fi
+  if (( age <= window )); then echo 0; return 0; fi
+
+  apl_expire_cap_pause "$age" "$window" "$c" "$window_note" >&2
   echo "$c"
+}
+
+# apl_expire_cap_pause <age-sec> <window-sec> <cap-in-force> [window-note] — say,
+# on stdout, that the cap file's 0 is no longer being held by anything, and clear
+# it back to the cap actually in force. Split out of apl_read_cap so the reader
+# stays one screen and so the message and the repair cannot drift apart:
+# whichever branch the rewrite takes is the branch the sentence describes.
+apl_expire_cap_pause() {
+  local age="$1" window="$2" c="$3" window_note="${4:-}" repair
+  if printf '%s\n' "$c" >| "$CAP_FILE" 2>/dev/null; then
+    repair="cleared it to $c"
+  else
+    repair="could NOT rewrite it (permissions?), so this warning repeats until the file is removed"
+  fi
+  printf 'WARNING: pool cap file %s has held 0 for %ss with nothing refreshing it (TASKPUMP_POOL_CAP_STALE_SEC window: %ss%s).\n' \
+    "$CAP_FILE" "$age" "$window" "$window_note"
+  printf '         A live tp-disk-watchdog re-stamps its pause every poll, so nothing is holding this one any more — using cap %s and %s.\n' \
+    "$c" "$repair"
 }
 
 # apl_repair_worktree_gitignore — undo the gh-worktree `.worktrees/` ignore
@@ -216,6 +289,88 @@ apl_agent_prefix() { printf '%s' "${TASKPUMP_AGENT_PREFIX:-tp-agent-}"; }
 # apl_docker — the container-runtime binary. TASKPUMP_DOCKER is the canonical
 # spelling; DOCKER is the legacy one every existing harness sets.
 apl_docker() { printf '%s' "${TASKPUMP_DOCKER:-${DOCKER:-docker}}"; }
+
+# ── Name safety: what may be carried as a path component or an argument ───────
+# The characters a name may use if it has to survive being a directory name, a
+# container name, and a word in a command this stack builds. Everything outside
+# it — a quote, a `$`, a `;`, a newline, a space — is refused at the boundary
+# rather than escaped at each of the dozen places it is later spliced, because
+# the escaping is what keeps going wrong (PI-C1: a ledger id carrying `'; …`
+# reached tp-cleanup's host eval).
+APL_SAFE_NAME_CHARS='A-Za-z0-9._-'
+
+# apl_unsafe_name_reason <what> <value> [extra-allowed] — one line naming the
+# first character of <value> outside the safe set (plus any characters in
+# <extra-allowed>, e.g. `/` for a path), and exit 1. Nothing and exit 0 when
+# every character is safe. An empty <value> is safe here: emptiness is a
+# different fault, and each caller words it for itself.
+#
+# <extra-allowed> goes FIRST in the bracket expression, because the safe set
+# ends in `-` and a `-` anywhere but last opens a character range: appending
+# `/` produced `[A-Za-z0-9._-/]`, i.e. the range `_` to `/`, which silently
+# stopped allowing the `/` it was added for.
+apl_unsafe_name_reason() {
+  local what="$1" value="$2" extra="${3:-}"
+  local stripped="${value//[$extra$APL_SAFE_NAME_CHARS]/}"
+  [[ -z "$stripped" ]] && return 0
+  printf '%s %q contains %q, which is not safe in a path or a command argument\n' \
+    "$what" "$value" "${stripped:0:1}"
+  return 1
+}
+
+# apl_id_reject_reason <id> — empty output and exit 0 when <id> may be handed on
+# as a task id; one line saying what is wrong and exit 1 when it may not.
+#
+# docs/LEDGER-CONTRACT.md §7.1 already states the rule — "an id is a filename":
+# no path separators, no whitespace, no character that is unsafe in a filename.
+# What was missing is anyone enforcing it on the way IN. `tp task create` and
+# `tp task fsck` check the id a human types; a task file written by hand, by an
+# agent with a filesystem, or by a merged pull request never passes either, and
+# every read path downstream trusted the contract's promise instead of the
+# bytes. Ids ENTER this stack from the filesystem, so they are checked there.
+#
+# This is the SAFETY rule only — the §7.1 shape, which every consumer shares and
+# nothing may opt out of, because it is what makes an id safe to hand on as a
+# path component and as one argv word. The project's own grammar
+# (TASKPUMP_ID_PATTERN) is a separate, ADVISORY question; see
+# apl_id_offgrammar_reason below for why the two must not be one check.
+apl_id_reject_reason() {
+  local id="$1" reason
+  if [[ -z "$id" ]]; then
+    printf 'the task id is empty\n'; return 1
+  fi
+  if [[ "$id" == -* ]]; then
+    printf 'task id %q starts with "-", which every CLI it is handed to reads as a flag\n' "$id"
+    return 1
+  fi
+  if [[ "$id" == "." || "$id" == ".." ]]; then
+    printf 'task id %q is a directory reference, not a filename\n' "$id"; return 1
+  fi
+  if ! reason="$(apl_unsafe_name_reason 'task id' "$id")"; then
+    printf '%s\n' "$reason"; return 1
+  fi
+  return 0
+}
+
+# apl_id_offgrammar_reason <id> — one line and exit 1 when TASKPUMP_ID_PATTERN is
+# configured and <id> does not match it; nothing and exit 0 otherwise, including
+# when no pattern is configured.
+#
+# ADVISORY, and separate from apl_id_reject_reason on purpose. The two questions
+# have different answers at a rescue sink: a `'` in an id makes it unsafe to hand
+# to anything, but `F79.2` under a conf pinning `^G[0-9]+…` is merely off-grammar
+# — filename-safe, one argv word, nothing to escape. Refusing THAT is a rescue
+# path that will not free a wedged agent over a naming convention, and `tp task
+# fsck --fix` skips exactly those files too (it filters on the same pattern), so
+# the operator's only route out would be a hand edit while an agent is stuck. A
+# caller reports this and proceeds; only apl_id_reject_reason stops the line.
+apl_id_offgrammar_reason() {
+  local id="$1"
+  [[ -n "${TASKPUMP_ID_PATTERN:-}" ]] || return 0
+  [[ "$id" =~ $TASKPUMP_ID_PATTERN ]] && return 0
+  printf 'task id %q does not match TASKPUMP_ID_PATTERN %s\n' "$id" "$TASKPUMP_ID_PATTERN"
+  return 1
+}
 
 # apl_branch_slug_reject_reason <branch> — empty output and exit 0 when the
 # branch can carry an agent name; one line saying what is wrong and exit 1 when

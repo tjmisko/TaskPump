@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # gates/claude-token-fresh — pause launching when the HOST's OAuth access token
 # is about to expire.
 #
