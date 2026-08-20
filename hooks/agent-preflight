@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # hooks/agent-preflight — TaskPump's own container pre-flight (G0.5).
 #
 # The project-specific half of the launch, run by the entrypoint's

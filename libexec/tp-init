@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # tp-init — scaffold a repository into a TaskPump consumer.
 #
 # The first command a new consumer runs. It writes a starter taskpump.conf at

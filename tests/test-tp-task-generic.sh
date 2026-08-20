@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # test-tp-task-generic.sh — tp-task against a project that is nothing like Arachne.
 #
 # test-tp-task.sh proves the tool still behaves exactly as it always did for an

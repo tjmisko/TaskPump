@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # pump-lib.sh — shared helpers for the supervisor, its gates, its hooks, and the
 # rescue tools.
 #

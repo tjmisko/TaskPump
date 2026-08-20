@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # test-pump-task-grain.sh — `tp pump --grain task` (issue #11).
 #
 # Phase grain serializes independent siblings behind one agent: during the

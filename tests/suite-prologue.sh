@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # suite-prologue.sh — the shared hermeticity prologue. Not a suite: run-all.sh
 # sources it before launching any suite (the central guard), and every
 # tests/test-*.sh sources it at the top of its own prologue (the double-guard

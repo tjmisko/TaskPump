@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # test-tp-runner-local.sh — runners/local/runner.sh against RUNNER CONTRACT v2.
 #
 # The local runner is the one with no runtime underneath it: no daemon keeps the

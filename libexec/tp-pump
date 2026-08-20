@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # tp-pump — usage-governed, DAG-aware, keep-acquiring task-loop supervisor.
 #
 # A singular HOST-level loop (so there is no cross-agent claim race) that points

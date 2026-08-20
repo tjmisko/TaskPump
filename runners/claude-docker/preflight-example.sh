@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # runners/claude-docker/preflight-example.sh — EXAMPLE, NOT WIRED.
 #
 # This is the project-specific half of what used to be one monolithic

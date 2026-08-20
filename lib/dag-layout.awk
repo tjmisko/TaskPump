@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # dag-layout.awk -- frontmatter extraction + layered DAG layout (v2).
 # Driven by libexec/tp-dag-render; see docs/design/monitor-dag-v2.md for the
 # algorithm and the invariants/objectives it is held to.

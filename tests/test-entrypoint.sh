@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # test-entrypoint.sh — guard for the claude-docker runner: entrypoint.sh,
 # preflight-example.sh, and runner.sh.
 #

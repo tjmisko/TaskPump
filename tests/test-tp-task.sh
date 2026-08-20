@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # test-tp-task.sh — fixture-based tests for libexec/tp-task.
 #
 # Creates a temp directory with fixture task files, runs CLI subcommands

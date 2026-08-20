@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # test-tp-task-lock.sh — the cross-agent state lock's file, and its lifetime.
 #
 # The lock is an flock on a file in the ledger's git root, so the file is part

@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # tp monitor -- at-a-glance status of parallel agents (btop-ish).
 #
 # Maps each running/recent agent container to its worktree, epic task status

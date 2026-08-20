@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # tty-safe.sh — the one rule for text that reaches an operator's terminal.
 #
 # This file is sourced, never executed — no `set -e`, no top-level side effects.

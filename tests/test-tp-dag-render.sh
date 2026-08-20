@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # test-arachne-dag-render.sh — fixture-driven tests for the layered task-DAG
 # renderer. Builds a synthetic tasks dir so layering, ordering, status glyphs
 # and the phase-range scope are all deterministic.

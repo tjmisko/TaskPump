@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # runners/claude-docker/entrypoint.sh — the generic in-container half of the
 # claude-docker runner. Baked into the agent image; started by runner.sh.
 #

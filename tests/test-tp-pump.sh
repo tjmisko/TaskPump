@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # test-arachne-pump.sh — dry-run fixture harness for scripts/arachne-pump.
 #
 # Per the F64.3 test plan: exercise the planning logic over a synthetic tasks dir

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # runners/claude-docker/runner.sh — the claude-docker runner. RUNNER CONTRACT v2.
 #
 # A runner is the seam between the supervisor (libexec/tp-pump) and whatever

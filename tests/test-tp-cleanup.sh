@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # test-tp-cleanup.sh -- fixture tests for the disk-reclaim path:
 #   * `tp cleanup --targets` runs the CONFIGURED reclaim command in each idle
 #     workspace the TASKPUMP_RECLAIM_DIR probe selects (unconfigured it touches

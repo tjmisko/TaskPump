@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # tp-task — TaskPump's ledger CLI: the sole reader/writer of a task DAG kept as
 # one markdown file per task, state in YAML frontmatter.
 #

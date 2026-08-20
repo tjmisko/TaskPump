@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # test-tp-init.sh — `tp init` scaffolds a new consumer (G4.1).
 #
 # Three things are being pinned here, and they pull in opposite directions:

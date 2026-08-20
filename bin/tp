@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # tp — TaskPump's single entry point.
 #
 # Every subcommand is a thin exec into the real tool under libexec/ or gates/,

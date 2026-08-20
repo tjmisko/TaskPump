@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # test-config-resolution.sh — the silent config-resolution class (issues #1,
 # #2, #3, #6). Shared root cause: a resolution answer derived from the wrong
 # anchor, silently — rc=0 with a wrong or empty result.

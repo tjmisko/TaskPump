@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # test-arachne-pump-lib.sh — offline unit tests for the shared pool helpers in
 # scripts/arachne-pump-lib.sh (sourced by both run-parallel.sh and arachne-pump).
 #

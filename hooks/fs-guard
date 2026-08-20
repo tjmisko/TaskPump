@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # hooks/fs-guard — flag edits that landed in the primary checkout.
 #
 # THE PRE-TICK HOOK CONTRACT

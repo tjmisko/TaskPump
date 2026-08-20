@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # test-tp-runner-list.sh — the `list` half of RUNNER CONTRACT v2.
 #
 # docs/RUNNERS.md §1.3 promises liveness is askable: `list` prints the name of

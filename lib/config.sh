@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # lib/config.sh — TaskPump's configuration core. Sourced by every tool, never
 # executed on its own.
 #

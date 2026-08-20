@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # tp-disk-watchdog -- pause new agent launches when free disk drops below a
 # threshold, and when space gets critical buy it back by cleaning worktree and
 # primary build dirs (`tp cleanup --targets --include-primary`, which skips any

@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # tp-cleanup -- one-button rescue for a parallel run.
 #
 # Background: a parallel run can leave the box in an awkward state — agents hung

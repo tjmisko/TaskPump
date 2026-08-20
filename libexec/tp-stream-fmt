@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # tp-stream-fmt -- format stream-json output from claude -p into readable text
 #
 # A filter, and nothing else: it reads stdin to EOF and takes no arguments at

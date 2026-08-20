@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # test-tp-task-fsck.sh — the whole-ledger conformance check and the import path.
 #
 # fsck is what a repository with a PRE-EXISTING markdown task DAG runs before

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # test-example-confs.sh — the example configurations must tell the truth
 # (issues #4, #5, #8, #9).
 #

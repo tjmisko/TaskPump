@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # test-env-hermeticity.sh — the suites must be hermetic against pump-exported
 # ledger environment (issue #18, G4.5).
 #

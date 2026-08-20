@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # run-all.sh — run every TaskPump suite and report.
 #
 # Each tests/test-*.sh is self-contained and exits non-zero on any failure. This

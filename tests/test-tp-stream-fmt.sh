@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Tristan Misko
 # test-tp-stream-fmt.sh — the agent-log pretty printer, and what it must not let
 # through.
 #
