@@ -144,8 +144,18 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 #    pressure).
 free_gb() {
     if [[ -n "${FREE_GB_OVERRIDE:-}" ]]; then echo "$FREE_GB_OVERRIDE"; return 0; fi
-    eval "${TASKPUMP_DISK_PROBE:-df --output=avail -BG '$MOUNT'}" 2>/dev/null \
-        | awk 'NR==2 {gsub("G",""); print $1}'
+    if [[ -n "${TASKPUMP_DISK_PROBE:-}" ]]; then
+        eval "$TASKPUMP_DISK_PROBE" 2>/dev/null \
+            | awk 'NR==2 {gsub("G",""); print $1}'
+        return
+    fi
+    local raw
+    if raw=$(df --output=avail -BG "$MOUNT" 2>/dev/null); then
+        printf '%s\n' "$raw" | awk 'NR==2 {gsub("G",""); print $1}'
+        return
+    fi
+    # macOS df has no --output. -k -P is POSIX; available is the 4th field, in KiB.
+    df -k -P "$MOUNT" 2>/dev/null | awk 'NR==2 {printf "%d\n", $4 / 1024 / 1024}'
 }
 
 # CAP_LOWERED is 1 while THIS process is the one holding the pause — set when a
