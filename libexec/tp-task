@@ -385,10 +385,17 @@ git_commit_state() {
   # Retry push with fetch-rebase + jittered backoff on non-fast-forward.
   # Under 10-12 concurrent agents, many small ledger pushes collide; jitter
   # spreads the retries so they don't thundering-herd the same remote ref.
-  local try max=$TASKPUMP_PUSH_RETRIES branch
+  local try max=$TASKPUMP_PUSH_RETRIES branch pushspec=()
   branch=$(git -C "$tasks_git_root" rev-parse --abbrev-ref HEAD)
+  if [[ "$branch" == "HEAD" ]]; then
+    # Detached HEAD (a submodule checkout): push to the remote's default branch.
+    branch=$(git -C "$tasks_git_root" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null || true)
+    branch=${branch#origin/}
+    branch=${branch:-main}
+    pushspec=(origin "HEAD:$branch")
+  fi
   for (( try=1; try<=max; try++ )); do
-    if git -C "$tasks_git_root" push 2>/dev/null; then
+    if git -C "$tasks_git_root" push ${pushspec[@]+"${pushspec[@]}"} 2>/dev/null; then
       dbg "pushed (attempt $try)"
       return 0
     fi
